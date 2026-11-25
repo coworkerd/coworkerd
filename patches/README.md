@@ -80,6 +80,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   valid SQL transactions whose frames require more than one record.
   Patch 0174 releases an empty platform database copy when the last root retires. It changes
   the threaded server and tests the home-reservation guard.
+  Patch 0177 reclaims the least recently used eligible database when opening another
+  needs a home or a process reservation. The home closes the actor and releases its copy
+  before admission retries.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

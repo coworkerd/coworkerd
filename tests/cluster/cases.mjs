@@ -536,6 +536,90 @@ async function threadedSqlTransactionLimit(cluster) {
   assert.equal(final.objects.repairs, before.objects.repairs, 'the connection needed no repair');
 }
 
+async function threadedDatabaseAdmission(cluster) {
+  const [owner] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-admission', { durableObjectNamespaces: 48 });
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 5]]));
+  const [first, blocked, oldestIdle, newcomer, overflow] = databases.get(owner);
+  const sql = (db, body) => request(cluster.urls.apiserver, `${db.path}/query`,
+    { method: 'POST', token: tenant.token, body, timeout: 25000 });
+  const read = async db => json(await sql(db, { sql: 'SELECT id FROM ledger ORDER BY id' }), 200, db.name).results;
+  const insert = (db, id) => sql(db, { sql: 'INSERT INTO ledger VALUES (?)', params: [id] });
+  const original = await durableGeneration(cluster, owner);
+  const sample = async expected => {
+    const latest = await durableGeneration(cluster, owner);
+    assert.equal(latest.pid, original.pid);
+    assert.equal(latest.generation, original.generation);
+    const admission = latest.lifecycle.durableAdmission;
+    for (const [field, value] of Object.entries(expected)) assert.equal(admission[field], value, field);
+  };
+  const observe = (label, expected) => eventually(label, () => sample(expected), { interval: 25 });
+
+  const clock = join(cluster.durableLifecycleGate, 'idle-offset-ms');
+  await writeFile(clock, '180000');
+  for (const db of [first, blocked, oldestIdle]) {
+    await eventually(`${db.name} can reach its owner`, async () => {
+      assert.equal(json(await sql(db, { sql: 'CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY)' }),
+        200, db.name).success, true);
+    });
+    assert.equal(json(await insert(db, 1), 200, db.name).success, true);
+  }
+  assert.deepEqual(await read(first), [{ id: 1 }], 'refresh the database on the first home');
+  await observe('three exclusive homes have settled', {
+    workerThreads: 3, homes: 3, residentRoots: 3, running: 0, waiting: 0, idleRetirements: 0,
+  });
+  // Keep the warmed roots younger than the normal retirement threshold for the pressure test.
+  const realClock = join(cluster.durableLifecycleGate, 'idle-offset-next');
+  await writeFile(realClock, '0');
+  await rename(realClock, clock);
+
+  const gate = join(cluster.peerAckGate, 'hold');
+  const writes = [];
+  let queuedRead;
+  const trackWrite = db => writes.push(insert(db, 2).catch(error => ({ error })));
+  const probe = { sql: 'SELECT 17 AS value' };
+  await writeFile(gate, '');
+  try {
+    trackWrite(blocked);
+    await observe('one database is waiting for WAL confirmation', { running: 1, pendingCommits: 1 });
+    queuedRead = read(blocked).catch(error => ({ error }));
+    await observe('the protected database also has a queued SQL request', { pendingCommits: 1, waiting: 1 });
+    assert.deepEqual(json(await sql(newcomer, probe), 200, newcomer.name).results, [{ value: 17 }]);
+    await observe('pressure retired exactly one database', {
+      admissionRetirements: 1, idleRetirements: 0, residentRoots: 3, pendingCommits: 1, waiting: 1,
+    });
+
+    assert.deepEqual(await read(first), [{ id: 1 }]);
+    await sample({ admissionRetirements: 1, idleRetirements: 0 });
+    assert.deepEqual(await read(oldestIdle), [{ id: 1 }], 'reopen the reclaimed database with its confirmed row');
+    await observe('reopening needed a second retirement', {
+      admissionRetirements: 2, idleRetirements: 0, residentRoots: 3,
+    });
+
+    trackWrite(first);
+    trackWrite(oldestIdle);
+    await observe('all three homes are busy with confirmations outstanding', {
+      running: 3, pendingCommits: 3, waiting: 1,
+    });
+    const refused = await sql(overflow, probe);
+    assert.ok(refused.status >= 400, refused.text);
+    assert.match(refused.text, /OVERLOADED|native invocation queue is full/i);
+    await sample({ admissionRetirements: 2, running: 3, pendingCommits: 3 });
+  } finally {
+    await unlink(gate);
+    await Promise.all([...writes, queuedRead]);
+  }
+  for (const result of await Promise.all(writes)) {
+    if (result.error) throw result.error;
+    assert.equal(json(result, 200, 'held write').success, true);
+  }
+  const queued = await queuedRead;
+  if (queued.error) throw queued.error;
+  assert.deepEqual(queued, [{ id: 1 }, { id: 2 }]);
+  assert.deepEqual(json(await sql(overflow, probe), 200, 'retry after drain').results, [{ value: 17 }]);
+  console.log('Three busy homes refused a fourth database. Idle admission preserved the queued read and confirmed rows.');
+}
+
 async function threadedSqlDeadline(cluster) {
   const [owner, ingress] = cluster.nodes;
   const tenant = await cluster.tenant('sql-deadline', { durableObjectNamespaces: 48 });
@@ -3109,6 +3193,11 @@ export const durableGatedCases = {
     test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNode: 'node-1',
     publishPeerPorts: true, controlDurableLifecycle: true, holdPeerAcks: false,
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
+  'durable-threaded-database-admission': {
+    test: threadedDatabaseAdmission, nodes: ['node-1'], databaseFixtureNode: 'node-1',
+    controlDurableLifecycle: true, confirmTimeoutMs: 15000,
+    nodeEnvironment: () => ({ COWORKERD_DO_TEST_HOME_COUNT: '3' }),
   },
   'threaded-sql-deadline': {
     test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNode: 'node-1',

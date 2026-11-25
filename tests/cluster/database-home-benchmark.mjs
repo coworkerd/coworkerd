@@ -8,12 +8,16 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
 
 const [side, checkoutArg, kernelArg, outputArg, mode, ...extra] = process.argv.slice(2);
-const idleAdmission = mode === '--idle-window-admission';
+const unpacedAdmission = mode === '--idle-admission-unpaced' || mode === '--idle-admission-memory';
+const busyProcesses = { '--idle-admission-busy-one': 1, '--idle-admission-busy-two': 2 }[mode];
+const idleAdmission = mode === '--idle-window-admission' || unpacedAdmission || Boolean(busyProcesses);
+const defaultHomes = mode === '--idle-admission-unpaced' || Boolean(busyProcesses);
 const defaultIdleWindow = mode === '--idle-window-default';
 const patchedIdleWindow = mode === '--idle-window-patched';
 const idleWindow = mode === '--idle-window' || defaultIdleWindow || patchedIdleWindow || idleAdmission;
 const modes = ['--smoke', '--default-admission', '--cold-follow-up', '--throughput', '--throughput-smoke',
-  '--idle-window', '--idle-window-default', '--idle-window-patched', '--idle-window-admission'];
+  '--idle-window', '--idle-window-default', '--idle-window-patched', '--idle-window-admission',
+  '--idle-admission-unpaced', '--idle-admission-memory', '--idle-admission-busy-one', '--idle-admission-busy-two'];
 if (!['object', 'native'].includes(side) || !checkoutArg || !kernelArg || !outputArg ||
     (mode !== undefined && !modes.includes(mode)) || (idleWindow && side !== 'object') || extra.length) {
   console.error('Usage: node tests/cluster/database-home-benchmark.mjs <object|native> <product-checkout> <kernel-directory> <new-report.jsonl> [' + modes.join('|') + ']');
@@ -39,7 +43,7 @@ const BenchmarkCluster = idleWindow
   ? (await import(pathToFileURL(join(checkout, 'tests/cluster/cluster.mjs')).href)).Cluster
   : Cluster;
 const settings = {
-  homes: idleWindow && !idleAdmission ? 80 : smoke || throughput ? 16 : 520,
+  homes: defaultHomes ? 4 : idleWindow && !idleAdmission ? 80 : smoke || throughput ? 16 : 520,
   density: idleWindow ? [0, 1, 32, 64] : smoke ? [0, 3, 8] : [0, 100, 500],
   coldSamples: smoke ? 6 : 200,
   warmSamples: smoke ? 20 : 1000,
@@ -51,7 +55,7 @@ const reopenRounds = defaultIdleWindow ? 1 : 4;
 // Shorten the copy's post-retirement grace period for the benchmark.
 const profileCopyIdleMs = mode === '--idle-window' ? 12000 : 300000;
 const admissionDatabases = 1000;
-const admissionSpacingMs = 50;
+const admissionSpacingMs = unpacedAdmission ? 0 : 50;
 const controller = new AbortController();
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => controller.abort(new Error('Interrupted by ' + signal)));
@@ -72,14 +76,18 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
     // The admission share derived from a small VM can refuse fewer than 500 copies.
     // Raise the planning budget while keeping an explicit, equal process cap.
     ...(!defaultAdmission && !idleWindow && { memoryBudgetBytes: 16 * 1024 ** 3 }),
-    processPool: { count: 1, inFlightLimit: throughput ? throughputInFlightLimit : 128,
+    processPool: { count: 1, ...(!unpacedAdmission && !busyProcesses && {
+      inFlightLimit: throughput ? throughputInFlightLimit : 128,
+    }),
       ...(!defaultAdmission && !idleWindow && { threadedMemoryBytes: 3 * 1024 ** 3 }) },
-    durableObjects: { processes: 1, threadedStorage: true, peers: 0 },
+    durableObjects: { processes: busyProcesses ?? 1, threadedStorage: true, peers: 0 },
   }),
   nodeEnvironment: () => ({
-    COWORKERD_DO_TEST_HOME_COUNT: String(settings.homes),
+    ...(!defaultHomes && { COWORKERD_DO_TEST_HOME_COUNT: String(settings.homes) }),
     // Keep both mailbox limits above the offered concurrency and its routing bytes.
-    COWORKERD_DO_TEST_MAILBOX_EVENTS: String(throughput ? throughputMailbox.events : 32),
+    ...(!unpacedAdmission && !busyProcesses && {
+      COWORKERD_DO_TEST_MAILBOX_EVENTS: String(throughput ? throughputMailbox.events : 32),
+    }),
     ...(throughput && { COWORKERD_DO_TEST_MAILBOX_BYTES: String(throughputMailbox.bytes) }),
   }),
 });
@@ -87,7 +95,7 @@ const [owner] = cluster.nodes;
 if (idleWindow) assert.equal(cluster.databaseFixtureNode, owner, 'supply a database placement checkout');
 const tenantName = 'database-benchmark';
 const workload = 'traffic';
-const databaseCount = idleAdmission ? admissionDatabases
+const databaseCount = busyProcesses ? 64 : idleAdmission ? admissionDatabases
   : throughput ? 8 : defaultAdmission ? settings.homes + 1 : settings.density.at(-1);
 const databases = Array.from({ length: databaseCount },
   (_, index) => 'db-' + String(index).padStart(4, '0'));
@@ -279,26 +287,37 @@ async function parallel(items, clients, run) {
   }));
 }
 
-async function durable() {
+async function durableProcesses() {
   const state = await cluster.state(owner);
-  const entries = state.processes.entries.filter(entry => entry.processClass === 'durable');
-  assert.equal(entries.length, 1);
-  const entry = entries[0];
-  assert.equal(entry.sandbox.durableServer, 'threaded');
-  assert.ok(entry.pid > 0 && entry.lifecycle?.durableAdmission);
-  return { entry, log: state.durableLog, processPool: state.processes.configuration };
+  const entries = state.processes.entries.filter(entry => entry.processClass === 'durable' && entry.state === 'ready');
+  assert.equal(entries.length, busyProcesses ?? 1);
+  for (const entry of entries) {
+    assert.equal(entry.sandbox.durableServer, 'threaded');
+    assert.ok(entry.pid > 0 && entry.lifecycle?.durableAdmission);
+  }
+  return { entries, log: state.durableLog, processPool: state.processes.configuration };
+}
+
+async function durable() {
+  const { entries: [entry], log, processPool } = await durableProcesses();
+  return { entry, log, processPool };
 }
 
 async function identify(kernelHash) {
-  const { entry, processPool } = await eventually('threaded durable child is ready', async () => {
-    const snapshot = await durable();
-    assert.equal(snapshot.entry.binarySha256, kernelHash);
-    assert.equal(snapshot.entry.lifecycle.durableAdmission.workerThreads, settings.homes);
+  const { entries, processPool } = await eventually('threaded durable children are ready', async () => {
+    const snapshot = await durableProcesses();
+    for (const entry of snapshot.entries) {
+      assert.equal(entry.binarySha256, kernelHash);
+      assert.equal(entry.lifecycle.durableAdmission.workerThreads, settings.homes);
+    }
     return snapshot;
   }, { timeout: 30000 });
   if (idleWindow) assert.equal(processPool.idleEvictMs, profileCopyIdleMs);
-  child = { processId: entry.processId, generation: entry.generation, pid: entry.pid };
-  await record('child', { ...child, processPool });
+  for (const entry of entries) {
+    const identity = { processId: entry.processId, generation: entry.generation, pid: entry.pid };
+    child ??= identity;
+    await record('child', { ...identity, processPool });
+  }
 }
 
 async function validateConfirmation() {
@@ -697,18 +716,25 @@ async function runIdleReopen(lastReadCompleted) {
   }
 }
 
-async function runIdleAdmission() {
+async function provisionAdmissionDatabases() {
   const tenant = await cluster.tenant(tenantName, { durableObjectNamespaces: databases.length });
   let revision = 0;
+  const catalog = [];
   for (const name of databases) {
     const created = await cluster.api(tenant.path + '/databases/' + name, { method: 'POST', token: tenant.token });
     revision = Math.max(created.revision, revision);
+    catalog.push(created.database);
   }
   assert.ok(revision > 0, 'database creation returns a catalog revision');
   await eventually('owner applies the database catalog', async () => {
     const state = await cluster.state(owner);
     assert.ok(Number(state.storage.appliedTenantsRevision) >= revision);
   });
+  return { tenant, revision, catalog };
+}
+
+async function runIdleAdmission() {
+  const { tenant, revision } = await provisionAdmissionDatabases();
   await record('idle-admission-setup', { databases: databases.length, revision, admissionSpacingMs,
     guest: await hostSample() });
 
@@ -746,10 +772,72 @@ async function runIdleAdmission() {
   }
   const elapsedMs = performance.now() - start;
   assert.ok(elapsedMs < profileCopyIdleMs, 'serial scan finishes inside the copy window');
+  const { entry } = await durable();
+  const admissionRetirements = entry.lifecycle.durableAdmission.admissionRetirements;
   await record('idle-admission-result', { tried: databases.length, succeeded, elapsedMs, peakRssBytes,
-    memoryBudgetBytes, failures, guest: await hostSample() });
+    memoryBudgetBytes, admissionRetirements, failures, guest: await hostSample() });
   assert.equal(failures.length, 0, 'every idle-admission query succeeded');
   assert.ok(peakRssBytes < memoryBudgetBytes, 'sampled RSS remains below the child memory budget');
+  if (defaultHomes) assert.ok(admissionRetirements > 0, 'the scan exercised admission-time retirement');
+}
+
+async function runBusyAdmission() {
+  const { tenant, catalog } = await provisionAdmissionDatabases();
+  const { entries: initial } = await durableProcesses();
+  const slots = initial.map(entry => entry.processId);
+  const groups = new Map(slots.map(slot => [slot, []]));
+  for (const { name, namespaceId } of catalog) {
+    // Match the platform's canonical database ID and durable slot rendezvous.
+    const objectId = sha256(Buffer.concat([Buffer.from(namespaceId, 'hex'), Buffer.from('namedatabase')]));
+    const scores = slots.map(slot => [slot, sha256(`${namespaceId}/${objectId}\0${slot}`).slice(0, 16)]);
+    scores.sort(([a, x], [b, y]) => y.localeCompare(x) || a.localeCompare(b));
+    groups.get(scores[0][0]).push(name);
+  }
+  for (const group of groups.values()) assert.ok(group.length > settings.homes);
+  const queryUrl = name => tenant.path + '/databases/' + name + '/query';
+  const read = name => request(cluster.urls.apiserver, queryUrl(name), {
+    method: 'POST', token: tenant.token, body: { sql: 'SELECT 1 AS value' },
+  });
+  const active = [...groups.values()].flatMap(group => group.slice(0, settings.homes));
+  for (const name of active) {
+    assert.deepEqual(json(await read(name), 200, name).results, [{ value: 1 }]);
+  }
+  const abort = new AbortController();
+  const activeSql = { sql: 'WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n < 1000000000) SELECT sum(n) FROM r' };
+  const queries = active.map(name => fetch(cluster.urls.apiserver + queryUrl(name), {
+    method: 'POST',
+    headers: { authorization: `Bearer ${tenant.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(activeSql), signal: AbortSignal.any([abort.signal, controller.signal]),
+  }).then(async reply => ({ status: reply.status, text: await reply.text() })).catch(error => ({ error })));
+  try {
+    const { entries, processPool } = await eventually('the default homes in every durable process are busy', async () => {
+      const snapshot = await durableProcesses();
+      for (const entry of snapshot.entries) {
+        const before = initial.find(candidate => candidate.processId === entry.processId);
+        assert.equal(entry.pid, before.pid);
+        assert.equal(entry.generation, before.generation);
+        assert.equal(entry.lifecycle.durableAdmission.running, settings.homes);
+        assert.equal(entry.lifecycle.durableAdmission.admissionRetirements, 0);
+      }
+      return snapshot;
+    }, { timeout: 10000, interval: 25 });
+    const refused = [];
+    for (const [slot, names] of groups) {
+      const reply = await read(names[settings.homes]);
+      assert.ok(reply.status >= 400, reply.text);
+      assert.match(reply.text, /OVERLOADED|native invocation queue is full/i);
+      refused.push({ slot, status: reply.status, reply: JSON.parse(reply.text) });
+    }
+    await record('busy-admission-result', {
+      processes: entries.map(({ processId, pid, generation, residentBytes, lifecycle }) => ({
+        processId, pid, generation, residentBytes, ...lifecycle.durableAdmission,
+      })),
+      totalBusy: active.length, refused, memoryBudgetBytes: processPool.threadedMemoryBytes,
+    });
+  } finally {
+    abort.abort();
+    await Promise.all(queries);
+  }
 }
 
 async function runDefaultAdmission(kernelHash) {
@@ -798,7 +886,9 @@ try {
   await cluster.start();
   if (!idleAdmission) await setup();
   await identify(kernelHash);
-  if (idleAdmission) {
+  if (busyProcesses) {
+    await runBusyAdmission();
+  } else if (idleAdmission) {
     await runIdleAdmission();
   } else if (throughput) {
     await runNetworkThroughput();
