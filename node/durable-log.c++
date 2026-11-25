@@ -5460,8 +5460,16 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   dirtyCacheSizes.insert(objectName);
   lap(laps.files);
   const auto publishingStarted = monotonicTimeMs();
-  if (tails.cut) co_await forceRecoverySnapshot(objectName);
-  else co_await publishRecovery(objectName, adopted);
+  if (tails.cut) {
+    // Many missing owners can reach the cut in the same wake tick. Pace the
+    // start of their snapshot publications so the durable process gets time
+    // to answer probes between the resulting cold opens.
+    co_await cutPublication.acquire().ignoreResult();
+    check();
+    co_await forceRecoverySnapshot(objectName);
+  } else {
+    co_await publishRecovery(objectName, adopted);
+  }
   check();
   lap(laps.publish);
   std::vector<RecoveryEvent> completed;
@@ -8220,6 +8228,7 @@ std::string DurableLog::recoverySchedulerJson(double now) const {
       << ",\"metadataRequests\":" << recoveryMetadata.started() << ",\"activeMetadataRequests\":" << recoveryMetadata.active()
       << ",\"peakMetadataRequests\":" << recoveryMetadata.peakActive()
       << ",\"reusedPredecessorEpochs\":" << reusedPredecessorEpochs
+      << ",\"cutPublicationsAdmitted\":" << cutPublication.started()
       << ",\"activeTailTransfers\":" << tailPages.active() << ",\"peakTailTransfers\":" << tailPages.peakActive()
       << ",\"entries\":[";
   bool first = true;

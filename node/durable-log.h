@@ -1156,6 +1156,7 @@ private:
   uint64_t threadedHomeCheckpointSamples = 0, threadedHomeCheckpointMaxNs = 0;
   uint64_t threadedHomeCheckpointMaxWalBytes = 0;
   RecoveryGate recoveryMetadata{timer, 2, 16, 4};
+  RecoveryGate cutPublication{timer, 1, 64, 4};
   std::function<std::shared_ptr<const ObjectResponse>(const std::string&, uint32_t, uint64_t, uint64_t)> predecessorEpochHook;
   uint64_t reusedPredecessorEpochs = 0;
   RecoveryGate tailPages{timer, settings.config.recoverParallelism};

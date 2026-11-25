@@ -58,7 +58,7 @@ async function databases(tenant, total) {
   return selected;
 }
 
-async function query(node, database, sql, value, retries = 0) {
+async function query(node, database, sql, retries = 0) {
   const path = `/__coworkerd/databases/${tenantName}/${database.name}/query`;
   const options = { method: 'POST', token: cluster.management, timeout: 35000, body: { sql } };
   let response = await request(peerUrls[node], path, options);
@@ -67,7 +67,10 @@ async function query(node, database, sql, value, retries = 0) {
     await delay(250, undefined, { signal: controller.signal });
     response = await request(peerUrls[node], path, options);
   }
-  const answer = json(response, 200, database.name);
+  return json(response, 200, database.name);
+}
+
+function verifyRow(database, answer, value) {
   assert.equal(answer.success, true, JSON.stringify(answer).slice(0, 500));
   assert.deepEqual(answer.results, [{ value }], database.name);
 }
@@ -145,6 +148,7 @@ async function measureLogs(node, since, selected) {
     }
   }
   assert.equal(samples.size, selected.length, `${node} rebuilt all its assigned databases`);
+  assert.equal(starts.size, selected.length, `${node} started all its assigned rebuilds`);
   for (const database of selected) {
     database.tailWaitMs = samples.get(database.namespace).laps.tailWaitMs;
     database.rebuildLoopDelayMs = samples.get(database.namespace).loopDelayMs;
@@ -165,7 +169,7 @@ async function runCold(databases, schedule) {
   const start = performance.now();
   const read = async database => {
     const sent = performance.now();
-    await query(original, database, 'SELECT 1 AS value', 1);
+    verifyRow(database, await query(original, database, 'SELECT 1 AS value'), 1);
     database.elapsedMs = performance.now() - sent;
   };
   if (schedule === 'serial') {
@@ -188,7 +192,7 @@ async function runLoss(databases) {
   const beforeSeed = await cluster.state(original);
   for (let offset = 0; offset < databases.length; offset += 16) {
     await Promise.all(databases.slice(offset, offset + 16)
-      .map(db => query(original, db, sql(db.name), db.name, 2)));
+      .map(async db => verifyRow(db, await query(original, db, sql(db.name), 2), db.name)));
   }
   const seeded = await cluster.state(original);
   assert.ok(seeded.durableLog.confirm.confirmations >= beforeSeed.durableLog.confirm.confirmations + count);
@@ -208,11 +212,12 @@ async function runLoss(databases) {
     // Give the client a short ramp at larger counts to avoid a connection burst.
     if (count > 500) await delay(Math.floor(index / 100) * 20, undefined, { signal: controller.signal });
     let attempts = 0;
-    await eventually(`read ${database.name}`, async () => {
+    const answer = await eventually(`read ${database.name}`, async () => {
       controller.signal.throwIfAborted();
       ++attempts;
-      await query(database.successor, database, 'SELECT value FROM sample', database.name);
+      return query(database.successor, database, 'SELECT value FROM sample');
     }, { timeout: count === 2000 ? 300000 : 180000, interval: 250 });
+    verifyRow(database, answer, database.name);
     return { ...database, elapsedMs: performance.now() - fault, attempts };
   }));
   reads.sort((left, right) => left.elapsedMs - right.elapsedMs);
