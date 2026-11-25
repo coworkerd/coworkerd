@@ -150,9 +150,8 @@ def allowed_path(name, path):
                               'src/workerd/threaded/protocol.capnp',
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
-                          name == '0162-alarm-limit-visibility.patch' and
-                              path == 'src/workerd/threaded/threaded-server.c++' or
-                          name == '0163-drain-promise-branch.patch' and
+                          name in {'0162-alarm-limit-visibility.patch', '0163-drain-promise-branch.patch',
+                                   '0164-own-drain-continuation.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0042-threaded-server-s1a.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
