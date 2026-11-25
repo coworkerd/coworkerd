@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 17:20:31 +0800
+Subject: [PATCH] Take a drain branch from the mutable response promise
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 0f0e8871ab1847cef28c34a8801a34c6ae4b57f7..343615ec98901cb464b500fb7b47baea6a2fe8b4 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1649,8 +1649,12 @@ struct RequestLimits final: LimitEnforcer {
+     auto deadline = [this]() {
+       return timer.timer.atTime(kj::max(kj::systemPreciseMonotonicClock().now(), timer.timer.now()) + WAIT_UNTIL_LIMIT);
+     };
+-    auto wait = measurement.responseEnded.map([&](auto &ended) { return ended.addBranch().then(deadline); })
+-        .orDefault([&]() { return deadline(); });
++    kj::Promise<void> wait = nullptr;
++    KJ_IF_SOME(ended, measurement.responseEnded) {
++      wait = ended.addBranch().then(deadline);
++    } else {
++      wait = deadline();
++    }
+     KJ_IF_SOME(ended, measurement.requestLeaseEnded) {
+       return kj::mv(wait).exclusiveJoin(ended.addBranch());
+     }
