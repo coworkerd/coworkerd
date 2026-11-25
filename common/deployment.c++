@@ -205,6 +205,10 @@ void validateDefinition(const VersionDefinition& version) {
   const auto tenant = tenantOf(version.workerId);
   KJ_REQUIRE(deploymentSafeName(version.versionId), "invalid versionId");
   KJ_REQUIRE(version.format == "v1" || version.format == "v2", "unsupported definition format");
+  if (version.subrequestLimit) {
+    KJ_REQUIRE(*version.subrequestLimit > 0 && *version.subrequestLimit <= MAX_SUBREQUEST_LIMIT,
+        "limits.subrequests must be a whole number between 1 and 10,000,000");
+  }
   if (version.format == "v2" && version.mainModule.empty()) {
     KJ_REQUIRE(version.assets, "a version without a main module must declare static assets");
   } else {
@@ -359,6 +363,10 @@ std::string definitionEncoding(const VersionDefinition& version) {
       for (const auto* binding : d1) { stringField(out, binding->binding); stringField(out, binding->database); }
     }
   }
+  if (version.subrequestLimit) {
+    stringField(out, "limits.subrequests");
+    uint32(out, *version.subrequestLimit);
+  }
   return out;
 }
 
@@ -415,6 +423,7 @@ std::string definitionJson(const VersionDefinition& version) {
     out += ']';
   }
   if (version.hasDurableObjects()) out += ",\"durableObjects\":" + durableObjectsJson(version) + ",\"classes\":" + durableClassesJson(version);
+  if (version.subrequestLimit) out += ",\"limits\":{\"subrequests\":" + std::to_string(*version.subrequestLimit) + '}';
   return out + '}';
 }
 
@@ -584,6 +593,7 @@ std::shared_ptr<const VersionDefinition> decodeDeploymentDefinition(const std::s
   version->contentHash = value.getContentHash().cStr();
   version->definitionHash = value.getDefinitionHash().cStr();
   version->format = value.getFormat().cStr();
+  if (value.hasLimits()) version->subrequestLimit = value.getLimits().getSubrequests();
   for (auto flag : value.getCompatibilityFlags()) version->compatibilityFlags.emplace_back(flag.cStr());
   for (auto v : value.getVariables()) version->variables.push_back({v.getName().cStr(), v.getType().cStr(), v.getValue().cStr()});
   for (auto binding : value.getBindings()) version->bindings.push_back({binding.getName().cStr(), binding.getWorkerId().cStr(),
@@ -622,6 +632,7 @@ DeploymentInput readDeploymentManifest(const std::filesystem::path& manifestPath
       value->workerId = id;
       value->versionId = version.getVersionId().cStr();
       value->format = version.getFormat().cStr();
+      if (version.hasLimits()) value->subrequestLimit = version.getLimits().getSubrequests();
       value->compatibilityDate = value->format == "v2" ? version.getCompatibilityDate().cStr() : date;
       value->mainModule = version.getMainModule().cStr();
       value->contentHash = version.getContentHash().cStr();

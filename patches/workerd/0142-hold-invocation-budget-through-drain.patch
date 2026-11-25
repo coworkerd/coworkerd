@@ -1,0 +1,446 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 14:14:58 +0800
+Subject: [PATCH] Hold invocation budgets through runtime request drain
+
+---
+ src/workerd/io/io-channels.h                  |  1 +
+ src/workerd/io/worker-entrypoint.c++          |  1 +
+ src/workerd/io/worker-interface.capnp         |  4 +-
+ .../server/factory/coworkerd-cpu-limit.c++    |  2 +-
+ .../server/factory/worker-factory-rpc.c++     | 12 +++-
+ src/workerd/server/factory/worker-factory.c++ | 20 +++---
+ src/workerd/server/factory/worker-factory.h   |  2 +-
+ src/workerd/threaded/protocol.capnp           |  2 +-
+ src/workerd/threaded/threaded-server.c++      | 63 ++++++++++++-------
+ 9 files changed, 69 insertions(+), 38 deletions(-)
+
+diff --git a/src/workerd/io/io-channels.h b/src/workerd/io/io-channels.h
+index a7ffc2e0209eda35cb6559d7b813ae1c59c81373..51e779255a9fc2cf8eacb92ef6028b16f514d279 100644
+--- a/src/workerd/io/io-channels.h
++++ b/src/workerd/io/io-channels.h
+@@ -251,6 +251,7 @@ class IoChannelFactory: public virtual kj::Refcounted {
+     // Bound by a Coworkerd platform dynamic entrypoint, never inferred from cf or props.
+     // Reporting identity only; it does not change the request or context lifetime.
+     kj::Maybe<kj::String> coworkerdInvocationIdentity;
++    capnp::Capability::Client coworkerdBudgetLifetime = nullptr;
+   };
+ 
+   // Parameters that can influence the version of a worker that is used to serve a subrequest.
+diff --git a/src/workerd/io/worker-entrypoint.c++ b/src/workerd/io/worker-entrypoint.c++
+index 15d6f7c3b2b0174826ecaf269bb8b5b247d6e595..e8ba366c98e67859fe7185849a7fe9de80f1740b 100644
+--- a/src/workerd/io/worker-entrypoint.c++
++++ b/src/workerd/io/worker-entrypoint.c++
+@@ -1045,6 +1045,7 @@ kj::Promise<WorkerInterface::AlarmResult> WorkerEntrypoint::runAlarmImpl(
+                 entrypointName = entrypointName.clone(), versionInfo = kj::mv(versionInfo),
+                 props = kj::mv(props)](Worker::Lock& lock, IoContext& context) mutable {
+           auto traceScope = context.makeRequestTraceScope(lock);
++          auto limitScope = incomingRequest.enterActorEvent(lock);
+ 
+           // If we have an invalid timeout, set it to the default value of 15 minutes.
+           auto timeout = context.getLimitEnforcer().getAlarmLimit();
+diff --git a/src/workerd/io/worker-interface.capnp b/src/workerd/io/worker-interface.capnp
+index 0636de681f8f81c14ff1388c90dc1d3f349b057c..679f3b5a1ce5c414824da98959a15e241dff0385 100644
+--- a/src/workerd/io/worker-interface.capnp
++++ b/src/workerd/io/worker-interface.capnp
+@@ -1088,7 +1088,8 @@ interface WorkerdBootstrap {
+   # Bootstrap interface exposed by workerd when serving Cap'n Proto RPC.
+ 
+   startEvent @0 (cfBlobJson :Text, fromPersistentStub :Bool, fromHandoff :Bool,
+-                 forwardedBy :Text, causedBy :List(Text)) -> (dispatcher :EventDispatcher);
++                 forwardedBy :Text, causedBy :List(Text), budgetLifetime :Capability)
++      -> (dispatcher :EventDispatcher);
+   # Start a new event. Exactly one event should be delivered to the returned EventDispatcher.
+   #
+   # If the event is an HTTP request, `cfBlobJson` optionally carries the JSON-encoded `request.cf`
+@@ -1101,6 +1102,7 @@ interface WorkerdBootstrap {
+   #
+   # `fromHandoff` and `causedBy` say which Durable Objects' work made the request, as
+   # `SubrequestMetadata::fromHandoff` and `SubrequestMetadata::causedBy`.
++  # Coworkerd's optional lifetime token is held by the incoming request's I/O channels.
+   #
+   # `forwardedBy` names the cluster node that sent the request on, as
+   # `SubrequestMetadata::forwardedBy`.
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+index 2f5ad8e9d6dc9449ff5c19cc4249346cbf5e820d..0ef772f419dc2036b96bec9721120206690064f4 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+@@ -336,7 +336,7 @@ class RequestLimits final: public LimitEnforcer {
+           auto handle = value.getHandle(jsg::Lock::from(isolate));
+           if (!handle->IsUndefined()) {
+             auto& request = jsg::unwrapOpaqueRef<kj::Weak<IoContext::IncomingRequest>>(isolate, handle);
+-            return KJ_REQUIRE_NONNULL(request.tryGet(), "the durable event that started this work has ended");
++            return request.tryGet();
+           }
+         }
+       }
+diff --git a/src/workerd/server/factory/worker-factory-rpc.c++ b/src/workerd/server/factory/worker-factory-rpc.c++
+index 0140383c545dd27ad2c92c89e26dcf1b6a6316f5..54d5542a20c9ed3570b7392b85d2e26db371d411 100644
+--- a/src/workerd/server/factory/worker-factory-rpc.c++
++++ b/src/workerd/server/factory/worker-factory-rpc.c++
+@@ -28,14 +28,16 @@ class WorkerdBootstrapImpl::EventDispatcherImpl final: public rpc::EventDispatch
+       Persistent fromPersistentStub,
+       FromHandoff fromHandoff,
+       kj::Maybe<kj::String> forwardedBy,
+-      kj::Array<kj::String> causedBy)
++      kj::Array<kj::String> causedBy,
++      capnp::Capability::Client budgetLifetime)
+       : httpOverCapnpFactory(httpOverCapnpFactory),
+         service(kj::mv(service)),
+         cfBlobJson(kj::mv(cfBlobJson)),
+         fromPersistentStub(fromPersistentStub),
+         fromHandoff(fromHandoff),
+         forwardedBy(kj::mv(forwardedBy)),
+-        causedBy(kj::mv(causedBy)) {}
++        causedBy(kj::mv(causedBy)),
++        budgetLifetime(kj::mv(budgetLifetime)) {}
+ 
+   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
+     IoChannelFactory::SubrequestMetadata metadata;
+@@ -44,6 +46,7 @@ class WorkerdBootstrapImpl::EventDispatcherImpl final: public rpc::EventDispatch
+     metadata.fromHandoff = fromHandoff;
+     metadata.forwardedBy = kj::mv(forwardedBy);
+     metadata.causedBy = kj::mv(causedBy);
++    metadata.coworkerdBudgetLifetime = kj::mv(budgetLifetime);
+     context.initResults(capnp::MessageSize{4, 1})
+         .setHttp(httpOverCapnpFactory.kjToCapnp(getService()->startRequest(kj::mv(metadata))));
+     return kj::READY_NOW;
+@@ -105,6 +108,7 @@ class WorkerdBootstrapImpl::EventDispatcherImpl final: public rpc::EventDispatch
+   FromHandoff fromHandoff;
+   kj::Maybe<kj::String> forwardedBy;
+   kj::Array<kj::String> causedBy;
++  capnp::Capability::Client budgetLifetime;
+ 
+   kj::Rc<IoChannelFactory::SubrequestChannel> getService() {
+     auto result =
+@@ -119,6 +123,7 @@ class WorkerdBootstrapImpl::EventDispatcherImpl final: public rpc::EventDispatch
+     metadata.fromHandoff = fromHandoff;
+     metadata.forwardedBy = kj::mv(forwardedBy);
+     metadata.causedBy = kj::mv(causedBy);
++    metadata.coworkerdBudgetLifetime = kj::mv(budgetLifetime);
+     return getService()->startRequest(kj::mv(metadata));
+   }
+ 
+@@ -143,7 +148,8 @@ kj::Promise<void> WorkerdBootstrapImpl::startEvent(StartEventContext context) {
+           kj::heap<EventDispatcherImpl>(httpOverCapnpFactory, service->addRef(), kj::mv(cfBlobJson),
+               Persistent(params.getFromPersistentStub()), FromHandoff(params.getFromHandoff()),
+               kj::mv(forwardedBy),
+-              KJ_MAP(object, params.getCausedBy()) { return kj::str(object); }));
++              KJ_MAP(object, params.getCausedBy()) { return kj::str(object); },
++              params.getBudgetLifetime()));
+   return kj::READY_NOW;
+ }
+ 
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index a1daec1d53b6c0e6123fbcfca0f8a158b51d28e6..35de0cf5fa454c85146d31388eec241fa7495d24 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -1152,6 +1152,8 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+ 
+   kj::Own<RequestObserver> observer =
+       kj::refcounted<RequestObserverWithTracer>(workerTracer.clone());
++  // Keep the token on the incoming request, even if actor limits keep its channel factory alive.
++  observer = kj::mv(observer).attach(kj::mv(metadata.coworkerdBudgetLifetime));
+ 
+   kj::Maybe<tracing::InvocationSpanContext> triggerContext;
+   KJ_IF_SOME(ctx, metadata.userSpanParent.toSpanContext()) {
+@@ -1320,16 +1322,20 @@ void request_metadata_set_coworkerd_invocation_identity(
+   metadata.coworkerdInvocationIdentity = kj::str(identity);
+ }
+ 
+-::rust::String coworkerd_current_invocation_identity() {
+-  KJ_IF_SOME(context, IoContext::tryCurrent()) {
+-    if (context.hasCurrentIncomingRequest()) {
+-      auto* channel = dynamic_cast<RustIoChannelFactory*>(&context.getIoChannelFactory());
+-      if (channel != nullptr) {
+-        KJ_IF_SOME(identity, channel->coworkerdIdentity) {
+-          return ::rust::String(identity.begin(), identity.size());
++::rust::String coworkerd_current_invocation_identity() noexcept {
++  try {
++    KJ_IF_SOME(context, IoContext::tryCurrent()) {
++      if (context.hasCurrentIncomingRequest()) {
++        auto* channel = dynamic_cast<RustIoChannelFactory*>(&context.getIoChannelFactory());
++        if (channel != nullptr) {
++          KJ_IF_SOME(identity, channel->coworkerdIdentity) {
++            return ::rust::String(identity.begin(), identity.size());
++          }
+         }
+       }
+     }
++  } catch (...) {
++    // The Rust FFI returns a string, so unavailable identity stays on the Rust error path.
+   }
+   return {};
+ }
+diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
+index 759b883ca141eb8ac630cf216dad1933d2ca3027..61275b39ff4f736b8e534953ff6bfbc5761d4390 100644
+--- a/src/workerd/server/factory/worker-factory.h
++++ b/src/workerd/server/factory/worker-factory.h
+@@ -373,7 +373,7 @@ void request_metadata_set_cause(
+     RequestMetadata& metadata, bool fromHandoff, ::rust::Vec<::rust::String> causedBy);
+ void request_metadata_set_coworkerd_invocation_identity(
+     RequestMetadata& metadata, ::rust::Str identity);
+-::rust::String coworkerd_current_invocation_identity();
++::rust::String coworkerd_current_invocation_identity() noexcept;
+ void request_metadata_set_actor_self_token(const WorkerFactory& factory,
+     RequestMetadata& metadata,
+     ::rust::Str uniqueKey,
+diff --git a/src/workerd/threaded/protocol.capnp b/src/workerd/threaded/protocol.capnp
+index be4772b1936089b2d8326fae2ecf5c859a5f2430..1ec43c46f76a3a595553b3f19fa99d810972dca9 100644
+--- a/src/workerd/threaded/protocol.capnp
++++ b/src/workerd/threaded/protocol.capnp
+@@ -97,7 +97,7 @@ interface ThreadedSocketControl @0xdc432f018090bcc4 {
+ }
+ 
+ interface Bootstrap @0xa0c731b2df279451 extends(Worker.WorkerdBootstrap) {
+-  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :Props)
++  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :Props, budgetLifetime :Capability)
+       -> (dispatcher :Worker.EventDispatcher);
+   socketControl @1 () -> (control :ThreadedSocketControl);
+ }
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267da806eaa7 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1591,8 +1591,8 @@ struct RequestLimits final: LimitEnforcer {
+   }
+   kj::Maybe<IoContext::IncomingRequest &> getActorEventRequest() override {
+     if (scope == nullptr || !scope->event) return kj::none;
+-    return KJ_REQUIRE_NONNULL(KJ_REQUIRE_NONNULL(scope->event->request).tryGet(),
+-        "the durable event that started this work has ended");
++    KJ_IF_SOME(request, scope->event->request) { return request.tryGet(); }
++    return kj::none;
+   }
+   struct EventToken {
+     const std::weak_ptr<int> owner;
+@@ -2255,11 +2255,13 @@ struct InvocationState: kj::Refcounted {
+ 
+ class Invocation final: public kj::HttpService {
+  public:
+-  Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props)
++  Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
++      capnp::Capability::Client budgetLifetime)
+       : server(server),
+         state(state),
+         descriptor(kj::mv(descriptor)),
+-        props(kj::mv(props)) {}
++        props(kj::mv(props)),
++        budgetLifetime(kj::mv(budgetLifetime)) {}
+   kj::Promise<void> request(kj::HttpMethod method,
+       kj::StringPtr url,
+       const kj::HttpHeaders &headers,
+@@ -2271,21 +2273,24 @@ class Invocation final: public kj::HttpService {
+   ThreadState &state;
+   kj::String descriptor;
+   Frankenvalue props;
++  capnp::Capability::Client budgetLifetime;
+   bool used = false;
+ };
+ 
+ class Dispatcher final: public rpc::EventDispatcher::Server {
+  public:
+-  Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props)
++  Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
++      capnp::Capability::Client budgetLifetime)
+       : server(server),
+         state(state),
+         descriptor(kj::mv(descriptor)),
+-        props(kj::mv(props)) {}
++        props(kj::mv(props)),
++        budgetLifetime(kj::mv(budgetLifetime)) {}
+   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
+     KJ_REQUIRE(!used, "NOT_SUPPORTED: one HTTP event per invocation");
+     used = true;
+     context.initResults().setHttp(state.http.kjToCapnp(
+-        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props))));
++        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props), kj::mv(budgetLifetime))));
+     return kj::READY_NOW;
+   }
+   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override;
+@@ -2295,6 +2300,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
+   ThreadState &state;
+   kj::String descriptor;
+   Frankenvalue props;
++  capnp::Capability::Client budgetLifetime;
+   bool used = false;
+ };
+ 
+@@ -2308,7 +2314,7 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+     KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
+         "NOT_SUPPORTED: persistent objects and handoff");
+     context.initResults().setDispatcher(
+-        kj::heap<Dispatcher>(server, state, kj::str(params.getCfBlobJson()), Frankenvalue()));
++        kj::heap<Dispatcher>(server, state, kj::str(params.getCfBlobJson()), Frankenvalue(), params.getBudgetLifetime()));
+     return kj::READY_NOW;
+   }
+ 
+@@ -2317,7 +2323,7 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+     used = true;
+     auto params = context.getParams();
+     context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
+-        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps())));
++        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()), params.getBudgetLifetime()));
+     return kj::READY_NOW;
+   }
+ 
+@@ -2363,7 +2369,8 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+   std::shared_ptr<DurableSessionScope> scope;
+   bool used = false;
+ 
+-  kj::Promise<rpc::EventDispatcher::Client> prepare(kj::String descriptor, Frankenvalue props);
++  kj::Promise<rpc::EventDispatcher::Client> prepare(kj::String descriptor, Frankenvalue props,
++      capnp::Capability::Client budgetLifetime);
+ };
+ 
+ struct SubrequestBudget {
+@@ -5052,6 +5059,7 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+   ThreadState &state;
+   ThreadedServer &server;
+   std::shared_ptr<Slot> slot;
++  std::weak_ptr<capnp::Capability::Client> budgetLifetime;
+   uint64_t sequence = 0;
+   std::shared_ptr<uint32_t> subrequests = std::make_shared<uint32_t>(0);
+   threaded::InvocationLogBudget logBudget;
+@@ -5589,6 +5597,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+     std::shared_ptr<Slot> slot,
+     Json::Reader input,
+     kj::StringPtr raw,
++    capnp::Capability::Client budgetLifetime,
+     Frankenvalue props,
+     std::shared_ptr<ResourcePreparation> preparation,
+     std::shared_ptr<TenantPermit> tenant,
+@@ -5617,6 +5626,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+     entrypoint.assign(name.begin(), name.size());
+   }
+   auto channels = kj::rc<Channels>(state, server, slot, raw);
++  auto budget = std::make_shared<capnp::Capability::Client>(kj::mv(budgetLifetime));
++  channels->budgetLifetime = budget;
+   auto tracer = kj::rc<TenantTracer>(channels.addRef());
+   auto identity = kj::str("\"workerId\":", encode(field(input, "workerId")),
+       ",\"versionId\":", encode(field(input, "versionId")),
+@@ -5626,6 +5637,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+     observer = kj::refcounted<DurableEventObserver>(
+         std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
+   }
++  observer = kj::mv(observer).attach(std::move(budget));
+   auto limits =
+       kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
+   if (slot->resetDurableRoot) {
+@@ -6093,7 +6105,7 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
+   void stop(const kj::Exception &reason);
+   kj::Promise<kj::Rc<LocalFacet>> openSocketFacet(uint id, kj::StringPtr descriptor);
+   kj::Promise<std::pair<kj::Own<WorkerInterface>, kj::Own<Worker::Actor>>> openSocket(
+-      kj::String descriptor);
++      kj::String descriptor, capnp::Capability::Client budgetLifetime);
+ 
+  private:
+   struct Invocation {
+@@ -6108,7 +6120,8 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
+ 
+   kj::Promise<void> initialize(kj::String descriptor);
+   kj::Promise<void> ensureStarted(kj::StringPtr descriptor);
+-  kj::Promise<kj::Own<WorkerInterface>> open(kj::String descriptor, kj::Own<Invocation> invocation);
++  kj::Promise<kj::Own<WorkerInterface>> open(kj::String descriptor, kj::Own<Invocation> invocation,
++      capnp::Capability::Client budgetLifetime);
+ 
+   std::shared_ptr<DurableTreeContext> tree;
+   std::shared_ptr<DurableFacetReservation> reservation;
+@@ -6339,8 +6352,10 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
+   auto &channels =
+       KJ_ASSERT_NONNULL(dynamic_cast<Channels *>(&IoContext::current().getIoChannelFactory()));
+   KJ_REQUIRE(tree->slot.lock() == channels.slot, "facet request must stay on the original home");
++  auto budget = channels.budgetLifetime.lock();
+   return newPromisedWorkerInterface(
+-      open(kj::str(channels.document.original), kj::heap<Invocation>(*this)));
++      open(kj::str(channels.document.original), kj::heap<Invocation>(*this),
++          budget ? capnp::Capability::Client(*budget) : capnp::Capability::Client(nullptr)));
+ }
+ 
+ kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
+@@ -6454,19 +6469,19 @@ kj::Promise<kj::Rc<LocalFacet>> LocalFacet::openSocketFacet(uint id, kj::StringP
+ }
+ 
+ kj::Promise<std::pair<kj::Own<WorkerInterface>, kj::Own<Worker::Actor>>> LocalFacet::openSocket(
+-    kj::String descriptor) {
+-  auto entry = co_await open(kj::mv(descriptor), kj::heap<Invocation>(*this));
++    kj::String descriptor, capnp::Capability::Client budgetLifetime) {
++  auto entry = co_await open(kj::mv(descriptor), kj::heap<Invocation>(*this), kj::mv(budgetLifetime));
+   co_return std::make_pair(kj::mv(entry), kj::addRef(*KJ_ASSERT_NONNULL(actor).value));
+ }
+ 
+ kj::Promise<kj::Own<WorkerInterface>> LocalFacet::open(
+-    kj::String descriptor, kj::Own<Invocation> invocation) {
++    kj::String descriptor, kj::Own<Invocation> invocation, capnp::Capability::Client budgetLifetime) {
+   co_await ensureStarted(descriptor);
+   auto slot = tree->slot.lock();
+   KJ_REQUIRE(slot != nullptr, "durable test facet lost its isolate copy");
+   JsonDoc input(descriptor);
+   auto prepared = prepareInvocation(tree->state, tree->server, std::move(slot), input.get(),
+-      descriptor, Frankenvalue(), nullptr, nullptr, kj::refcounted<RequestObserver>(),
++      descriptor, kj::mv(budgetLifetime), Frankenvalue(), nullptr, nullptr, kj::refcounted<RequestObserver>(),
+       kj::addRef(*KJ_ASSERT_NONNULL(actor).value), className.asPtr());
+   co_return kj::mv(prepared.entry).attach(kj::mv(invocation));
+ }
+@@ -6549,7 +6564,7 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
+ }
+ 
+ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+-    kj::String descriptor, Frankenvalue props) {
++    kj::String descriptor, Frankenvalue props, capnp::Capability::Client budgetLifetime) {
+   KJ_REQUIRE(!used, "one event per durable connection");
+   used = true;
+   KJ_REQUIRE(!server.durableLog || server.durableLog->ready(), "durable WAL channel unavailable");
+@@ -6731,7 +6746,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+     auto socketActor = kj::addRef(*root.actor);
+     if (facetId != 0) {
+       auto facet = co_await root.hooks->getSocketFacet(facetId, descriptor);
+-      auto opened = co_await facet->openSocket(kj::str(descriptor));
++      auto opened = co_await facet->openSocket(kj::str(descriptor), kj::mv(budgetLifetime));
+       entry = kj::mv(opened.first);
+       socketActor = kj::mv(opened.second);
+     }
+@@ -6739,7 +6754,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+       kj::mv(socketActor), text(socketDescriptor, "id"), durableNumber(socketDescriptor, "frame")};
+   }
+   if (entry.get() == nullptr) {
+-    entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props), nullptr,
++    entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props), nullptr,
+         nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor))
+                 .entry;
+   }
+@@ -6767,7 +6782,7 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
+   try {
+     KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
+     auto dispatcher =
+-        co_await scope->preparing.wrap(prepare(kj::str(params.getCfBlobJson()), Frankenvalue()));
++        co_await scope->preparing.wrap(prepare(kj::str(params.getCfBlobJson()), Frankenvalue(), params.getBudgetLifetime()));
+     context.getResults().setDispatcher(kj::mv(dispatcher));
+     if (accepted->isWaiting()) accepted->fulfill();
+   } catch (const kj::Exception &error) {
+@@ -6781,7 +6796,7 @@ kj::Promise<void> DurableBootstrap::startNativeEvent(StartNativeEventContext con
+   try {
+     KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
+     auto dispatcher = co_await scope->preparing.wrap(prepare(
+-        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps())));
++        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()), params.getBudgetLifetime()));
+     context.getResults().setDispatcher(kj::mv(dispatcher));
+     if (accepted->isWaiting()) accepted->fulfill();
+   } catch (const kj::Exception &error) {
+@@ -6829,7 +6844,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
+     co_await server.confirmDecision(input, state, "load-rejected", error.getDescription(), stage);
+     kj::throwRecoverableException(error.clone());
+   }
+-  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props),
++  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props),
+       std::move(preparation), std::move(tenant));
+   auto identity = invocationIdentity(*slot, input);
+   startBoundRpcSession(context.getResults(),
+@@ -6970,7 +6985,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
+     co_await output->write(report.asBytes());
+     co_return;
+   }
+-  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props),
++  auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props),
+       std::move(preparation), std::move(tenant),
+       httpEntryObserver(input, entrypoint.c_str(), headers, state.placementCallId));
+   auto &invocation = prepared.invocation;

@@ -87,7 +87,7 @@ const again = env.COUNTERS.get(env.COUNTERS.idFromString(id.toString()));
 
 A stub exposes `fetch` and the class's public methods. workerd serializes RPC arguments and results in the isolates; the node validates the trusted envelope and proxies the capability, also across nodes. Returned capabilities last only for the tree's lease. See [compatibility](../compatibility.md), section 7, for RPC types, the 32 MiB serialized limit and exception shapes.
 
-A stateless Worker's call to an object consumes its call tree's subrequest budget. An object's call to another object starts a fresh tree and is not charged to the caller's budget; a chain longer than eight object hops is refused with `508 DO_HOP_LIMIT`. These calls follow ownership, independently of `placement.subcalls`, which controls stateless Service Binding placement.
+A call to an object consumes one subrequest from the calling Worker or object. The callee starts with its own invocation allowance. An object's outgoing calls charge the event that is running them. When a newer request takes over background work, its balance pays for that work. A chain longer than eight object-to-object hops is refused with `508 DO_HOP_LIMIT`. These calls follow ownership, independently of `placement.subcalls`, which controls stateless Service Binding placement.
 
 ## 4. WebSockets and hibernation
 

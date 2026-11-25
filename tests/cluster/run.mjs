@@ -68,10 +68,10 @@ async function main(args) {
       failed += await runSuite(webSockets, kernel, controller.signal, { webSocketsPerNode: 2 });
     }
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
-      delayRecoveryPeers, platformFixture }] of gated) {
+      delayRecoveryPeers, budgetLifetime, platformFixture }] of gated) {
       failed += await runSuite([[name, test]], kernel, controller.signal, {
         threadedNodes: nodes, holdPeerAcks: true, membership, confirmTimeoutMs, versionDrainTimeoutMs,
-        controlDurableLifecycle, delayRecoveryPeers, platformFixture,
+        controlDurableLifecycle, delayRecoveryPeers, budgetLifetime, platformFixture,
       });
     }
     console.log(`${regular.length + webSockets.length + gated.length} executed, ${failed} failed`);
