@@ -6,8 +6,10 @@ import { eventually, request } from './cluster.mjs';
 const source = `export default {
   fetch(request) {
     if (!new URL(request.url).pathname.endsWith('/idle')) return new Response('ready');
-    return new Response(new ReadableStream({ start(controller) {
+    return new Response(new ReadableStream({ async start(controller) {
       controller.enqueue(new TextEncoder().encode('data: ready\\n\\n'));
+      await scheduler.wait(300_000);
+      controller.close();
     } }), { headers: { 'content-type': 'text/event-stream' } });
   },
 };`;

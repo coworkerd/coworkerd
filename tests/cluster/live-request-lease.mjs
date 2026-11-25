@@ -87,8 +87,10 @@ const worker = `
         return env.OBJECT.getByName(actor).fetch('https://object.test/' + path);
       }
       if (path === 'silent') {
-        return new Response(new ReadableStream({ start(controller) {
+        return new Response(new ReadableStream({ async start(controller) {
           controller.enqueue(new TextEncoder().encode('started'));
+          await scheduler.wait(60_000);
+          controller.close();
         } }));
       }
       if (path !== 'stream') return new Response('ready');
