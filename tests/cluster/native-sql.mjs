@@ -632,7 +632,15 @@ export async function sqlProcessSpill(cluster) {
 
 export async function sqlWalAndTemporaryFiles(cluster) {
   const tenant = await cluster.tenant('sql-wal-and-temp');
-  const db = await database(cluster, tenant, 'ledger');
+  const db = await database(cluster, tenant, 'ledger', { warm: false });
+  await eventually('every node knows all three durable members', async () => {
+    const states = await Promise.all(cluster.nodes.map(node => cluster.state(node)));
+    for (const { membership } of states) {
+      const active = membership.members.filter(member => member.state === 'active' && member.durableProcesses > 0);
+      assert.deepEqual(active.map(member => member.nodeId).sort(), [...cluster.nodes].sort());
+    }
+  });
+  await eventually('the database is ready after membership converges', db.ready);
   assert.equal((await db.query({ sql: 'CREATE TABLE ledger(payload BLOB)' })).success, true);
   const placement = await acceptedOn(cluster, db.namespaceId);
   const state = () => cluster.state(placement.nodeId);
@@ -642,7 +650,13 @@ export async function sqlWalAndTemporaryFiles(cluster) {
     assert.equal(owner.generation, placement.processGeneration);
     return owner;
   };
-  const before = (await state()).durableLog;
+  const peersAt = (durableLog) => durableLog.peers.streams.filter(peer =>
+    peer.open && BigInt(peer.ackedSeq) >= BigInt(durableLog.log.nextSeq));
+  const before = await eventually('a peer acknowledges the schema commit', async () => {
+    const { durableLog } = await state();
+    assert.ok(peersAt(durableLog).length > 0);
+    return durableLog;
+  });
   const cap = BigInt(before.settings.recordLimitBytes);
   const { confirmTimeoutMs } = before.settings;
   assert.equal(confirmTimeoutMs, 5000);
@@ -663,8 +677,7 @@ export async function sqlWalAndTemporaryFiles(cluster) {
   const confirmMs = confirmed.confirm.meanMs * confirmed.confirm.confirmations -
     before.confirm.meanMs * before.confirm.confirmations;
   assert.ok(confirmMs >= 0 && confirmMs < confirmTimeoutMs, `node confirmed in ${confirmMs} ms`);
-  const acknowledgedPeers = confirmed.peers.streams.filter(peer =>
-    BigInt(peer.ackedSeq) >= BigInt(confirmed.log.nextSeq));
+  const acknowledgedPeers = peersAt(confirmed);
   assert.ok(acknowledgedPeers.length > 0, 'a peer confirmed the near-limit record');
   assert.ok(confirmed.threadedHomeIo.openSamples > 0);
   console.log('Native SQL near-limit confirmation', JSON.stringify({
