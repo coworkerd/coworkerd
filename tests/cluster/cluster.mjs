@@ -10,7 +10,6 @@ import { promisify } from 'node:util';
 const exec = promisify(execFile);
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const nodes = ['node-1', 'node-2', 'node-3'];
-const services = [...nodes, 'apiserver'];
 
 export async function request(base, path, { method = 'GET', token, body, timeout = 5000 } = {}) {
   const headers = token ? { authorization: `Bearer ${token}` } : {};
@@ -46,14 +45,14 @@ export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
-    platformFixture,
+    nodeEnvironment, singleNode = false, productRoot = root, platformFixture,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
     this.signal = signal;
     this.project = `coworkerd-test-${randomBytes(6).toString('hex')}`;
     this.urls = {};
-    this.nodes = nodes;
+    this.nodes = singleNode ? nodes.slice(0, 1) : nodes;
     this.env = {
       ...Object.fromEntries(Object.entries(process.env).filter(([name]) => !/^(COMPOSE_|COWORKERD_|COWCTL_)/.test(name))),
       COWORKERD_VERSION: this.project,
@@ -74,6 +73,8 @@ export class Cluster {
     this.versionDrainTimeoutMs = versionDrainTimeoutMs;
     this.webSocketsPerNode = webSocketsPerNode;
     this.configureNode = configureNode;
+    this.nodeEnvironment = nodeEnvironment;
+    this.productRoot = productRoot;
     this.platformFixture = platformFixture;
   }
 
@@ -90,15 +91,16 @@ export class Cluster {
 
   compose(args, options) {
     return this.command('docker', [
-      'compose', '--env-file', '/dev/null', '--project-name', this.project, '--profile', 'cluster',
-      '-f', join(root, 'docker/docker-compose.yml'), '-f', this.override, ...args,
+      'compose', '--env-file', '/dev/null', '--project-name', this.project,
+      ...(this.nodes.length > 1 ? ['--profile', 'cluster'] : []),
+      '-f', join(this.productRoot, 'docker/docker-compose.yml'), '-f', this.override, ...args,
     ], options);
   }
 
   async start() {
     const context = join(this.directory, 'image');
     await Promise.all(['bin', 'docker', 'runtime'].map(dir => mkdir(join(context, dir), { recursive: true })));
-    const binaries = process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(root, 'build');
+    const binaries = process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(this.productRoot, 'build');
     const files = Object.fromEntries(['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher']
       .map(file => [`bin/${file}`, join(binaries, file)]));
     if (this.platformFixture) files['bin/coworkerd'] = join(binaries, 'coworkerd-platform-test');
@@ -108,13 +110,13 @@ export class Cluster {
       const file = `coworkerd-syscalls-${phase}.txt`;
       files[`bin/${file}`] = join(this.kernel, 'allowlist', file);
     }
-    for (const file of ['docker/Dockerfile', 'docker/entrypoint.sh', 'runtime/runtime.js']) files[file] = join(root, file);
+    for (const file of ['docker/Dockerfile', 'docker/entrypoint.sh', 'runtime/runtime.js']) files[file] = join(this.productRoot, file);
     await Promise.all(Object.entries(files).map(([file, source]) => copyFile(source, join(context, file))));
     if (this.peerAckGate) await mkdir(this.peerAckGate, { mode: 0o755 });
     if (this.fatalControl) await mkdir(this.fatalControl, { mode: 0o755 });
     if (this.durableLifecycleGate) await mkdir(this.durableLifecycleGate, { mode: 0o755 });
     const overrides = {};
-    const platformSource = this.platformFixture && await readFile(join(root, 'tests/cluster/platform.js'), 'utf8');
+    const platformSource = this.platformFixture && await readFile(join(this.productRoot, 'tests/cluster/platform.js'), 'utf8');
     if (this.recoveryRelayGate) {
       await mkdir(this.recoveryRelayGate, { mode: 0o755 });
       overrides['recovery-relay'] = {
@@ -127,7 +129,7 @@ export class Cluster {
         ],
       };
     }
-    for (const node of nodes) {
+    for (const node of this.nodes) {
       const peer = `${node}-peer:8934`;
       const secrets = '/var/lib/coworkerd-secrets';
       const config = join(this.directory, `${node}.json`);
@@ -161,7 +163,7 @@ export class Cluster {
         ...(this.webSocketsPerNode ? { ulimits: { nofile: { soft: 1024, hard: 524288 } } } : {}),
         // Keep a killed owner down so that only a different node can recover the object.
         restart: 'no',
-        environment: { COWORKERD_CONFIG: target },
+        environment: { ...this.nodeEnvironment?.(node), COWORKERD_CONFIG: target },
         volumes: [{ type: 'bind', source: config, target, read_only: true }],
       };
       if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS = '32';
@@ -201,12 +203,12 @@ export class Cluster {
     console.log(`Starting Compose project ${this.project}`);
     this.started = true;
     await this.compose(['up', '-d', '--wait', '--wait-timeout', '120'], { timeout: 180000 });
-    await Promise.all(services.map(service => this.refreshUrl(service)));
+    await Promise.all([...this.nodes, 'apiserver'].map(service => this.refreshUrl(service)));
     this.admin = await this.compose(['exec', '-T', 'apiserver', 'coworkerd-entrypoint', 'tool', 'admin-credential']);
     this.management = await this.compose(['exec', '-T', 'apiserver', 'coworkerd-entrypoint', 'tool', 'token']);
-    await eventually('three registered nodes', async () => {
+    await eventually('registered nodes', async () => {
       const status = await this.api('/v1/status');
-      assert.deepEqual(status.nodes.map(node => node.nodeId).sort(), nodes);
+      assert.deepEqual(status.nodes.map(node => node.nodeId).sort(), this.nodes);
     });
   }
 
