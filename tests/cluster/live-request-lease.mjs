@@ -46,27 +46,33 @@ const worker = `
     }
   }
 
-  function disconnect(env, ctx, mode) {
+  function disconnect(request, env, ctx, mode) {
     const ledger = env.OBJECT.getByName('disconnect-markers');
     const record = async marker => {
       const result = await ledger.fetch('https://object.test/' + mode + '/' + marker, { method: 'PUT' });
       if (result.status !== 204) throw new Error('Could not record ' + marker + ': ' + result.status);
     };
     const registered = record('registered');
-    ctx.waitUntil((async () => {
-      await registered;
-      await scheduler.wait(32_000);
-      await record('background');
-      await scheduler.wait(8_000);
-      await record('after-drain');
-    })());
+    if (mode !== 'no-wait-until') {
+      ctx.waitUntil((async () => {
+        await registered;
+        await scheduler.wait(32_000);
+        await record('background');
+        await scheduler.wait(8_000);
+        await record('after-drain');
+      })());
+    }
+    if (mode === 'checks-signal') {
+      const aborted = new Promise(resolve => request.signal.addEventListener('abort', resolve, { once: true }));
+      ctx.waitUntil(aborted.then(() => record('aborted')));
+    }
 
     const foreground = async () => {
       await registered;
-      await scheduler.wait(8_000);
+      await scheduler.wait(8_000, mode === 'checks-signal' ? { signal: request.signal } : {});
       await record('foreground');
     };
-    if (mode === 'before-headers') return foreground().then(() => new Response('finished'));
+    if (mode !== 'during-body') return foreground().then(() => new Response('finished'));
     return new Response(new ReadableStream({
       async start(controller) {
         await registered;
@@ -74,13 +80,14 @@ const worker = `
         await foreground();
         controller.close();
       },
+      cancel() { return record('body-canceled'); },
     }));
   }
 
   export default {
     fetch(request, env, ctx) {
       const path = new URL(request.url).pathname.split('/').at(-1);
-      if (path === 'before-headers' || path === 'during-body') return disconnect(env, ctx, path);
+      if (['no-wait-until', 'checks-signal', 'during-body'].includes(path)) return disconnect(request, env, ctx, path);
       if (path === 'markers') return env.OBJECT.getByName('disconnect-markers').fetch('https://object.test/markers');
       if (path === 'timer' || path === 'take-over' || path === 'timer-result') {
         const actor = new URL(request.url).searchParams.get('actor');
@@ -120,6 +127,7 @@ async function prepareLeaseWorker(cluster, tenantName) {
   const tenant = await cluster.tenant(tenantName);
   await cluster.deploy(tenant, 'lease-service', serviceWorker);
   await cluster.deploy(tenant, 'lease-stream', worker, { wrangler: {
+    compatibility_flags: ['enable_request_signal'],
     services: [{ binding: 'SERVICE', service: 'lease-service' }],
     durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'LeaseObject' }] },
     migrations: [{ tag: 'v1', new_sqlite_classes: ['LeaseObject'] }],
@@ -204,14 +212,14 @@ export async function disconnectedRequestLease(cluster) {
     });
     setInterval(() => {}, 1000);
   `;
-  for (const mode of ['before-headers', 'during-body']) {
+  for (const mode of ['no-wait-until', 'checks-signal', 'during-body']) {
     const markers = async () => json(await request(base, path + '/markers'), 200, 'read disconnect markers')
       .filter(marker => marker.startsWith(mode + '/')).map(marker => marker.slice(mode.length + 1));
     const client = `${cluster.project}-${mode}`;
     await cluster.command('docker', ['run', '--rm', '--detach', '--network', network, '--name', client,
       'node:22-trixie', 'node', '-e', script, `http://${ingress}-peer:8930${path}/${mode}`]);
     try {
-      await eventually(`${mode} registered background work`, async () => {
+      await eventually(`${mode} began execution`, async () => {
         assert.deepEqual(await markers(), ['registered']);
       }, { timeout: 8000, interval: 100 });
       const registeredAt = performance.now();
@@ -223,7 +231,7 @@ export async function disconnectedRequestLease(cluster) {
       // The background marker is scheduled after the original 30 s lease.
       // Give the request four seconds before starting the disconnect drain.
       await delay(4000, undefined, { signal: cluster.signal });
-      if (mode === 'before-headers') assert.equal(await cluster.command('docker', ['logs', client]), '');
+      if (mode !== 'during-body') assert.equal(await cluster.command('docker', ['logs', client]), '');
       assert.equal((await cluster.state(ingress)).placement.proxyingIngress, 1);
       const resetAt = performance.now();
       await cluster.command('docker', ['kill', '--signal=SIGUSR2', client]);
@@ -231,12 +239,24 @@ export async function disconnectedRequestLease(cluster) {
         assert.equal((await cluster.state(ingress)).placement.proxyingIngress, 0);
       }, { timeout: 1000, interval: 25 });
       console.log(`HTTP reset ${mode} stopped ingress forwarding in ${(performance.now() - resetAt).toFixed(1)} ms`);
-      await eventually(`${mode} left only the registered work alive`, async () => {
-        assert.deepEqual(await markers(), ['background', 'registered']);
+      if (mode === 'no-wait-until') {
+        await delay(6000, undefined, { signal: cluster.signal });
+        assert.deepEqual(await markers(), ['registered'], 'the context stopped with no waitUntil work');
+        continue;
+      }
+      const notification = mode === 'checks-signal' ? 'aborted' : 'body-canceled';
+      await eventually(`${mode} notified the Worker of the reset`, async () => {
+        assert.deepEqual(await markers(), [notification, 'registered']);
+      }, { timeout: 2000, interval: 50 });
+      console.log(`HTTP reset ${mode} reached workerd in ${(performance.now() - resetAt).toFixed(1)} ms`);
+      const withinDrain = mode === 'checks-signal' ? ['aborted', 'background', 'registered'] :
+        ['background', 'body-canceled', 'foreground', 'registered'];
+      await eventually(`${mode} drained with workerd's cancellation semantics`, async () => {
+        assert.deepEqual(await markers(), withinDrain);
       }, { timeout: 31_000, interval: 250 });
       const untilAfterDrain = registeredAt + 42_000 - performance.now();
       if (untilAfterDrain > 0) await delay(untilAfterDrain, undefined, { signal: cluster.signal });
-      assert.deepEqual(await markers(), ['background', 'registered'], `${mode} ended all work after its one drain`);
+      assert.deepEqual(await markers(), withinDrain, `${mode} ended all work after its one drain`);
     } finally {
       await cluster.command('docker', ['stop', '-t', '1', client], { cleanup: true });
     }
