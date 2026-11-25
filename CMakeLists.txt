@@ -265,6 +265,7 @@ foreach(case native-config tenant-execution deadlines event-loop shutdown-signal
     cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()
+add_test(NAME node-ingress-descriptor-plan COMMAND coworkerd-node-contract-test ingress-descriptor-plan)
 # The object store client's kept-alive connections, against a loopback store of the test's own.
 add_executable(coworkerd-object-store-test EXCLUDE_FROM_ALL common/object-store-test.c++)
 target_link_libraries(coworkerd-object-store-test PRIVATE common)
@@ -278,6 +279,7 @@ target_link_libraries(coworkerd-config-test PRIVATE common)
 add_test(NAME node-config-idle COMMAND coworkerd-config-test idle)
 add_test(NAME node-config-memory COMMAND coworkerd-config-test memory)
 add_test(NAME node-config-tenant-borrow COMMAND coworkerd-config-test tenant-borrow)
+add_test(NAME node-config-websocket COMMAND coworkerd-config-test websocket)
 add_test(NAME node-config-liveness-grace COMMAND coworkerd-config-test liveness-grace)
 add_executable(coworkerd-v8-sandbox-test EXCLUDE_FROM_ALL node/v8-sandbox-test.c++ node/v8-sandbox.c++)
 target_include_directories(coworkerd-v8-sandbox-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
@@ -396,8 +398,7 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
     add_test(NAME node-threaded-durable-queues COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" queues 4 64)
-    add_test(NAME node-threaded-durable-fd-limit COMMAND /bin/sh
-      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-fd-limit.test.sh" "${COWORKERD_TEST_NODE}"
+    add_test(NAME node-threaded-durable-fd-limit COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" queue-limit 4 64)
     set_tests_properties(node-threaded-durable-queues node-threaded-durable-fd-limit PROPERTIES TIMEOUT 30)

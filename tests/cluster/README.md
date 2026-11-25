@@ -41,6 +41,18 @@ peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses up
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+To measure idle WebSocket memory on fresh clusters:
+
+```sh
+node tests/cluster/websocket-memory.mjs "$kernel" local 3072
+node tests/cluster/websocket-memory.mjs "$kernel" forwarded 3072
+```
+
+The probe sets the ingress ceiling to the requested sample size and raises the native process's in-flight limit
+to accommodate all its invocation channels. It verifies the ingress and execution relay counts. It compares
+median Linux `smaps_rollup` RSS with 32 and 3,072 idle connections to the same Worker and reports the delta per
+added connection for the daemon and ordinary workerd process on each measured node.
+
 ### Fatal attribution with the test kernel
 
 In the imported Linux kernel checkout, build the separate shared-cage test executable and run the focused
@@ -99,6 +111,7 @@ archive, Docker images and temporary volumes. These are observed values from the
 | Case | Product behavior whose regression fails the case |
 | --- | --- |
 | `deployment` | A new Worker version never reaches one of the three nodes, or an ingress continues to serve the previous version. |
+| `websocket-admission` | The fixture starts with a soft descriptor limit of 1,024 and sets one ingress to two places. Two tenants fill it, and a third upgrade gets a retryable `503 WEBSOCKET_NODE_CAPACITY` before dispatch. A clean close, disconnect after upgrade and a declined handshake release places. An abandoned handshake releases its place when the Worker answers. Ordinary HTTP and another ingress keep serving. |
 | `sql-atomicity` | A successful SQL batch loses a write, or a write from a failed batch is visible after the duplicate-key error. |
 | `sql-atomicity-threaded` | The same batch atomicity contract fails with native database homes. |
 | `sql-protocol`, `sql-protocol-threaded` | The HTTP and Worker binding contract differs for binary and text values, result modes, counters, authorization, rollback, or the confirmed prefix of D1 `exec()`. Both backends execute the same assertions. |

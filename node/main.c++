@@ -11,6 +11,7 @@
 #include "rpc-error.h"
 #include "coworkerd.capnp.h"
 #include "config.h"
+#include "ingress-descriptors.h"
 #include "code-package.h"
 #include "log-cleaning.h"
 #include "log-sink.h"
@@ -73,6 +74,9 @@
 #include <random>
 #include <unistd.h>
 #include <sys/resource.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <sstream>
 #include <cerrno>
 #include <cstring>
@@ -576,8 +580,7 @@ void phaseTiming(const char* stage, double started, const std::shared_ptr<cowork
 // A connection is a request whose Worker answered 101. It has a relay on the node whose ingress holds the client's
 // connection and one on the node that executes the Worker -- back to back when that is the same node --, each passing
 // messages and close frames on as they come (WebSocketRelay, below). The registry holds this node's relays: the drain and
-// a retiring process generation tell theirs to go away (1001), it counts the ingress's connections per tenant against
-// ingress.webSocketsPerTenant, and it keeps the counts the state endpoint shows.
+// a retiring process generation tell theirs to go away (1001). Ingress upgrades share one allowance across all tenants.
 class WebSocketRegistry final {
 public:
   enum class Role { INGRESS, EXECUTION };
@@ -602,27 +605,24 @@ public:
     std::string direction, cause;
     uint64_t toWorker = 0, toClient = 0;
   };
-  explicit WebSocketRegistry(uint32_t perTenant): perTenant(perTenant) {}
-  uint32_t limitPerTenant() const { return perTenant; }
-  // An upgrade at the ingress takes one of its tenant's places before it is sent on, and gives it back when its request
-  // ends -- a refused upgrade at once, a connection when it closes --, so that upgrades in flight count as well. False:
-  // the tenant holds as many places on this node as the limit allows.
+  explicit WebSocketRegistry(uint32_t ingressLimit): ingressLimit(ingressLimit) {}
+  uint32_t limit() const { return ingressLimit; }
+  uint32_t inUse() const { return ingressInUse; }
+  // Reserve before dispatch so that upgrades in progress and open connections both count.
   bool reserve(const std::string& tenant) {
-    if (perTenant != 0 && placesOf(tenant) >= perTenant) {
+    if (ingressInUse >= ingressLimit) {
       ++refusedByTenant[tenant];
       return false;
     }
     ++places[tenant];
+    ++ingressInUse;
     return true;
   }
   void release(const std::string& tenant) {
     auto found = places.find(tenant);
-    KJ_ASSERT(found != places.end() && found->second > 0, "WebSocket place underflow");
+    KJ_ASSERT(found != places.end() && found->second > 0 && ingressInUse > 0, "WebSocket place underflow");
     if (--found->second == 0) places.erase(found);
-  }
-  uint32_t placesOf(const std::string& tenant) const {
-    auto found = places.find(tenant);
-    return found == places.end() ? 0 : found->second;
+    --ingressInUse;
   }
   void opened(Relay& relay) {
     relays.insert(&relay);
@@ -717,7 +717,8 @@ public:
       for (const auto& [key, count] : values) out += (out.size() > 1 ? "," : "") + ("\"" + jsonEscape(key) + "\":") + std::to_string(count);
       return out + "}";
     };
-    std::string out = "{\"limitPerTenant\":" + std::to_string(perTenant) + ",\"open\":" + std::to_string(relays.size());
+    std::string out = "{\"limitPerNode\":" + std::to_string(ingressLimit) + ",\"inUse\":" + std::to_string(ingressInUse) +
+        ",\"open\":" + std::to_string(relays.size());
     for (auto role : {Role::INGRESS, Role::EXECUTION}) {
       const auto i = index(role);
       uint64_t total = 0;
@@ -745,7 +746,8 @@ private:
     return static_cast<uint32_t>(chosen.size());
   }
   struct Totals { std::map<std::string, uint64_t> codes, causes; uint64_t toWorker = 0, toClient = 0; };
-  const uint32_t perTenant;
+  const uint32_t ingressLimit;
+  uint32_t ingressInUse = 0;
   std::set<Relay*> relays;
   std::map<std::string, Relay*, std::less<>> managed;
   std::map<std::pair<std::string, std::string>, std::set<Relay*>> byObject;
@@ -3722,7 +3724,7 @@ private:
   std::map<std::string, uint64_t> nextArrivalOrder;
   LeaseConfig leaseConfig;
   ServerConfig serverConfig;
-  WebSocketRegistry webSocketRegistry{serverConfig.webSocketsPerTenant};
+  WebSocketRegistry webSocketRegistry{serverConfig.webSocketsPerNode};
   DurableSocketDispatch durableSocketDispatch;
   // What the forked log writers hide on this node, and which calls with secrets it starts
   // (node/secret-dictionary.h). Mutable: encodeDescriptor() records what each descriptor carries.
@@ -8514,15 +8516,17 @@ private:
 // the response is complete fails this request (the client sees it cut off). The backend's
 // call is never cancelled by an early end, so the call accounting -- in-flight calls, the contexts a
 // drain waits for -- still follows the backend.
-// An upgrade request at the ingress (GatewayService): one of its tenant's places under ingress.webSocketsPerTenant, held
-// until the request ends, and what the relay of the connection it may become names.
+// An upgrade request at the ingress (GatewayService) owns one node place while the handshake is pending or the relay
+// is open. The tenant is recorded for diagnostics.
 struct IngressWebSocket {
   WebSocketRegistry& registry;
   std::string tenant, workerId, versionId, treeId, executingNodeId;
   bool forwarded = false;
   double receivedAtMonotonicMs = monotonicTimeMs();
-  IngressWebSocket(WebSocketRegistry& registry, std::string tenant): registry(registry), tenant(std::move(tenant)) {}
-  ~IngressWebSocket() { registry.release(tenant); }
+  const bool reserved;
+  IngressWebSocket(WebSocketRegistry& registry, std::string tenant)
+      : registry(registry), tenant(std::move(tenant)), reserved(registry.reserve(this->tenant)) {}
+  ~IngressWebSocket() { if (reserved) registry.release(tenant); }
 };
 
 class HttpForwarder final: private kj::TaskSet::ErrorHandler {
@@ -8538,7 +8542,7 @@ public:
       kj::HttpHeaders headers,
       kj::AsyncInputStream& requestBody,
       kj::HttpService::Response& response, SharedPathTiming timing = {}, std::string target = {},
-      std::shared_ptr<IngressWebSocket> webSocket = {}) {
+      std::unique_ptr<IngressWebSocket> webSocket = {}) {
     auto exchange = kj::heap<Exchange>(server, response, method, timing, std::move(target), std::move(webSocket));
     auto& ref = *exchange;
     auto getHttp = opened.dispatcher.getHttpServiceRequest().send();
@@ -8568,7 +8572,7 @@ private:
   class Exchange final: public kj::HttpService::Response {
   public:
     Exchange(ServerCore& server, kj::HttpService::Response& client, kj::HttpMethod method, SharedPathTiming timing,
-        std::string target, std::shared_ptr<IngressWebSocket> webSocket)
+        std::string target, std::unique_ptr<IngressWebSocket> webSocket)
         : server(server), client(client), method(method), timing(std::move(timing)), target(std::move(target)),
           webSocket(std::move(webSocket)) {
       auto paf = kj::newPromiseAndFulfiller<void>();
@@ -8589,6 +8593,8 @@ private:
       KJ_REQUIRE(!started, "the backend sent a second response");
       pathMark(timing, "response-headers");
       started = true;
+      // A regular HTTP response declines the upgrade. Its body can outlive the handshake.
+      webSocket.reset();
       expected = expectedBodySize;
       clientBody = client.send(status, statusText, headers, expectedBodySize);
       bool empty = method == kj::HttpMethod::HEAD;
@@ -8621,12 +8627,11 @@ private:
       relayTask = relay->run().then([this]() { complete(); }, [this](kj::Exception&&) { complete(); }).eagerlyEvaluate(nullptr);
       return kj::mv(pipe.ends[0]);
     }
-    // The connection's place under ingress.webSocketsPerTenant goes back with it, not with this exchange, which may wait a
-    // little longer for the backend's return.
+    // Give back the ingress place with the relay. The backend may still be finishing.
     void endWebSocket() {
       relayTask = kj::none;
       relay = nullptr;
-      if (started) webSocket = nullptr;
+      webSocket.reset();
     }
 
   private:
@@ -8700,7 +8705,7 @@ private:
     kj::Maybe<uint64_t> expected;
     uint64_t written = 0, completedAtUnixMs = 0;
     bool started = false, completed = false, isSettled = false;
-    std::shared_ptr<IngressWebSocket> webSocket;
+    std::unique_ptr<IngressWebSocket> webSocket;
     kj::Own<WebSocketRelay> relay;
     kj::Maybe<kj::Promise<void>> relayTask;  // destroyed before the relay
     // Last: destroyed first, with the backend's relay into this exchange.
@@ -9339,21 +9344,19 @@ private:
         response, deadline)) co_return;
     if (timing) timing->target = selected.version->key();
     pathMark(timing, "route");
-    // An upgrade to a WebSocket takes one of its tenant's places on this node before anything is sent on: beyond
-    // ingress.webSocketsPerTenant it is refused here, and nothing executes. The request keeps its handshake headers.
-    std::shared_ptr<IngressWebSocket> webSocket;
+    // Only the node holding the client socket charges a place. Refuse a full node before dispatch.
+    std::unique_ptr<IngressWebSocket> webSocket;
     if (method == kj::HttpMethod::GET && headers.isWebSocket()) {
-      const auto tenant = coworkerd::tenantOf(selected.version->workerId);
       auto& sockets = server.webSockets();
-      if (!sockets.reserve(tenant)) {
-        auto refused = server.refusal("WEBSOCKET_LIMIT", "the tenant holds " + std::to_string(sockets.limitPerTenant()) +
-            " WebSocket connections on this node, the limit of ingress.webSocketsPerTenant", 429, true);
-        refused.inFlight = sockets.placesOf(tenant);
-        refused.limit = sockets.limitPerTenant();
+      webSocket = std::make_unique<IngressWebSocket>(sockets, coworkerd::tenantOf(selected.version->workerId));
+      if (!webSocket->reserved) {
+        auto refused = server.refusal("WEBSOCKET_NODE_CAPACITY", "the node's ingress WebSocket capacity is full", 503, true);
+        refused.inFlight = sockets.inUse();
+        refused.limit = sockets.limit();
+        refused.notExecuted = refused.retryable = true;
         server.observeLocalRefusal(refused, "localIngress");
-        co_return co_await sendText(response, 429, "Too Many Requests", refusalBody(refused, deadline), "application/json");
+        co_return co_await sendText(response, 503, "Service Unavailable", refusalBody(refused, deadline), "application/json");
       }
-      webSocket = std::make_shared<IngressWebSocket>(sockets, tenant);
       webSocket->workerId = selected.version->workerId;
       webSocket->versionId = selected.version->versionId;
     }
@@ -9960,11 +9963,6 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
       (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
   if (pool.count + pool.quarantineProcesses > 0) {
-    // Include a replacement generation, private channels and prepared sockets;
-    // reject an insufficient host hard limit before starting any child process.
-    const auto childRequired = uint64_t(pool.inFlightLimit) * 8 + 256;
-    const auto nodeRequired = 256 + generations * (uint64_t(pool.inFlightLimit) * 4 + 128);
-    const auto required = std::max(childRequired, nodeRequired);
     const auto threadsRequired = 32 + (uint64_t(pool.count) + pool.quarantineProcesses + 1) *
         (uint64_t(pool.inFlightLimit) + 27) + uint64_t(pool.durableProcesses) * 8;
     uint64_t uidThreads = 0;
@@ -10012,14 +10010,6 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
     const auto minimumMemory = (64ull << 20) + (uint64_t(pool.inFlightLimit) + 16) * (256ull << 10) + (2ull << 20);
     KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, std::max<uint64_t>(8ull << 20, uint64_t(pool.inFlightLimit) << 20)) > minimumMemory,
         "native process memory budget leaves no active Worker", minimumMemory, pool.threadedMemoryBytes);
-    rlimit inherited;
-    KJ_REQUIRE(getrlimit(RLIMIT_NOFILE, &inherited) == 0, "cannot read descriptor configuration");
-    KJ_REQUIRE(inherited.rlim_max >= required, "insufficient host descriptor hard limit",
-        required, inherited.rlim_max, "missing", required > inherited.rlim_max ? required - inherited.rlim_max : 0);
-    if (inherited.rlim_cur < required) {
-      inherited.rlim_cur = required;
-      KJ_REQUIRE(setrlimit(RLIMIT_NOFILE, &inherited) == 0, "cannot set node descriptor soft limit", required);
-    }
   }
   for (auto [name, field] : {std::pair{"COWORKERD_IDLE_EVICT_MS", &pool.idleEvictMs},
                              std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &pool.idleDestroyIntervalMs},
@@ -10079,6 +10069,41 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
     if (preparationBudget < MAX_PACKAGE_PREPARATION_BYTES)
       std::cout << ",\"warning\":\"COWORKERD_STATIC_HEAP_MIB cannot reserve a maximum 10 MiB package with a 1 MiB descriptor; larger packages fail LOAD_FAILED without retry; increase the runtime heap\"";
     std::cout << '}' << std::endl;
+  }
+}
+
+// Budget the active and replacement generations, other ingress traffic, and the open WebSockets together.
+void applyNodeDescriptorLimit(ServerConfig& config) {
+  const auto& pool = config.processPool;
+  const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
+  const auto childRequired = uint64_t(pool.inFlightLimit) * 8 + 256;
+  const auto nodeRequired = 256 + generations * (uint64_t(pool.inFlightLimit) * 4 + 128);
+  const auto poolDescriptors = std::max(childRequired, nodeRequired);
+  rlimit limits;
+  KJ_SYSCALL(getrlimit(RLIMIT_NOFILE, &limits));
+  auto soft = limits.rlim_cur == RLIM_INFINITY ? UINT64_MAX : uint64_t(limits.rlim_cur);
+  auto hard = limits.rlim_max == RLIM_INFINITY ? UINT64_MAX : uint64_t(limits.rlim_max);
+#ifdef __APPLE__
+  int maxFilesPerProcess;
+  size_t size = sizeof(maxFilesPerProcess);
+  KJ_SYSCALL(sysctlbyname("kern.maxfilesperproc", &maxFilesPerProcess, &size, nullptr, 0));
+  KJ_REQUIRE(maxFilesPerProcess > 0, "invalid kern.maxfilesperproc", maxFilesPerProcess);
+  hard = std::min(hard, static_cast<uint64_t>(maxFilesPerProcess));
+  soft = std::min(soft, hard);
+#endif
+  const auto plan = coworkerd::planIngressDescriptors(soft, hard, poolDescriptors, config.webSocketsPerNode);
+  KJ_REQUIRE(plan.webSockets > 0, "insufficient host descriptor hard limit for the node and one ingress WebSocket",
+      "required", poolDescriptors + coworkerd::OTHER_INGRESS_DESCRIPTORS + coworkerd::DESCRIPTORS_PER_WEBSOCKET,
+      "hard limit", hard);
+  if (soft < plan.softLimit) {
+    limits.rlim_cur = static_cast<rlim_t>(plan.softLimit);
+    KJ_SYSCALL(setrlimit(RLIMIT_NOFILE, &limits), "cannot set node descriptor soft limit", plan.softLimit);
+  }
+  config.webSocketsPerNode = plan.webSockets;
+  if (plan.webSockets < plan.requested) {
+    std::cout << "[server] {\"event\":\"warning\",\"subject\":\"ingress-websocket-capacity\",\"requested\":" << plan.requested
+              << ",\"effective\":" << plan.webSockets << ",\"hardDescriptorLimit\":" << hard
+              << ",\"poolDescriptors\":" << poolDescriptors << '}' << std::endl;
   }
 }
 
@@ -10155,7 +10180,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << "},\"suspects\":{\"baseMs\":" << c.suspectBaseMs << ",\"maxMs\":" << c.suspectMaxMs
       << ",\"probation\":" << b(c.suspectProbation)
       << "},\"drainTimeoutMs\":" << c.drainTimeoutMs << ",\"loadCheck\":" << b(c.loadCheck)
-      << ",\"ingress\":{\"webSocketsPerTenant\":" << c.webSocketsPerTenant << "}"
+      << ",\"ingress\":{\"webSocketsPerNode\":" << c.webSocketsPerNode << "}"
       << ",\"durableObjects\":{\"processes\":" << c.processPool.durableProcesses << "}"
       << ",\"lease\":{\"mode\":" << q(lease.naive() ? "naive" : "correct") << ",\"ttlMs\":" << lease.ttlMs
       << ",\"rootBudget\":" << lease.rootBudget << ",\"grantCap\":" << lease.grantCap
@@ -10248,6 +10273,7 @@ int run(Launch launch) {
     serverConfig.memoryWatermarkEnabled = std::string(enabled) == "1";
   }
   applyProcessPoolEnvironment(serverConfig.processPool, serverConfig.memoryBudgetBytes, launch.workerd);
+  applyNodeDescriptorLimit(serverConfig);
   // Outbound requests and the peer key, as the file says or these override; the rules are checked here.
   if (const char* mode = std::getenv("COWORKERD_EGRESS_MODE"); mode != nullptr && *mode) serverConfig.egress.mode = mode;
   if (const char* policy = std::getenv("COWORKERD_EGRESS_DEFAULT_POLICY"); policy != nullptr && *policy) serverConfig.egress.defaultPolicy = policy;
@@ -10694,8 +10720,9 @@ int runSelfCheck(const std::vector<std::string>& args) {
     const char* runtimeFile = std::getenv("COWORKERD_RUNTIME_FILE");
     if (runtimeFile) launch->runtime = fs::absolute(runtimeFile).string();
     applyProcessPoolEnvironment(launch->config.processPool, launch->config.memoryBudgetBytes, launch->workerd);
+    applyNodeDescriptorLimit(launch->config);
     report("configuration", true, ",\"configFile\":\"" + jsonEscape(launch->configFile.string()) + "\",\"nodeId\":\"" +
-        jsonEscape(launch->config.serverId) + "\"");
+        jsonEscape(launch->config.serverId) + "\",\"webSocketsPerNode\":" + std::to_string(launch->config.webSocketsPerNode));
   } catch (const kj::Exception& error) {
     report("configuration", false, ",\"reason\":\"" + jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
     std::cout << "[check] {\"event\":\"result\",\"ok\":false}" << std::endl;

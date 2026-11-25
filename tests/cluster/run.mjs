@@ -62,6 +62,7 @@ async function main(args) {
     if (regular.length) {
       failed += await runSuite(regular, kernel, controller.signal, {
         fatalTestBinary: fatalTest ? resolve(testBinary) : undefined,
+        webSocketsPerNode: regular.some(([name]) => name === 'websocket-admission') ? 2 : undefined,
       });
     }
     for (const [name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs, controlDurableLifecycle,
