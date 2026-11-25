@@ -201,7 +201,12 @@ async function threadedDatabasePlacement(cluster) {
   assert.equal(databases.get(threaded).length, 2, 'two databases are assigned to the same threaded owner');
   assert.equal(databases.get(upstream).length, 1, 'one database is assigned to the upstream owner');
   const selected = [...databases.values()].flat();
-  const sqlAt = async (ingress, db, body) => json(await request(cluster.urls[ingress],
+  const peerUrls = new Map(await Promise.all([threaded, upstream].map(async node => {
+    const address = await cluster.compose(['port', node, '8934']);
+    assert.match(address, /^127\.0\.0\.1:\d+$/);
+    return [node, `http://${address}`];
+  })));
+  const sqlAt = async (ingress, db, body) => json(await request(peerUrls.get(ingress),
     `/__coworkerd/databases/${tenant.name}/${db.name}/query`,
     { method: 'POST', token: cluster.management, body, timeout: 15000 }), 200, `${ingress} SQL to ${db.name}`);
   const publicSql = (db, body) => cluster.api(`${db.path}/query`, { method: 'POST', token: tenant.token, body });
@@ -2314,6 +2319,7 @@ export const durableGatedCases = {
   'durable-threaded-mixed': { test: mixedDurableStorage, nodes: ['node-1'] },
   'durable-threaded-database-placement': {
     test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNode: 'node-1',
+    publishPeerPorts: true,
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
   },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
