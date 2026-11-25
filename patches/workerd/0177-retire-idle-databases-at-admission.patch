@@ -119,7 +119,7 @@ index aa8797f2c2121581aaa333ad7074ba1559b4d10b..1baf904461406d0f275a7f048b3c93f1
  
   private:
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109967cfd3a 100644
+index fbae87c6f5f828f9f312a94b7f30ece160c927a8..fba95492f78723c92a3c6a8936457daf748f4bec 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1875,6 +1875,7 @@ struct ThreadState {
@@ -130,7 +130,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
      std::shared_ptr<class DurableNodeSockets> nodeSockets;
      kj::Function<bool()> hasLocalSockets;
      kj::Function<kj::Promise<SocketParkResult>()> parkSockets;
-@@ -2519,8 +2520,18 @@ struct ThreadedServer {
+@@ -2522,8 +2523,18 @@ struct ThreadedServer {
    std::mutex durableRoutingMutex;
    using DurableWake = kj::Own<kj::CrossThreadPromiseFulfiller<void>>;
    std::map<uint64_t, std::map<uint64_t, DurableWake>> durableWaiters;
@@ -149,7 +149,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
    std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
    std::atomic<uint64_t> nextDurableActor{0};
    std::atomic<uint64_t> durablePendingCommits{0};
-@@ -2563,6 +2574,8 @@ struct ThreadedServer {
+@@ -2566,6 +2577,8 @@ struct ThreadedServer {
        server::DurablePressure pressure;
        std::vector<DurableIncoming> incoming;
        std::set<uint64_t> resident;
@@ -158,7 +158,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
      };
      std::optional<DurableHome> home;
      uint64_t homeId = 0;
-@@ -2936,6 +2949,40 @@ struct ThreadedServer {
+@@ -2939,6 +2952,40 @@ struct ThreadedServer {
      return true;
    }
  
@@ -199,7 +199,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
    // durableRoutingMutex holds placement and event admission together, before
    // the accept loop acknowledges a connection or reads its dispatch bytes.
    bool reserveDurableHome(const DurableRoute &route, server::DurableAdmission::Ticket ticket) {
-@@ -2946,6 +2993,7 @@ struct ThreadedServer {
+@@ -2949,6 +2996,7 @@ struct ThreadedServer {
        const auto now = server::DurableAdmission::Clock::now();
        for (size_t i = 0; i < threads.size(); ++i) {
          if (!threads[i]->home) continue;
@@ -207,7 +207,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
          auto &home = *threads[i]->home;
          // An empty copy keeps its definition until its isolate is released.
          // Prefer a matching warm copy, then an unused home, then a different empty copy.
-@@ -2976,10 +3024,16 @@ struct ThreadedServer {
+@@ -2979,10 +3027,16 @@ struct ThreadedServer {
      std::lock_guard lock(durableRoutingMutex);
      auto result =
          durableAdmission->queue(route.key, route.open, bytes, deadline, Admission::Clock::now());
@@ -225,7 +225,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
      }
      return result;
    }
-@@ -3016,7 +3070,7 @@ struct ThreadedServer {
+@@ -3019,7 +3073,7 @@ struct ThreadedServer {
      root.idle->eventFinished(durableIdleNow());
    }
  
@@ -234,7 +234,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
      std::lock_guard lock(durableRoutingMutex);
      durableAdmission->cancel(ticket);
      wakeDurableTree(ticket.tree);
-@@ -3027,7 +3081,14 @@ struct ThreadedServer {
+@@ -3030,7 +3084,14 @@ struct ThreadedServer {
      }
      const auto finished = durableAdmission->complete(ticket, *assigned);
      auto &home = *threads[*assigned - 1]->home;
@@ -250,7 +250,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
        return finished;
      KJ_ASSERT(durableAdmission->releaseTree(ticket.tree, *assigned));
      if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
-@@ -3085,9 +3146,12 @@ struct ThreadedServer {
+@@ -3088,9 +3149,12 @@ struct ThreadedServer {
    }
  
    kj::Promise<void> startDurableSession(ThreadState &state, DurableIncoming call) {
@@ -265,7 +265,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
          if (root != state.durableRoots.end() && !root->second.resetting) {
            root->second.sockets.erase(call.ticket.event);
            root->second.idle->eventFinished(durableIdleNow());
-@@ -3160,10 +3224,40 @@ struct ThreadedServer {
+@@ -3163,10 +3227,40 @@ struct ThreadedServer {
      }));
    }
  
@@ -307,7 +307,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
      auto &memory = *state.durableSlot->limits->memory;
      const auto accounted = [&] { return memory.heap.load() + memory.external.load(); };
      const auto placementLimit = kj::min(durablePlacement.placementBytes, memory.maximum * 3 / 4);
-@@ -3174,6 +3268,9 @@ struct ThreadedServer {
+@@ -3177,6 +3271,9 @@ struct ThreadedServer {
        using Decision = server::DurableIdleLifecycle::Decision;
        auto& root = current->second;
        auto& actor = *root.actor;
@@ -317,7 +317,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
        if (root.adopting) continue;
        if (root.parking != kj::none && root.parked == kj::none) continue;
        KJ_IF_SOME(parked, root.parked) {
-@@ -3181,6 +3278,7 @@ struct ThreadedServer {
+@@ -3184,6 +3281,7 @@ struct ThreadedServer {
          if (!parked) {
            root.parked = kj::none;
            root.cancelExpiredWork = false;
@@ -325,7 +325,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
            if (!root.resetting && !root.closeRequested) {
              std::lock_guard lock(durableRoutingMutex);
              KJ_ASSERT(durableAdmission->resumeIdleTree(current->first, homeId));
-@@ -3196,7 +3294,7 @@ struct ThreadedServer {
+@@ -3199,7 +3297,7 @@ struct ThreadedServer {
        auto decision = Decision::RETIRE;
        if (!explicitClose) {
          if (root.parked == kj::none)
@@ -334,7 +334,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
          else if (root.cancelExpiredWork)
            decision = Decision::CANCEL_PENDING;
        }
-@@ -3213,12 +3311,17 @@ struct ThreadedServer {
+@@ -3216,12 +3314,17 @@ struct ThreadedServer {
            if (context.hasCurrentIncomingRequest()) continue;
          }
        }
@@ -353,7 +353,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
        }
        // Park the whole object's node transports before canceling I/O or
        // closing standard sockets. The abort would break the actor and make
-@@ -3226,7 +3329,7 @@ struct ThreadedServer {
+@@ -3229,7 +3332,7 @@ struct ThreadedServer {
        if (!explicitClose && root.parked == kj::none && root.nodeSockets) {
          root.cancelExpiredWork = cancelPending;
          root.parking = root.parkSockets()
@@ -362,7 +362,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
            if (result == SocketParkResult::UNKNOWN && !root.resetting) {
              auto reason =
                  KJ_EXCEPTION(DISCONNECTED, "Durable Object could not confirm WebSocket parking.");
-@@ -3234,9 +3337,11 @@ struct ThreadedServer {
+@@ -3237,9 +3340,11 @@ struct ThreadedServer {
              root.actor->abort(kj::mv(reason));
            }
            root.parked = result == SocketParkResult::PARKED;
@@ -375,7 +375,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
          }).eagerlyEvaluate(nullptr);
          continue;
        }
-@@ -3255,7 +3360,9 @@ struct ThreadedServer {
+@@ -3258,7 +3363,9 @@ struct ThreadedServer {
          actor.abort(KJ_EXCEPTION(DISCONNECTED, "Durable Object retired after its idle deadline."));
          continue;
        }
@@ -386,7 +386,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
          if (pressured && !root.idleClosing) {
            durablePressureRetirements.fetch_add(1);
            reclaimed = true;
-@@ -3272,6 +3379,8 @@ struct ThreadedServer {
+@@ -3275,6 +3382,8 @@ struct ThreadedServer {
          KJ_ASSERT(durableAdmission->releaseTree(tree, homeId));
          auto &home = *threads[homeId - 1]->home;
          home.resident.erase(tree);
@@ -395,7 +395,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
          if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
          if (home.resident.empty()) state.durableSlot->lastUseNs.store(nowNs());
        }
-@@ -3285,11 +3394,14 @@ struct ThreadedServer {
+@@ -3288,11 +3397,14 @@ struct ThreadedServer {
          memory.observe(true);
        });
      }
@@ -410,7 +410,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
        home.memory = accounted();
        const bool rejectedGrowth =
            memory.cause->load() == LimitCause::MEMORY || memory.durableProcessPressure.load();
-@@ -3365,6 +3477,7 @@ struct ThreadedServer {
+@@ -3368,6 +3480,7 @@ struct ThreadedServer {
          ",\"groupCreationRefusals\":" + std::to_string(sandboxRefusals.load()) +
          ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
          ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
@@ -418,7 +418,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
          ",\"actorResets\":" + std::to_string(durableActorResets.load()) +
          ",\"isolateResets\":" + std::to_string(durableIsolateResets.load()) +
          ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
-@@ -3931,8 +4044,8 @@ struct ThreadedServer {
+@@ -3934,8 +4047,8 @@ struct ThreadedServer {
      return worker;
    }
  
@@ -429,7 +429,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
      JsonDoc document(descriptor);
      auto input = document.get();
      auto reservation = std::make_shared<ResourceReservation>(
-@@ -3943,7 +4056,7 @@ struct ThreadedServer {
+@@ -3946,7 +4059,7 @@ struct ThreadedServer {
      slot->instance = ++nextInstance;
      slot->workerId = str(input, "workerId");
      slot->versionId = str(input, "versionId");
@@ -438,7 +438,7 @@ index e7d66a783ca4b177a087f3dc92f21f3ea37f58ee..783812b62b20e9a0602dd43d93c43109
      slot->isolateLabel = "coworkerd-durable:" + std::to_string(slot->instance);
      slot->homeTurn = [this, homeId = state.durableHome, loaded = slot.get()](bool entering) {
        const auto &memory = *loaded->limits->memory;
-@@ -3980,6 +4093,21 @@ struct ThreadedServer {
+@@ -3983,6 +4096,21 @@ struct ThreadedServer {
      co_return slot;
    }
  
