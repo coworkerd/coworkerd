@@ -193,9 +193,12 @@ async function threadedDatabasePlacement(cluster) {
   }
   const tenant = await cluster.tenant('sql-placement', { durableObjectNamespaces: 48 });
   const databases = new Map([[threaded, []], [upstream, []]]);
+  let revision = 0;
   for (let i = 0; i < 36 && (databases.get(threaded).length < 2 || databases.get(upstream).length < 1); i++) {
     const path = `${tenant.path}/databases/db-${i}`;
-    const { database } = await cluster.api(path, { method: 'POST', token: tenant.token });
+    const created = await cluster.api(path, { method: 'POST', token: tenant.token });
+    const { database } = created;
+    revision = Math.max(revision, created.revision);
     // The first access uses the shard's rendezvous owner. Check the resulting owner in the dispatch log below.
     const scores = cluster.nodes.map(node => [node, createHash('sha256')
       .update(`${database.namespaceId}/0\0${node}`).digest().readBigUInt64BE()]);
@@ -207,6 +210,14 @@ async function threadedDatabasePlacement(cluster) {
   assert.equal(databases.get(threaded).length, 2, 'two databases are assigned to the same threaded owner');
   assert.equal(databases.get(upstream).length, 1, 'one database is assigned to the upstream owner');
   const selected = [...databases.values()].flat();
+  assert.ok(revision > 0, 'database creation returns a catalog revision');
+  // Avoid opening a shard while its designated owner is still waiting for the namespace catalog.
+  await eventually('all peers have applied the database catalog', async () => {
+    await Promise.all(cluster.nodes.map(async node => {
+      const state = await cluster.state(node);
+      assert.ok(Number(state.storage.appliedTenantsRevision) >= revision, `${node} has applied revision ${revision}`);
+    }));
+  });
   const peerUrls = new Map(await Promise.all([threaded, upstream].map(async node => {
     const address = await cluster.compose(['port', node, '8934']);
     assert.match(address, /^127\.0\.0\.1:\d+$/);
