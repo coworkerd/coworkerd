@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { once } from 'node:events';
 import { get } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
@@ -103,6 +105,21 @@ const worker = `
         const actor = new URL(request.url).searchParams.get('actor');
         return env.OBJECT.getByName(actor).fetch('https://object.test/' + path);
       }
+      if (path === 'decline-upgrade') {
+        return scheduler.wait(32_000).then(async () => {
+          const response = await env.SERVICE.fetch('https://service.test/');
+          return new Response(await response.text(), { status: response.ok ? 403 : response.status });
+        });
+      }
+      if (path === 'socket') {
+        const [client, server] = Object.values(new WebSocketPair());
+        server.accept();
+        server.addEventListener('message', async () => {
+          const response = await env.SERVICE.fetch('https://service.test/');
+          server.send(await response.text());
+        });
+        return new Response(null, { status: 101, webSocket: client });
+      }
       if (path === 'silent') {
         return new Response(new ReadableStream({ async start(controller) {
           controller.enqueue(new TextEncoder().encode('started'));
@@ -204,6 +221,37 @@ export async function connectedRequestLease(cluster) {
     console.log(`A half-closed HTTP client received the complete ${(elapsed / 1000).toFixed(1)} s stream`);
   } finally {
     controller.abort();
+  }
+}
+
+export async function upgradeRequestLease(cluster) {
+  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-upgrade');
+  const signal = AbortSignal.any([cluster.signal, AbortSignal.timeout(50_000)]);
+  const url = new URL(base + path + '/socket');
+  url.protocol = 'ws:';
+  const socket = new WebSocket(url);
+  try {
+    await once(socket, 'open', { signal });
+    const pending = await new Promise((resolve, reject) => {
+      const client = get(base + path + '/decline-upgrade', {
+        signal, headers: { Connection: 'Upgrade', Upgrade: 'websocket', 'Sec-WebSocket-Version': '13',
+          'Sec-WebSocket-Key': randomBytes(16).toString('base64') },
+      }, resolve);
+      client.once('error', reject);
+      client.once('upgrade', (_response, connection) => {
+        connection.destroy();
+        reject(new Error('the worker should decline the upgrade'));
+      });
+    });
+    let body = '';
+    for await (const chunk of pending) body += chunk;
+    assert.equal(pending.statusCode, 403, 'a pending upgrade kept its HTTP lease beyond 30 seconds');
+    assert.equal(body, 'service');
+    const message = once(socket, 'message', { signal });
+    socket.send('fetch');
+    assert.equal((await message)[0].data, 'service', '101 hands off to the WebSocket message lease');
+  } finally {
+    socket.close();
   }
 }
 

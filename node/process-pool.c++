@@ -312,7 +312,7 @@ public:
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
       std::function<void()> onDispatched,
       std::function<void()> onCapacityRejected, kj::Own<kj::PromiseFulfiller<void>> ready,
-      std::shared_ptr<RequestLease> lease);
+      std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call);
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
@@ -321,11 +321,12 @@ public:
   bool disconnected = false;
   OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps,
       kj::Maybe<capnp::Capability::Client> budgetLifetime, std::function<void()> onDispatched,
-      std::function<void()> onCapacityRejected, std::shared_ptr<RequestLease> lease) {
+      std::function<void()> onCapacityRejected, std::shared_ptr<RequestLease> lease,
+      std::shared_ptr<const ProcessCall> call) {
     if (threaded) {
       auto ready = kj::newPromiseAndFulfiller<void>();
       return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
-          kj::mv(budgetLifetime), std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller), std::move(lease))),
+          kj::mv(budgetLifetime), std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller), std::move(lease), std::move(call))),
           kj::mv(ready.promise)};
     }
     KJ_REQUIRE(!nativeProps, "native loopback props require a threaded process");
@@ -366,17 +367,24 @@ private:
 
 class NativeLeaseControl final: public v1::rpc::NativeLeaseControl::Server {
 public:
-  explicit NativeLeaseControl(std::shared_ptr<RequestLease> lease): lease(std::move(lease)) {}
-  kj::Promise<void> whenEnded(WhenEndedContext) override { return lease->whenClosed(); }
+  NativeLeaseControl(std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call)
+      : lease(std::move(lease)), call(std::move(call)) {}
+  kj::Promise<void> whenEnded(WhenEndedContext) override {
+    return lease->whenClosed().then([call = call]() -> kj::Promise<void> {
+      if (call->upgradedToWebSocket) return kj::NEVER_DONE;
+      return kj::READY_NOW;
+    });
+  }
 private:
   std::shared_ptr<RequestLease> lease;
+  std::shared_ptr<const ProcessCall> call;
 };
 
 kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor,
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
     std::function<void()> onDispatched,
     std::function<void()> onCapacityRejected, kj::Own<kj::PromiseFulfiller<void>> ready,
-    std::shared_ptr<RequestLease> lease) {
+    std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call) {
   auto lifetime = shared_from_this();
   KJ_REQUIRE(deferredDeletes != nullptr);
   auto connection = std::shared_ptr<RuntimeConnection>(new RuntimeConnection(),
@@ -461,7 +469,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       auto request = connection->bootstrap.castAs<v1::rpc::ThreadedBootstrap>().startNativeEventRequest();
       request.setCfBlobJson(descriptor);
       if (nativeProps) request.getCoworkerdProps().set(nativeProps->getRoot<capnp::AnyPointer>());
-      if (lease && !threadedDurable) request.setLease(kj::heap<NativeLeaseControl>(std::move(lease)));
+      if (lease && !threadedDurable) request.setLease(kj::heap<NativeLeaseControl>(std::move(lease), std::move(call)));
       request.setBudgetLifetime(kj::mv(budgetToken));
       request.setBudgetTicket(budgetTicket);
       auto response = request.send();
@@ -4232,7 +4240,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
   auto result = p->runtime->open(descriptor, std::move(nativeProps), kj::mv(budgetLifetime), [call] { call->dispatched = true; }, [call] {
     call->capacityRejected = true;
     if (call->onCapacityRejected) call->onCapacityRejected();
-  }, std::move(requestLease));
+  }, std::move(requestLease), call);
   result.ready = kj::mv(result.ready).exclusiveJoin(call->onExit()).catch_([call](kj::Exception&& error) -> kj::Promise<void> {
     return call->rejectAfterCrash(kj::mv(error));
   }).attach(std::shared_ptr<ProcessCall>(call));

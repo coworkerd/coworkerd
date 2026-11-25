@@ -3,12 +3,14 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { cases, durableGatedCases, fatalAttribution, webSocketCases } from './cases.mjs';
 import { Cluster } from './cluster.mjs';
-import { alarmRequestLease, actorRequestLease, connectedRequestLease, disconnectedRequestLease, silentRequestLease }
+import { alarmRequestLease, actorRequestLease, connectedRequestLease, disconnectedRequestLease,
+  silentRequestLease, upgradeRequestLease }
   from './live-request-lease.mjs';
 import { liveRequestCapacity } from './live-request-load.mjs';
 
 const leaseCases = {
   'live-request-lease': connectedRequestLease,
+  'upgrade-request-lease': upgradeRequestLease,
   'disconnected-request-lease': disconnectedRequestLease,
   'silent-request-lease': silentRequestLease,
 };

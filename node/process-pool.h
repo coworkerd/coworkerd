@@ -52,6 +52,7 @@ public:
   uint64_t startedAtUnixMs = 0;
   bool dispatched = false;
   bool capacityRejected = false;
+  bool upgradedToWebSocket = false;
   std::function<void()> onCapacityRejected;
 private:
   friend class ProcessPool;
