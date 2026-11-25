@@ -45,7 +45,7 @@ export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
-    budgetLifetime, nodeEnvironment, singleNode = false, productRoot = root,
+    budgetLifetime, nodeEnvironment, singleNode = false, publishPeerPorts = false, productRoot = root,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -76,13 +76,15 @@ export class Cluster {
     this.configureNode = configureNode;
     this.nodeEnvironment = nodeEnvironment;
     this.productRoot = productRoot;
+    this.publishPeerPorts = publishPeerPorts;
   }
 
-  async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000 } = {}) {
+  async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000,
+    maxBuffer = 4 * 1024 * 1024 } = {}) {
     try {
       return (await exec(program, args, {
         cwd, env: token ? { ...this.env, COWCTL_TOKEN: token } : this.env,
-        timeout, signal: cleanup ? undefined : this.signal, maxBuffer: 4 * 1024 * 1024,
+        timeout, signal: cleanup ? undefined : this.signal, maxBuffer,
       })).stdout.trim();
     } catch (error) {
       throw new Error(`${program} ${args.join(' ')} failed (${error.signal ?? error.code})\n${error.stderr ?? ''}${error.stdout ?? ''}`);
@@ -141,7 +143,7 @@ export class Cluster {
       await writeFile(config, JSON.stringify({
         nodeId: node, stackDirectory: '/var/lib/coworkerd', listenAddress: '0.0.0.0:8930',
         advertisedAddress: this.recoveryRelayGate ? `recovery-relay:${18001 + nodes.indexOf(node)}` : peer,
-        peerListenAddress: peer,
+        peerListenAddress: this.publishPeerPorts ? '0.0.0.0:8934' : peer,
         secrets: { keyFile: `${secrets}/secrets-key.json` },
         peerAuth: { keyFile: `${secrets}/cluster-key.json` },
         storage: { endpoint: 'http://storage:8333', credentialsFile: `${secrets}/server.json` },
@@ -166,6 +168,7 @@ export class Cluster {
         ...this.configureNode?.(node),
       }));
       overrides[node] = {
+        ...(this.publishPeerPorts && { ports: ['127.0.0.1:0:8934'] }),
         ...(this.webSocketsPerNode ? { ulimits: { nofile: { soft: 1024, hard: 524288 } } } : {}),
         // Keep a killed owner down so that only a different node can recover the object.
         restart: 'no',
