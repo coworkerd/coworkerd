@@ -9,8 +9,8 @@ import { Cluster, eventually, json, request } from './cluster.mjs';
 const [kernel, mode, countArg, ...extra] = process.argv.slice(2);
 const count = mode === 'cold' ? 200 : Number(countArg);
 if (!kernel || !['cold', 'loss'].includes(mode) || extra.length ||
-    (mode === 'cold' ? countArg !== undefined : ![100, 500].includes(count))) {
-  console.error('Usage: node tests/cluster/database-first-access.mjs <kernel> <cold | loss 100 | loss 500>');
+    (mode === 'cold' ? countArg !== undefined : ![100, 500, 1000, 2000].includes(count))) {
+  console.error('Usage: node tests/cluster/database-first-access.mjs <kernel> <cold | loss <100|500|1000|2000>>');
   process.exit(2);
 }
 
@@ -78,15 +78,18 @@ async function hostSample(node) {
 }
 
 async function scheduler(node) {
-  const { membership, durableLog, peerConnectBudget } = await cluster.state(node);
+  const { membership, durableLog, peerConnectBudget, processes } = await cluster.state(node);
   const { entries, ...metrics } = durableLog.recovery.scheduler;
+  const durable = processes.entries.find(entry => entry.processClass === 'durable');
   return { ...metrics, leaseFences: membership.leaseFences, leaseLosses: durableLog.confirm.leaseLosses,
-    peakPeerConnect: peerConnectBudget?.peak, activeRebuilds: durableLog.objects.activeRebuilds };
+    peakPeerConnect: peerConnectBudget?.peak, activeRebuilds: durableLog.objects.activeRebuilds,
+    durableGeneration: durable?.generation, durableLastExit: durable?.lastExitCategory };
 }
 
 async function logs(node, since) {
   const container = await cluster.compose(['ps', '-a', '-q', node]);
-  const output = await cluster.command('docker', ['logs', '--since', since, container], { timeout: 30000 });
+  const output = await cluster.command('docker', ['logs', '--since', since, container],
+    { timeout: 30000, maxBuffer: 32 * 1024 * 1024 });
   const entries = [];
   for (const line of output.split('\n')) {
     const index = line.indexOf('[do-log] {');
@@ -99,12 +102,17 @@ async function measureLogs(node, since, selected) {
   const byNamespace = new Map(selected.map(database => [database.namespace, database]));
   const samples = new Map();
   const waits = new Map();
+  let additionalRebuilds = 0;
   for (const entry of await logs(node, since)) {
     if (entry.event === 'rebuilt') {
       const [namespace] = entry.object.split('/');
       if (!byNamespace.has(namespace)) continue;
-      assert.ok(!samples.has(namespace), `${node} repeated rebuild of ${namespace}`);
-      samples.set(namespace, entry.laps.tailWaitMs);
+      if (samples.has(namespace)) {
+        assert.equal(mode, 'loss', `${node} repeated cold rebuild of ${namespace}`);
+        ++additionalRebuilds;
+      } else {
+        samples.set(namespace, entry.laps.tailWaitMs);
+      }
     }
     if (entry.event === 'measurement-epoch-gate') {
       const [, namespace] = entry.key.split('/');
@@ -118,6 +126,7 @@ async function measureLogs(node, since, selected) {
     database.tailWaitMs = samples.get(database.namespace);
     database.epochGateWaitMs = waits.get(database.namespace);
   }
+  return additionalRebuilds;
 }
 
 async function runCold(databases, schedule) {
@@ -166,26 +175,31 @@ async function runLoss(databases) {
   }, { timeout: 60000, interval: 200 });
   const detectionMs = performance.now() - fault;
   write('owner-lost', { databases: count, original, detectionMs });
-  const reads = await Promise.all(databases.map(async database => {
+  const reads = await Promise.all(databases.map(async (database, index) => {
+    // Give the client a short ramp at larger counts to avoid a connection burst.
+    if (count > 500) await delay(Math.floor(index / 100) * 20, undefined, { signal: controller.signal });
     let attempts = 0;
     await eventually(`read ${database.name}`, async () => {
       controller.signal.throwIfAborted();
       ++attempts;
       await query(database.successor, database, 'SELECT value FROM sample', database.name);
-    }, { timeout: 180000, interval: 250 });
+    }, { timeout: count === 2000 ? 300000 : 180000, interval: 250 });
     return { ...database, elapsedMs: performance.now() - fault, attempts };
   }));
+  reads.sort((left, right) => left.elapsedMs - right.elapsedMs);
+  const readTimes = summarize(reads.map(db => db.elapsedMs));
+  write('loss-readable', { count, detectionMs, reads: readTimes });
   const hostAfter = await hostSample(survivors[0]);
   const after = Object.fromEntries(await Promise.all(survivors.map(async node => [node, await scheduler(node)])));
+  const additionalRebuilds = {};
   for (const node of survivors) {
     assert.equal(after[node].leaseFences, before[node].leaseFences);
     assert.equal(after[node].leaseLosses, before[node].leaseLosses);
-    await measureLogs(node, since, reads.filter(db => db.successor === node));
+    additionalRebuilds[node] = await measureLogs(node, since, reads.filter(db => db.successor === node));
   }
-  reads.sort((left, right) => left.elapsedMs - right.elapsedMs);
   for (const database of reads) write('loss-read', database);
   const gateTotals = reads.filter(db => db.epochGateWaitMs).map(db => db.epochGateWaitMs.reduce((sum, ms) => sum + ms, 0));
-  write('loss-summary', { count, detectionMs, reads: summarize(reads.map(db => db.elapsedMs)),
+  write('loss-summary', { count, detectionMs, reads: readTimes, additionalRebuilds,
     epochGateSamples: gateTotals.length, ...(gateTotals.length && { epochGateWait: summarize(gateTotals) }),
     before, after, hostBefore, hostAfter });
 }
@@ -202,7 +216,7 @@ try {
     assert.match(address, /^127\.0\.0\.1:\d+$/);
     peerUrls[node] = 'http://' + address;
   }
-  const tenant = await cluster.tenant(tenantName, { durableObjectNamespaces: 3000 });
+  const tenant = await cluster.tenant(tenantName, { durableObjectNamespaces: Math.max(3000, 4 * count) });
   const selected = await databases(tenant, mode === 'cold' ? 2 * count : count);
   if (mode === 'cold') {
     await runCold(selected.slice(0, count), 'serial');

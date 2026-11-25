@@ -2160,6 +2160,35 @@ struct DurableLogChannelTest {
     const auto discovery = log.tailTargets().wait(io.waitScope);
     KJ_REQUIRE(discovery->addresses.contains("old/7@old:8934") && discovery->unresolved.contains(memberKey),
         "a failed later discovery preserves a previously known holder");
+
+    // A first epoch that names a remote owner needs that owner's proof.
+    // The rebuild parks and its discovery waits for a permit.
+    const std::string foreignNs(64, 'c'), foreignId(64, '1');
+    const auto foreignName = durableHostName(foreignNs, foreignId, 1);
+    store.objects[shardEpochKey(foreignNs, 0, 1)] = shardEpochJson(
+        {foreignNs, "old", "first", "old-instance", "nonce", "", 0, 1, 7, 1, 1});
+    log.rebuildMetadataLimit = DurableLog::REBUILD_METADATA_LIMIT;
+    log.recoveryDiscoveryAtMs = 0;
+    auto busyOne = log.recoveryMetadata.acquire().wait(io.waitScope);
+    auto busyTwo = log.recoveryMetadata.acquire().wait(io.waitScope);
+    const auto metadataStarts = log.recoveryMetadata.started();
+    auto heldDiscovery = kj::newPromiseAndFulfiller<void>();
+    store.reads.emplace(MEMBERS_PREFIX, heldDiscovery.promise.fork());
+    auto foreignAccess = log.openObject({foreignNs, foreignId, "", 1, 1, 0}, false).eagerlyEvaluate(nullptr);
+    until("foreign first epoch parks", [&] {
+      auto run = log.rebuildRuns.find(foreignName);
+      return run != log.rebuildRuns.end() && run->second->parkedAtMs != 0;
+    });
+    check(0, 0);
+    KJ_REQUIRE(!foreignAccess.poll(io.waitScope) && !store.heldReads.contains(MEMBERS_PREFIX) &&
+        log.recoveryMetadata.started() == metadataStarts);
+    busyOne = nullptr;
+    until("foreign first epoch discovery", [&] { return store.heldReads.contains(MEMBERS_PREFIX); });
+    KJ_REQUIRE(log.recoveryMetadata.started() == metadataStarts + 1 && !foreignAccess.poll(io.waitScope));
+    check(0, 0);
+    log.rebuildCancelers.at(foreignName)->cancel("fixture cancellation");
+    heldDiscovery.fulfiller->fulfill();
+    KJ_REQUIRE(!foreignAccess.wait(io.waitScope).ready);
   }
 
   static LogRecord recoveryPage(const std::string& name, const std::string& page) {

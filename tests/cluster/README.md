@@ -107,6 +107,8 @@ save the output. Each command starts a fresh cluster.
 node tests/cluster/database-first-access.mjs "$kernel" cold | tee cold.log
 node tests/cluster/database-first-access.mjs "$kernel" loss 100 | tee loss-100.log
 node tests/cluster/database-first-access.mjs "$kernel" loss 500 | tee loss-500.log
+node tests/cluster/database-first-access.mjs "$kernel" loss 1000 | tee loss-1000.log
+node tests/cluster/database-first-access.mjs "$kernel" loss 2000 | tee loss-2000.log
 ```
 
 The cold probe sends one `SELECT 1` to each of 200 untouched D1 databases serially, then sends
@@ -116,10 +118,12 @@ probe records the change in waiting-recovery metadata requests during each windo
 
 The loss probe seeds one confirmed row in each database on one owner. Every database has its own
 namespace and shard. The probe selects namespaces that default placement assigns to the original node
-and then evenly to the two survivors. It
-sends `SIGKILL`, waits for both survivors to detect the lost owner, issues all reads, and retries at
-250 ms after unsuccessful responses. It checks every saved value and rebuild on its expected
-successor. Read times start at the kill request. Percentiles use nearest rank.
+and then evenly to the two survivors. It sends `SIGKILL`, waits for both survivors to detect the
+lost owner, and issues all reads. The 1,000- and 2,000-database workloads start 100 clients every
+20 ms. The probe retries at 250 ms after unsuccessful responses. It checks every saved value and
+rebuild on its expected successor. The probe records additional rebuilds and the durable process
+generation and last exit category at each end of the run. Read times start at the kill request.
+Percentiles use nearest rank.
 
 The pre-change measurement used `c5e8524` with a timing-only patch that logs the wait from requesting
 an epoch metadata permit until it is granted. Apply the patch in a separate baseline checkout. The
