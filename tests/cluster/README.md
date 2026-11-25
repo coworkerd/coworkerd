@@ -99,6 +99,56 @@ median and last successful reads, and samples of lease and recovery counters. Th
 requires all reads within 55 seconds of detection. To time an earlier build without that assertion, set
 `COWORKERD_RECOVERY_MEASURE_BASELINE=1` and point `COWORKERD_CLUSTER_BIN_DIR` at its Linux binaries.
 
+### Database first access and node loss
+
+Build the daemons and launcher as above. Run each workload in its own quiet measurement window and
+save the output. Each command starts a fresh cluster.
+
+```sh
+node tests/cluster/database-first-access.mjs "$kernel" cold | tee cold.log
+node tests/cluster/database-first-access.mjs "$kernel" loss 100 | tee loss-100.log
+node tests/cluster/database-first-access.mjs "$kernel" loss 500 | tee loss-500.log
+node tests/cluster/database-first-access.mjs "$kernel" loss 1000 | tee loss-1000.log
+node tests/cluster/database-first-access.mjs "$kernel" loss 2000 | tee loss-2000.log
+```
+
+The cold probe sends one `SELECT 1` to each of 200 untouched D1 databases serially, then sends
+200 queries at once to a second untouched set. It uses one node and sends SQL to the peer endpoint
+used by the control plane. The node reports the rebuild's tail-wait lap for each database and the
+probe records the change in waiting-recovery metadata requests during each window.
+
+The loss probe seeds one confirmed row in each database on one owner. Every database has its own
+namespace and shard. The probe selects namespaces that default placement assigns to the original node
+and then evenly to the two survivors. It sends `SIGKILL`, waits for both survivors to detect the
+lost owner, and issues all reads. The 1,000- and 2,000-database workloads start 100 clients every
+20 ms. The probe retries at 250 ms after unsuccessful responses. It checks every saved value and
+rebuild on its expected successor. The probe records additional rebuilds and the durable process
+generation and last exit category at each end of the run. Read times start at the kill request.
+Percentiles use nearest rank.
+
+The pre-change measurement used `c5e8524` with a timing-only patch that logs the wait from requesting
+an epoch metadata permit until it is granted. Apply the patch in a separate baseline checkout. The
+driver sums the two source-epoch waits for each database in the 500-database run. Those waits
+can overlap the missing-owner deadline, and databases wait concurrently across the two survivors.
+
+```sh
+baseline="$PWD/../coworkerd-db-first-access-baseline"
+git worktree add --detach "$baseline" c5e8524
+git -C "$baseline" apply "$PWD/tests/cluster/database-epoch-gate-baseline.patch"
+(cd "$baseline" && bash scripts/build.sh && cmake --build build --target coworkerd-launcher)
+COWORKERD_CLUSTER_BIN_DIR="$baseline/build" \
+  node tests/cluster/database-first-access.mjs "$kernel" loss 500 | tee baseline-loss-500.log
+COWORKERD_CLUSTER_BIN_DIR="$baseline/build" \
+  node tests/cluster/database-first-access.mjs "$kernel" cold | tee baseline-cold.log
+```
+
+The recorded runs used the same ARM64 Docker Desktop VM (Apple M4 host, 10 CPUs and 7.75 GiB
+assigned to the VM), SeaweedFS 4.48, default durable settings, release builds with Clang 19.1.7,
+and the pinned [ARM64 kernel archive](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-3aa588b669ff-run-45491272877-1).
+The client ran on the host through Docker's loopback port forwarding. See the per-window VM pressure
+and client load samples in the output. The [installation guide](../../docs/guide/install.md#database-recovery-after-a-node-loss)
+lists the recovery results.
+
 ## Measured time and resources
 
 A fresh GitHub-hosted Ubuntu 24.04 x86-64 runner with 4 vCPUs, 15.3 GiB RAM, Docker Engine 28.0.4 and Compose

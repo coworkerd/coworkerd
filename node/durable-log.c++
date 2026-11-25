@@ -5240,11 +5240,12 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   std::vector<ManifestFacet> facets;
   uint64_t fromSeq = 0;
   object->recoveryManifestRevision = manifest ? manifest->revision : 0;
-  // A trusted restart on the original disk can prove its own source epochs
-  // during preparation. Remote, missing or incomplete sources park as usual.
+  // The first shard epoch has no predecessor. Read it and collect the local
+  // tail under the rebuild slot, as for a trusted restart on the original disk.
+  // Remote, missing or incomplete proof still releases the slot for polling.
   kj::Maybe<kj::Promise<bool>> preparedLocally;
   kj::Own<kj::PromiseFulfiller<bool>> localPreparation;
-  if (diskTrusted && sameBootCache && targetDataEpoch < targetEpoch) {
+  if (targetEpoch == 1 || (diskTrusted && sameBootCache && targetDataEpoch < targetEpoch)) {
     auto prepared = kj::newPromiseAndFulfiller<bool>();
     preparedLocally = kj::mv(prepared.promise);
     localPreparation = kj::mv(prepared.fulfiller);
