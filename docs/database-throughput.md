@@ -25,12 +25,12 @@ The full tables show the spread across instances.
   durable home stayed at 30–34%. That pattern points to a limit on the single-home path, with
   the particular source of waiting unresolved. With eight Native databases the node main thread
   reached 90–93% while the hottest durable thread used about 5%.
-- **Confirmed inserts.** The highest measured Object insert rates left the node main thread
-  below 86%. The same runs showed Linux I/O wait in the insert windows and almost none in the
-  read windows. With zero remote WAL peers, the node's confirmation path calls `fdatasync`
-  before acknowledging writes. Waiting for local WAL confirmation is a likely contributor to
-  the write plateau. The benchmark measures confirmation latency and CPU, so it cannot
-  separately time the flush or other waits on the write path.
+- **Confirmed inserts.** The node main thread is also the likely limit for Object inserts and
+  the eight-database Native insert cells. It spends part of its time on CPU and performs local WAL
+  flushes inline. The confirmation interval stayed broadly flat as concurrency rose, with
+  per-cell means of 0.24–0.28 ms on the Intel guests and 0.41–0.56 ms on the AMD guest. This gives
+  little evidence of a separate queue building at the flush. The single Native database plateau
+  lifted with eight databases, as it did for reads. See the main-thread time budget below.
 - **Scope.** The earlier figure of about 1,300 reads/s came from the Mac-to-Docker Desktop path
   with a different client and hardware. These measurements identify the limiting stages on the
   Linux runners. The earlier records contain too little CPU information to assign that exact
@@ -38,10 +38,10 @@ The full tables show the spread across instances.
 
 ## Measurement setup
 
-Three independent standard GitHub-hosted Ubuntu 24.04 x86-64 instances each ran the full matrix with
-identical release binaries built in separate jobs. Each instance had four vCPUs and about 16 GiB of guest memory. Each product ran in
-a fresh single-node Compose project. Product order rotated across the instances. Docker used a named
-volume for the node's data. [Runner details and workflow artifacts](https://github.com/coworkerd/coworkerd/actions/runs/45637644215)
+Three independent standard GitHub-hosted Ubuntu 24.04 x86-64 instances each ran the full matrix.
+For each product, the instances shared one release build from a separate job. Each instance had four
+vCPUs and about 16 GiB of guest memory. Each product ran in a fresh single-node Compose project.
+Product order rotated across the instances. Docker used a named volume for the node's data. [Runner details and workflow artifacts](https://github.com/coworkerd/coworkerd/actions/runs/45637644215)
 
 The HTTP client resolved `node-1` on the Compose frontend and used its ingress port directly.
 Each connection had one request outstanding. The controller completed deployment and seeding before
@@ -74,20 +74,65 @@ Docker Engine 28.0.4 ran on each guest. The runner agent, Docker and the cluster
 health checks and object store shared the guest with the benchmark. Each measurement job ran one
 cluster at a time and reused the same product binaries as the other two jobs. Host busy CPU peaked
 at 3.28 of four cores over all 144 windows. Reported guest steal time was at most 0.03% of aggregate
-CPU time. Instance 1 delivered the lowest rates in most cells even at broadly similar CPU utilization.
-The experiment did not separate CPU model, virtualization and other machine differences.
+CPU time.
 
-All 144 timed windows and their warm-ups completed without request failures. The calibration runs
-reached the node and process admission ceilings while requests whose HTTP replies had arrived were
-still retiring. The measured fixture uses higher admission ceilings for that reason. It sets the
-node's root and nested limits to 512 and 1,024, the process in-flight limit to 512, and the durable
-mailbox limits to 64 events and 1 MiB. [Calibration run 1](https://github.com/coworkerd/coworkerd/actions/runs/45631888750) ·
+The 32-client Worker-only control was partially refused with the default admission limits.
+The first calibration returned `503 OVERLOADED` at the node's 128-invocation root limit, including
+605 timed refusals on one instance. After raising the node limits, the next calibration returned
+`503 PROCESS_UNAVAILABLE` before dispatch during warm-up with the ordinary process limit still
+at 128. Requests can continue to occupy an admission slot after their HTTP reply. The measured
+fixture gives the node 512 root and 1,024 nested slots, gives the process 512 in-flight slots, and
+allows 64 events and 1 MiB per durable mailbox. All 144 timed windows and their warm-ups completed
+without request failures at those settings. [Calibration run 1](https://github.com/coworkerd/coworkerd/actions/runs/45631888750) ·
 [Calibration run 2](https://github.com/coworkerd/coworkerd/actions/runs/45634696226)
 
 The raw records include per-window throughput, latency, process and thread CPU, guest CPU and pressure
 counters, and write confirmation deltas. [Instance 1](database-throughput/runner-1.jsonl) ·
 [Instance 2](database-throughput/runner-2.jsonl) · [Instance 3](database-throughput/runner-3.jsonl) ·
 [Measurement workflow](https://github.com/coworkerd/coworkerd/blob/f9e97002245a904f3e0b8b7e7d0ebba927033ba3/.github/workflows/database-throughput-measure.yml)
+
+## Node main-thread time per request
+
+The table shows milliseconds of main-thread CPU per successful reply at 32 clients. Divide the
+main thread's CPU ticks by the clock rate and the number of replies, then convert to milliseconds.
+Across the 8- and 32-client Object read cells, the two Intel guests used 1.23–1.34 ms per read
+and the AMD guest used 1.97–2.53 ms. For example, the AMD guest delivered 449 and 378 single-database reads/s in the 32-client
+Main and #84 Object cells at 91% and 93% main-thread CPU. The higher CPU cost per read accounts for
+the lower observed rate at similar occupancy. CPU model, virtualization and other machine
+differences remain combined in this comparison.
+
+| Instance | Product | Worker only | Object no-op | Read, 1 DB | Read, 8 DBs | Insert, 1 DB | Insert, 8 DBs |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | Main Object | 0.72 | 2.33 | 2.03 | 2.03 | 2.23 | 2.42 |
+| 1 | #84 Object | 0.67 | 1.79 | 2.47 | 2.53 | 2.76 | 2.75 |
+| 1 | #84 Native | 0.80 | 2.23 | 2.35 | 2.42 | 2.85 | 2.56 |
+| 2 | Main Object | 0.45 | 1.12 | 1.25 | 1.32 | 1.45 | 1.42 |
+| 2 | #84 Object | 0.47 | 1.10 | 1.23 | 1.34 | 1.49 | 1.49 |
+| 2 | #84 Native | 0.45 | 1.09 | 1.41 | 1.22 | 1.62 | 1.44 |
+| 3 | Main Object | 0.41 | 1.01 | 1.24 | 1.24 | 1.40 | 1.45 |
+| 3 | #84 Object | 0.43 | 1.02 | 1.23 | 1.33 | 1.41 | 1.37 |
+| 3 | #84 Native | 0.45 | 1.00 | 1.26 | 1.13 | 1.44 | 1.26 |
+
+Linux CPU pressure, measured from the change in the guest's `/proc/pressure/cpu` `some` total,
+was 21–37% in the read windows with at least 90% main-thread CPU. It was 9–12% in the 8- and
+32-client single-database Native read windows. The pressure metric reports time when at least one
+task was runnable and waiting for a CPU. It can account for some of the gap between the main
+thread's measured utilization and a full core. It describes the guest, so it cannot assign that
+waiting time to the node thread.
+
+The insert time budget uses the confirmation count and cumulative mean at the two outer
+boundaries to estimate the mean confirmation latency for each cell, including its warm-up.
+With zero remote peers, `DurableLog::checkConfirmations` calls `fdatasync` inline on the node
+main thread, once per pass. Multiplying inserts/s by the mean confirmation latency gives an
+upper bound on the share of wall time in the flush. Confirmation latency includes other work,
+a flush can cover multiple inserts, and the estimate can overlap with the CPU measurement.
+For example, on instance 2 the 32-client Main Object cell completed 578 inserts/s with 0.27 ms
+mean confirmation latency. The bound is about 16% beside 84% of measured main-thread CPU.
+That sum is close to one thread's wall time and supports the inference that the main thread
+limits the write path through CPU work and synchronous flushing. It does not time blocked
+syscalls. The sum for the 32-client single-database Native cells was 88–90%, consistent with
+additional headroom on the node for that layout.
+[Local WAL confirmation path](https://github.com/coworkerd/coworkerd/blob/abab77c7bdc5373743e6b5195d6ac83e4f2e29d0/node/durable-log.c%2B%2B#L2970-L2979)
 
 ## Results by cell
 
@@ -96,7 +141,9 @@ Each process CPU column reports median user plus system CPU as a percentage of o
 node column also shows its main thread. The workerd and durable columns also show the busiest thread
 present at both endpoints of the window. Process and thread counters are separate reads of Linux
 CPU ticks, so rounding can differ. Ordinary workerd can schedule invocations of the same Worker on
-different threads, so its process total exceeds a single thread's use.
+different threads, so its process total exceeds a single thread's use. The durable process's total
+CPU and the corresponding drop in its busiest thread show the work spreading in the eight-database
+cells. The driver checks the eight distinct database targets and does not verify home assignment.
 
 The last numeric column reports busy CPU cores for each instance in order. It comes from the runner's
 aggregate Linux CPU counters and includes the rest of the runner's work and the kernel's interrupt time.
@@ -119,10 +166,10 @@ logical CPUs, and the node and client containers had no CFS CPU quota.
 | Read | 8 / 8 | 8 | 687 [452–704] | 88% / 88% | 81% / 8% | 73% / 8% | 16% | 2.79 / 2.72 / 2.74 | Approaching node limit |
 | Read | 8 / 8 | 32 | 709 [462–752] | 94% / 94% | 85% / 2% | 69% / 8% | 16% | 2.79 / 2.75 / 2.77 | Node main near limit |
 | Insert | 1 / 1 | 1 | 301 [222–309] | 52% / 52% | 34% / 31% | 34% / 29% | 10% | 1.47 / 1.38 / 1.39 | One request in flight |
-| Insert | 1 / 1 | 8 | 545 [365–554] | 79% / 78% | 65% / 6% | 52% / 45% | 14% | 2.37 / 2.24 / 2.28 | CPU headroom, WAL wait inferred |
-| Insert | 1 / 1 | 32 | 578 [369–601] | 85% / 84% | 69% / 4% | 55% / 47% | 13% | 2.39 / 2.35 / 2.39 | CPU headroom, WAL wait inferred |
-| Insert | 8 / 8 | 8 | 563 [355–564] | 80% / 80% | 66% / 6% | 64% / 7% | 14% | 2.43 / 2.41 / 2.42 | CPU headroom, WAL wait inferred |
-| Insert | 8 / 8 | 32 | 562 [334–576] | 83% / 82% | 68% / 2% | 60% / 7% | 13% | 2.37 / 2.39 / 2.36 | CPU headroom, WAL wait inferred |
+| Insert | 1 / 1 | 8 | 545 [365–554] | 79% / 78% | 65% / 6% | 52% / 45% | 14% | 2.37 / 2.24 / 2.28 | Likely node main (CPU and flush) |
+| Insert | 1 / 1 | 32 | 578 [369–601] | 85% / 84% | 69% / 4% | 55% / 47% | 13% | 2.39 / 2.35 / 2.39 | Likely node main (CPU and flush) |
+| Insert | 8 / 8 | 8 | 563 [355–564] | 80% / 80% | 66% / 6% | 64% / 7% | 14% | 2.43 / 2.41 / 2.42 | Likely node main (CPU and flush) |
+| Insert | 8 / 8 | 32 | 562 [334–576] | 83% / 82% | 68% / 2% | 60% / 7% | 13% | 2.37 / 2.39 / 2.36 | Likely node main (CPU and flush) |
 
 ### #84 Object
 
@@ -140,10 +187,10 @@ logical CPUs, and the node and client containers had no CFS CPU quota.
 | Read | 8 / 8 | 8 | 673 [379–689] | 88% / 88% | 81% / 8% | 72% / 8% | 16% | 2.75 / 2.72 / 2.73 | Approaching node limit |
 | Read | 8 / 8 | 32 | 699 [370–703] | 94% / 94% | 86% / 2% | 68% / 8% | 15% | 2.72 / 2.75 / 2.75 | Node main near limit |
 | Insert | 1 / 1 | 1 | 306 [173–306] | 52% / 52% | 33% / 30% | 34% / 29% | 10% | 1.49 / 1.39 / 1.39 | One request in flight |
-| Insert | 1 / 1 | 8 | 543 [295–554] | 79% / 79% | 65% / 6% | 52% / 45% | 14% | 2.26 / 2.26 / 2.25 | CPU headroom, WAL wait inferred |
-| Insert | 1 / 1 | 32 | 570 [298–600] | 85% / 84% | 69% / 5% | 54% / 47% | 13% | 2.33 / 2.37 / 2.41 | CPU headroom, WAL wait inferred |
-| Insert | 8 / 8 | 8 | 550 [294–570] | 80% / 80% | 65% / 6% | 64% / 7% | 14% | 2.43 / 2.39 / 2.44 | CPU headroom, WAL wait inferred |
-| Insert | 8 / 8 | 32 | 552 [297–587] | 82% / 82% | 68% / 2% | 59% / 7% | 13% | 2.39 / 2.38 / 2.38 | CPU headroom, WAL wait inferred |
+| Insert | 1 / 1 | 8 | 543 [295–554] | 79% / 79% | 65% / 6% | 52% / 45% | 14% | 2.26 / 2.26 / 2.25 | Likely node main (CPU and flush) |
+| Insert | 1 / 1 | 32 | 570 [298–600] | 85% / 84% | 69% / 5% | 54% / 47% | 13% | 2.33 / 2.37 / 2.41 | Likely node main (CPU and flush) |
+| Insert | 8 / 8 | 8 | 550 [294–570] | 80% / 80% | 65% / 6% | 64% / 7% | 14% | 2.43 / 2.39 / 2.44 | Likely node main (CPU and flush) |
+| Insert | 8 / 8 | 32 | 552 [297–587] | 82% / 82% | 68% / 2% | 59% / 7% | 13% | 2.39 / 2.38 / 2.38 | Likely node main (CPU and flush) |
 
 ### #84 Native
 
@@ -161,7 +208,7 @@ logical CPUs, and the node and client containers had no CFS CPU quota.
 | Read | 8 / 8 | 8 | 806 [438–849] | 90% / 90% | 95% / 9% | 43% / 5% | 16% | 2.63 / 2.60 / 2.64 | Approaching node limit |
 | Read | 8 / 8 | 32 | 758 [385–814] | 92% / 92% | 94% / 3% | 43% / 5% | 17% | 2.58 / 2.60 / 2.63 | Node main near limit |
 | Insert | 1 / 1 | 1 | 356 [193–365] | 56% / 56% | 41% / 37% | 23% / 20% | 11% | 1.53 / 1.44 / 1.45 | One request in flight |
-| Insert | 1 / 1 | 8 | 485 [264–507] | 74% / 74% | 60% / 6% | 34% / 30% | 15% | 2.05 / 1.96 / 1.98 | CPU headroom, WAL wait inferred |
-| Insert | 1 / 1 | 32 | 476 [269–521] | 77% / 76% | 62% / 2% | 37% / 32% | 15% | 2.12 / 2.04 / 2.06 | CPU headroom, WAL wait inferred |
-| Insert | 8 / 8 | 8 | 624 [319–655] | 81% / 80% | 74% / 7% | 39% / 4% | 14% | 2.35 / 2.25 / 2.31 | CPU headroom, WAL wait inferred |
-| Insert | 8 / 8 | 32 | 563 [322–633] | 82% / 81% | 72% / 2% | 40% / 5% | 14% | 2.30 / 2.24 / 2.29 | CPU headroom, WAL wait inferred |
+| Insert | 1 / 1 | 8 | 485 [264–507] | 74% / 74% | 60% / 6% | 34% / 30% | 15% | 2.05 / 1.96 / 1.98 | Single-home limit inferred |
+| Insert | 1 / 1 | 32 | 476 [269–521] | 77% / 76% | 62% / 2% | 37% / 32% | 15% | 2.12 / 2.04 / 2.06 | Single-home limit inferred |
+| Insert | 8 / 8 | 8 | 624 [319–655] | 81% / 80% | 74% / 7% | 39% / 4% | 14% | 2.35 / 2.25 / 2.31 | Likely node main (CPU and flush) |
+| Insert | 8 / 8 | 32 | 563 [322–633] | 82% / 81% | 72% / 2% | 40% / 5% | 14% | 2.30 / 2.24 / 2.29 | Likely node main (CPU and flush) |
