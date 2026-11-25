@@ -33,6 +33,9 @@ export class SqlDatabase extends DurableObject {
     const encoder = new TextEncoder();
     const budget = { bytes: Array.isArray(body) ? 2 : 0, size: text => encoder.encode(text).byteLength };
     const deadline = this.constructor.wallDeadline;
+    // Pending storage work can outlive an event, including implicit writes
+    // from native alarm cleanup. Drain it before a threaded SQL transaction.
+    if (deadline) await this.ctx.storage.sync();
     const failure = error => {
       if (error?.code === "SQL_CLIENT_DISCONNECTED") throw error;
       const message = String(error instanceof Error ? error.message : error);

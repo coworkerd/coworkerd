@@ -347,6 +347,9 @@ def allowed_path(name, path):
                               'src/workerd/api/actor-state.c++', 'src/workerd/io/actor-sqlite.c++',
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h'} or
+                          name == '0175-harden-platform-sql-transaction-settlement.patch' and path in {
+                              'src/workerd/api/actor-state.c++',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

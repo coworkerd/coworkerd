@@ -6,9 +6,10 @@ import { DatabaseSync } from 'node:sqlite';
 
 const source = await readFile(new URL('../sql-database.js', import.meta.url), 'utf8');
 const classSource = source.replace(/^import .*;$/m, '').replace(/^export /gm, '');
-function fixture() {
+function fixture({ threaded = false } = {}) {
   const db = new DatabaseSync(':memory:');
   const sqlite = {
+    checkExecutionDeadline() {},
     get databaseSize() { return db.prepare('PRAGMA page_count').get().page_count * 4096; },
     prepare(text) {
       return (...params) => {
@@ -31,11 +32,33 @@ function fixture() {
     DurableObject: class { constructor(ctx) { this.ctx = ctx; } },
     ArrayBuffer, Uint8Array, Request, Response, URL, TextEncoder,
   });
+  if (threaded) C.wallDeadline = true;
   const worker = new C({ storage });
-  return { db, close: () => db.close(), async query(body, endpoint = 'query', format = 'ARRAY_OF_OBJECTS') {
+  return { db, storage, close: () => db.close(), async query(body, endpoint = 'query', format = 'ARRAY_OF_OBJECTS') {
     return (await worker.fetch(new Request(`http://sql/${endpoint}?resultsFormat=${format}`, { method: 'POST', body: JSON.stringify(body) }))).json();
   } };
 }
+
+test('threaded SQL waits for a pending metadata write before entering its transaction', async () => {
+  const f = fixture({ threaded: true });
+  try {
+    f.db.exec('CREATE TABLE ledger (value); BEGIN; INSERT INTO ledger VALUES (1)');
+    let metadataCommitted = false;
+    f.storage.sync = async () => {
+      await Promise.resolve();
+      f.db.exec('COMMIT');
+      metadataCommitted = true;
+    };
+    const transactionSync = f.storage.transactionSync;
+    f.storage.transactionSync = (fn) => {
+      assert.ok(metadataCommitted);
+      return transactionSync(fn);
+    };
+    const answer = await f.query({ sql: 'SELECT value FROM ledger' });
+    assert.equal(answer.success, true, answer.error);
+    assert.deepEqual(answer.results, [{ value: 1 }]);
+  } finally { f.close(); }
+});
 
 test('byte parameters including empty and all byte values round trip in both result formats', async () => {
   const f = fixture();

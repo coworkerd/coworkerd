@@ -339,7 +339,8 @@ recoverable WAL record. With default node settings, the encoded record can hold 
 The frame budget reserves the record's identity fields, length fields, checksum and WAL generation
 header. Each SQLite frame counts its page and its 24-byte frame header. Lowering
 `durableObjects.peerBufferBytes` can lower the cap. For changes that exceed this limit, write smaller
-transactions. An index build must fit in one transaction.
+transactions. An index build must fit in one transaction. Replicating a larger transaction across
+multiple records is tracked in [#71](https://github.com/coworkerd/coworkerd/issues/71).
 
 HTTP SQL returns `422 SQL_TRANSACTION_TOO_LARGE` and rolls back the entire request. A D1 batch
 rejects with `D1_ERROR: SQL_TRANSACTION_TOO_LARGE: …` and rolls back the entire batch.
