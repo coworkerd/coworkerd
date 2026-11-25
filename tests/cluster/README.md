@@ -63,6 +63,7 @@ latency, throughput, CPU time, live database counts and idle memory.
 The throughput mode of the database home benchmark runs the load generator inside the Compose frontend
 network. It uses one node, one ordinary workerd process and one threaded durable child. Each trial starts
 with a fresh cluster. Run the trial on an otherwise quiet Linux machine with the build tools above.
+The [Linux throughput report](../../docs/database-throughput.md) records the exact product revisions and raw runs.
 
 Build the current Object product and the two products from [the original comparison](../../docs/database-home-benchmark.md).
 The native SQLite experiment was built separately in #59. Its daemon and kernel pin come from that checkout.
