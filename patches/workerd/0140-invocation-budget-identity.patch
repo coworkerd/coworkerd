@@ -1,0 +1,245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 11:03:15 +0800
+Subject: [PATCH] Carry invocation identity on counted outbound requests
+
+
+diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.c++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+index 8714d62e48726abe5ce6c4c5710925e158bc76c9..2f5ad8e9d6dc9449ff5c19cc4249346cbf5e820d 100644
+--- a/src/workerd/server/factory/coworkerd-cpu-limit.c++
++++ b/src/workerd/server/factory/coworkerd-cpu-limit.c++
+@@ -1,4 +1,5 @@
+ #include "coworkerd-cpu-limit.h"
++#include <workerd/io/io-context.h>
+ #include <workerd/util/autogate.h>
+ #include <workerd/util/sqlite.h>
+ #include <csignal>
+@@ -321,6 +322,26 @@ class RequestLimits final: public LimitEnforcer {
+       if (limits->memoryIdentityWanted()) return kj::heap<IdentityScope>(lock, *this);
+       return limits->enterRequestJs(cpuUsed, identity, [this]() { if (limits->publish()) abortIsolate(); }, &gcExcluded);
+     }
++    kj::Own<void> enterActorEvent(jsg::Lock& js, IoContext::IncomingRequest& request) override {
++      if (!isActor) return {};
++      auto token = jsg::wrapOpaque(js.v8Context(), request.addWeak());
++      return kj::heap<jsg::AsyncContextFrame::StorageScope>(js, actorEventKey().addRef(), js.v8Ref(token));
++    }
++    kj::Maybe<IoContext::IncomingRequest&> getActorEventRequest() override {
++      auto* isolate = v8::Isolate::TryGetCurrent();
++      if (!isActor || isolate == nullptr) return kj::none;
++      KJ_IF_SOME(frame, jsg::AsyncContextFrame::current(isolate)) {
++        KJ_IF_SOME(value, frame.get(*actorEventKey())) {
++          v8::HandleScope handles(isolate);
++          auto handle = value.getHandle(jsg::Lock::from(isolate));
++          if (!handle->IsUndefined()) {
++            auto& request = jsg::unwrapOpaqueRef<kj::Weak<IoContext::IncomingRequest>>(isolate, handle);
++            return KJ_REQUIRE_NONNULL(request.tryGet(), "the durable event that started this work has ended");
++          }
++        }
++      }
++      return kj::none;
++    }
+     // Each new event a request receives starts with its CPU topped up: a message of a WebSocket it accepted, a call on
+     // an RPC target it handed out, and -- upstream's contract, which tops up actors only -- an actor's request (an
+     // actor's requests share one IoContext, and this enforcer, for the actor's whole life). A connection's messages are
+@@ -370,6 +391,10 @@ class RequestLimits final: public LimitEnforcer {
+     }
+     size_t getSqliteMemoryUsage() const override { return accounting ? 0 : fallback->getSqliteMemoryUsage(); }
+    private:
++    static const kj::Arc<jsg::AsyncContextFrame::StorageKey>& actorEventKey() {
++      static const auto key = kj::arc<jsg::AsyncContextFrame::StorageKey>();
++      return key;
++    }
+     kj::Own<LimitEnforcer> fallback;
+     kj::Own<CpuIsolateLimitEnforcer> limits;
+     kj::Function<void()> abortIsolate;
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index ac0280962beb544fd6682b80f3b45481fa7da405..a1daec1d53b6c0e6123fbcfca0f8a158b51d28e6 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -769,10 +769,14 @@ kj::Own<AccessInfo> parseAccessBlob(
+ // C++ (a dynamic worker's env tables, channel tokens, the debug port).
+ class RustIoChannelFactory final: public IoChannelFactory {
+  public:
+-  RustIoChannelFactory(kj::Own<CompiledWorker::Impl> worker, ::rust::Box<ChannelFactory> channels)
+-      : worker(kj::mv(worker)),
++  RustIoChannelFactory(kj::Own<CompiledWorker::Impl> worker, ::rust::Box<ChannelFactory> channels,
++      kj::Maybe<kj::String> coworkerdIdentity = kj::none)
++      : coworkerdIdentity(kj::mv(coworkerdIdentity)),
++        worker(kj::mv(worker)),
+         channels(kj::mv(channels)) {}
+ 
++  kj::Maybe<kj::String> coworkerdIdentity;
++
+   ~RustIoChannelFactory() noexcept(false) {
+     // A request's drain task runs in the worker's own task set and may hold the worker's last
+     // references (the server dropped the worker meanwhile; `channels` may hold the Rust side's,
+@@ -1157,7 +1161,8 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+     }
+   }
+ 
+-  auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
++  auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels),
++      metadata.coworkerdInvocationIdentity.map([](const auto& value) { return kj::str(value); }));
+   auto& invocationIdentity = metadata.coworkerdInvocationIdentity != kj::none
+       ? metadata.coworkerdInvocationIdentity : metadata.cfBlobJson;
+   auto requestLimits = wrapCpuRequestLimits(kj::refcounted<NullLimitEnforcer>(),
+@@ -1315,6 +1320,20 @@ void request_metadata_set_coworkerd_invocation_identity(
+   metadata.coworkerdInvocationIdentity = kj::str(identity);
+ }
+ 
++::rust::String coworkerd_current_invocation_identity() {
++  KJ_IF_SOME(context, IoContext::tryCurrent()) {
++    if (context.hasCurrentIncomingRequest()) {
++      auto* channel = dynamic_cast<RustIoChannelFactory*>(&context.getIoChannelFactory());
++      if (channel != nullptr) {
++        KJ_IF_SOME(identity, channel->coworkerdIdentity) {
++          return ::rust::String(identity.begin(), identity.size());
++        }
++      }
++    }
++  }
++  return {};
++}
++
+ namespace {
+ 
+ // The self-token of a root actor, for `ctx.restore()`: only the namespace and id, so that
+diff --git a/src/workerd/server/factory/worker-factory.h b/src/workerd/server/factory/worker-factory.h
+index 9b55e4b3e6845ea99204cc8a15d1472b8a4eb607..759b883ca141eb8ac630cf216dad1933d2ca3027 100644
+--- a/src/workerd/server/factory/worker-factory.h
++++ b/src/workerd/server/factory/worker-factory.h
+@@ -373,6 +373,7 @@ void request_metadata_set_cause(
+     RequestMetadata& metadata, bool fromHandoff, ::rust::Vec<::rust::String> causedBy);
+ void request_metadata_set_coworkerd_invocation_identity(
+     RequestMetadata& metadata, ::rust::Str identity);
++::rust::String coworkerd_current_invocation_identity();
+ void request_metadata_set_actor_self_token(const WorkerFactory& factory,
+     RequestMetadata& metadata,
+     ::rust::Str uniqueKey,
+diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
+index ecaeb88afbba43b2aa2581b0ed467ff0ce30b619..a595768c89ad40154441d7873127c36a5ba70be4 100644
+--- a/src/workerd/server/server/bridge.rs
++++ b/src/workerd/server/server/bridge.rs
+@@ -658,6 +658,7 @@ pub mod ffi {
+             metadata: Pin<&mut RequestMetadata>,
+             identity: &str,
+         );
++        fn coworkerd_current_invocation_identity() -> String;
+         /// Makes stubs the request creates for the actor itself restorable: they encode the
+         /// actor's namespace and id.
+         fn request_metadata_set_actor_self_token(
+diff --git a/src/workerd/server/server/root_loader.rs b/src/workerd/server/server/root_loader.rs
+index 95c10ef3d9f4b86624ca6ece8092109642823942..381c494e534a33541b82a209ef98ca7b0930206a 100644
+--- a/src/workerd/server/server/root_loader.rs
++++ b/src/workerd/server/server/root_loader.rs
+@@ -924,6 +924,15 @@ impl RootRegistry {
+             .root_binding(&target.service, target.entrypoint.as_deref(), props)
+     }
+ 
++    fn budget_target(&self, target: &RootTarget, props: Value) -> Rc<dyn Channel> {
++        Rc::new(BudgetedRootTarget {
++            server: self.server.borrow().clone(),
++            service: target.service.clone(),
++            entrypoint: target.entrypoint.clone(),
++            props,
++        })
++    }
++
+     fn root_props(&self, selection: &RootOrigin) -> Result<KjOwn<ffi::Frankenvalue>> {
+         let plan = self
+             .plans
+@@ -942,7 +951,7 @@ impl RootRegistry {
+                 json!({"namespaceId": selection.namespace_id, "objectId": selection.object_id});
+             target_props["workerId"] = json!(plan.deployment.worker_id);
+             target_props["versionId"] = json!(plan.deployment.version_id);
+-            let channel = self.target(&binding.target, &target_props)?;
++            let channel = self.budget_target(&binding.target, target_props);
+             let mut entry = ffi::frankenvalue_from_json(&binding.metadata.to_string());
+             ffi::frankenvalue_set_service_stub(
+                 entry.pin_mut(),
+@@ -1099,9 +1108,10 @@ impl RootRegistry {
+         }
+         cf.insert("workerId".to_owned(), json!(plan.deployment.worker_id));
+         cf.insert("versionId".to_owned(), json!(plan.deployment.version_id));
+-        let cf = Value::Object(cf).to_string();
+-        ffi::request_metadata_set_cf_blob_json(metadata.pin_mut(), &cf);
+-        ffi::request_metadata_set_coworkerd_invocation_identity(metadata.pin_mut(), &cf);
++        ffi::request_metadata_set_cf_blob_json(metadata.pin_mut(), &json!(cf).to_string());
++        cf.insert("leaseDeadline".to_owned(), json!(selection.lease_deadline));
++        cf.insert("requiresChildSequence".to_owned(), json!(selection.requires_child_sequence));
++        ffi::request_metadata_set_coworkerd_invocation_identity(metadata.pin_mut(), &json!(cf).to_string());
+         Ok(())
+     }
+ 
+@@ -1277,7 +1287,7 @@ impl RootRegistry {
+             return Err(kj::failed!("root worker binding kind is not implemented"));
+         }
+         let global = match &plan.deployment.global_outbound {
+-            Some(target) => self.target(target, &target.props)?,
++            Some(target) => self.budget_target(target, target.props.clone()),
+             None => Rc::new(Denied) as Rc<dyn Channel>,
+         };
+         let streaming_tails = match &plan.deployment.streaming_tail {
+@@ -2411,6 +2421,34 @@ impl Channel for Denied {
+     }
+ }
+ 
++// Only platform-owned routes use the current invocation, from the caller's I/O
++// context. The tenant's headers, cf and channel props cannot select a lease.
++struct BudgetedRootTarget {
++    server: Weak<crate::config::Server>,
++    service: String,
++    entrypoint: Option<String>,
++    props: Value,
++}
++
++impl Channel for BudgetedRootTarget {
++    fn start_request(&self, metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
++        let identity = ffi::coworkerd_current_invocation_identity();
++        let mut props = self.props.clone();
++        if !identity.is_empty() {
++            props["callerInvocation"] = serde_json::from_str(&identity)
++                .map_err(|error| kj::failed!("invalid budget caller identity: {error}"))?;
++        }
++        self.server.upgrade().ok_or_else(|| kj::disconnected!("root server gone"))?
++            .root_binding(&self.service, self.entrypoint.as_deref(), &props)?
++            .start_request(metadata)
++    }
++
++    fn require_allows_transfer(&self) -> Result<()> { Err(not_transferable("Private budgeted binding")) }
++    fn token(&self, _usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
++        Err(not_transferable("Private budgeted binding"))
++    }
++}
++
+ impl Channel for RootRegistry {
+     fn for_props(
+         &self,
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 7f355641445dd2329a222cf84eedeaf028c1b154..7b0c5b5aeeb1d1c2addfafb7f80ffc200452d05f 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -5147,9 +5147,12 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+       root.setString(value);
+       return encode(root.asReader());
+     };
++    auto target = field(input(), "durableObject");
+     auto object = kj::str("{\"namespaceId\":", quoted(route.space),
+         ",\"className\":", quoted(route.className), ",\"objectId\":", quoted(objectId),
+-        ",\"callerNamespaceId\":\"\",\"callerObjectId\":\"\",\"database\":", quoted(route.database),
++        ",\"callerNamespaceId\":", quoted(text(target, "namespaceId")),
++        ",\"callerObjectId\":", quoted(text(target, "objectId")),
++        ",\"database\":", quoted(route.database),
+         "}");
+     return envelope(input(), "", false, kj::mv(object));
+   }
+@@ -5173,7 +5176,8 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+     if (channel < IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT) {
+       auto identity =
+           kj::str(server.egressToken.c_str(), " {\"workerId\":", encode(field(input(), "workerId")),
+-              ",\"versionId\":", encode(field(input(), "versionId")), "}");
++              ",\"versionId\":", encode(field(input(), "versionId")),
++              ",\"invocationId\":", encode(field(input(), "invocationId")), "}");
+       return newPromisedWorkerInterface(
+           queuedRequest(true, kj::mv(identity)).attach(kj::addRef(*this)));
+     }

@@ -35,16 +35,35 @@ inline std::string invocationName(const std::string& node, const std::string& ep
 }
 
 struct ChildBudget {
-  uint16_t grant, charged, remaining;
+  uint32_t grant, charged, remaining;
 };
 // The caller has already rejected an empty budget in the correct mode. An
 // allocation carries the resulting grant and charge through placement attempts.
-inline ChildBudget childBudget(uint16_t before, uint16_t cap, bool naive) {
+inline ChildBudget childBudget(uint32_t before, uint32_t cap, bool naive) {
   if (naive) return {before, 0, before};
-  const auto grant = std::min<uint16_t>(cap, static_cast<uint16_t>(before - 1));
-  const auto charged = static_cast<uint16_t>(1 + grant);
-  return {grant, charged, static_cast<uint16_t>(before - charged)};
+  if (before == 0) return {};
+  const auto grant = std::min(cap, before - 1);
+  return {grant, 1 + grant, before - 1 - grant};
 }
+
+struct InvocationBudget {
+  uint32_t grant, remaining;
+  uint32_t d1Limit, d1Remaining;
+
+  InvocationBudget(uint32_t grant, uint32_t d1Limit)
+      : grant(grant), remaining(grant), d1Limit(d1Limit), d1Remaining(d1Limit) {}
+
+  uint32_t childCap(bool root) const {
+    // Keep room for wide root fan-out, and let children use most of their grant
+    // on a deeper branch while still keeping some for siblings.
+    return std::max(1u, root ? grant / 128 : grant * 3 / 4);
+  }
+
+  void refill() {
+    remaining = grant;
+    d1Remaining = d1Limit;
+  }
+};
 
 struct TenantAdmissionCounts {
   uint32_t roots = 0, nested = 0;

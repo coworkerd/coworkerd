@@ -98,6 +98,8 @@ function workerResponses() {
   const [, budgetStatus, expiredStatus] = evidence(node,
     /const uint status = budget \? (\d{3}) : expired \? (\d{3}) : (\d{3});/);
   add(budgetStatus, budget);
+  const [, hopCode, hopStatus] = evidence(node, /server\.refusal\("(BINDING_HOP_LIMIT)", detail, (\d{3})\)/);
+  add(hopStatus, hopCode);
   add(expiredStatus, expired);
   // The ordering refusal is only reachable in the intentionally incorrect
   // lease counterexample. Check that guard before excluding it from the table.

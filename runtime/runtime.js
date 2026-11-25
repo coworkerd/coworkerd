@@ -146,7 +146,9 @@ export class Egress extends WorkerEntrypoint {
   async fetch(request) {
     if (!this.env.EGRESS) throw new Error("EGRESS_DENIED: egress-off");
     const headers = new Headers(request.headers);
-    headers.set(EGRESS_SOURCE_HEADER, this.env.EGRESS_TOKEN + " " + JSON.stringify(this.ctx.props));
+    const { workerId, versionId, callerInvocation } = this.ctx.props;
+    headers.set(EGRESS_SOURCE_HEADER, this.env.EGRESS_TOKEN + " " +
+      JSON.stringify({ workerId, versionId, invocationId: callerInvocation?.invocationId }));
     const response = await this.env.EGRESS.fetch(request.url, {
       method: request.method, headers, body: request.body, redirect: "manual",
     });
@@ -706,10 +708,10 @@ function descriptorFrom(request) {
     typeof value.lease !== "object" ||
     !Number.isInteger(remainingSubrequests) ||
     remainingSubrequests < 0 ||
-    remainingSubrequests > 65_535 ||
+    remainingSubrequests > 10_000_000 ||
     !Number.isInteger(grant) ||
     grant < 0 ||
-    grant > 65_535 ||
+    grant > 10_000_000 ||
     !Number.isFinite(expiresAtMonotonicMs) ||
     expiresAtMonotonicMs <= 0 ||
     !Number.isInteger(orderSequence) ||
@@ -978,49 +980,41 @@ export class DurableNamespace extends WorkerEntrypoint {
   // A method call on a stub of this namespace: the same envelope its `fetch` puts in cf, with the object the stub
   // names, as the one method of a session to the node. The node finds the shard's owner (the epoch and the fencing as
   // for a request) and answers with the object's own capability, which the tenant's call is then pipelined onto.
-  rpcTarget(objectId) {
-    const { workerId, versionId, contentHash, definitionHash, namespaceId, className, database, treeId,
-      parentInvocationId, orderSequence, expiresAtMonotonicMs, requiresChildSequence, caller } = this.ctx.props;
-    if (typeof objectId !== "string" || !SHA256_HEX.test(objectId)) throw new Error("Invalid Durable Object call");
-    if (typeof workerId !== "string" || typeof versionId !== "string" || !SHA256_HEX.test(contentHash ?? "") ||
-        !SHA256_HEX.test(definitionHash ?? "") || !SHA256_HEX.test(namespaceId ?? "") || !CLASS_NAME.test(className ?? "")) {
-      throw new Error("Invalid Durable Object call");
-    }
-    const fromObject = caller !== undefined && caller !== null;
-    const callSequence = !fromObject && requiresChildSequence ? nextChildSequence(parentInvocationId) : 0;
-    return this.env.SERVER[JSON.stringify({
-      workerId, versionId, contentHash, definitionHash,
-      treeId: fromObject ? "" : treeId, parentInvocationId: fromObject ? "" : parentInvocationId,
-      callSequence, orderSequence: !fromObject && requiresChildSequence ? (orderSequence || callSequence) : 0,
-      expiresAtMonotonicMs: fromObject ? 0 : expiresAtMonotonicMs, sequenceMapSize: nextChildSequences.size, entrypoint: "",
-      durableObject: { namespaceId, className, objectId, database: database ?? "",
-        callerNamespaceId: fromObject ? caller.namespaceId : "", callerObjectId: fromObject ? caller.objectId : "" },
-    })]();
-  }
-
-  async fetch(request) {
-    const { workerId, versionId, contentHash, definitionHash, namespaceId, className, database, treeId, parentInvocationId,
-      orderSequence, expiresAtMonotonicMs, requiresChildSequence, caller } = this.ctx.props;
-    const objectId = request.headers.get(DO_OBJECT_HEADER);
+  #envelope(objectId) {
+    const { workerId, versionId, contentHash, definitionHash, namespaceId, className, database, caller,
+      callerInvocation } = this.ctx.props;
     if (typeof workerId !== "string" || typeof versionId !== "string" || !SHA256_HEX.test(contentHash ?? "") ||
         !SHA256_HEX.test(definitionHash ?? "") || !SHA256_HEX.test(namespaceId ?? "") || !CLASS_NAME.test(className ?? "") ||
         typeof objectId !== "string" || !SHA256_HEX.test(objectId)) {
       throw new Error("Invalid Durable Object call");
     }
+    if (caller && !callerInvocation?.invocationId)
+      throw new Error("LEASE_EXPIRED: the Durable Object has no active invocation");
+    const treeId = callerInvocation?.treeId ?? this.ctx.props.treeId;
+    const parentInvocationId = callerInvocation?.invocationId ?? this.ctx.props.parentInvocationId;
+    const orderSequence = callerInvocation?.orderSequence ?? this.ctx.props.orderSequence;
+    const expiresAtMonotonicMs = callerInvocation?.leaseDeadline
+      ? Number(callerInvocation.leaseDeadline) : this.ctx.props.expiresAtMonotonicMs;
+    const requiresChildSequence = callerInvocation?.requiresChildSequence ?? this.ctx.props.requiresChildSequence;
+    const callSequence = requiresChildSequence ? nextChildSequence(parentInvocationId) : 0;
+    return {
+      workerId, versionId, contentHash, definitionHash, treeId, parentInvocationId, callSequence,
+      orderSequence: requiresChildSequence ? (orderSequence || callSequence) : 0,
+      expiresAtMonotonicMs, sequenceMapSize: nextChildSequences.size, entrypoint: "",
+      durableObject: { namespaceId, className, objectId, database: database ?? "",
+        callerNamespaceId: caller?.namespaceId ?? "", callerObjectId: caller?.objectId ?? "" },
+    };
+  }
+
+  rpcTarget(objectId) {
+    return this.env.SERVER[JSON.stringify(this.#envelope(objectId))]();
+  }
+
+  async fetch(request) {
+    const cf = this.#envelope(request.headers.get(DO_OBJECT_HEADER));
     const headers = new Headers(request.headers);
     headers.delete(DO_OBJECT_HEADER);
-    const fromObject = caller !== undefined && caller !== null;
-    const callSequence = !fromObject && requiresChildSequence ? nextChildSequence(parentInvocationId) : 0;
-    return this.env.SERVER.fetch(new Request(request, { headers }), {
-      cf: {
-        workerId, versionId, contentHash, definitionHash,
-        treeId: fromObject ? "" : treeId, parentInvocationId: fromObject ? "" : parentInvocationId,
-        callSequence, orderSequence: !fromObject && requiresChildSequence ? (orderSequence || callSequence) : 0,
-        expiresAtMonotonicMs: fromObject ? 0 : expiresAtMonotonicMs, sequenceMapSize: nextChildSequences.size, entrypoint: "",
-        durableObject: { namespaceId, className, objectId, database: database ?? "",
-          callerNamespaceId: fromObject ? caller.namespaceId : "", callerObjectId: fromObject ? caller.objectId : "" },
-      },
-    });
+    return this.env.SERVER.fetch(new Request(request, { headers }), { cf });
   }
 }
 
@@ -1463,7 +1457,8 @@ async function prepareSelectedRoot(descriptor, env, ctx, preparationNonce) {
     plan = remember(plan === null ? await install() : plan);
   } else remember(plan);
   const select = async () => {
-    const selection = { ...descriptor.rootSelection, plan, tenantCf: tenantCf(descriptor, env), preparationNonce };
+    const selection = { ...descriptor.rootSelection, plan, tenantCf: tenantCf(descriptor, env), preparationNonce,
+      leaseDeadline: String(descriptor.lease.expiresAtMonotonicMs), requiresChildSequence: descriptor.requiresChildSequence };
     try {
       return await env.ROOTS.getRoot(JSON.stringify(selection));
     } catch (error) {

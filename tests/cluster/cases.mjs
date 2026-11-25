@@ -176,6 +176,118 @@ async function sqlAtomicity(cluster) {
   assert.deepEqual(await read(), rows, 'the failed transaction left the committed rows intact');
 }
 
+async function invocationBudgets(cluster) {
+  const [node] = cluster.nodes;
+  const tenant = await cluster.tenant('invocation-budget');
+  const bindings = [{ binding: 'CHILD', service: 'budget-child' }];
+  const child = `export default { fetch(request) {
+    return Response.json(request.cf.lease.grant);
+  } };`;
+  const root = `export default { async fetch(request, env) {
+    const count = Number(new URL(request.url).searchParams.get('count') ?? '0');
+    const grants = [];
+    let refusal;
+    for (let i = 0; i < count; i++) {
+      const reply = await env.CHILD.fetch('https://binding.test/');
+      if (!reply.ok) { refusal = await reply.json(); break; }
+      grants.push(await reply.json());
+    }
+    return Response.json({ rootGrant: request.cf.lease.grant, grants, refusal: refusal?.code });
+  } };`;
+  await cluster.deploy(tenant, 'budget-child', child);
+  await cluster.deploy(tenant, 'budget-root', root, { wrangler: { services: bindings } });
+  const call = async (worker, count) => json(await workerCall(cluster, node, tenant, worker + '?count=' + count),
+    200, 'the budget test Worker handled its request');
+  const normal = await call('budget-root', 100);
+  assert.equal(normal.rootGrant, 10_000);
+  assert.deepEqual(normal.grants, Array(100).fill(78));
+  assert.equal(normal.refusal, undefined);
+
+  await cluster.api(tenant.path, { method: 'PATCH', body: { defaultLimits: { subrequests: 5, d1Queries: 2 } } });
+  const lower = await eventually('tenant budget is visible', async () => {
+    const value = await call('budget-root', 4);
+    assert.equal(value.rootGrant, 5);
+    return value;
+  });
+  assert.deepEqual(lower.grants, [1, 1, 0]);
+  assert.equal(lower.refusal, 'SUBREQUEST_BUDGET_EXHAUSTED');
+
+  const wrangler = { services: bindings, limits: { subrequests: 10_000_000 } };
+  await cluster.deploy(tenant, 'budget-wide', root, { wrangler });
+  assert.equal((await call('budget-wide', 0)).rootGrant, 10_000_000);
+
+  await cluster.deploy(tenant, 'budget-egress', `export default { async fetch(request, env) {
+    const reply = await env.CHILD.fetch('https://binding.test/');
+    await reply.text();
+    try {
+      await fetch('http://127.0.0.1/');
+      return new Response('egress unexpectedly ran');
+    } catch (error) {
+      return new Response(error.message);
+    }
+  } };`, { wrangler: { services: bindings, limits: { subrequests: 1 } } });
+  const egress = await workerCall(cluster, node, tenant, 'budget-egress');
+  assert.equal(egress.status, 200);
+  assert.match(egress.text, /SUBREQUEST_BUDGET_EXHAUSTED/);
+}
+
+async function d1InvocationBudgets(cluster) {
+  const [node] = cluster.nodes;
+  const tenant = await cluster.tenant('d1-budget');
+  await cluster.api(tenant.path, { method: 'PATCH', body: { defaultLimits: { subrequests: 5, d1Queries: 2 } } });
+  await cluster.api(`${tenant.path}/databases/budget-db`, { method: 'POST', token: tenant.token });
+  await cluster.deploy(tenant, 'budget-child', respondWith('ok'));
+  await cluster.deploy(tenant, 'd1-edge', `
+    async function exercise(env) {
+      const statement = n => env.DB.prepare('SELECT ? AS value').bind(n);
+      const batch = await env.DB.batch([statement(1), statement(2)]);
+      const query = await statement(3).first('value');
+      let refusal;
+      try { await statement(4).run(); } catch (error) { refusal = error.message; }
+      const bindings = [];
+      for (let i = 0; i < 3; i++) {
+        const reply = await env.CHILD.fetch('https://binding.test/');
+        bindings.push(reply.ok ? await reply.text() : (await reply.json()).code);
+      }
+      return { batch: batch.map(result => result.results[0].value), query, refusal, bindings };
+    }
+    export default { async fetch(request, env) {
+      if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return Response.json(await exercise(env));
+      const [client, socket] = Object.values(new WebSocketPair());
+      socket.accept();
+      socket.addEventListener('message', async () => {
+        try { socket.send(JSON.stringify(await exercise(env))); }
+        catch (error) { socket.send(JSON.stringify({ unexpected: error.message })); }
+      });
+      return new Response(null, { status: 101, webSocket: client });
+    } };
+  `, { wrangler: { services: [{ binding: 'CHILD', service: 'budget-child' }],
+    d1_databases: [{ binding: 'DB', database_name: 'budget-db' }] } });
+  const verify = ({ batch, query, refusal, bindings, unexpected }) => {
+    assert.equal(unexpected, undefined);
+    assert.deepEqual(batch, [1, 2]);
+    assert.equal(query, 3);
+    assert.match(refusal, /^D1_ERROR: D1_QUERY_BUDGET_EXHAUSTED:/);
+    assert.deepEqual(bindings, ['ok', 'ok', 'SUBREQUEST_BUDGET_EXHAUSTED']);
+  };
+  verify(json(await workerCall(cluster, node, tenant, 'd1-edge'), 200, 'D1 budget over HTTP'));
+  const { WebSocket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
+  const url = new URL(`/${tenant.name}/d1-edge`, cluster.urls[node]);
+  url.protocol = 'ws:';
+  const socket = new WebSocket(url);
+  try {
+    const waitFor = event => once(socket, event, { signal: AbortSignal.timeout(10000) });
+    await waitFor('open');
+    for (const message of ['first', 'second']) {
+      const reply = waitFor('message');
+      socket.send(message);
+      verify(JSON.parse((await reply)[0]));
+    }
+  } finally {
+    socket.terminate();
+  }
+}
+
 async function ordinaryProcess(cluster, node) {
   const { processes } = await cluster.state(node);
   const ordinary = processes.entries.filter(entry => entry.processClass === 'ordinary');
@@ -2102,7 +2214,8 @@ async function threadedSocketRetirement(cluster) {
 }
 
 // The profiler uses the standard cluster. Its node-level fault runs last.
-export const cases = { deployment, 'websocket-admission': webSocketAdmission, 'sql-atomicity': sqlAtomicity, 'cpu-isolation': cpuIsolation,
+export const cases = { deployment, 'websocket-admission': webSocketAdmission, 'sql-atomicity': sqlAtomicity,
+  'invocation-budgets': invocationBudgets, 'd1-invocation-budgets': d1InvocationBudgets, 'cpu-isolation': cpuIsolation,
   'process-replacement': processReplacement, 'log-quota': logQuota,
   'durable-takeover': durableTakeover };
 

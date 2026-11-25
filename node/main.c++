@@ -219,8 +219,8 @@ enum class LeaseMode {
 
 struct LeaseConfig {
   LeaseMode mode;
-  uint16_t rootBudget;
-  uint16_t grantCap;
+  uint32_t rootBudget;
+  std::optional<uint32_t> grantCap;
   uint64_t ttlMs;
 
   // The naive lease is a test-only counterexample: only the explicit command-line switch
@@ -238,10 +238,10 @@ struct LeaseConfig {
     KJ_REQUIRE(ttlMs > 0, "COWORKERD_LEASE_TTL_MS must be positive");
     return {
       experimentalNaive ? LeaseMode::NAIVE : LeaseMode::CORRECT,
-      static_cast<uint16_t>(environmentUnsigned(
-          "COWORKERD_SUBREQUEST_BUDGET", 8, 65'535)),
-      static_cast<uint16_t>(environmentUnsigned(
-          "COWORKERD_SUBREQUEST_GRANT", 1, 65'535)),
+      static_cast<uint32_t>(environmentUnsigned(
+          "COWORKERD_SUBREQUEST_BUDGET", coworkerd::DEFAULT_SUBREQUEST_LIMIT, coworkerd::MAX_SUBREQUEST_LIMIT)),
+      std::getenv("COWORKERD_SUBREQUEST_GRANT") == nullptr ? std::nullopt
+          : std::optional<uint32_t>(environmentUnsigned("COWORKERD_SUBREQUEST_GRANT", 0, coworkerd::MAX_SUBREQUEST_LIMIT)),
       ttlMs,
     };
   }
@@ -249,7 +249,20 @@ struct LeaseConfig {
   bool naive() const {
     return mode == LeaseMode::NAIVE;
   }
+
+  std::string grantCapJson() const { return grantCap ? std::to_string(*grantCap) : "null"; }
 };
+
+void writeSubrequestGrant(auto invocation, uint32_t grant) {
+  invocation.setSubrequestGrant(std::min<uint32_t>(grant, UINT16_MAX));
+  invocation.setWideSubrequestGrant(grant);
+}
+
+uint32_t readSubrequestGrant(auto invocation) {
+  const auto wide = invocation.getWideSubrequestGrant();
+  KJ_REQUIRE(wide <= coworkerd::MAX_SUBREQUEST_LIMIT, "invalid remote subrequest grant");
+  return wide == 0 ? invocation.getSubrequestGrant() : wide;
+}
 
 double remainingLeaseMs(double expiresAtMonotonicMs) {
   return coworkerd::remainingLeaseMs(expiresAtMonotonicMs, monotonicTimeMs());
@@ -319,8 +332,8 @@ struct ExecutionRecord {
   std::string parentInvocationId;
   uint64_t callSequence;
   uint64_t orderSequence;
-  uint16_t grant;
-  uint16_t remainingAfter;
+  uint32_t grant;
+  uint32_t remainingAfter;
   uint16_t depth;
   double expiresAtMonotonicMs;
   std::string ingressServerId;
@@ -334,17 +347,16 @@ struct DebitRecord {
   std::string parentInvocationId;
   std::string target;
   std::string targetServerId;
-  uint16_t grant;
-  uint16_t charged;
-  uint16_t remainingAfter;
+  uint32_t grant;
+  uint32_t charged;
+  uint32_t remainingAfter;
   uint16_t depth;
   double expiresAtMonotonicMs;
 };
 
 struct InvocationLeaseState {
   std::string treeId;
-  uint16_t remainingSubrequests;
-  uint16_t grant;
+  coworkerd::InvocationBudget budget;
   uint16_t depth;
   double expiresAtMonotonicMs;
   SharedVersionPins pins;
@@ -372,9 +384,9 @@ struct ChildAllocation {
   std::string parentInvocationId;
   uint64_t callSequence;
   uint64_t orderSequence;
-  uint16_t grant;
-  uint16_t charged;
-  uint16_t remainingAfter;
+  uint32_t grant;
+  uint32_t charged;
+  uint32_t remainingAfter;
   uint16_t depth;
   double expiresAtMonotonicMs;
   SharedVersionPins pins;
@@ -436,6 +448,8 @@ kj::Promise<void> waitForSocketTestGate(kj::Timer& timer, fs::path marker) {
 constexpr const char* MANAGED_SOCKET_HEADER = "x-coworkerd-managed-socket";
 // More Durable Object calls than this in a row are refused (DO_HOP_LIMIT).
 constexpr uint16_t MAX_DURABLE_HOPS = 8;
+constexpr uint16_t MAX_BINDING_DEPTH = 8;
+enum class SubrequestKind { worker, object, d1 };
 
 struct LeaseExpiry {
   double expiresAtMonotonicMs;
@@ -1003,7 +1017,7 @@ public:
     }
     std::cout << "[server] lease mode=" << (leaseConfig.naive() ? "naive" : "correct")
               << " root-budget=" << leaseConfig.rootBudget
-              << " grant-cap=" << leaseConfig.grantCap
+              << " grant-cap=" << leaseConfig.grantCapJson()
               << " ttl-ms=" << leaseConfig.ttlMs
               << " node-id=" << this->serverConfig.serverId
               << " placements=" << this->serverConfig.placements.size()
@@ -1025,6 +1039,29 @@ public:
   bool tenantDeleting(const std::string& tenant) const { return tenants && tenants->deleting(tenant); }
   // Why a tenant's Workers start nothing here ("" when they may): its record says deleting, or there is none.
   std::string tenantUnavailable(const std::string& tenant) const { return tenants ? tenants->unavailable(tenant) : std::string(); }
+  uint32_t subrequestLimit(const VersionDefinition& version) const {
+    if (version.subrequestLimit) return *version.subrequestLimit;
+    const auto* tenant = tenants ? tenants->tenant(coworkerd::tenantOf(version.workerId)) : nullptr;
+    return tenant && tenant->defaultLimits.subrequests ? tenant->defaultLimits.subrequests : leaseConfig.rootBudget;
+  }
+  uint32_t d1QueryLimit(const VersionDefinition& version) const {
+    const auto* tenant = tenants ? tenants->tenant(coworkerd::tenantOf(version.workerId)) : nullptr;
+    return tenant && tenant->defaultLimits.d1Queries ? tenant->defaultLimits.d1Queries : coworkerd::DEFAULT_D1_QUERY_LIMIT;
+  }
+  coworkerd::EgressDebit chargeEgress(const std::string& invocationId) {
+    auto lease = leases.find(invocationId);
+    if (lease == leases.end() || lease->second.expiresAtMonotonicMs <= monotonicTimeMs()) {
+      ++expiredLeaseRejections;
+      return coworkerd::EgressDebit::expired;
+    }
+    auto& remaining = lease->second.budget.remaining;
+    if (remaining == 0) {
+      ++budgetRejections;
+      return coworkerd::EgressDebit::exhausted;
+    }
+    --remaining;
+    return coworkerd::EgressDebit::charged;
+  }
   // Each tenant this node knows of: its record's status and log quota, its Workers here (valid of all), whether it
   // is a suspect and which quarantine process is its shard, and the limits its Workers name (their own, else the
   // tenant's default, else this node's).
@@ -1469,7 +1506,7 @@ public:
     auto lease = leases.find(invocationId);
     if (lease == leases.end()) return;
     auto& state = lease->second;
-    state.remainingSubrequests = state.grant;
+    state.budget.refill();
     const auto renewed = monotonicTimeMs() + static_cast<double>(leaseConfig.ttlMs);
     if (renewed <= state.expiresAtMonotonicMs) return;
     if (state.presentedExpiresAtMonotonicMs == 0) state.presentedExpiresAtMonotonicMs = state.expiresAtMonotonicMs;
@@ -1990,13 +2027,14 @@ public:
     std::cout << "[decision-time] " << std::setprecision(17) << us << std::endl;
   }
   std::string nextPlacementId() { return invocationId(nextPlacementSequence++) + "-placement"; }
-  ChildAllocation allocateRoot(SharedVersionPins pins, double deadline) {
+  ChildAllocation allocateRoot(const VersionDefinition& version, SharedVersionPins pins, double deadline) {
     auto tree = coworkerd::invocationName(serverConfig.serverId, epoch(), "-tree-", nextTreeSequence++);
+    const auto grant = subrequestLimit(version);
     std::cout << "[root] {\"nodeId\":\"" << serverConfig.serverId << "\",\"treeId\":\"" << tree
-              << "\",\"grant\":" << leaseConfig.rootBudget << ",\"remainingMs\":" << remainingLeaseMs(deadline)
+              << "\",\"grant\":" << grant << ",\"remainingMs\":" << remainingLeaseMs(deadline)
               << ",\"expiresAtMonotonicMs\":" << std::setprecision(17) << deadline
               << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
-    return {tree, {}, 0, 0, leaseConfig.rootBudget, 0, leaseConfig.rootBudget, 0, deadline,
+    return {tree, {}, 0, 0, grant, 0, grant, 0, deadline,
         std::move(pins), true, serverConfig.serverId};
   }
   void reroute(const std::string& code) { ++placementReroutes[code]; }
@@ -2402,9 +2440,10 @@ public:
     auto id = invocationId(sequence);
     auto expires = deadline > 0 ? deadline : nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
     KJ_REQUIRE(std::isfinite(expires), "lease deadline overflow");
-    addLease(id, {id, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId});
+    const auto grant = subrequestLimit(*version);
+    addLease(id, {id, {grant, d1QueryLimit(*version)}, 0, expires, pins, serverConfig.serverId});
     return execute(std::move(version), sequence, id, id, std::move(kind), {}, 0, 0,
-        leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId,
+        grant, grant, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId,
         check.coldLoaded);
   }
 
@@ -2572,19 +2611,21 @@ public:
     startObjectLogEvent(id, target.key());
     if (allocation) {
       if (slot) slot->timing = allocation->timing;
-      addLease(id, {allocation->treeId, allocation->grant, allocation->grant, allocation->depth, allocation->expiresAtMonotonicMs,
+      const auto grant = std::min(allocation->grant, subrequestLimit(*version));
+      addLease(id, {allocation->treeId, {grant, d1QueryLimit(*version)}, allocation->depth, allocation->expiresAtMonotonicMs,
           allocation->pins, allocation->ingressServerId});
       return execute(std::move(version), sequence, std::move(id), allocation->treeId, "durable", allocation->parentInvocationId,
-          allocation->callSequence, allocation->orderSequence, allocation->grant, allocation->remainingAfter, allocation->depth,
+          allocation->callSequence, allocation->orderSequence, grant, allocation->remainingAfter, allocation->depth,
           allocation->expiresAtMonotonicMs, allocation->pins, std::move(slot), std::move(process), allocation->ingressServerId, false, &target,
           &*root);
     }
     auto tree = coworkerd::invocationName(serverConfig.serverId, epoch(), "-tree-", nextTreeSequence++);
     const auto expires = nowMonotonicMs + static_cast<double>(leaseConfig.ttlMs);
     auto pins = std::make_shared<const VersionPins>(VersionPins{{version->workerId, coworkerd::versionPin(*version)}});
-    addLease(id, {tree, leaseConfig.rootBudget, leaseConfig.rootBudget, 0, expires, pins, serverConfig.serverId});
-    return execute(std::move(version), sequence, std::move(id), tree, "durable", {}, 0, 0, leaseConfig.rootBudget,
-        leaseConfig.rootBudget, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId, false, &target,
+    const auto grant = subrequestLimit(*version);
+    addLease(id, {tree, {grant, d1QueryLimit(*version)}, 0, expires, pins, serverConfig.serverId});
+    return execute(std::move(version), sequence, std::move(id), tree, "durable", {}, 0, 0, grant,
+        grant, 0, expires, pins, std::move(slot), std::move(process), serverConfig.serverId, false, &target,
         &*root);
   }
 
@@ -2593,14 +2634,14 @@ public:
       std::string parentInvocationId,
       uint64_t callSequence,
       uint64_t orderSequence,
-      double presentedExpiresAtMonotonicMs) {
+      double presentedExpiresAtMonotonicMs, SubrequestKind kind = SubrequestKind::worker) {
     const auto nowMonotonicMs = monotonicTimeMs();
     expireLeases(nowMonotonicMs);
     // Coworkerd Servers are assumed to share one trust domain. The trusted runtime
     // descriptor and RemoteInvocation fields are accepted directly. Crossing a
     // trust-domain boundary requires a new authentication and authorization design.
     auto parent = leases.find(parentInvocationId);
-    if (parent == leases.end() ||
+    if (parent == leases.end() || parent->second.treeId != treeId ||
         parent->second.expiresAtMonotonicMs <= nowMonotonicMs ||
         !parent->second.presents(presentedExpiresAtMonotonicMs)) {
       if (parent != leases.end() && parent->second.expiresAtMonotonicMs <= nowMonotonicMs && !parent->second.held) {
@@ -2617,7 +2658,16 @@ public:
     auto inherited = coworkerd::inheritLease(parent->second);
     auto depth = static_cast<uint16_t>(parent->second.depth + 1);
     KJ_REQUIRE(depth > parent->second.depth, "invocation depth overflow");
-    const auto parentRemainingBefore = parent->second.remainingSubrequests;
+    if (kind == SubrequestKind::worker && depth > MAX_BINDING_DEPTH) {
+      KJ_FAIL_REQUIRE("Binding call depth exceeds the hop limit");
+    }
+    const bool database = kind == SubrequestKind::d1;
+    auto& budget = parent->second.budget;
+    const auto parentRemainingBefore = budget.remaining;
+    if (database && budget.d1Remaining == 0) {
+      lastRejection = "D1 query budget exhausted before execution (limit " + std::to_string(budget.d1Limit) + ")";
+      KJ_FAIL_REQUIRE(lastRejection.c_str());
+    }
     if (!leaseConfig.naive() && parentRemainingBefore < 1) {
       ++budgetRejections;
       lastRejection = "subrequest budget exhausted before execution for parent=" +
@@ -2626,9 +2676,9 @@ public:
       KJ_FAIL_REQUIRE(lastRejection.c_str());
     }
     // The naive counterexample copies the budget without debiting the parent.
+    const auto cap = database ? 0 : leaseConfig.grantCap.value_or(budget.childCap(parent->second.depth == 0));
     const auto [grant, charged, remainingAfter] = coworkerd::childBudget(
-        parentRemainingBefore, leaseConfig.grantCap, leaseConfig.naive());
-    if (!leaseConfig.naive()) parent->second.remainingSubrequests = remainingAfter;
+        parentRemainingBefore, cap, leaseConfig.naive());
 
     if (leaseConfig.naive()) {
       auto orderKey = treeId + "#" + std::to_string(depth);
@@ -2645,6 +2695,8 @@ public:
       }
       ++expected;
     }
+    budget.remaining = remainingAfter;
+    if (database) --budget.d1Remaining;
 
     return {
       std::move(treeId),
@@ -2671,10 +2723,10 @@ public:
     auto process = selectProcess(version->workerId);
     auto sequence = check.sequence ? check.sequence : nextSequence++;
     auto invocationId = this->invocationId(sequence);
+    const auto grant = allocation.ingressRoot ? allocation.grant : std::min(allocation.grant, subrequestLimit(*version));
     addLease(invocationId, {
       allocation.treeId,
-      allocation.grant,
-      allocation.grant,
+      {grant, d1QueryLimit(*version)},
       allocation.depth,
       allocation.expiresAtMonotonicMs,
       allocation.pins,
@@ -2689,7 +2741,7 @@ public:
         std::move(allocation.parentInvocationId),
         allocation.callSequence,
         allocation.orderSequence,
-        allocation.grant,
+        grant,
         allocation.remainingAfter,
         allocation.depth,
         allocation.expiresAtMonotonicMs,
@@ -2700,7 +2752,7 @@ public:
       std::shared_ptr<const VersionDefinition> version,
       std::string treeId,
       std::string parentInvocationId,
-      uint16_t grant,
+      uint32_t grant,
       uint16_t depth,
       double expiresAtMonotonicMs,
       uint64_t callSequence,
@@ -2718,7 +2770,8 @@ public:
     }
     auto sequence = check.sequence ? check.sequence : nextSequence++;
     auto invocationId = this->invocationId(sequence);
-    addLease(invocationId, {treeId, grant, grant, depth, expiresAtMonotonicMs, pins, ingressServerId});
+    if (!ingressRoot) grant = std::min(grant, subrequestLimit(*version));
+    addLease(invocationId, {treeId, {grant, d1QueryLimit(*version)}, depth, expiresAtMonotonicMs, pins, ingressServerId});
     return execute(
         std::move(version),
         sequence,
@@ -2761,7 +2814,7 @@ public:
       const std::string& parentInvocationId,
       const std::string& target,
       const std::string& targetServerId,
-      uint16_t grant,
+      uint32_t grant,
       uint16_t depth,
       double expiresAtMonotonicMs) {
     ++forwardedInvocations;
@@ -2816,8 +2869,8 @@ private:
       std::string parentInvocationId,
       uint64_t callSequence,
       uint64_t orderSequence,
-      uint16_t grant,
-      uint16_t remainingAfter,
+      uint32_t grant,
+      uint32_t remainingAfter,
       uint16_t depth,
       double expiresAtMonotonicMs,
       SharedVersionPins pins, std::shared_ptr<AdmissionSlot> slot, std::shared_ptr<coworkerd::ProcessCall> process,
@@ -3166,7 +3219,7 @@ public:
            << ",\"leaseReaperIntervalMs\":" << LEASE_REAPER_INTERVAL_MS
            << ",\"leaseReaperRuns\":" << leaseReaperRuns
            << ",\"rootBudget\":" << leaseConfig.rootBudget
-           << ",\"grantCap\":" << leaseConfig.grantCap
+           << ",\"grantCap\":" << leaseConfig.grantCapJson()
            << ",\"budgetRejections\":" << budgetRejections
            << ",\"orderRejections\":" << orderRejections
            << ",\"forwardedInvocations\":" << forwardedInvocations
@@ -3216,8 +3269,9 @@ public:
         if (index > 0) output << ',';
         output << "{\"treeId\":\"" << jsonEscape(lease.treeId)
              << "\",\"invocationId\":\"" << jsonEscape(invocationId)
-             << "\",\"grant\":" << lease.grant
-             << ",\"remainingSubrequests\":" << lease.remainingSubrequests
+             << "\",\"grant\":" << lease.budget.grant
+             << ",\"remainingSubrequests\":" << lease.budget.remaining
+             << ",\"remainingD1Queries\":" << lease.budget.d1Remaining
              << ",\"depth\":" << lease.depth
              << ",\"expiresAtMonotonicMs\":" << lease.expiresAtMonotonicMs << "}";
       }
@@ -3440,8 +3494,8 @@ private:
       const VersionDefinition& version,
       const std::string& invocationId,
       const std::string& treeId,
-      uint16_t remainingSubrequests,
-      uint16_t grant,
+      uint32_t remainingSubrequests,
+      uint32_t grant,
       uint64_t orderSequence,
       uint16_t depth,
       double expiresAtMonotonicMs,
@@ -4883,7 +4937,7 @@ struct RemoteInvocationData {
   std::string contentHash;
   std::string treeId;
   std::string parentInvocationId;
-  uint16_t subrequestGrant;
+  uint32_t subrequestGrant;
   double expiresAtMonotonicMs;
   uint16_t depth;
   uint8_t placementHops;
@@ -5381,7 +5435,7 @@ public:
     remote.setWorkerId(invocation.workerId.c_str()); remote.setVersionId(invocation.versionId.c_str());
     remote.setContentHash(invocation.contentHash.c_str()); remote.setDefinitionHash(invocation.definitionHash.c_str());
     remote.setTreeId(invocation.treeId.c_str()); remote.setParentInvocationId(invocation.parentInvocationId.c_str());
-    remote.setSubrequestGrant(invocation.subrequestGrant);
+    writeSubrequestGrant(remote, invocation.subrequestGrant);
     remote.setDepth(invocation.depth); remote.setPlacementHops(invocation.placementHops);
     remote.setAlreadyPlaced(invocation.alreadyPlaced); remote.setOriginServerId(invocation.originServerId.c_str());
     remote.setIngressRoot(invocation.ingressRoot); remote.setIngressServerId(invocation.ingressServerId.c_str());
@@ -5482,7 +5536,7 @@ public:
       const auto& allocation = *invocation.allocation;
       remote.setTreeId(allocation.treeId.c_str());
       remote.setParentInvocationId(allocation.parentInvocationId.c_str());
-      remote.setSubrequestGrant(allocation.grant);
+      writeSubrequestGrant(remote, allocation.grant);
       remote.setDepth(allocation.depth);
       remote.setCallSequence(allocation.callSequence);
       remote.setOrderSequence(allocation.orderSequence);
@@ -6077,7 +6131,7 @@ public:
       remote.getContentHash().cStr(),
       remote.getTreeId().cStr(),
       remote.getParentInvocationId().cStr(),
-      remote.getSubrequestGrant(),
+      readSubrequestGrant(remote),
       expiresAtMonotonicMs,
       remote.getDepth(),
       remote.getPlacementHops(),
@@ -7602,8 +7656,9 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
     KJ_REQUIRE(remote.getCallerObjectId().size() == 0, "invalid remote Durable Object call: both a call tree and an object");
     // A Binding call of the caller's tree, with its share of the budget and the time it had left; the lease's version pin
     // is the object's version here.
-    ChildAllocation allocation{treeId, parent, remote.getCallSequence(), remote.getOrderSequence(), remote.getSubrequestGrant(), 0,
-        remote.getSubrequestGrant(), remote.getDepth(), receivedAtMonotonicMs + remainingMs, nullptr, false, ingress};
+    const auto grant = readSubrequestGrant(remote);
+    ChildAllocation allocation{treeId, parent, remote.getCallSequence(), remote.getOrderSequence(), grant, 0,
+        grant, remote.getDepth(), receivedAtMonotonicMs + remainingMs, nullptr, false, ingress};
     request.allocation = std::move(allocation);
   } else {
     request.callerNamespaceId = remote.getCallerNamespaceId().cStr();
@@ -7997,14 +8052,25 @@ public:
           coworkerd::environmentName(request.target.className), "invalid Durable Object call: namespace, object id or class");
       KJ_REQUIRE(!assetsCall && entrypoint.empty(), "a Durable Object call names no entrypoint");
       try {
-        if (callerObject.empty()) {
+        if (!callerObject.empty()) {
+          KJ_REQUIRE(validSha256(callerNamespace) && validSha256(callerObject), "invalid Durable Object call: the calling object");
+          if (!request.target.isDatabase()) {
+            request.target.hops = static_cast<uint16_t>(server.objectHops(callerNamespace + "/" + callerObject) + 1);
+          }
+          request.callerNamespaceId = callerNamespace;
+          request.callerObjectId = callerObject;
+        } else {
           KJ_REQUIRE(callerNamespace.empty(), "invalid Durable Object call: a caller namespace without an object");
+        }
+        if (!treeId.empty() || callerObject.empty()) {
           KJ_REQUIRE(!treeId.empty() && safeName(treeId) && !parentInvocationId.empty() && safeName(parentInvocationId) &&
               expiresAtMonotonicMs > 0, "invalid Durable Object call: the caller's call tree");
-          auto allocation = server.allocateChild(treeId, parentInvocationId, callSequence, orderSequence, expiresAtMonotonicMs);
+          auto allocation = server.allocateChild(treeId, parentInvocationId, callSequence, orderSequence,
+              expiresAtMonotonicMs, request.target.isDatabase() ? SubrequestKind::d1 : SubrequestKind::object);
           expiresAtMonotonicMs = allocation.expiresAtMonotonicMs;
           allocation.timing = timing;
-          if (!server.perCallForTest() && !server.pinMatches(allocation.pins, {workerId, versionId, contentHash, definitionHash})) {
+          if (callerObject.empty() && !server.perCallForTest() &&
+              !server.pinMatches(allocation.pins, {workerId, versionId, contentHash, definitionHash})) {
             auto reason = "Durable Object call: the calling version disagrees with its lease's version pins";
             server.rejectPinMismatch(reason);
             server.observeLocalRefusal(server.refusal("VERSION_PIN_MISMATCH", reason, 409), "durableObject");
@@ -8013,14 +8079,16 @@ public:
             co_return;
           }
           request.allocation = std::move(allocation);
-        } else {
-          KJ_REQUIRE(validSha256(callerNamespace) && validSha256(callerObject), "invalid Durable Object call: the calling object");
-          request.target.hops = static_cast<uint16_t>(server.objectHops(callerNamespace + "/" + callerObject) + 1);
-          request.callerNamespaceId = callerNamespace;
-          request.callerObjectId = callerObject;
         }
       } catch (const kj::Exception& error) {
         std::string reason = error.getDescription().cStr();
+        if (reason.find("D1 query budget exhausted") != std::string::npos) {
+          auto detail = server.lastRejectionReason();
+          server.observeLocalRefusal(server.refusal("D1_QUERY_BUDGET_EXHAUSTED", detail, 429), "durableObject");
+          context.initResults().setDispatcher(makeRejectionDispatcher(factory, headerTable, 429, "Too Many Requests",
+              "D1_QUERY_BUDGET_EXHAUSTED", std::move(detail), expiresAtMonotonicMs));
+          co_return;
+        }
         const bool budget = reason.find("subrequest budget exhausted") != std::string::npos;
         const bool expired = reason.find("lease expired before execution") != std::string::npos;
         if (!budget && !expired) throw;
@@ -8131,6 +8199,13 @@ public:
       co_return;
     } catch (const kj::Exception& error) {
       std::string reason = error.getDescription().cStr();
+      if (reason.find("Binding call depth exceeds the hop limit") != std::string::npos) {
+        std::string detail = "more than " + std::to_string(MAX_BINDING_DEPTH) + " nested calls to a Worker in one tree";
+        server.observeLocalRefusal(server.refusal("BINDING_HOP_LIMIT", detail, 508), "localBinding");
+        context.initResults().setDispatcher(makeRejectionDispatcher(factory, headerTable, 508, "Loop Detected",
+            "BINDING_HOP_LIMIT", std::move(detail), expiresAtMonotonicMs));
+        co_return;
+      }
       const bool budget = reason.find("subrequest budget exhausted") != std::string::npos;
       const bool order = reason.find("Binding arrival out of order") != std::string::npos;
       const bool expired = reason.find("lease expired before execution") != std::string::npos;
@@ -9320,7 +9395,7 @@ private:
       webSocket->versionId = selected.version->versionId;
     }
     if (server.placementConfig().ingressPlacement && !server.placementConfig().hasPlacement(selected.version->workerId)) {
-      auto allocation = server.allocateRoot(selected.pins, deadline);
+      auto allocation = server.allocateRoot(*selected.version, selected.pins, deadline);
       allocation.timing = timing;
       pathMark(timing, "allocate-root");
       if (webSocket) webSocket->treeId = allocation.treeId;
@@ -10142,7 +10217,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"ingress\":{\"webSocketsPerNode\":" << c.webSocketsPerNode << "}"
       << ",\"durableObjects\":{\"processes\":" << c.processPool.durableProcesses << "}"
       << ",\"lease\":{\"mode\":" << q(lease.naive() ? "naive" : "correct") << ",\"ttlMs\":" << lease.ttlMs
-      << ",\"rootBudget\":" << lease.rootBudget << ",\"grantCap\":" << lease.grantCap
+      << ",\"rootBudget\":" << lease.rootBudget << ",\"grantCap\":" << lease.grantCapJson()
       << "},\"logs\":{\"tenantBufferBytes\":" << c.logs.tenantBufferBytes << ",\"totalBufferBytes\":" << c.logs.totalBufferBytes
       << ",\"linesPerSecond\":" << c.logs.linesPerSecond << ",\"maxLineBytes\":" << c.logs.maxLineBytes
       << ",\"workerdLogMaxBytes\":" << c.logs.sinkMaxBytes << ",\"workerdLogFiles\":" << c.logs.sinkFiles
@@ -10494,6 +10569,7 @@ int run(Launch launch) {
         if (!found) return std::nullopt;
         return coworkerd::EgressSource{found->first, found->second};
       },
+      [&server](const std::string& invocationId) { return server.chargeEgress(invocationId); },
       // The tenant's hourly usage rows: egressBytes.
       [&tenantUsage](const std::string& tenant, uint64_t bytes) { tenantUsage.egress(tenant, bytes); });
   server.addStateSection("egress", [&egress]() { return egress.json(); });

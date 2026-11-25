@@ -57,6 +57,10 @@ def git(checkout, *args, env=None, input=None):
 # live below the server package. Startup identity only forwards one owned value.
 SERVER_CPP_ROOTS = ("src/workerd/server/factory/",)
 RUST_PATHS = {
+    "0140-invocation-budget-identity.patch": frozenset({
+        "src/workerd/server/server/bridge.rs",
+        "src/workerd/server/server/root_loader.rs",
+    }),
     "0041-ordinary-lease-deadline.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0038-preparation-queue-and-failure-cache.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0035-preparation-failure-recovery.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
@@ -291,6 +295,8 @@ def allowed_path(name, path):
                               'src/workerd/threaded/protocol.capnp',
                               'src/workerd/threaded/threaded-server-test.c++',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0140-invocation-budget-identity.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0130-ordinary-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',

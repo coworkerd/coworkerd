@@ -69,6 +69,10 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   reports and the descriptors workerd inherits are a contract between them), and a release's `VERSION` names the
   upstream tag and the series it was built from.
 
+`0140-invocation-budget-identity` carries the active event's trusted identity to the node's egress service and
+the legacy Durable Object binding shims. The threaded server also includes the calling object's identity on a
+Durable Object call so the node can count object hops. Its Rust paths are `server/root_loader.rs` and `server/bridge.rs`.
+
 ## Working on the series
 
 `scripts/workerd-patches.py` goes back and forth between the files here and commits in a workerd checkout (by default

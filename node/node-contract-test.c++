@@ -406,6 +406,33 @@ void budget() {
   KJ_REQUIRE(childBudget(1, 3, false).remaining == 0);
   auto naive = childBudget(8, 3, true);
   KJ_REQUIRE(naive.grant == 8 && naive.charged == 0 && naive.remaining == 8);
+
+  InvocationBudget root(DEFAULT_SUBREQUEST_LIMIT, DEFAULT_D1_QUERY_LIMIT);
+  for (unsigned call = 0; call < 100; ++call) {
+    const auto next = childBudget(root.remaining, root.childCap(true), false);
+    KJ_REQUIRE(next.grant == 78 && next.charged == 79);
+    root.remaining = next.remaining;
+  }
+  KJ_REQUIRE(root.remaining == 2'100);
+  InvocationBudget nested(78, DEFAULT_D1_QUERY_LIMIT);
+  const auto grandchild = childBudget(nested.remaining, nested.childCap(false), false);
+  KJ_REQUIRE(grandchild.grant == 58 && grandchild.charged == 59 && grandchild.remaining == 19);
+  KJ_REQUIRE(grandchild.remaining + grandchild.grant + 1 == nested.grant);
+
+  const auto wide = childBudget(MAX_SUBREQUEST_LIMIT, MAX_SUBREQUEST_LIMIT, false);
+  KJ_REQUIRE(wide.grant == 9'999'999 && wide.charged == 10'000'000 && wide.remaining == 0);
+  const auto last = childBudget(1, 4, false);
+  KJ_REQUIRE(last.grant == 0 && last.charged == 1 && last.remaining == 0);
+  KJ_REQUIRE(childBudget(0, 4, false).charged == 0);
+
+  // Message delivery refills the original allowance, including a lowered tenant
+  // D1 limit. A socket opened by a child refills its grant, as on the handshake.
+  InvocationBudget socket(78, 50);
+  socket.remaining = 0;
+  socket.d1Remaining = 1;
+  socket.refill();
+  KJ_REQUIRE(socket.remaining == 78 && socket.d1Remaining == 50);
+  KJ_REQUIRE(childBudget(socket.remaining, socket.childCap(false), false).charged == grandchild.charged);
 }
 void identity() {
   KJ_REQUIRE(invocationName("n1", "epoch-9", "-tree-", 12) == "n1.epoch-9-tree-12");
