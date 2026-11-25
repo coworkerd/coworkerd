@@ -46,9 +46,11 @@ Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different b
 
 `durable-threaded-database-placement` uses the test executable on the threaded owner and the upstream
 database backend on the other nodes. It checks HTTP SQL and D1 in both directions, batch rollback, two
-same-tenant databases in separate isolate copies of the same threaded process generation, and confirmed
-reads after the threaded owner is killed. To run it with an actual older node build, point the runner at
-a checkout containing its built Linux `build/coworkerd` and its original `runtime/runtime.js`.
+same-tenant databases in separate isolate copies of the same threaded process generation before and after
+idle release, and acknowledged writes recovered at a later shard epoch after either build's owner is killed.
+`durable-threaded-database-release` checks that a public SQL query on a threaded owner returns the release
+executable's `501 NOT_SUPPORTED` response. To run the placement test with an actual older node build,
+point the runner at a checkout containing its built Linux `build/coworkerd` and its original `runtime/runtime.js`.
 
 ```sh
 COWORKERD_CLUSTER_PREVIOUS_PRODUCT=/path/to/previous-checkout \
