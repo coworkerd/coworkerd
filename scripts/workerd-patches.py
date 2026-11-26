@@ -354,6 +354,7 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name == '0178-keep-platform-databases-open-after-sql-interruption.patch' and path in {
+                              'src/workerd/api/actor-state.c++',
                               'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h',
                               'src/workerd/util/sqlite-test.c++'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
