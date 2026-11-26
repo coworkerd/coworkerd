@@ -80,6 +80,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   singleNode: true,
   productRoot: checkout,
   controlDurableLifecycle: mixedCeiling === 'memory',
+  threadedNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
   ...(idleWindow && {
     databaseFixtureNodes: ['node-1'],
     // The imported Cluster from a historical checkout uses the singular option.
@@ -914,39 +915,25 @@ async function runMixedAdmission() {
       await writeFile(nextOffset, String(milliseconds));
       await rename(nextOffset, offset);
     };
-    for (warmed = 0; warmed < settings.homes; warmed += 8) {
-      await setOffset(180000 - Math.floor(performance.now() - warmStart));
-      const replies = await Promise.all(databases.slice(warmed, warmed + 8).map(sql));
-      let contended = false;
-      for (const reply of replies) {
-        if (reply.status === 200) {
-          assert.deepEqual(JSON.parse(reply.text).results, [{ value: 1 }]);
-        } else {
-          contended = true;
-          assert.equal(reply.status, 503, reply.text);
-          assert.match(reply.text, /OVERLOADED|admission budget is full|native invocation queue is full/i);
-        }
-      }
-      const residency = contended ? await eventually('memory replacement after the warm-up batch', async () => {
-        const state = await readResidency();
-        assert.ok(state.admissionRetirements > 0);
-        return state;
-      }) : await readResidency();
-      if (residency.admissionRetirements > 0) {
-        warmed += 8;
+    for (warmed = 0; warmed < settings.homes; ++warmed) {
+      if (warmed % 8 === 0) await setOffset(180000 - Math.floor(performance.now() - warmStart));
+      await expectSql(databases[warmed]);
+      if ((await readResidency()).admissionRetirements > 0) {
+        ++warmed;
         break;
       }
     }
     await setOffset(0);
     const { entry, processPool, log } = await durable();
+    const treeLimit = log.settings.residentObjects;
     await record('mixed-memory-warmup', {
       warmed, elapsedMs: performance.now() - warmStart, rssBytes: entry.residentBytes,
       memoryBudgetBytes: processPool.threadedMemoryBytes, isolateLimit: processPool.threadedResidentLimit,
-      treeLimit: log.residentObjects, residency: entry.lifecycle.durableAdmission,
+      treeLimit, residency: entry.lifecycle.durableAdmission,
     });
     assert.ok(warmed < settings.homes, 'memory admission started with spare homes');
     assert.ok(warmed < processPool.threadedResidentLimit, 'isolate count has headroom');
-    assert.ok(warmed < log.residentObjects, 'routing tree count has headroom');
+    assert.ok(warmed < treeLimit, 'routing tree count has headroom');
     assert.equal(entry.lifecycle.durableAdmission.groupCreationRefusals, 0, 'isolate groups are available');
   } else {
     for (const name of databases.slice(0, warmed)) await expectSql(name);

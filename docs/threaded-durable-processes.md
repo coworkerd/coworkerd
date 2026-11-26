@@ -377,6 +377,11 @@ serving calls during that interval.
 A cold load that cannot register its initial reservation may retire one database whose
 charge would cover the shortfall. One preparation credit is held for a database while
 the reservation returns and for up to 100 ms afterward. The cold load retries once.
+Above the initial-admission ceiling, a database can only replace one idle database.
+Its first reservation must fit within the returned charge and leave the total within
+the hard process budget. In the memory probe the existing copies charged 1,974,448,702
+bytes against the initial-admission ceiling of 1,973,251,124 bytes. A typical copy
+returned 2,732,370 bytes, and the new copy's first reservation was 2,621,440 bytes.
 If retirement cannot return the reservation within one second, the process clears the
 victim, counts an overload and logs its home and tree. Capacity waiters receive a refusal
 and the process can use the home once its normal close is complete.
