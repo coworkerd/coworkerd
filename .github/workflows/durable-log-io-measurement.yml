@@ -15,6 +15,7 @@ jobs:
       CXX: clang++-19
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       WRANGLER_SEND_METRICS: 'false'
+      CANDIDATE: 272b58b5a682d328fc44b26d320b5ed8f2e927f0
       BASELINE: 01a9af30fdca886e1cc4ae3b82399c202099fe78
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -50,7 +51,7 @@ jobs:
           KERNEL: ${{ steps.kernel.outputs.path }}
         run: |
           mkdir reports
-          printf 'baseline=%s\ncandidate=%s\n' "$BASELINE" "$(git rev-parse HEAD^)" | tee reports/revisions.txt
+          printf 'baseline=%s\ncandidate=%s\n' "$BASELINE" "$CANDIDATE" | tee reports/revisions.txt
           bash tests/cluster/durable-log-io/run.sh "$RUNNER_TEMP/plain" "$RUNNER_TEMP/log-baseline/build" "$KERNEL" reports
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
