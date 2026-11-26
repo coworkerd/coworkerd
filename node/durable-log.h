@@ -112,8 +112,8 @@ struct LogRecord {
     return objectName + "/" + std::to_string(dataEpoch) + "/" + std::to_string(facetId);
   }
 };
-// The record, with its CRC32C: a peer refuses a record whose bytes do not add up rather than letting a rebuild find
-// out (experiment 25, B.7).
+// The record includes a CRC32C. Peers check it when accepting records so a corrupt record is refused
+// before it can reach a rebuild.
 std::string encodeLogRecord(const LogRecord& record);
 std::optional<LogRecord> decodeLogRecord(std::string_view bytes, std::string* error = nullptr);
 // Records one after another, each behind its length (UInt32, little endian), as a stream carries them.
@@ -194,8 +194,8 @@ std::string objectManifestJson(const ObjectManifest& manifest);
 std::optional<ObjectManifest> parseObjectManifest(const std::string& bytes);
 
 // ---- Replaying records into database files ----
-// One database being rebuilt: the frames of its records are written at their pages' offsets and the file truncated at
-// every commit, which gives the same bytes as the owner's file after a checkpoint (experiment 25, B.1/B.4).
+// Replay writes WAL frames at their database page offsets and truncates the file to the size in each commit frame,
+// producing the same database bytes as a checkpoint of the owner's WAL.
 class DatabaseReplay {
 public:
   explicit DatabaseReplay(std::filesystem::path path, bool fromEmpty, bool validateOnly = false);

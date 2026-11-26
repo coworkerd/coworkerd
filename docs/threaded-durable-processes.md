@@ -385,6 +385,8 @@ returned 2,732,370 bytes, and the new copy's first reservation was 2,621,440 byt
 If retirement cannot return the reservation within one second, the process clears the
 victim, counts an overload and logs its home and tree. Capacity waiters receive a refusal
 and the process can use the home once its normal close is complete.
+A refused call can retire several databases over the node's five-second routing retry
+window, one per retry after each preceding retirement reaches its own one-second deadline.
 
 The earlier archive completed 1 of 116 queries with `residentObjects: 4` and
 105 of 116 at the default memory budget with extra homes. The revised kernel completed

@@ -160,10 +160,22 @@ async function webSocketAdmission(cluster) {
   }
 }
 
+async function waitForDatabaseCatalog(cluster) {
+  const { storage } = await cluster.api('/v1/status');
+  const revision = BigInt(storage.tenantsRevision);
+  await eventually('every node has applied the database catalog', async () => {
+    await Promise.all(cluster.nodes.map(async node => {
+      const { storage } = await cluster.state(node);
+      assert.ok(BigInt(storage.appliedTenantsRevision) >= revision, node);
+    }));
+  });
+}
+
 async function sqlAtomicity(cluster) {
   const { path, token } = await cluster.tenant('sql-test');
   const database = `${path}/databases/ledger`;
   const { database: created } = await cluster.api(database, { method: 'POST', token });
+  await waitForDatabaseCatalog(cluster);
   const query = (body) => cluster.api(`${database}/query`, { method: 'POST', token, body, timeout: 35000 });
   // The database's namespace can take time to become visible on the nodes.
   await eventually('database serves SELECT', async () => {
@@ -252,6 +264,16 @@ async function waitForDurableMembership(cluster) {
   });
 }
 
+async function waitForWalPeers(cluster, owner) {
+  const peers = cluster.nodes.filter(node => node !== owner);
+  await eventually('the database owner has both WAL confirmation streams', async () => {
+    const { durableLog } = await cluster.state(owner);
+    assert.equal(durableLog.peers.want, peers.length);
+    assert.ok(peers.every(peer => durableLog.peers.streams.some(stream => stream.nodeId === peer && stream.open)));
+  });
+  return peers;
+}
+
 async function threadedSqlCliParity(cluster) {
   await waitForDurableMembership(cluster);
   const ledger = await sqlAtomicity(cluster);
@@ -263,7 +285,9 @@ async function threadedSqlCliParity(cluster) {
   const cli = async (...args) => JSON.parse(await cluster.command(process.execPath,
     [cowctl, 'd1', ...args, '--json'], { cwd, token: tenant.token, env: { HOME: cwd } }));
 
-  const { database: source } = await cli('create', 'books');
+  // Let the fixture wait on the tenant index before any SQL claims the shard.
+  const { database: source } = await cli('create', 'books', '--no-wait');
+  await waitForDatabaseCatalog(cluster);
   const migration = await cli('migrations', 'create', source.name, 'create books');
   await writeFile(join(migration.directory, migration.created), `CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
 CREATE UNIQUE INDEX book_title ON books(title);
@@ -308,7 +332,8 @@ INSERT INTO books VALUES (1, 'One');
   const exported = await cli('export', source.name, '--output', 'backup.sql');
   assert.equal(exported.success, true);
   assert.equal(exported.mode, 'atomic');
-  const { database: backup } = await cli('create', 'books-backup');
+  const { database: backup } = await cli('create', 'books-backup', '--no-wait');
+  await waitForDatabaseCatalog(cluster);
   await importFile(backup.name, 'backup.sql');
 
   await execute(source.name, "INSERT INTO books VALUES (3, 'After bookmark')");
@@ -320,6 +345,7 @@ INSERT INTO books VALUES (1, 'One');
   assert.equal(restored.database, 'books-restored');
   assert.equal(restored.point.bookmark, point.bookmark);
   assert.notEqual(restored.namespaceId, source.namespaceId);
+  await waitForDatabaseCatalog(cluster);
   const historical = { name: restored.database, namespaceId: restored.namespaceId };
   for (const db of [backup, historical]) {
     await eventually(`${db.name} serves the restored schema`, async () => {
@@ -667,7 +693,7 @@ async function threadedSqlTransactionLimit(cluster) {
 
 async function threadedDatabaseAdmission(cluster) {
   await waitForDurableMembership(cluster);
-  const [owner, ...peers] = cluster.nodes;
+  const [owner] = cluster.nodes;
   const tenant = await cluster.tenant('sql-admission', { durableObjectNamespaces: 48 });
   const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 5]]));
   const [first, blocked, oldestIdle, newcomer, overflow] = databases.get(owner);
@@ -699,11 +725,7 @@ async function threadedDatabaseAdmission(cluster) {
   await observe('three exclusive homes have settled', {
     workerThreads: 3, homes: 3, residentRoots: 3, running: 0, waiting: 0, idleRetirements: 0,
   });
-  await eventually('the database owner has both WAL confirmation streams', async () => {
-    const { durableLog } = await cluster.state(owner);
-    assert.equal(durableLog.peers.want, peers.length);
-    assert.ok(peers.every(peer => durableLog.peers.streams.some(stream => stream.nodeId === peer && stream.open)));
-  });
+  const peers = await waitForWalPeers(cluster, owner);
   // Keep the warmed roots younger than the normal retirement threshold for the pressure test.
   const realClock = join(cluster.durableLifecycleGate, 'idle-offset-next');
   await writeFile(realClock, '0');
@@ -2041,6 +2063,7 @@ async function threadedPlatformDefinition(cluster) {
 }
 
 async function durableAdmissionRefusal(cluster) {
+  await waitForDurableMembership(cluster);
   const [objectOwner, databaseOwner] = cluster.nodes;
   const tenant = await cluster.tenant('durable-refusal', { durableObjectNamespaces: 48 });
   const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[databaseOwner, 1]]));
@@ -2161,6 +2184,7 @@ async function durableAdmissionRefusal(cluster) {
     assert.equal(json(await sql('SELECT 1'), 200, 'database ready').success, true);
   });
   assert.equal(json(await sql('CREATE TABLE ledger(value INTEGER)'), 200, 'create ledger').success, true);
+  const peers = await waitForWalPeers(cluster, databaseOwner);
   const gate = join(cluster.peerAckGate, 'hold');
   await writeFile(gate, '');
   const held = sql('INSERT INTO ledger VALUES (0)');
@@ -2168,7 +2192,7 @@ async function durableAdmissionRefusal(cluster) {
   let queued;
   try {
     await eventually('the first SQL write is held by the output gate', async () => {
-      const states = await Promise.all(cluster.nodes.filter(node => node !== databaseOwner).map(node => cluster.state(node)));
+      const states = await Promise.all(peers.map(node => cluster.state(node)));
       assert.ok(states.every(state => state.durableLog.peers.heldAcksForTest > 0));
     });
     queued = sql(rows);
