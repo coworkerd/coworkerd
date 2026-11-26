@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, open, rm } from 'node:fs/promises';
+import { access, open, rm, stat } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
@@ -36,6 +36,7 @@ export async function summarizeStacks(path, [begin, end]) {
   let period = 0;
   let stack = [];
   let available = 0;
+  const firstLines = [];
   let select = false;
   function finish() {
     if (!select) return;
@@ -50,11 +51,12 @@ export async function summarizeStacks(path, [begin, end]) {
 
   const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
   for await (const line of lines) {
-    const sample = line.match(/^\s*\S+\s+\d+\s+(\d+)\.(\d{9}):\s+(\d+)\s+cpu-clock:/);
+    if (firstLines.length < 8) firstLines.push(line.slice(0, 160));
+    const sample = line.match(/\s(\d+)\.(\d{3,9}):\s+(\d+)\s+cpu-clock(?:[:\w-]*):/);
     if (sample) {
       ++available;
       finish();
-      const time = BigInt(sample[1]) * 1_000_000_000n + BigInt(sample[2]);
+      const time = BigInt(sample[1]) * 1_000_000_000n + BigInt(sample[2].padEnd(9, '0'));
       select = time >= start && time < stop;
       period = Number(sample[3]);
       stack = [];
@@ -65,7 +67,7 @@ export async function summarizeStacks(path, [begin, end]) {
   }
   finish();
   const samples = Object.values(histogram).reduce((sum, entry) => sum + entry.samples, 0);
-  assert.ok(samples > 0, `no in-window cpu-clock samples among ${available} records in ${path}`);
+  assert.ok(samples > 0, `no in-window cpu-clock samples among ${available} records in ${path}\n${firstLines.join('\n')}`);
   return { samples, histogram, stacks };
 }
 
@@ -83,6 +85,7 @@ export async function recordPerf({ pid, data, script, drive }) {
       eventually('perf event is open', () => access(data), { timeout: 10000 }),
       closed.then(([code]) => { throw new Error(`perf record exited (${code}) before measurement\n${stderr}`); }),
     ]);
+    child.stdin.write('enable\n');
     result = await drive();
   } finally {
     child.stdin.end('stop\n');
@@ -100,5 +103,7 @@ export async function recordPerf({ pid, data, script, drive }) {
     await fd.close();
     await rm(data, { force: true });
   }
-  return result;
+  const bytes = (await stat(script)).size;
+  assert.ok(bytes > 0, 'perf produced no stack dump for TID ' + pid + '\n' + stderr);
+  return { ...result, perfCapture: { tid: pid, scriptBytes: bytes, recordLog: stderr.trim() } };
 }

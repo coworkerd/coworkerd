@@ -5,14 +5,14 @@ index ba88bf7..1af47d7 100644
 @@ -32,6 +32,10 @@ if(NOT patch_check EQUAL 0)
      WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
  endif()
- 
+
 +add_executable(coworkerd-bench-http-forwarder EXCLUDE_FROM_ALL
 +  tests/cluster/main-thread-profile/http-forwarder.c++)
 +target_link_libraries(coworkerd-bench-http-forwarder PRIVATE kj-http)
 +
  set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
  file(MAKE_DIRECTORY "${GENERATED_DIR}")
- 
+
 diff --git a/node/durable-log.c++ b/node/durable-log.c++
 index b77c262..01a8525 100644
 --- a/node/durable-log.c++
@@ -70,6 +70,6 @@ index 6af8fe7..1b155dc 100644
    auto& timer = io.provider->getTimer();
    coworkerd::eventLoopTrace::openTrace();
 +  coworkerd::benchmarkTrace::open();
- 
+
    capnp::ByteStreamFactory byteStreamFactory;
    kj::HttpHeaderTable::Builder headerTableBuilder;
