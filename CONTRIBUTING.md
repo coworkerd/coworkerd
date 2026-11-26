@@ -234,7 +234,6 @@ runner to check a change on Linux, with all cases or a single case. Linux pull-r
 
 1. Read `tag=` in [patches/workerd/UPSTREAM](patches/workerd/UPSTREAM) on product `main`. The per-tag base on
    [coworkerd/workerd](https://github.com/coworkerd/workerd) is `coworkerd-<tag>`, including the `v` in the tag.
-   During the [branch cutover](https://github.com/coworkerd/coworkerd/issues/4), confirm the active fork base there.
    Start your topic branch from that base and open the kernel PR against it. Keep the implementation in our own
    files and upstream hooks within the [documented patch scope](patches/README.md#how-the-series-is-maintained).
 2. Open a companion PR against `main` of [coworkerd/coworkerd](https://github.com/coworkerd/coworkerd). Record
