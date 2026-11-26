@@ -1222,10 +1222,12 @@ async function threadedSqlProcessMemory(cluster) {
   const refused = await query(first, materialize, 422);
   assert.equal(refused.code, 'SQL_MEMORY_LIMIT_EXCEEDED');
   assert.deepEqual((await query(first, read)).results, [{ value: 0 }]);
-  const afterRefusal = await snapshot();
-  assert.equal(afterRefusal.residentRoots, 3);
-  assert.equal(afterRefusal.sqliteHeapReservedBytes, 3 * MiB);
-  assert.equal(afterRefusal.actorResets, allOpen.actorResets);
+  await eventually('the refused query returns temporary heap without closing its database', async () => {
+    const afterRefusal = await snapshot();
+    assert.equal(afterRefusal.residentRoots, 3);
+    assert.equal(afterRefusal.sqliteHeapReservedBytes, 3 * MiB);
+    assert.equal(afterRefusal.actorResets, allOpen.actorResets);
+  }, { timeout: 3000 });
   assert.equal(await opens(), openSamples, 'the same database handled the next query');
 
   const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
