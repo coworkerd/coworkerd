@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
+import { profileOperations, runProfile, traceInContainer } from './main-thread-profile/profile.mjs';
 
 const [side, checkoutArg, kernelArg, outputArg, mode, ...extra] = process.argv.slice(2);
 const memoryAdmission = mode === '--idle-admission-memory';
@@ -23,20 +24,24 @@ const defaultHomes = mode === '--idle-admission-unpaced' || mixedCeiling === 'ho
 const defaultIdleWindow = mode === '--idle-window-default';
 const patchedIdleWindow = mode === '--idle-window-patched';
 const idleWindow = mode === '--idle-window' || defaultIdleWindow || patchedIdleWindow || idleAdmission;
-const modes = ['--smoke', '--default-admission', '--cold-follow-up', '--throughput', '--throughput-smoke',
+const mainThreadProfile = mode === '--main-thread-profile' || mode === '--main-thread-profile-smoke';
+const profileControl = mainThreadProfile ? process.env.COWORKERD_PROFILE_CONTROL : undefined;
+assert.ok(profileControl === undefined || ['plain', 'traced'].includes(profileControl));
+const modes = ['--main-thread-profile', '--main-thread-profile-smoke', '--smoke', '--default-admission', '--cold-follow-up', '--throughput', '--throughput-smoke',
   '--idle-window', '--idle-window-default', '--idle-window-patched', '--idle-window-admission',
   '--idle-admission-unpaced', '--idle-admission-memory', '--idle-admission-mixed',
   '--idle-admission-mixed-memory', '--idle-admission-mixed-resident',
   '--idle-admission-busy-one', '--idle-admission-busy-two'];
 if (!['object', 'native'].includes(side) || !checkoutArg || !kernelArg || !outputArg ||
-    (mode !== undefined && !modes.includes(mode)) || (idleWindow && side !== 'object') || extra.length) {
+    (mode !== undefined && !modes.includes(mode)) || ((idleWindow || mainThreadProfile) && side !== 'object') || extra.length) {
   console.error('Usage: node tests/cluster/database-home-benchmark.mjs <object|native> <product-checkout> <kernel-directory> <new-report.jsonl> [' + modes.join('|') + ']');
   process.exit(2);
 }
-const throughput = mode === '--throughput' || mode === '--throughput-smoke';
-const smoke = mode === '--smoke' || mode === '--throughput-smoke';
+const throughput = mainThreadProfile || mode === '--throughput' || mode === '--throughput-smoke';
+const smoke = mode === '--smoke' || mode === '--throughput-smoke' || mode === '--main-thread-profile-smoke';
 const clientImage = 'node:22-trixie@sha256:f92a4668ece057eff6b83ed531b5f6277892b5c8fa8c1df4ea4ef470bf92b91e';
-const throughputSettings = { warmMs: smoke ? 200 : 1500, measureMs: smoke ? 500 : 10000 };
+const throughputSettings = { warmMs: smoke ? 200 : 1500,
+  measureMs: smoke ? 500 : mainThreadProfile ? 6000 : 10000 };
 const throughputMailbox = { events: 64, bytes: 1024 * 1024 };
 const throughputPlacement = { rootLimit: 512, nestedLimit: 1024 };
 const throughputInFlightLimit = 512;
@@ -109,6 +114,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
     }),
     ...(mixedCeiling === 'memory' && { COWORKERD_DO_TEST_MAILBOX_EVENTS: '4' }),
     ...(throughput && { COWORKERD_DO_TEST_MAILBOX_BYTES: String(throughputMailbox.bytes) }),
+    ...(mainThreadProfile && profileControl !== 'plain' && { COWORKERD_BENCHMARK_TRACE: traceInContainer }),
   }),
 });
 const [owner] = cluster.nodes;
@@ -180,6 +186,7 @@ async function provenance() {
     settings: throughput ? { homes: settings.homes, mailbox: throughputMailbox,
       placement: throughputPlacement, inFlightLimit: throughputInFlightLimit, ...throughputSettings } : settings,
     mode: mode ?? 'full', node: process.version,
+    ...(profileControl && { profileControl }),
     ...(throughput && { clientImage,
       runner: process.env.GITHUB_ACTIONS === 'true' ? {
         runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
@@ -510,7 +517,7 @@ async function runNetworkThroughput() {
   const source = fileURLToPath(new URL('./database-throughput-client.mjs', import.meta.url));
   await cluster.command('docker', ['pull', clientImage], { timeout: 240000 });
   const nodeCpuMax = await execOwner('if test -r /sys/fs/cgroup/cpu.max; then cat /sys/fs/cgroup/cpu.max; fi');
-  await seed([workload, ...databases]);
+  await seed(mainThreadProfile ? [workload] : [workload, ...databases]);
   const rows = new Map([workload, ...databases].map(name => [name, 1]));
   const cells = [];
   for (const operation of ['worker-only', 'object-noop', 'read', 'insert']) {
@@ -524,23 +531,27 @@ async function runNetworkThroughput() {
   assert.deepEqual(processes.durable, child);
   const pids = Object.fromEntries(Object.entries(processes).map(([role, entry]) => [role, entry.pid]));
   await record('throughput-processes', { processes, nodeCpuMax: nodeCpuMax || null });
-  for (const { operation, clients, targets } of cells) {
+  async function runCell({ operation, clients, targets = [workload], site = owner,
+    extraPids = {}, profileMode, round, observe }) {
     const ids = targets.map(name => rows.get(name));
-    const args = JSON.stringify({ operation, clients, targets, ids, ...throughputSettings, pids });
+    const args = JSON.stringify({ operation, clients, targets, ids, ...throughputSettings,
+      pids: { ...pids, ...extraPids }, ...(mainThreadProfile && { host: owner + ':8930', clockWindow: true }) });
     const writes = operation === 'insert';
     const before = await cluster.state(owner);
     assert.deepEqual(throughputProcesses(before), processes);
-    const result = JSON.parse(await cluster.command('docker', [
+    const drive = async () => JSON.parse(await cluster.command('docker', [
       'run', '--rm', '--network', cluster.project + '_frontend', '--pid', 'container:' + container,
       '--mount', 'type=bind,src=' + source + ',dst=/client.mjs,readonly',
-      clientImage, 'node', '/client.mjs', base, args,
+      clientImage, 'node', '/client.mjs', site === owner ? base : 'http://' + site + ':8930/' + tenantName, args,
     ], { timeout: throughputSettings.measureMs + throughputSettings.warmMs + 45000 }));
+    const result = observe ? await observe(drive) : await drive();
     const after = await cluster.state(owner);
     await record('throughput-window', { operation, ...result,
+      ...(profileMode && { profileMode, round }),
       ...(writes && { confirm: { before: before.durableLog.confirm, after: after.durableLog.confirm } }) });
     assert.deepEqual(throughputProcesses(after), processes, 'same server and children throughout the window');
     assert.equal(result.measurement.failures, 0, 'all timed requests succeeded');
-    if (writes) assert.equal(result.warmup.failures, 0, 'all warm-up inserts succeeded');
+    if (writes || mainThreadProfile) assert.equal(result.warmup.failures, 0, 'all warm-up requests succeeded');
     assert.ok(result.n > 0);
     if (writes) {
       let acknowledged = 0;
@@ -556,8 +567,20 @@ async function runNetworkThroughput() {
       assert.equal(after.durableLog.confirm.unconfirmed, 0);
       const confirmations = after.durableLog.confirm.confirmations - before.durableLog.confirm.confirmations;
       assert.ok(confirmations >= acknowledged, 'local WAL confirmed every acknowledged insert');
-      await record('throughput-confirmation', { clients, targets, acknowledged, confirmations });
+      await record('throughput-confirmation', { clients, targets, acknowledged, confirmations,
+        ...(profileMode && { profileMode, round }) });
     }
+    return result;
+  }
+  if (profileControl === 'plain') {
+    for (const operation of profileOperations) {
+      await runCell({ operation, clients: 16, profileMode: 'plain', round: 1 });
+    }
+  } else if (mainThreadProfile) {
+    await runProfile({ cluster, container, owner, binaries, runCell, record, smoke,
+      control: profileControl === 'traced' });
+  } else {
+    for (const cell of cells) await runCell(cell);
   }
 }
 
