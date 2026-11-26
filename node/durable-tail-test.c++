@@ -18,7 +18,7 @@ enum class Control { NONE, IGNORE_OBJECT, STALE_CURSOR, DROP_PROOF, TRUNCATED_PA
 struct DurableTailTest {
   static void run(unsigned seed, Control control = Control::NONE) {
     constexpr size_t PAGE_BYTES = 4096;
-    auto temp = (std::filesystem::temp_directory_path() / "b54-tail-XXXXXX").string();
+    auto temp = (std::filesystem::temp_directory_path() / "durable-tail-XXXXXX").string();
     KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
     KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
     auto io = kj::setupAsyncIo();

@@ -41,7 +41,7 @@ void cpu() {
   report(); KJ_REQUIRE(run() != "null" && confirmations == 1, "live dispatched call");
   active.dispatched = false; KJ_REQUIRE(run() == "null"); active.dispatched = true;
   process.calls.clear(); process.recentDispatched.push_back(active);
-  KJ_REQUIRE(run() != "null" && confirmations == 2, "S1 attributes a just-completed CPU call");
+  KJ_REQUIRE(run() != "null" && confirmations == 2, "watchdog attributes a just-completed CPU call");
   process.threaded = false; KJ_REQUIRE(run() == "null"); process.threaded = true;
   report("other/worker"); KJ_REQUIRE(run() == "null");
   report("tenant/worker", "v2"); KJ_REQUIRE(run() == "null");

@@ -12,7 +12,7 @@
 
 #include <kj/async-io.h>
 
-namespace coworkerd::r47 {
+namespace coworkerd::eventLoopTrace {
 
 enum Kind : uint64_t {
   TIMER = 1,
@@ -62,14 +62,14 @@ inline uint64_t clockNs(clockid_t clock) {
 }
 
 inline void openTrace() {
-  const char* path = std::getenv("COWORKERD_R47_TRACE");
+  const char* path = std::getenv("COWORKERD_EVENT_LOOP_TRACE");
   if (!path || !*path) return;
   const int fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
-  if (fd < 0) throw std::runtime_error("could not create r47 trace");
+  if (fd < 0) throw std::runtime_error("could not create event loop trace");
   auto buffer = ftruncate(fd, sizeof(Trace)) == 0
       ? mmap(nullptr, sizeof(Trace), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
   close(fd);
-  if (buffer == MAP_FAILED) throw std::runtime_error("could not map r47 trace");
+  if (buffer == MAP_FAILED) throw std::runtime_error("could not map event loop trace");
   std::memset(buffer, 0, sizeof(Trace));
   trace = static_cast<Trace*>(buffer);
   trace->version = 1;
@@ -123,4 +123,4 @@ inline kj::Promise<void> runTimer(kj::Timer& timer) {
   return sampleTimer(timer);
 }
 
-}  // namespace coworkerd::r47
+}  // namespace coworkerd::eventLoopTrace

@@ -14,7 +14,7 @@
 #include "log-cleaning.h"
 #include "memory-watermark.h"
 #include "background-value.h"
-#include "r47-trace.h"
+#include "event-loop-trace.h"
 #include <capnp/rpc-twoparty.h>
 #include <capnp/membrane.h>
 #include <capnp/compat/json.h>
@@ -4267,7 +4267,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
 }
 kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& timer) const {
   {
-    r47::Span span(r47::STATE_POOL);
+    eventLoopTrace::Span span(eventLoopTrace::STATE_POOL);
     impl->refresh();
     impl->syncEvents();
   }
@@ -4275,7 +4275,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
   // The worker gets only value snapshots; process generations are owned by the node thread.
   for (const auto& slot : impl->slots) {
     {
-      r47::Span span(r47::STATE_POOL);
+      eventLoopTrace::Span span(eventLoopTrace::STATE_POOL);
       Impl::eachGeneration(slot, [&](const auto& p) {
         if (p->pid > 0) inputs.push_back({p->pid, p->lifecycle.read()});
       });
@@ -4323,7 +4323,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << "},\"entries\":[";
   size_t i = 0;
   for (const auto& s : impl->slots) {
-    r47::Span span(r47::STATE_POOL);
+    eventLoopTrace::Span span(eventLoopTrace::STATE_POOL);
     const auto slotIndex = i;
     if (i++) out << ',';
     auto p = s.current;
@@ -4377,7 +4377,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
     span.finish();
     co_await timer.afterDelay(1 * kj::MICROSECONDS);
   }
-  r47::Span tail(r47::STATE_POOL);
+  eventLoopTrace::Span tail(eventLoopTrace::STATE_POOL);
   out << "],\"residentIsolatesByTenant\":{";
   bool firstResidentTenant = true;
   for (const auto& [tenant, count] : residentCounts) {

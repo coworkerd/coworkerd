@@ -43,6 +43,12 @@ The profiler records their separate hashes and selects the traced program by pro
 counter absent from the threaded lifecycle is recorded as unobserved, not as a successful collection.
 The generated allowlist must name the exact `workerd` being packaged; keep the paired threaded hash
 in the profile provenance with the archive record.
+
+When running `scripts/syscall-profile.mjs` directly in the profiling container, set
+`COWORKERD_PROFILE_BIN_DIR` to the directory containing the profiling binaries. The optional
+`COWORKERD_PROFILE_STACK_DIR` sets the disposable stack directory (default `/tmp/coworkerd-lab-stack`),
+`COWORKERD_PROFILE_SERVER_LOG` mirrors node output to a file, and `COWORKERD_PROFILE_MACHINE` labels
+the machine in the profile record. See the usage in [the script](scripts/syscall-profile.mjs).
 If `ALLOWLIST` is the generated directory, package and unpack your build into the same layout as the fetch command:
 
 ```bash

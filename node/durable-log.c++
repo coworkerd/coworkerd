@@ -1,5 +1,5 @@
 #include "durable-log.h"
-#include "r47-trace.h"
+#include "event-loop-trace.h"
 #include "background-value.h"
 #include "recovery-history.h"
 #include "durable-shards.h"
@@ -1967,7 +1967,7 @@ bool DurableLog::consumeChannelInbox(Channel& channel, bool sliced) {
   constexpr size_t FRAMES_PER_SLICE = 16;
   constexpr double SLICE_MS = 0.5;
   const auto began = sliced ? monotonicTimeMs() : 0;
-  r47::Span slice(r47::DURABLE_CHANNEL_SLICE);
+  eventLoopTrace::Span slice(eventLoopTrace::DURABLE_CHANNEL_SLICE);
   size_t at = 0, frames = 0;
   // At every suspension the inbox starts at the first unprocessed frame. Close can cancel
   // the reader and drain this same inbox without replaying its already processed prefix.
@@ -3271,7 +3271,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   // Keep the isolated records until this succeeds, so a failed manifest write is retried on the next seal.
   for (const auto sequence : isolated) {
     {
-      r47::Span build(r47::SEAL_BUILD);
+      eventLoopTrace::Span build(eventLoopTrace::SEAL_BUILD);
       auto found = parsed.find(sequence);
       if (found != parsed.end()) touched.insert(hostNameOf(found->second));
     }
@@ -3285,7 +3285,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   for (const auto& [sequence, record] : records) {
     if (sequence > selectionEnd) break;
     {
-      r47::Span build(r47::SEAL_BUILD);
+      eventLoopTrace::Span build(eventLoopTrace::SEAL_BUILD);
       if (isolated.contains(sequence)) {
         if (!first) first = sequence;
         last = sequence;
@@ -3391,7 +3391,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   }
   // The records are on the object store and every manifest names them: this node drops them, the peers are told to,
   // and each database may now checkpoint the frames the segment covers.
-  r47::Span commit(r47::SEAL_COMMIT);
+  eventLoopTrace::Span commit(eventLoopTrace::SEAL_COMMIT);
   for (uint64_t sequence = (first ? first : last); sequence <= last; ++sequence) {
     auto found = records.find(sequence);
     if (found != records.end()) {
@@ -3423,7 +3423,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   auto slice = monotonicTimeMs();
   for (const auto& name : touched) {
     {
-      r47::Span position(r47::SEAL_POSITION);
+      eventLoopTrace::Span position(eventLoopTrace::SEAL_POSITION);
       auto* object = objectOf(name);
       if (object != nullptr) writePosition(*object);
     }
@@ -3926,7 +3926,7 @@ kj::Promise<void> DurableLog::checkpointIdleObjects(double now) {
   auto began = monotonicTimeMs();
   while (!idleCheckpoints.empty() && idleCheckpoints.begin()->first <= now) {
     {
-      r47::Span scan(r47::CHECKPOINT_SCAN);
+      eventLoopTrace::Span scan(eventLoopTrace::CHECKPOINT_SCAN);
       auto due = idleCheckpoints.extract(idleCheckpoints.begin());
       if (auto* object = objectOf(due.value().second)) {
         object->checkpointDueMs = 0;
@@ -4038,7 +4038,7 @@ kj::Promise<void> DurableLog::cleanupClosedEpoch() {
     const auto original = logDirectory() / (wide(epoch) + ".log");
     std::error_code code;
     if (!std::filesystem::is_regular_file(original, code) || code) continue;
-    std::optional<r47::Span> cleanup(std::in_place, r47::CLOSED_EPOCH_CLEANUP);  // the loop's part only
+    std::optional<eventLoopTrace::Span> cleanup(std::in_place, eventLoopTrace::CLOSED_EPOCH_CLEANUP);  // the loop's part only
     std::vector<RecoveryEvent> carry;
     std::vector<std::string> carried;
     // Snapshot aggregate object state once per destination epoch. Later live
@@ -4512,7 +4512,7 @@ kj::Promise<void> DurableLog::publishEarlierObject(uint64_t epoch, const Segment
 void DurableLog::accountCacheSize(Object& object) {
   std::error_code code;
   uint64_t bytes = 0;
-  r47::Span disk(r47::COLD_OBJECT_FILES);
+  eventLoopTrace::Span disk(eventLoopTrace::COLD_OBJECT_FILES);
   for (const auto& [facetId, facet] : object.facets) {
     const auto database = std::filesystem::file_size(databasePath(object, facetId), code);
     if (!code) bytes += database;
@@ -4543,7 +4543,7 @@ kj::Promise<void> DurableLog::dropColdFiles(uint64_t reservedBytes) {
   auto resetSlice = [&] { items = 0; began = monotonicTimeMs(); };
   for (const auto& entry : std::filesystem::directory_iterator(logDirectory(), code)) {
     {
-      r47::Span logFiles(r47::COLD_LOG_FILES);
+      eventLoopTrace::Span logFiles(eventLoopTrace::COLD_LOG_FILES);
       if (entry.is_regular_file(code)) {
         const auto bytes = entry.file_size(code);
         if (!code) logBytes += bytes;
@@ -4610,7 +4610,7 @@ kj::Promise<void> DurableLog::dropColdFiles(uint64_t reservedBytes) {
       ++coldFilesSkippedLive;
       continue;
     }
-    r47::Span removal(r47::COLD_REMOVE);
+    eventLoopTrace::Span removal(eventLoopTrace::COLD_REMOVE);
     uint64_t freed = 0;
     for (const auto& [facetId, facet] : object->facets) {
       for (const char* suffix : {"", "-wal", "-shm"}) {
@@ -5319,7 +5319,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   const auto historyName = object->namespaceId + "/" + object->objectId;
   std::set<std::pair<uint64_t, uint64_t>> localUnsealed;
   {
-    r47::Span local(r47::RECOVERY_LOCAL_HISTORY);
+    eventLoopTrace::Span local(eventLoopTrace::RECOVERY_LOCAL_HISTORY);
     size_t decodedCount = 0;
     // The encoded unsealed log is node-wide. Decode only this object's sequences, in the
     // same order as the log, from the same event-loop turn as before. Do not hold a view
@@ -7574,7 +7574,7 @@ kj::Promise<void> DurableLog::usageLoop() {
 
 kj::Promise<void> DurableLog::publishUsage() {
   if (!enabled()) co_return;
-  r47::Span build(r47::USAGE_BUILD);
+  eventLoopTrace::Span build(eventLoopTrace::USAGE_BUILD);
   std::map<std::string, uint64_t> mine;
   for (const auto& [name, object] : objects) {
     if (object.tenant.empty() || object.state == ObjectState::GONE) continue;
