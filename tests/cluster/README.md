@@ -80,7 +80,8 @@ own default node admission budget. [Maintainer decision](https://github.com/cowo
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-memory-limit` with the matching Linux
 binaries. The threaded owner uses a 1 MiB SQLite heap budget. The case checks repeated queries
 below and above the budget, HTTP and D1 rollback, the confirmed `exec()` prefix, and recovery
-on the same SQLite connection after sort, value size and reply size errors.
+on the same SQLite connection after sort, value size and reply size errors. It also forces a
+WAL checkpoint and checks the child logs for allocator scope and accounting errors.
 
 ### Threaded SQL and CLI parity
 

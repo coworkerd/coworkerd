@@ -980,10 +980,19 @@ async function threadedSqlMemoryLimit(cluster) {
   await query([
     { sql: 'CREATE TABLE ledger (id INTEGER PRIMARY KEY, value TEXT)' },
     { sql: "INSERT INTO ledger VALUES (1, 'confirmed')" },
+    { sql: 'CREATE TABLE checkpoint_probe (value BLOB)' },
+    { sql: 'INSERT INTO checkpoint_probe VALUES (zeroblob(98304))' },
   ]);
   const log = async () => (await cluster.state(owner)).durableLog;
-  const before = await log();
+  const before = await eventually('the threaded SQL database checkpoints its confirmed WAL', async () => {
+    const state = await log();
+    assert.ok(state.threadedHomeIo.checkpointSamples > 0);
+    assert.ok(state.threadedHomeIo.maxCheckpointWalBytes >= 65536);
+    return state;
+  });
   assert.equal(before.threadedHomeIo.openSamples, 1);
+  assert.deepEqual((await query({ sql: 'SELECT length(value) AS bytes FROM checkpoint_probe' })).results,
+    [{ bytes: 98304 }]);
   const committed = [{ id: 1, value: 'confirmed' }];
   const code = 'SQL_MEMORY_LIMIT_EXCEEDED';
   const reason = 'the statement exceeds the database SQLite memory limit';
@@ -998,6 +1007,12 @@ async function threadedSqlMemoryLimit(cluster) {
     { sql: "INSERT INTO ledger VALUES (2, 'unconfirmed')" }, { sql: tooLargeWrite },
   ], 422), expected);
   assert.deepEqual(await binding('batch'), { message: `D1_ERROR: ${failure}`, cause: failure });
+  const conflict = await query([
+    { sql: "INSERT INTO ledger VALUES (6, 'unconfirmed')" },
+    { sql: "INSERT OR ROLLBACK INTO ledger VALUES (1, 'duplicate')" },
+  ]);
+  assert.equal(conflict[0].success, false);
+  assert.match(conflict[0].error, /UNIQUE constraint failed/);
   assert.deepEqual((await binding()).results, committed);
   assert.equal((await log()).log.records, before.log.records, 'failed batches wrote no log records');
 
@@ -1019,6 +1034,13 @@ async function threadedSqlMemoryLimit(cluster) {
   const after = await log();
   assert.equal(after.threadedHomeIo.openSamples, before.threadedHomeIo.openSamples, 'the same database stayed open');
   assert.equal(after.objects.repairs, before.objects.repairs, 'the connection needed no repair');
+  const childLogs = await cluster.compose(['logs', '--no-color', owner], { maxBuffer: 8 * 1024 * 1024 });
+  assert.equal(Array.from(childLogs.matchAll(/sqliteMem\w+ did not find a valid scope/g)).length, 0,
+    'SQLite allocations and frees during the checkpoint have a memory scope');
+  assert.equal(Array.from(childLogs.matchAll(/sqliteMem\w+ would have triggered a memoryBytes underflow/g)).length, 0,
+    'SQLite checkpoint allocations and frees balance');
+  assert.equal(Array.from(childLogs.matchAll(/SQL transaction refusal cleanup did not finish/g)).length, 0,
+    'the implicit rollback was settled before handling another request');
 }
 
 async function threadedDatabaseAccounting(cluster) {
@@ -3871,6 +3893,9 @@ export const durableGatedCases = {
   },
   'threaded-sql-memory-limit': {
     test: threadedSqlMemoryLimit, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
+    configureNode: node => node === 'node-1' ? ({
+      durableObjects: { threadedStorage: true, checkpointBytes: 65536 },
+    }) : ({}),
     nodeEnvironment: node => node === 'node-1' ? { COWORKERD_DO_TEST_SQL_MEMORY_BYTES: '1048576' } : {},
   },
   'threaded-sql-cli-parity': {
