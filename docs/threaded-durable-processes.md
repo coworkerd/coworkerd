@@ -56,9 +56,7 @@ seconds, the next woken tree of that Worker goes to another copy. A tree and its
 Choose placement before constructing the actor, and reserve thread, address space, heap and native charges
 before publishing it. Count initializing and closing trees against the backstop until their reservations
 are released. Include native databases in the process backstop, as database objects count today. Preserve the
-version pin and actor input/output gates, including supported
-interleaving across awaits. The mailbox bounds waiting events, rather than turning every event into a
-run-to-completion lock.
+version pin and actor input/output gates, including supported interleaving across awaits.
 
 An isolate-wide V8 interrupt needs a stricter contract for object-local CPU reset than the ordinary path
 does. Consume CPU only while that event executes (including its synchronous SQLite work). Once an interrupt
@@ -74,6 +72,44 @@ Choose the 30 s default and resolve the existing Worker `limits.cpuMs` and tenan
 admitting the event. The threaded durable ceiling is 300,000 ms. A higher per-Worker setting
 still needs room under the tenant's `maxWorkerCpuMs`, which defaults to 30,000 ms.
 [Worker limits](control-plane-api.md) · [Tenant defaults](../common/tenancy.h).
+
+### Per-object admission mailbox
+
+The threaded durable child keeps one FIFO of waiting events per root object tree, shared by the
+root and its facets for events admitted through the child. The release binaries use a depth of
+**4 waiting events** (`mailboxDepth`) and **64 KiB of waiting bytes** (`mailboxBytes`) when the
+experimental `durableObjects.threadedStorage` backend is enabled. The normal release configuration
+leaves that backend off. During a synchronous event, up to four more events can wait for that tree,
+provided their combined byte charge fits and the child can reserve them. Admission refuses an event
+when the count is already full or its addition would exceed the byte limit.
+
+The child charges a mailbox entry on accepting the routing preface and frees its waiting count and
+bytes when the home begins delivery, or when the queued event is canceled, expires or is refused.
+The node declares the byte charge as the encoded invocation descriptor size plus the payload bytes
+of a node-delivered WebSocket message, when present. HTTP bodies stream separately after admission.
+Delivered events, including those suspended at an `await` or waiting at an actor input gate, can
+still hold process resources. The input and output gates govern execution and allow supported
+interleaving across awaits. See [kernel admission](../patches/workerd/0045-threaded-durable-admission.patch)
+and [node routing](../node/main.c++).
+
+Each admitted event reserves a descriptor and 4 KiB of metadata plus its declared bytes from the
+child's shared budget. The per-tree bounds limit how much of that budget one busy tree can hold in
+waiting connections and metadata. The original queue profiles measured those costs before body
+reads and supported the initial four-event and 64 KiB settings. Admission can refuse earlier if
+the child lacks memory or descriptor reservations, a cold tree hits the resident limit or cannot
+reserve a home, or its assigned home is resetting. These conditions can produce the same `R`
+receipt as a full mailbox.
+See the [original queue profiles](https://github.com/coworkerd/coworkerd/pull/43) and the
+[operator guide](guide/durable-objects.md#threaded-object-admission).
+
+At `f1e41d5`, the hibernation cluster fixture already allowed 32 waiting events with the default
+64 KiB byte bound. The diagnostics for the parallel batch of 16 facet calls recorded a refusal
+before execution, with the same child PID and generation, zero actor or isolate resets, and further
+events delivered on the same home. Each deletion also schedules a close event on that home, and
+#93 changed the fixture to issue deletions one at a time. The recorded receipt and overload count
+leave the specific admission condition undetermined. See the
+[failure record](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7161010583) and
+[fixture change](https://github.com/coworkerd/coworkerd/pull/93).
 
 ## Node and child protocol
 
@@ -326,18 +362,29 @@ either saves the old actor before close begins or joins the next open, once.
 An eligible threaded platform database closes its tree and releases its exclusive copy about
 10 seconds after its last request finishes. Retaining empty copies exhausted the process
 admission budget in a serial scan of distinct databases. Releasing the copy with the tree
-returns that reservation. The first read after full release took an extra 9.86 ms p50 and
-14.45 ms p99 compared with its immediate warm repeat in the same-epoch D1 profile.
-[Idle-window measurements](database-home-benchmark.md#idle-window-for-exclusive-platform-database-copies)
+returns that reservation. With timed release enabled, the first read after full release
+took an extra 9.46 ms at p50 and 14.38 ms at p99 compared with its immediate warm repeat
+in the same-epoch D1 profile.
+[Idle-window measurements](database-home-benchmark.md#verification-with-patch-0174)
 
 A threaded database can also retire under admission pressure before its idle timer fires.
 The process ranks eligible database trees across its homes by the last completed call.
 The selected home rechecks the mailbox, active calls, tracked background work and WAL
 confirmation before closing the tree. The admission retry follows the normal close and
-copy release. The home remains available to a database for 100 ms after a routing
-retirement, giving the preface retry time to return even when tenant objects are arriving.
+copy release. After a routing retirement, the home and one routing tree credit give
+databases 100 ms to retry at the native preface. Existing tenant trees can continue
+serving calls during that interval.
 A cold load that cannot register its initial reservation may retire one database whose
-charge would cover the shortfall. It waits for that reservation to return before one retry.
+charge would cover the shortfall. One preparation credit is held for a database while
+the reservation returns and for up to 100 ms afterward. The cold load retries once.
+Above the initial-admission ceiling, a database can only replace one idle database.
+Its first reservation must fit within the returned charge and leave the total within
+the hard process budget. In the memory probe the existing copies charged 1,974,448,702
+bytes against the initial-admission ceiling of 1,973,251,124 bytes. A typical copy
+returned 2,732,370 bytes, and the new copy's first reservation was 2,621,440 bytes.
+If retirement cannot return the reservation within one second, the process clears the
+victim, counts an overload and logs its home and tree. Capacity waiters receive a refusal
+and the process can use the home once its normal close is complete.
 [Admission measurements](database-home-benchmark.md#database-admission-at-the-ceiling)
 
 Use the node's WebSocket registry and transport loop for parked connections. The handoff carries the

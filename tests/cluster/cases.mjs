@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { rename, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { get } from 'node:http';
 import { createRequire } from 'node:module';
 import { createConnection } from 'node:net';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import { assertStatus, eventually, json, request } from './cluster.mjs';
 
 function respondWith(value) {
@@ -162,7 +163,7 @@ async function webSocketAdmission(cluster) {
 async function sqlAtomicity(cluster) {
   const { path, token } = await cluster.tenant('sql-test');
   const database = `${path}/databases/ledger`;
-  await cluster.api(database, { method: 'POST', token });
+  const { database: created } = await cluster.api(database, { method: 'POST', token });
   const query = (body) => cluster.api(`${database}/query`, { method: 'POST', token, body, timeout: 35000 });
   // The database's namespace can take time to become visible on the nodes.
   await eventually('database serves SELECT', async () => {
@@ -182,6 +183,7 @@ async function sqlAtomicity(cluster) {
   assert.equal(refused[0]?.success, false, 'the duplicate primary key must reject the transaction');
   assert.match(refused[0].error, /UNIQUE constraint failed/);
   assert.deepEqual(await read(), rows, 'the failed transaction left the committed rows intact');
+  return created;
 }
 
 async function createDatabaseHomes(cluster, tenant, counts, { limit = 36, successors } = {}) {
@@ -230,6 +232,125 @@ function shardOwnerOrder(cluster, namespaceId, shard) {
     .update(`${namespaceId}/${shard}\0${node}`).digest().readBigUInt64BE()]);
   scores.sort((a, b) => a[1] > b[1] ? -1 : a[1] < b[1] ? 1 : a[0].localeCompare(b[0]));
   return scores.map(([node]) => node);
+}
+
+async function databaseDispatches(cluster, db, owner) {
+  const logs = await cluster.compose(['logs', '--no-color', owner]);
+  return logs.split('\n').filter(line => line.includes('[do] ')).map(line => JSON.parse(line.split('[do] ')[1]))
+    .filter(row => row.nodeId === owner && row.namespaceId === db.namespaceId.slice(0, 12) && row.status === 200);
+}
+
+async function threadedSqlCliParity(cluster) {
+  const ledger = await sqlAtomicity(cluster);
+  const tenant = await cluster.tenant('sql-cli');
+  const cwd = join(cluster.directory, 'd1-cli');
+  await mkdir(cwd);
+  await writeFile(join(cwd, 'cowctl.json'), JSON.stringify({ tenant: tenant.name, controlPlane: cluster.urls.apiserver }));
+  const cowctl = fileURLToPath(new URL('../../cli/bin/cowctl.mjs', import.meta.url));
+  const cli = async (...args) => JSON.parse(await cluster.command(process.execPath,
+    [cowctl, 'd1', ...args, '--json'], { cwd, token: tenant.token, env: { HOME: cwd } }));
+
+  const { database: source } = await cli('create', 'books');
+  const migration = await cli('migrations', 'create', source.name, 'create books');
+  await writeFile(join(migration.directory, migration.created), `CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+CREATE UNIQUE INDEX book_title ON books(title);
+INSERT INTO books VALUES (1, 'One');
+`);
+  assert.deepEqual((await cli('migrations', 'list', source.name)).pending, [migration.created]);
+  assert.deepEqual((await cli('migrations', 'apply', source.name, '--yes')).applied, [migration.created]);
+  assert.deepEqual((await cli('migrations', 'list', source.name)).pending, []);
+
+  const importFile = async (name, file) => {
+    const result = await cli('execute', name, '--file', file, '--yes');
+    assert.equal(result.success, true);
+    assert.equal(result.committedOffset, (await stat(join(cwd, file))).size);
+  };
+  await writeFile(join(cwd, 'seed.sql'), "INSERT INTO books VALUES (2, 'Two; 二')\n");
+  await importFile(source.name, 'seed.sql');
+  const rowsSql = 'SELECT id, title FROM books ORDER BY id';
+  const rows = [{ id: 1, title: 'One' }, { id: 2, title: 'Two; 二' }];
+  const execute = async (name, sql) => {
+    const result = await cli('execute', name, '--sql', sql);
+    assert.equal(result.success, true, result.error);
+    return result.results;
+  };
+  const schemaSql = "SELECT type, name, sql FROM sqlite_schema WHERE name IN ('books', 'book_title', 'd1_migrations') ORDER BY name";
+  const schema = await execute(source.name, schemaSql);
+  assert.equal(schema.length, 3);
+  assert.deepEqual(await execute(source.name, rowsSql), rows);
+
+  const sourceOwner = shardOwnerOrder(cluster, source.namespaceId, 0)[0];
+  const log = async () => (await cluster.state(sourceOwner)).durableLog.log;
+  const publishedPoint = async () => {
+    const confirmed = BigInt((await log()).nextSeq);
+    assert.ok(confirmed > 0n);
+    await eventually('the owner publishes the confirmed source writes', async () => {
+      assert.ok(BigInt((await log()).sealedSeq) >= confirmed);
+    });
+    return (await cli('time-travel', 'info', source.name)).point;
+  };
+  const point = await publishedPoint();
+  assert.ok(point.bookmark);
+
+  const exported = await cli('export', source.name, '--output', 'backup.sql');
+  assert.equal(exported.success, true);
+  assert.equal(exported.mode, 'atomic');
+  const { database: backup } = await cli('create', 'books-backup');
+  await importFile(backup.name, 'backup.sql');
+
+  await execute(source.name, "INSERT INTO books VALUES (3, 'After bookmark')");
+  const latest = await publishedPoint();
+  assert.ok(BigInt(latest.revision) > BigInt(point.revision));
+  const restored = await cli('time-travel', 'restore', source.name, '--bookmark', point.bookmark,
+    '--to', 'books-restored', '--yes', '--timeout-ms', '45000');
+  assert.equal(restored.phase, 'completed');
+  assert.equal(restored.database, 'books-restored');
+  assert.equal(restored.point.bookmark, point.bookmark);
+  assert.notEqual(restored.namespaceId, source.namespaceId);
+  const historical = { name: restored.database, namespaceId: restored.namespaceId };
+  for (const db of [backup, historical]) {
+    await eventually(`${db.name} serves the restored schema`, async () => {
+      assert.deepEqual(await execute(db.name, schemaSql), schema);
+    });
+    assert.deepEqual(await execute(db.name, 'SELECT name FROM d1_migrations ORDER BY id'), [{ name: migration.created }]);
+    assert.deepEqual(await execute(db.name, rowsSql), rows, `${db.name} contains the confirmed snapshot rows`);
+  }
+
+  await cluster.deploy(tenant, 'read-write', `export default { async fetch(request, env) {
+    const db = env[new URL(request.url).searchParams.get('db')];
+    if (request.method === 'POST') {
+      await db.prepare('INSERT INTO books VALUES (?, ?)').bind(4, 'D1 write').run();
+    }
+    return Response.json((await db.prepare(${JSON.stringify(rowsSql)}).all()).results);
+  } };`, { wrangler: { d1_databases: [backup, historical].map(({ name }, index) => ({
+    binding: `DB${index}`, database_name: name,
+  })) } });
+  const withWrite = [...rows, { id: 4, title: 'D1 write' }];
+  for (const [index, db] of [backup, historical].entries()) {
+    const [, ingress] = shardOwnerOrder(cluster, db.namespaceId, 0);
+    const call = async method => json(await workerCall(cluster, ingress, tenant, `read-write?db=DB${index}`, { method }),
+      200, `${db.name} D1 ${method}`);
+    await eventually(`${db.name} is readable through its D1 binding`, async () => assert.deepEqual(await call('GET'), rows));
+    assert.deepEqual(await call('POST'), withWrite);
+    assert.deepEqual(await execute(db.name, rowsSql), withWrite);
+  }
+  assert.deepEqual(await execute(source.name, rowsSql), [...rows, { id: 3, title: 'After bookmark' }]);
+
+  for (const db of [ledger, source, backup, historical]) {
+    const [owner] = shardOwnerOrder(cluster, db.namespaceId, 0);
+    const process = await durableGeneration(cluster, owner);
+    assert.equal(process.lifecycle.durableServer, 'threaded');
+    const callers = db === backup || db === historical ? ['node', 'worker'] : ['node'];
+    await eventually(`${db.name} dispatched SqlDatabase in ${owner}'s threaded generation`, async () => {
+      const calls = await databaseDispatches(cluster, db, owner);
+      for (const caller of callers) {
+        assert.ok(calls.some(call => call.caller === caller && call.className === '__coworkerdSqlDatabase' &&
+          call.processId === process.processId && call.processGeneration === process.generation), `${db.name} ${caller}`);
+      }
+    });
+    console.log(`${db.name}: ${callers.join(' and ')} dispatch through ${owner}/${process.processId} generation ${process.generation}`);
+  }
+  console.log(`Restored published revision ${point.revision} and the atomic SQL export`);
 }
 
 async function threadedDatabaseAlarm(cluster) {
@@ -337,11 +458,6 @@ async function threadedDatabasePlacement(cluster) {
     const reply = await publicSql(db, { sql: 'SELECT value FROM records' });
     assert.deepEqual(reply.results, [{ value: db.name }]);
   };
-  const dispatches = async (db, owner) => {
-    const logs = await cluster.compose(['logs', '--no-color', owner]);
-    return logs.split('\n').filter(line => line.includes('[do] ')).map(line => JSON.parse(line.split('[do] ')[1]))
-      .filter(row => row.nodeId === owner && row.namespaceId === db.namespaceId.slice(0, 12) && row.status === 200);
-  };
   const assertMapping = (call, generation) => {
     assert.equal(call.workerId, `${tenant.name}/__databases`);
     assert.equal(call.className, '__coworkerdSqlDatabase');
@@ -396,7 +512,7 @@ async function threadedDatabasePlacement(cluster) {
     const from = db.owner === threaded ? upstream : threaded;
     const ownerProcess = db.owner === threaded ? process : await durableGeneration(cluster, upstream);
     await eventually(`both requests reached the local SqlDatabase on ${db.owner}`, async () => {
-      const calls = (await dispatches(db, db.owner)).filter(row => row.route === 'received' && row.node === from);
+      const calls = (await databaseDispatches(cluster, db, db.owner)).filter(row => row.route === 'received' && row.node === from);
       for (const caller of ['node', 'worker']) {
         const call = calls.find(row => row.caller === caller);
         assert.ok(call, `${from} forwarded ${caller} to ${db.owner}`);
@@ -425,7 +541,7 @@ async function threadedDatabasePlacement(cluster) {
     for (const db of databases.get(original)) {
       await eventually(`${successor} takes over ${db.name} and reads its acknowledged row`, async () => {
         await read(db);
-        const calls = await dispatches(db, successor);
+        const calls = await databaseDispatches(cluster, db, successor);
         const call = calls.find(row => row.caller === 'node' && (row.route === 'local' || row.route === 'received') &&
           BigInt(row.shardEpoch) > epochs.get(db.name));
         assert.ok(call, `${successor} served ${db.name} at a later epoch than ${original}`);
@@ -552,6 +668,7 @@ async function threadedDatabaseAdmission(cluster) {
     assert.equal(latest.generation, original.generation);
     const admission = latest.lifecycle.durableAdmission;
     for (const [field, value] of Object.entries(expected)) assert.equal(admission[field], value, field);
+    return admission;
   };
   const observe = (label, expected) => eventually(label, () => sample(expected), { interval: 25 });
 
@@ -617,7 +734,82 @@ async function threadedDatabaseAdmission(cluster) {
   if (queued.error) throw queued.error;
   assert.deepEqual(queued, [{ id: 1 }, { id: 2 }]);
   assert.deepEqual(json(await sql(overflow, probe), 200, 'retry after drain').results, [{ value: 17 }]);
+
+  const beforeDeadline = await observe('three homes are idle before the next admission',
+    { residentRoots: 3, running: 0, waiting: 0, pendingCommits: 0 });
+  const holdReservation = join(cluster.durableLifecycleGate, 'hold-database-reservation');
+  await writeFile(holdReservation, '');
+  try {
+    assert.deepEqual(json(await sql(newcomer, probe), 200, 'retry after a retirement deadline').results,
+      [{ value: 17 }]);
+    await observe('the stranded reservation produces one refusal without pinning its home', {
+      admissionRetirements: beforeDeadline.admissionRetirements + 1,
+      overloaded: beforeDeadline.overloaded + 1, residentRoots: 3, idleRetirements: 0,
+    });
+  } finally {
+    await unlink(holdReservation);
+  }
   console.log('Three busy homes refused a fourth database. Idle admission preserved the queued read and confirmed rows.');
+}
+
+async function threadedDatabaseAdmissionMixed(cluster) {
+  const [owner] = cluster.nodes;
+  const homes = 4;
+  const count = 36;
+  const competitorCount = 6;
+  const sqlTenant = await cluster.tenant('sql-mixed', { durableObjectNamespaces: count });
+  const objectTenant = await cluster.tenant('sql-mixed-objects', {
+    workers: competitorCount, durableObjectNamespaces: competitorCount,
+  });
+  const workers = Array.from({ length: competitorCount }, (_, index) => 'object-' + index);
+  for (const name of workers) {
+    await cluster.deploy(objectTenant, name, `
+      export class Service { fetch() { return new Response('admitted'); } }
+      export default { fetch(request, env) { return env.SERVICE.getByName('one').fetch(request); } };
+    `, { wrangler: {
+      durable_objects: { bindings: [{ name: 'SERVICE', class_name: 'Service' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['Service'] }],
+    } });
+  }
+  const { databases } = await createDatabaseHomes(cluster, sqlTenant, new Map([[owner, count]]));
+  const names = databases.get(owner);
+  const query = db => request(cluster.urls.apiserver, db.path + '/query', {
+    method: 'POST', token: sqlTenant.token, body: { sql: 'SELECT 1 AS value' },
+  });
+  const expectQuery = async db => assert.deepEqual(
+    json(await query(db), 200, db.name).results, [{ value: 1 }]);
+  for (const db of names.slice(0, homes)) await expectQuery(db);
+  const before = await eventually('four homes hold settled databases before the scan', async () => {
+    const state = await durableGeneration(cluster, owner);
+    assert.equal(state.lifecycle.durableAdmission.residentRoots, homes);
+    assert.equal(state.lifecycle.durableAdmission.running, 0);
+    return state;
+  }, { interval: 25 });
+  let scanning = true;
+  let attempts = 0;
+  const traffic = Promise.allSettled(workers.map(async name => {
+    while (scanning) {
+      await request(cluster.urls[owner], '/' + objectTenant.name + '/' + name);
+      ++attempts;
+    }
+  }));
+  try {
+    await eventually('the tenant Workers contend for new homes before the scan', () => {
+      assert.ok(attempts >= competitorCount);
+    }, { interval: 10 });
+    for (const db of names.slice(homes)) await expectQuery(db);
+  } finally {
+    scanning = false;
+    for (const result of await traffic) {
+      if (result.status === 'rejected') throw result.reason;
+    }
+  }
+  await eventually('the same process retires databases for the scan while tenant Workers compete', async () => {
+    const after = await durableGeneration(cluster, owner);
+    assert.equal(after.pid, before.pid);
+    assert.equal(after.generation, before.generation);
+    assert.ok(after.lifecycle.durableAdmission.admissionRetirements >= count - homes);
+  }, { interval: 25 });
 }
 
 async function threadedDatabaseAccounting(cluster) {
@@ -3254,34 +3446,43 @@ export const durableGatedCases = {
     test: threadedDatabaseRelease, nodes: ['node-1', 'node-2', 'node-3'], holdPeerAcks: false,
   },
   'durable-threaded-database-alarm': {
-    test: threadedDatabaseAlarm, nodes: ['node-1'], databaseFixtureNode: 'node-1',
+    test: threadedDatabaseAlarm, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
     databaseAlarmFixture: true, holdPeerAcks: false,
   },
   'durable-threaded-database-placement': {
-    test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNode: 'node-1',
+    test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
     publishPeerPorts: true, controlDurableLifecycle: true, holdPeerAcks: false,
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
   },
   'durable-threaded-database-admission': {
-    test: threadedDatabaseAdmission, nodes: ['node-1'], databaseFixtureNode: 'node-1',
+    test: threadedDatabaseAdmission, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
     controlDurableLifecycle: true, confirmTimeoutMs: 15000,
     nodeEnvironment: () => ({ COWORKERD_DO_TEST_HOME_COUNT: '3' }),
   },
+  'durable-threaded-database-admission-mixed': {
+    test: threadedDatabaseAdmissionMixed, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    singleNode: true, holdPeerAcks: false,
+  },
   'durable-threaded-database-accounting': {
-    test: threadedDatabaseAccounting, nodes: ['node-1'], databaseFixtureNode: 'node-1', holdPeerAcks: false,
+    test: threadedDatabaseAccounting, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
     platformFixture: () => [{ worker: 'sql-accounting/object', bindingClass: 'Echo', className: 'PlatformEcho' }],
   },
   'threaded-sql-deadline': {
-    test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNode: 'node-1',
+    test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
   },
   'threaded-sql-transaction-limit': {
-    test: threadedSqlTransactionLimit, nodes: ['node-1'], databaseFixtureNode: 'node-1', holdPeerAcks: false,
+    test: threadedSqlTransactionLimit, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
     // Only the owner uses the small record cap. Its two peers need room to
     // hold the schema record and the boundary record together.
     configureNode: node => node === 'node-1' ? ({
       durableObjects: { threadedStorage: true, peerBufferBytes: sqlWalPeerBufferBytes,
         checkpointBytes: 8 * 1024 * 1024 },
     }) : ({}),
+  },
+  'threaded-sql-cli-parity': {
+    test: threadedSqlCliParity, nodes: ['node-1', 'node-2', 'node-3'],
+    databaseFixtureNodes: ['node-1', 'node-2', 'node-3'], holdPeerAcks: false,
+    configureNode: () => ({ durableObjects: { threadedStorage: true, segmentIntervalMs: 1000 } }),
   },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-platform-definition': {

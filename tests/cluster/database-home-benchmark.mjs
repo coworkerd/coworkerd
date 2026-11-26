@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { appendFile, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, rename, writeFile } from 'node:fs/promises';
 import { arch, cpus, freemem, loadavg, platform, release, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -10,16 +10,23 @@ import { Cluster, eventually, json, request } from './cluster.mjs';
 const [side, checkoutArg, kernelArg, outputArg, mode, ...extra] = process.argv.slice(2);
 const memoryAdmission = mode === '--idle-admission-memory';
 const unpacedAdmission = mode === '--idle-admission-unpaced' || memoryAdmission;
-const mixedAdmission = mode === '--idle-admission-mixed';
+const mixedCeiling = {
+  '--idle-admission-mixed': 'homes',
+  '--idle-admission-mixed-memory': 'memory',
+  '--idle-admission-mixed-resident': 'residentObjects',
+}[mode];
+const mixedAdmission = mixedCeiling !== undefined;
+const residentObjects = mixedCeiling === 'residentObjects' ? 4 : undefined;
 const busyProcesses = { '--idle-admission-busy-one': 1, '--idle-admission-busy-two': 2 }[mode];
 const idleAdmission = mode === '--idle-window-admission' || unpacedAdmission || mixedAdmission || Boolean(busyProcesses);
-const defaultHomes = mode === '--idle-admission-unpaced' || mixedAdmission || Boolean(busyProcesses);
+const defaultHomes = mode === '--idle-admission-unpaced' || mixedCeiling === 'homes' || Boolean(busyProcesses);
 const defaultIdleWindow = mode === '--idle-window-default';
 const patchedIdleWindow = mode === '--idle-window-patched';
 const idleWindow = mode === '--idle-window' || defaultIdleWindow || patchedIdleWindow || idleAdmission;
 const modes = ['--smoke', '--default-admission', '--cold-follow-up', '--throughput', '--throughput-smoke',
   '--idle-window', '--idle-window-default', '--idle-window-patched', '--idle-window-admission',
   '--idle-admission-unpaced', '--idle-admission-memory', '--idle-admission-mixed',
+  '--idle-admission-mixed-memory', '--idle-admission-mixed-resident',
   '--idle-admission-busy-one', '--idle-admission-busy-two'];
 if (!['object', 'native'].includes(side) || !checkoutArg || !kernelArg || !outputArg ||
     (mode !== undefined && !modes.includes(mode)) || (idleWindow && side !== 'object') || extra.length) {
@@ -46,7 +53,8 @@ const BenchmarkCluster = idleWindow
   ? (await import(pathToFileURL(join(checkout, 'tests/cluster/cluster.mjs')).href)).Cluster
   : Cluster;
 const settings = {
-  homes: memoryAdmission ? 192
+  homes: mixedCeiling === 'memory' ? 768
+    : residentObjects ? 12 : memoryAdmission ? 192
     : defaultHomes ? 4 : idleWindow && !idleAdmission ? 80 : smoke || throughput ? 16 : 520,
   density: idleWindow ? [0, 1, 32, 64] : smoke ? [0, 3, 8] : [0, 100, 500],
   coldSamples: smoke ? 6 : 200,
@@ -71,7 +79,13 @@ process.env.COWORKERD_CLUSTER_BIN_DIR = binaries;
 const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   singleNode: true,
   productRoot: checkout,
-  databaseFixtureNode: idleWindow ? 'node-1' : undefined,
+  controlDurableLifecycle: mixedCeiling === 'memory',
+  threadedNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
+  ...(idleWindow && {
+    databaseFixtureNodes: ['node-1'],
+    // The imported Cluster from a historical checkout uses the singular option.
+    databaseFixtureNode: 'node-1',
+  }),
   configureNode: () => ({
     quarantineProcesses: 1,
     // A completed HTTP reply can precede retirement of its invocation.
@@ -85,7 +99,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
     }),
       ...(memoryAdmission && { threadedMemoryBytes: 448 * 1024 ** 2 }),
       ...(!defaultAdmission && !idleWindow && { threadedMemoryBytes: 3 * 1024 ** 3 }) },
-    durableObjects: { processes: busyProcesses ?? 1, threadedStorage: true, peers: 0 },
+    durableObjects: { processes: busyProcesses ?? 1, threadedStorage: true, peers: 0, residentObjects },
   }),
   nodeEnvironment: () => ({
     ...(!defaultHomes && { COWORKERD_DO_TEST_HOME_COUNT: String(settings.homes) }),
@@ -97,10 +111,14 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   }),
 });
 const [owner] = cluster.nodes;
-if (idleWindow) assert.equal(cluster.databaseFixtureNode, owner, 'supply a database placement checkout');
+if (idleWindow) {
+  assert.ok(cluster.databaseFixtureNodes?.has(owner) ?? (cluster.databaseFixtureNode === owner),
+    'supply a database placement checkout');
+}
 const tenantName = 'database-benchmark';
 const workload = 'traffic';
-const databaseCount = memoryAdmission ? 125 : mixedAdmission ? 120 : busyProcesses ? 64 : idleAdmission ? admissionDatabases
+const databaseCount = mixedCeiling === 'memory' ? settings.homes + 120
+  : memoryAdmission ? 125 : mixedAdmission ? 120 : busyProcesses ? 64 : idleAdmission ? admissionDatabases
   : throughput ? 8 : defaultAdmission ? settings.homes + 1 : settings.density.at(-1);
 const databases = Array.from({ length: databaseCount },
   (_, index) => 'db-' + String(index).padStart(4, '0'));
@@ -864,7 +882,10 @@ async function runMixedAdmission() {
         return new Response(${JSON.stringify(name)});
       }
     }
-    export default { async fetch(request, env) { return env.SERVICE.getByName('one').fetch(request); } };`,
+    export default { async fetch(request, env) {
+      const id = new URL(request.url).searchParams.get('object') ?? 'one';
+      return env.SERVICE.getByName(id).fetch(request);
+    } };`,
     { wrangler: {
       durable_objects: { bindings: [{ name: 'SERVICE', class_name: 'Service' }] },
       migrations: [{ tag: 'v1', new_sqlite_classes: ['Service'] }],
@@ -873,22 +894,74 @@ async function runMixedAdmission() {
   const sql = name => request(cluster.urls.apiserver, tenant.path + '/databases/' + name + '/query', {
     method: 'POST', token: tenant.token, body: { sql: 'SELECT 1 AS value' },
   });
-  for (const name of databases.slice(0, settings.homes)) {
+  const expectSql = async name => {
     assert.deepEqual(json(await sql(name), 200, name).results, [{ value: 1 }]);
+  };
+  const readResidency = async () => (await durable()).entry.lifecycle.durableAdmission;
+  const objectPath = name => `/${objects.name}/${name}`;
+  let warmed = residentObjects ? residentObjects - 1 : settings.homes;
+  if (residentObjects) {
+    const name = workers[0];
+    const reply = await request(cluster.urls[owner], objectPath(name));
+    assert.equal(reply.status, 200, reply.text);
   }
-  await eventually('all homes hold a settled database before offering competing objects', async () => {
-    const { entry } = await durable();
-    assert.equal(entry.lifecycle.durableAdmission.residentRoots, settings.homes);
-    assert.equal(entry.lifecycle.durableAdmission.running, 0);
+  if (mixedCeiling === 'memory') {
+    // Keep the timed release clock near its initial value while filling hundreds
+    // of homes. Leave the process memory budget and routing tree limit at defaults.
+    const warmStart = performance.now();
+    const offset = join(cluster.durableLifecycleGate, 'idle-offset-ms');
+    const nextOffset = offset + '-next';
+    const setOffset = async milliseconds => {
+      await writeFile(nextOffset, String(milliseconds));
+      await rename(nextOffset, offset);
+    };
+    for (warmed = 0; warmed < settings.homes; ++warmed) {
+      if (warmed % 8 === 0) await setOffset(180000 - Math.floor(performance.now() - warmStart));
+      await expectSql(databases[warmed]);
+      if ((await readResidency()).admissionRetirements > 0) {
+        ++warmed;
+        break;
+      }
+    }
+    await setOffset(0);
+    const { entry, processPool, log } = await durable();
+    const treeLimit = log.settings.residentObjects;
+    await record('mixed-memory-warmup', {
+      warmed, elapsedMs: performance.now() - warmStart, rssBytes: entry.residentBytes,
+      memoryBudgetBytes: processPool.threadedMemoryBytes, isolateLimit: processPool.threadedResidentLimit,
+      treeLimit, residency: entry.lifecycle.durableAdmission,
+    });
+    assert.ok(warmed < settings.homes, 'memory admission started with spare homes');
+    assert.ok(warmed < processPool.threadedResidentLimit, 'isolate count has headroom');
+    assert.ok(warmed < treeLimit, 'routing tree count has headroom');
+    assert.equal(entry.lifecycle.durableAdmission.groupCreationRefusals, 0, 'isolate groups are available');
+  } else {
+    for (const name of databases.slice(0, warmed)) await expectSql(name);
+  }
+  const before = await eventually('databases settle at the chosen ceiling before competing traffic', async () => {
+    const residency = await readResidency();
+    assert.equal(residency.running, 0);
+    if (mixedCeiling === 'memory') {
+      assert.ok(residency.homes < settings.homes);
+      assert.ok(residency.admissionRetirements > 0);
+    } else {
+      assert.equal(residency.residentRoots, residentObjects ?? settings.homes);
+    }
+    return residency;
   });
+  const scan = databases.slice(warmed, warmed + 116);
   const start = performance.now();
   let scanning = true;
   let objectAttempts = 0;
   const objectAdmissions = new Map();
   const sqlStatuses = new Map();
+  let firstSqlFailure;
   const objectTraffic = workers.map(async name => {
     while (scanning && performance.now() - start < 20000) {
-      const reply = await request(cluster.urls[owner], `/${objects.name}/${name}`);
+      // At the tree ceiling a new key can claim the freed place through an
+      // already warm tenant copy, with no new home or isolate reservation.
+      const key = residentObjects ? '?object=candidate-' + objectAttempts : '';
+      const reply = await request(cluster.urls[owner], objectPath(name) + key);
       ++objectAttempts;
       if (reply.status === 200 && !objectAdmissions.has(name)) {
         objectAdmissions.set(name, performance.now() - start);
@@ -898,10 +971,11 @@ async function runMixedAdmission() {
   // Capture early traffic failures immediately so they are reported after cleanup.
   const objectResults = Promise.allSettled(objectTraffic);
   try {
-    for (const name of databases.slice(settings.homes)) {
+    for (const name of scan) {
       const reply = await sql(name);
       sqlStatuses.set(reply.status, (sqlStatuses.get(reply.status) ?? 0) + 1);
       if (reply.status === 200) assert.deepEqual(JSON.parse(reply.text).results, [{ value: 1 }]);
+      else firstSqlFailure ??= { name, status: reply.status, body: reply.text };
     }
   } finally {
     scanning = false;
@@ -909,17 +983,20 @@ async function runMixedAdmission() {
       if (result.status === 'rejected') throw result.reason;
     }
   }
-  const { entry } = await durable();
+  const { entry, processPool } = await durable();
   assert.equal(entry.pid, child.pid);
   assert.equal(entry.generation, child.generation);
   await record('mixed-admission-result', {
+    ceiling: mixedCeiling, warmed, databasesOffered: scan.length, before, residentObjects,
+    memoryBudgetBytes: processPool.threadedMemoryBytes, rssBytes: entry.residentBytes,
     elapsedMs: performance.now() - start, objectsOffered: workers.length, objectAttempts,
     objectAdmissions: Object.fromEntries(objectAdmissions), sqlStatuses: Object.fromEntries(sqlStatuses),
+    firstSqlFailure,
     residency: entry.lifecycle.durableAdmission,
   });
   assert.ok(objectAttempts >= workers.length);
-  assert.equal(sqlStatuses.get(200), databases.length - settings.homes);
-  assert.ok(entry.lifecycle.durableAdmission.admissionRetirements > 0);
+  assert.equal(sqlStatuses.get(200), scan.length);
+  assert.ok(entry.lifecycle.durableAdmission.admissionRetirements > before.admissionRetirements);
 }
 
 async function runDefaultAdmission(kernelHash) {

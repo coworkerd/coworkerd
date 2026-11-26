@@ -51,6 +51,14 @@ including writes with a connected client. It checks the complete reply on a half
 connection and terminates an active HTTP writer with a TCP reset. Reads already queued behind
 the interrupted writes must return the earlier confirmed value, with no additional SQLite opens.
 
+### Threaded SQL and CLI parity
+
+Run `node tests/cluster/run.mjs "$kernel" threaded-sql-cli-parity` to run `sql-atomicity` with the
+`coworkerd-platform-test` executable on all three threaded nodes. The case applies a `cowctl d1` migration,
+imports a small SQL file, and restores both a SQL export and a published bookmark into new databases. It compares
+the schema, migration ledger and confirmed rows, then writes through a D1 binding and reads the result through the
+CLI. Owner dispatch records verify that the SQL calls reached the platform database in a threaded process.
+
 ### Database placement across builds
 
 `threaded-sql-transaction-limit` uses the test executable on the threaded owner. It sets the peer
@@ -62,7 +70,11 @@ confirmed `exec()` prefix. A follow-up write and read run on the same open datab
 refreshes the first database. A new database displaces the least recently used eligible one while a
 third database waits for write confirmation with another query queued behind it. The case reopens the
 displaced database and reads its previously confirmed row. It then holds all three homes busy and
-checks the capacity refusal and recovery.
+checks the capacity refusal and recovery. A test fixture holds the final reservation past the
+one-second deadline so the case also verifies that the refusal is counted and the home is reusable.
+
+`durable-threaded-database-admission-mixed` fills the four default homes and runs a serial SQL scan
+while tenant objects from six definitions compete for the released homes in the same process.
 
 `durable-threaded-database-placement` uses the test executable on the threaded owner and the upstream
 database backend on the other nodes. It checks HTTP SQL and D1 in both directions, batch rollback, two
