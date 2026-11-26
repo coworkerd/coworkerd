@@ -361,6 +361,20 @@ rejects with `D1_ERROR: SQL_TRANSACTION_TOO_LARGE: …` and rolls back the entir
 `exec()` reports the failing line as a `D1_EXEC_ERROR` and keeps the earlier confirmed lines.
 The same open database can serve another request after the rollback.
 
+SQLite can spill dirty pages to the WAL and open temporary files for work such as sorting.
+`durableObjects.sqlDatabaseSpillBytes` defaults to 1 GiB and covers the active transaction's
+uncommitted WAL frames plus the database's live temporary files. Reused WAL space counts for the
+current transaction. WAL frames from earlier commits are outside this charge. The WAL charge
+ends at commit or rollback, and temporary files are charged through close. The sum across open
+databases in one persistent durable process is limited by `durableObjects.sqlProcessSpillBytes`,
+which defaults to four times the database budget (4 GiB with defaults). Temporary files live in
+the node's durable storage directory (`do/` under the stack directory), with or without the launcher.
+
+Exceeding either disk budget returns HTTP `507 SQL_SPILL_LIMIT_EXCEEDED` and rolls back the
+current transaction. A D1 batch rejects with `D1_ERROR: SQL_SPILL_LIMIT_EXCEEDED: …` and rolls back
+all its writes. A failing `exec()` line keeps its earlier confirmed lines. The same open database
+can serve subsequent requests. The one-record transaction limit above also applies.
+
 Each threaded platform database in the test executable has a 32 MiB SQLite heap budget. It covers
 SQLite allocations for the open connection, including statements and page and sort buffers. Growing
 a buffer charges its increase in size. SQLite returns the charge for freed buffers. A statement that

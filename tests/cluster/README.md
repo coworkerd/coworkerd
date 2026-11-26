@@ -121,12 +121,20 @@ imports a small SQL file, and restores both a SQL export and a published bookmar
 the schema, migration ledger and confirmed rows, then writes through a D1 binding and reads the result through the
 CLI. Owner dispatch records verify that the SQL calls reached the platform database in a threaded process.
 
-### Database placement across builds
+### Threaded SQL limits
 
 `threaded-sql-transaction-limit` uses the test executable on the threaded owner. It sets the peer
 buffer to allow a 254-frame SQL transaction including the record envelope and RPC headroom. It
 checks peer confirmation at the limit, HTTP 422 one frame over the limit, D1 batch rollback and the
 confirmed `exec()` prefix. A follow-up write and read run on the same open database.
+
+`threaded-sql-spill-limit` configures a threaded owner with 4 MiB per database and 5 MiB per
+process. With a committed WAL already larger than the database budget it checks ordinary and
+SQLite-initiated rollback, HTTP 507, D1 batch rollback and the confirmed `exec()` prefix. It inspects the live sort file under the durable storage directory
+with the launcher off, then checks that a second database meets the process limit while the first
+sort is open. It verifies both databases stay open and the spill charge returns to zero.
+
+### Database placement across builds
 
 `durable-threaded-database-admission` uses three homes on a threaded owner. SQL fills the homes and
 refreshes the first database. A new database displaces the least recently used eligible one while a
