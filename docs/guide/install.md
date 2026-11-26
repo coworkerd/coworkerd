@@ -591,6 +591,8 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | `peerBufferBytes` | `268435456` | 256 MiB total memory for other owners' tails; refusal beyond it |
 | `objectBytes` | `10737418240` | 10 GiB per object including its facet databases, based on reported checkpoint / open / close sizes |
 | `checkpointBytes` / `idleCheckpointMs` | `4194304` / `10000` | Checkpoint threshold 4 MiB and idle delay 10 s |
+| `sqlDatabaseSpillBytes` | `1073741824` | Uncommitted WAL plus live SQLite temporary files for one threaded platform database. Range 64 KiB–1 TiB |
+| `sqlProcessSpillBytes` | `0` | Combined spill in one persistent durable process. `0` uses four times the per-database limit (4 GiB with defaults). Explicit range 64 KiB–4 TiB |
 | `uploadRetryMs` / `uploadRetryMaxMs` | `500` / `30000` | Upload retry backoff, doubling to 30 s |
 | `recoverParallelism` | `4` | Downloads in flight per recovery; range 1–16 |
 | `rebuildConcurrency` | `4` | Concurrent rebuilds doing work per node, range 1–64. Foreground and alarm recoveries share the slots. Collecting evidence or waiting for a holder releases the rebuild slot |
@@ -610,6 +612,11 @@ A single encoded WAL record is limited to `min(64 MiB, 256 MiB, peerBufferBytes,
 limit; it is not a new configuration key. Oversized commits fail with `STORAGE_UNAVAILABLE` before replication
 and are discarded by the existing repair path; split large transactions. CPU and memory limits can reject
 smaller transactions. See the record-size discussion in cluster-state section 12.
+
+For threaded platform database tests, allow `durableObjects.processes ×` the effective
+`sqlProcessSpillBytes` per node for uncommitted WAL and live temporary files, plus space for
+committed WAL, database images, logs, and recovery. Each threaded platform database opens its
+SQLite temporary files under the durable storage directory in either launch mode.
 
 A takeover starts each object's `membership.ttlSeconds * 1000 + membership.livenessGraceMs` deadline (25 s by default)
 when its preparation begins. A complete owner answer ends collection early. Otherwise the node checks the silent

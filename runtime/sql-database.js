@@ -44,13 +44,18 @@ export class SqlDatabase extends DurableObject {
         if (!deadline) this.ctx.storage.sql.abortExecutionLimit();
         return { success: false, error: message, code: error.code, reason: message };
       }
-      if (unprocessable(error?.code)) {
+      if (unprocessable(error?.code) || error?.code === "SQL_SPILL_LIMIT_EXCEEDED") {
         // D1 reads the error string and can discard the structured fields.
         return { success: false, error: `${error.code}: ${message}`, code: error.code, reason: message };
       }
       return { success: false, error: message };
     };
-    const failureStatus = answer => unprocessable(answer?.code) ? 422 : answer?.code ? 503 : 200;
+    const failureStatus = answer => {
+      const code = answer?.code;
+      if (code === "SQL_SPILL_LIMIT_EXCEEDED") return 507;
+      if (unprocessable(code)) return 422;
+      return code ? 503 : 200;
+    };
     const fail = (error, batch = false) => {
       const answer = failure(error);
       return Response.json(batch && !answer.code ? [answer] : answer, { status: failureStatus(answer) });
