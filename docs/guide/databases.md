@@ -361,6 +361,14 @@ rejects with `D1_ERROR: SQL_TRANSACTION_TOO_LARGE: …` and rolls back the entir
 `exec()` reports the failing line as a `D1_EXEC_ERROR` and keeps the earlier confirmed lines.
 The same open database can serve another request after the rollback.
 
+Each threaded platform database in the test executable has a 32 MiB SQLite heap budget. It covers
+SQLite allocations for the open connection, including statements and page and sort buffers. Growing
+a buffer charges its increase in size. SQLite returns the charge for freed buffers. A statement that
+exceeds the budget returns HTTP `422 SQL_MEMORY_LIMIT_EXCEEDED` or `D1_ERROR: SQL_MEMORY_LIMIT_EXCEEDED: …`.
+The current transaction rolls back and the next query can use the same open connection.
+`batch()` rolls back all its statements, and `exec()` keeps its earlier confirmed lines.
+The SQL value size and reply size limits also apply.
+
 Database names follow `[a-z0-9][a-z0-9-]{0,62}`: hyphens and a leading digit are supported. A malformed entry in the deployment's database or namespace table is skipped independently; `deployment.invalidNamespaceEntryCount` at the node's state endpoint counts skipped entries.
 
 

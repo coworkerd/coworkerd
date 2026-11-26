@@ -91,6 +91,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   `src/workerd/threaded/threaded-server.c++`.
   Patch 0181 marks a refused cold-copy reservation on the private threaded durable bootstrap. The node
   uses that detail before it receives an event dispatcher to confirm that the operation never ran.
+  Patch 0182 uses SQLite's per-connection allocator meter for threaded platform databases.
+  A local heap refusal rolls back the current transaction and preserves the open connection.
   Patch 0184 adds each platform database's SQLite heap to its copy's process memory reservation
   in 1 MiB steps. The hooks use the existing allocator scope in `src/workerd/util/` and the copy
   accounting in `src/workerd/threaded/`.

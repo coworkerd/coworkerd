@@ -934,6 +934,115 @@ async function threadedSqlDefaultMailbox(cluster) {
   assert.equal(after.lifecycle.durableAdmission.overloaded, before.lifecycle.durableAdmission.overloaded);
 }
 
+async function threadedSqlMemoryLimit(cluster) {
+  const [owner, ingress] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-memory-limit', { durableObjectNamespaces: 48 });
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 1]]));
+  const [db] = databases.get(owner);
+  const query = (body, status = 200) => cluster.api(`${db.path}/query`,
+    { method: 'POST', token: tenant.token, body, status });
+  const read = { sql: 'SELECT id, value FROM ledger ORDER BY id' };
+  const tooLarge = 'SELECT length(hex(zeroblob(600000))) AS bytes';
+  const fits = 'SELECT length(hex(zeroblob(250000))) AS bytes';
+  const tooLargeWrite = 'UPDATE ledger SET value = hex(zeroblob(600000)) WHERE id = 1';
+
+  await cluster.deploy(tenant, 'probe', `export default { async fetch(request, { DB }) {
+    const mode = new URL(request.url).searchParams.get('mode');
+    try {
+      if (mode === 'batch') {
+        return Response.json(await DB.batch([
+          DB.prepare("INSERT INTO ledger VALUES (3, 'unconfirmed')"),
+          DB.prepare(${JSON.stringify(tooLargeWrite)}),
+        ]));
+      }
+      if (mode === 'exec') {
+        return Response.json(await DB.exec(${JSON.stringify([
+          "INSERT INTO ledger VALUES (4, 'confirmed')",
+          tooLargeWrite,
+          "INSERT INTO ledger VALUES (5, 'skipped')",
+        ].join('\n'))}));
+      }
+      return Response.json(await DB.prepare(${JSON.stringify(read.sql)}).all());
+    } catch (error) {
+      return Response.json({ message: error.message, cause: error.cause?.message });
+    }
+  } };`, { wrangler: { d1_databases: [{ binding: 'DB', database_name: db.name }] } });
+  const binding = async (mode = 'read') => json(await request(cluster.urls[ingress],
+    `/${tenant.name}/probe?mode=${mode}`), 200, 'D1 memory limit');
+
+  await eventually('the SQL memory owner sees all durable peers', async () => {
+    const { membership } = await cluster.state(owner);
+    for (const node of cluster.nodes.slice(1)) {
+      assert.ok(membership.members.some(member => member.nodeId === node && member.durableProcesses > 0), node);
+    }
+  });
+
+  await query([
+    { sql: 'CREATE TABLE ledger (id INTEGER PRIMARY KEY, value TEXT)' },
+    { sql: "INSERT INTO ledger VALUES (1, 'confirmed')" },
+    { sql: 'CREATE TABLE checkpoint_probe (value BLOB)' },
+    { sql: 'INSERT INTO checkpoint_probe VALUES (zeroblob(98304))' },
+  ]);
+  const log = async () => (await cluster.state(owner)).durableLog;
+  const before = await eventually('the threaded SQL database checkpoints its confirmed WAL', async () => {
+    const state = await log();
+    assert.ok(state.threadedHomeIo.checkpointSamples > 0);
+    assert.ok(state.threadedHomeIo.maxCheckpointWalBytes >= 65536);
+    return state;
+  });
+  assert.equal(before.threadedHomeIo.openSamples, 1);
+  assert.deepEqual((await query({ sql: 'SELECT length(value) AS bytes FROM checkpoint_probe' })).results,
+    [{ bytes: 98304 }]);
+  const committed = [{ id: 1, value: 'confirmed' }];
+  const code = 'SQL_MEMORY_LIMIT_EXCEEDED';
+  const reason = 'the statement exceeds the database SQLite memory limit';
+  const failure = `${code}: ${reason}`;
+  const expected = { success: false, error: failure, reason, code };
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    assert.deepEqual((await query({ sql: fits })).results, [{ bytes: 500000 }]);
+    assert.deepEqual(await query({ sql: tooLarge }, 422), expected);
+  }
+  assert.deepEqual(await query([
+    { sql: "INSERT INTO ledger VALUES (2, 'unconfirmed')" }, { sql: tooLargeWrite },
+  ], 422), expected);
+  assert.deepEqual(await binding('batch'), { message: `D1_ERROR: ${failure}`, cause: failure });
+  const conflict = await query([
+    { sql: "INSERT INTO ledger VALUES (6, 'unconfirmed')" },
+    { sql: "INSERT OR ROLLBACK INTO ledger VALUES (1, 'duplicate')" },
+  ]);
+  assert.equal(conflict[0].success, false);
+  assert.match(conflict[0].error, /UNIQUE constraint failed/);
+  assert.deepEqual((await binding()).results, committed);
+  assert.equal((await log()).log.records, before.log.records, 'failed batches wrote no log records');
+
+  const rows = n => `WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n < ${n})`;
+  const sort = `${rows(1000)} SELECT n FROM r ORDER BY hex(zeroblob(16384)) || n`;
+  assert.deepEqual(await query({ sql: sort }, 422), expected);
+  assert.deepEqual(await query({ sql: 'SELECT zeroblob(1048576)' }, 422), expected);
+  const value = await query({ sql: 'SELECT hex(zeroblob(100 * 1024 * 1024))' });
+  assert.equal(value.success, false);
+  assert.match(value.error, /string or blob too big/i);
+  const reply = await query({ sql: `${rows(90)} SELECT hex(zeroblob(50000)) AS value FROM r` });
+  assert.equal(reply.success, false);
+  assert.match(reply.error, /^D1_RESULT_TOO_LARGE:/);
+  assert.deepEqual((await query(read)).results, committed);
+
+  const execFailure = `Error in line 2: ${tooLargeWrite}: ${failure}`;
+  assert.deepEqual(await binding('exec'), { message: `D1_EXEC_ERROR: ${execFailure}`, cause: execFailure });
+  assert.deepEqual((await query(read)).results, [...committed, { id: 4, value: 'confirmed' }]);
+  const after = await log();
+  assert.equal(after.threadedHomeIo.openSamples, before.threadedHomeIo.openSamples, 'the same database stayed open');
+  assert.equal(after.objects.repairs, before.objects.repairs, 'the connection needed no repair');
+  const childLogs = await cluster.compose(['logs', '--no-color', owner], { maxBuffer: 8 * 1024 * 1024 });
+  assert.equal(Array.from(childLogs.matchAll(/sqliteMem\w+ did not find a valid scope/g)).length, 0,
+    'SQLite allocations and frees during the checkpoint have a memory scope');
+  assert.equal(Array.from(childLogs.matchAll(/sqliteMem\w+ would have triggered a memoryBytes underflow/g)).length, 0,
+    'SQLite checkpoint allocations and frees balance');
+  assert.equal(Array.from(childLogs.matchAll(/SQL transaction refusal cleanup did not finish/g)).length, 0,
+    'the implicit rollback was settled before handling another request');
+}
+
 async function threadedSqlProcessMemory(cluster) {
   const MiB = 1024 ** 2;
   const [owner] = cluster.nodes;
@@ -4036,6 +4145,13 @@ export const durableGatedCases = {
       durableObjects: { threadedStorage: true, peerBufferBytes: sqlWalPeerBufferBytes,
         checkpointBytes: 8 * 1024 * 1024 },
     }) : ({}),
+  },
+  'threaded-sql-memory-limit': {
+    test: threadedSqlMemoryLimit, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
+    configureNode: node => node === 'node-1' ? ({
+      durableObjects: { threadedStorage: true, checkpointBytes: 65536 },
+    }) : ({}),
+    nodeEnvironment: node => node === 'node-1' ? { COWORKERD_DO_TEST_SQL_MEMORY_BYTES: '1048576' } : {},
   },
   'threaded-sql-process-memory': {
     test: threadedSqlProcessMemory, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
