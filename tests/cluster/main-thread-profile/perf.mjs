@@ -20,7 +20,8 @@ const stages = [
 ];
 const sharedProtocol = /capnp::.*(?:Rpc|rpc|TwoParty|HttpOverCapnp|HttpService|ByteStream|Message|Segment|Membrane|Pipeline|Capability|ClientHook|copyToUnchecked)|CoarseTwoParty/;
 const allocation = /^(?:malloc|cfree|free|__libc_calloc|operator delete\(|operator new\()/;
-const stageNames = [...new Set(stages.map(([name]) => name)), 'sharedProtocol', 'allocation', 'unresolved', 'other'];
+const residualStages = new Set(['allocation', 'unresolved', 'other']);
+const stageNames = [...new Set(stages.map(([name]) => name)), 'sharedProtocol', ...residualStages];
 
 function emptyHistogram() {
   return Object.fromEntries(stageNames.map(stage => [stage, { samples: 0, periodNs: 0 }]));
@@ -41,8 +42,10 @@ export async function summarizeStacks(path, [begin, end]) {
   const stop = BigInt(end);
   const histogram = emptyHistogram();
   const stacks = {};
+  const residualByDso = {};
   let period = 0;
   let stack = [];
+  let leafDso;
   let available = 0;
   const firstLines = [];
   let select = false;
@@ -51,7 +54,9 @@ export async function summarizeStacks(path, [begin, end]) {
     const stage = classify(stack);
     ++histogram[stage].samples;
     histogram[stage].periodNs += period;
-    const signature = JSON.stringify([stage, ...stack]);
+    const dso = leafDso ?? '[unknown]';
+    if (residualStages.has(stage)) residualByDso[dso] = (residualByDso[dso] ?? 0) + period;
+    const signature = JSON.stringify([stage, { dso }, ...stack]);
     const count = stacks[signature] ??= { samples: 0, periodNs: 0 };
     ++count.samples;
     count.periodNs += period;
@@ -68,15 +73,19 @@ export async function summarizeStacks(path, [begin, end]) {
       select = time >= start && time < stop;
       period = Number(sample[3]);
       stack = [];
+      leafDso = undefined;
     } else if (select) {
-      const frame = line.match(/^\s*[0-9a-f]+\s+(.+?)(?:\+0x[0-9a-f]+)?\s+\((.+)\)\s*$/i);
-      if (frame) stack.push(frame[1]);
+      const frame = line.match(/^\s*[0-9a-f]+\s+(.+?)(?:\+0x[0-9a-f]+)?\s+\(([^()]*)\)(?:\s+\(inlined\))?\s*$/i);
+      if (frame) {
+        stack.push(frame[1]);
+        leafDso ??= frame[2];
+      }
     }
   }
   finish();
   const samples = Object.values(histogram).reduce((sum, entry) => sum + entry.samples, 0);
   assert.ok(samples > 0, `no in-window cpu-clock samples among ${available} records for ${begin}–${end} ns in ${path}\n${firstLines.join('\n')}`);
-  return { samples, histogram, stacks };
+  return { samples, histogram, residualByDso, stacks };
 }
 
 export async function recordPerf({ pid, data, script, drive, seconds }) {
@@ -126,6 +135,7 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     const histogram = emptyHistogram();
     for (const [key, count] of Object.entries(stacks)) {
       const [, ...stack] = JSON.parse(key);
+      if (typeof stack[0] === 'object') stack.shift();
       const bucket = histogram[classify(stack)];
       bucket.samples += count.samples;
       bucket.periodNs += count.periodNs;
