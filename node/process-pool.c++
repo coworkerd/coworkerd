@@ -311,7 +311,8 @@ public:
   kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor,
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
       std::function<void()> onDispatched, std::function<void()> onCapacityRejected,
-      kj::Own<kj::PromiseFulfiller<void>> ready, std::shared_ptr<ProcessCall> sqlCall);
+      kj::Own<kj::PromiseFulfiller<void>> ready, kj::Own<kj::PromiseFulfiller<bool>> capacityRejected,
+      std::shared_ptr<ProcessCall> sqlCall);
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
@@ -323,10 +324,11 @@ public:
       std::function<void()> onCapacityRejected, std::shared_ptr<ProcessCall> sqlCall) {
     if (threaded) {
       auto ready = kj::newPromiseAndFulfiller<void>();
+      auto capacity = threadedDurable ? kj::newPromiseAndFulfiller<bool>() : kj::PromiseFulfillerPair<bool>{false, {}};
       return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
           kj::mv(budgetLifetime), std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller),
-          std::move(sqlCall))),
-          kj::mv(ready.promise)};
+          kj::mv(capacity.fulfiller), std::move(sqlCall))),
+          kj::mv(ready.promise), kj::mv(capacity.promise)};
     }
     KJ_REQUIRE(!nativeProps, "native loopback props require a threaded process");
     onDispatched();
@@ -367,7 +369,8 @@ private:
 kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor,
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
     std::function<void()> onDispatched, std::function<void()> onCapacityRejected,
-    kj::Own<kj::PromiseFulfiller<void>> ready, std::shared_ptr<ProcessCall> sqlCall) {
+    kj::Own<kj::PromiseFulfiller<void>> ready, kj::Own<kj::PromiseFulfiller<bool>> capacityRejected,
+    std::shared_ptr<ProcessCall> sqlCall) {
   auto lifetime = shared_from_this();
   KJ_REQUIRE(deferredDeletes != nullptr);
   auto connection = std::shared_ptr<RuntimeConnection>(new RuntimeConnection(),
@@ -415,6 +418,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
       if (decision == 'R') {
         onCapacityRejected();
+        if (capacityRejected.get() != nullptr) capacityRejected->fulfill(true);
         kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, "native invocation queue is full; nothing executed"));
       }
       if (threadedDurable && decision == 'E') {
@@ -440,6 +444,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       break;
     }
     onDispatched();
+    if (capacityRejected.get() != nullptr) capacityRejected->fulfill(false);
     if (!threadedDurable) ready->fulfill();
     connection->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*connection->stream);
     connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
@@ -488,6 +493,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
     cancelBudget.cancel();
     co_return result;
   } catch (const kj::Exception& error) {
+    if (capacityRejected.get() != nullptr && capacityRejected->isWaiting()) capacityRejected->fulfill(false);
     if (threadedDurable && ready->isWaiting()) ready->reject(error.clone());
     throw;
   }

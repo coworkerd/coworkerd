@@ -385,6 +385,11 @@ returned 2,732,370 bytes, and the new copy's first reservation was 2,621,440 byt
 If retirement cannot return the reservation within one second, the process clears the
 victim, counts an overload and logs its home and tree. Capacity waiters receive a refusal
 and the process can use the home once its normal close is complete.
+
+The earlier archive completed 1 of 116 queries with `residentObjects: 4` and
+105 of 116 at the default memory budget with extra homes. The revised kernel completed
+116 of 116 in both mixed probes while six tenant definitions competed for the returned
+credits.
 [Admission measurements](database-home-benchmark.md#database-admission-at-the-ceiling)
 
 Use the node's WebSocket registry and transport loop for parked connections. The handoff carries the
