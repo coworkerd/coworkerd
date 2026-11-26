@@ -448,6 +448,31 @@ The mixed probe runs the same admission path with six competing tenant definitio
 as the SQL scan opens distinct databases. Before the freed-home preference, four tenant
 definitions filled all four homes and only one of the 116 subsequent SQL reads succeeded.
 
+### Verification with patch 0177
+
+The public ARM64 archive was built from product `c2808ff8a53573cff176c9ee3428e739a3a09b6f`
+and workerd tree `794097b14ed3deb797aaf8ef0668ea90e55df080`. The measurements ran through
+the compile-time database fixture on a single Linux ARM64 Docker node. The daemon and launcher
+binaries were built from `1ec4ab7d1bde0d86a2cf5925dcd715d9885f062c`, with byte-identical
+daemon, launcher and runtime sources. The default memory budget was derived from the guest.
+[Hosted build](https://github.com/coworkerd/coworkerd/actions/runs/45716815453) ·
+[Verified release](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-5f686b6b4e1f-run-45716815453-1)
+
+| Workload | Result |
+| --- | --- |
+| Default homes, one process, no pacing | 1,000/1,000 queries in 17.00 s in the same generation. The final sample recorded 993 admission retirements. Peak sampled RSS was 73.75 MiB against a 2.33 GiB process budget. |
+| 192 homes, 448 MiB process budget | 125/125 queries in 1.46 s. The peak was 91 occupied homes and 435.10 MiB RSS. The final sample recorded 26 admission retirements. |
+| Six competing tenant definitions | 116/116 queries after warm-up in 2.62 s. The tenant callers made 4,733 attempts while all four homes were occupied by databases or being reclaimed for them. No competing definition acquired a home during the scan. |
+| One and two processes, default homes | Four busy databases in one process and eight across two, with four routed to each process. A further query to either full process returned a capacity refusal. |
+
+[Unpaced samples](database-home-benchmark/platform-database-admission-0177-unpaced.jsonl) ·
+[Memory samples](database-home-benchmark/platform-database-admission-0177-memory.jsonl) ·
+[Mixed samples](database-home-benchmark/platform-database-admission-0177-mixed.jsonl) ·
+[One-process samples](database-home-benchmark/platform-database-admission-0177-busy-one.jsonl) ·
+[Two-process samples](database-home-benchmark/platform-database-admission-0177-busy-two.jsonl)
+
+### Reproduce admission
+
 ```sh
 export COWORKERD_CLUSTER_BIN_DIR="$PWD/build"
 for mode in unpaced memory mixed busy-one busy-two; do
