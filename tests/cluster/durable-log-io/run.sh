@@ -51,10 +51,10 @@ cc -Wall -Wextra -Werror -O2 -shared -fPIC "$trace_source/trace.c" -ldl -o "$run
 
 cell() {
   local side=$1 tier=$2 binaries=$3 root=$4
-  local path="$root/$side"
-  sudo install -d -o 10001 -g 10001 -m 0755 "$path"
+  local path="$root/$side" objects="$runner/$side-$tier-objects"
+  sudo install -d -o 10001 -g 10001 -m 0755 "$path" "$objects/log"
   COWORKERD_CLUSTER_BIN_DIR="$binaries" node "$trace_source/measure.mjs" "$kernel" \
-    "$reports/$side-$tier.jsonl" "$path" "$runner/trace.so"
+    "$reports/$side-$tier.jsonl" "$path" "$runner/trace.so" "$objects"
 }
 
 cell baseline normal "$baseline" "$runner"

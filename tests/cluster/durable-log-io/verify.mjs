@@ -18,6 +18,7 @@ for (const tier of ['normal', 'slow']) {
     }));
     const timing = data.filter(row => row.flushes);
     for (const row of timing) {
+      assert.equal(row.appendOnMain, side === 'baseline' ? row.appends : 0);
       assert.equal(row.flushOnMain, side === 'baseline' ? row.flushes : 0);
       if (tier === 'slow') assert.ok(row.flush.p50Ms >= 18, 'device flush really delayed fdatasync');
     }

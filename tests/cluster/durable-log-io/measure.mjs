@@ -6,8 +6,9 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Cluster, eventually } from '../cluster.mjs';
 
-const [kernel, output, volume, probe] = process.argv.slice(2).map(path => resolve(path));
-assert.ok(kernel && output && volume && probe, 'usage: measure.mjs KERNEL REPORT.jsonl LOG_VOLUME TRACE.so');
+const [kernel, output, volume, probe, objects] = process.argv.slice(2).map(path => resolve(path));
+assert.ok(kernel && output && volume && probe && objects,
+  'usage: measure.mjs KERNEL REPORT.jsonl LOG_VOLUME TRACE.so OBJECT_VOLUME');
 assert.equal(process.platform, 'linux');
 await access(volume, constants.R_OK);
 assert.deepEqual(await readdir(volume), []);
@@ -20,6 +21,7 @@ const bind = (source, target, read_only = false) => ({ type: 'bind', source, tar
 const cluster = new Cluster(directory, kernel, undefined, {
   singleNode: true, threadedNodes: ['node-1'],
   configureNode: () => ({
+    memoryBudgetBytes: 16 * 1024 ** 3,
     placement: { rootLimit: 512, nestedLimit: 1024 },
     processPool: { count: 1, inFlightLimit: 512, threadedMemoryBytes: 3 * 1024 ** 3 },
     durableObjects: { processes: 1, threadedStorage: true, peers: 0, segmentBytes: 512 * 1024 ** 2, segmentIntervalMs: 3600000 },
@@ -32,6 +34,7 @@ const cluster = new Cluster(directory, kernel, undefined, {
     LD_PRELOAD: '/tmp/log-io-trace.so',
   }),
   nodeVolumes: () => [
+    bind(objects, '/var/lib/coworkerd/do'),
     bind(volume, '/var/lib/coworkerd/do/log'),
     bind(probe, '/tmp/log-io-trace.so', true),
     bind(trace, '/tmp/log-io-probe'),
@@ -98,7 +101,7 @@ async function listEvents() {
   const events = [];
   for (let offset = 0; offset + 32 <= raw.length; offset += 32) {
     const [kind, start, end, main] = [0, 8, 16, 24].map(i => Number(raw.readBigUInt64LE(offset + i)));
-    assert.ok(kind === 1 || kind === 2, 'the real log fdatasync succeeded');
+    assert.ok([1, 2, 4].includes(kind), 'the real log fdatasync succeeded');
     events.push({ kind, start, end, main: Boolean(main) });
   }
   return events;
@@ -138,12 +141,14 @@ async function measure(clients, durationMs, round, withReader = false) {
   const events = await listEvents();
   const flushes = events.filter(event => event.kind === 2 && event.end >= begin && event.start <= end);
   const gaps = events.filter(event => event.kind === 1 && event.end >= begin && event.start <= end);
+  const appends = events.filter(event => event.kind === 4 && event.end >= begin && event.start <= end);
   const measured = inside(writes, begin, end);
-  assert.ok(flushes.length && measured.length);
+  assert.ok(flushes.length && appends.length && measured.length);
   const overlap = inside(reads, begin, end).filter(read =>
     flushes.some(flush => read.start >= flush.start && read.end <= flush.end));
   await save({ round, clients, durationMs, withReader, completed: measured.length,
     perSecond: measured.length * 1000 / durationMs, insert: latency(measured.map(({ start, end }) => end - start)),
+    appends: appends.length, appendOnMain: appends.filter(event => event.main).length,
     flushes: flushes.length, flushOnMain: flushes.filter(event => event.main).length,
     flush: latency(flushes.map(({ start, end }) => end - start)),
     longestMainPollGapMs: Math.max(0.1, ...gaps.map(({ start, end }) => ms(end - start))),
@@ -179,6 +184,13 @@ try {
   assert.equal((await call(writer, 'count')).value, nextId - 1, 'every successful insert is visible');
   await save({ confirmedInserts: nextId - 2, readerTenant: reader, writerTenant: writer });
 } catch (error) {
+  if (cluster.started) {
+    try {
+      console.error(await cluster.compose(['logs', '--no-color', '--tail', '60', owner]));
+    } catch (logsError) {
+      console.error(logsError.message);
+    }
+  }
   await cluster.diagnostics('durable-log-io', error);
   throw error;
 } finally {
