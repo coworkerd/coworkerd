@@ -465,26 +465,33 @@ It had 1,893 competing attempts at the tree limit and 5,085 at the memory limit.
 
 ### Verification with patch 0177
 
-The public ARM64 archive was built from product `c2808ff8a53573cff176c9ee3428e739a3a09b6f`
-and workerd tree `794097b14ed3deb797aaf8ef0668ea90e55df080`. The measurements ran through
-the compile-time database fixture on a single Linux ARM64 Docker node. The daemon and launcher
-binaries were built from `1ec4ab7d1bde0d86a2cf5925dcd715d9885f062c`, with byte-identical
-daemon, launcher and runtime sources. The default memory budget was derived from the guest.
-[Hosted build](https://github.com/coworkerd/coworkerd/actions/runs/45716815453) ·
-[Verified release](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-5f686b6b4e1f-run-45716815453-1)
+The public ARM64 archive was built from product `5eda3623d0cb172321942048ef028ec1d591b24e`
+and workerd tree `c81a3704a705e865b1e125a49a6ebc1f8dd9a81d`. The driver ran through the compile-time
+database fixture on a single Linux ARM64 Docker node at product revision
+`583b44ea4dc8502e3ef8e84d8b260e9f1795e962`. The Linux daemons and launcher were built from
+`2fc7460475c4edc1bf007f621cbc717619be42d5` with byte-identical daemon, launcher and runtime sources.
+The guest supplied the default memory budget.
+[Hosted build](https://github.com/coworkerd/coworkerd/actions/runs/45781070271) · [Verified release](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-c3fbec45d920-run-45781070271-1)
 
 | Workload | Result |
 | --- | --- |
-| Default homes, one process, no pacing | 1,000/1,000 queries in 17.00 s in the same generation. The final sample recorded 993 admission retirements. Peak sampled RSS was 73.75 MiB against a 2.33 GiB process budget. |
-| 192 homes, 448 MiB process budget | 125/125 queries in 1.46 s. The peak was 91 occupied homes and 435.10 MiB RSS. The final sample recorded 26 admission retirements. |
-| Six competing tenant definitions | 116/116 queries after warm-up in 2.62 s. The tenant callers made 4,733 attempts while all four homes were occupied by databases or being reclaimed for them. No competing definition acquired a home during the scan. |
-| One and two processes, default homes | Four busy databases in one process and eight across two, with four routed to each process. A further query to either full process returned a capacity refusal. |
+| Default homes, one process, no pacing | 1,000/1,000 queries in 17.00 s in the same generation. The final sample recorded 996 admission retirements. Peak sampled RSS was 73.51 MiB against a 2.33 GiB process budget. |
+| 192 homes, 448 MiB process budget | 125/125 queries in 1.44 s. The peak was 91 occupied homes and 433.82 MiB RSS. The final sample recorded 30 admission retirements. |
+| Mixed at the four-home limit | 116/116 SQL queries in 2.73 s while six tenant callers made a total of 4,655 attempts. |
+| Mixed at the default process admission budget | 116/116 SQL queries in 3.18 s while six tenant callers made a total of 4,882 attempts. |
+| Mixed at the four-tree routing limit | 116/116 SQL queries in 3.30 s while six tenant callers made a total of 1,969 attempts. |
+| One and two processes, default homes | Four busy databases in one process and eight across two, with four on each. The extra query to each full process returned HTTP 503 `OVERLOADED` with `dispatched: false` and `retryable: true`. |
+
+Across the three mixed probes, no competing request returned HTTP 200. The guest assigned
+2.33 GiB of admission memory to the single process and 1.87 GiB to each of the two processes.
 
 [Unpaced samples](database-home-benchmark/platform-database-admission-0177-unpaced.jsonl) ·
 [Memory samples](database-home-benchmark/platform-database-admission-0177-memory.jsonl) ·
-[Mixed samples](database-home-benchmark/platform-database-admission-0177-mixed.jsonl) ·
-[One-process samples](database-home-benchmark/platform-database-admission-0177-busy-one.jsonl) ·
-[Two-process samples](database-home-benchmark/platform-database-admission-0177-busy-two.jsonl)
+[Mixed homes samples](database-home-benchmark/platform-database-admission-0177-mixed.jsonl) ·
+[Mixed memory samples](database-home-benchmark/platform-database-admission-0177-mixed-memory.jsonl) ·
+[Mixed routing samples](database-home-benchmark/platform-database-admission-0177-mixed-resident.jsonl) ·
+[One process samples](database-home-benchmark/platform-database-admission-0177-busy-one.jsonl) ·
+[Two processes samples](database-home-benchmark/platform-database-admission-0177-busy-two.jsonl)
 
 ### Reproduce admission
 
