@@ -644,6 +644,23 @@ async function threadedSqlTransactionLimit(cluster) {
   const insert = 'INSERT INTO ledger VALUES (?, zeroblob(?))';
   const fill = (id, pages) => ({ sql: insert, params: [id, pages * 4092] });
   const read = { sql: 'SELECT id, length(value) AS bytes FROM ledger ORDER BY id' };
+  // Deploy the probe first to keep its setup outside the open database's idle window.
+  const oversizedInsert = `INSERT INTO ledger VALUES (6, zeroblob(${253 * 4092}))`;
+  await cluster.deploy(tenant, 'probe', `export default { async fetch(request, { DB }) {
+    try {
+      if (new URL(request.url).searchParams.has('exec')) {
+        await DB.exec("INSERT INTO ledger VALUES (5, x'05')\\n" +
+          ${JSON.stringify(oversizedInsert + '\n')} +
+          "INSERT INTO ledger VALUES (7, x'07')");
+      } else {
+        await DB.batch([DB.prepare("INSERT INTO ledger VALUES (4, x'04')"),
+          DB.prepare(${JSON.stringify(insert)}).bind(6, ${253 * 4092})]);
+      }
+      return Response.json({ success: true });
+    } catch (error) {
+      return Response.json({ message: error.message, cause: error.cause?.message });
+    }
+  } };`, { wrangler: { d1_databases: [{ binding: 'DB', database_name: db.name }] } });
   await query([
     { sql: 'CREATE TABLE ledger (id INTEGER PRIMARY KEY, value BLOB)' },
     { sql: 'INSERT INTO ledger VALUES (1, x\'01\')' },
@@ -673,22 +690,6 @@ async function threadedSqlTransactionLimit(cluster) {
   const committed = [{ id: 1, bytes: 1 }, { id: 2, bytes: 252 * 4092 }];
   assert.deepEqual((await query(read)).results, committed);
 
-  const oversizedInsert = `INSERT INTO ledger VALUES (6, zeroblob(${253 * 4092}))`;
-  await cluster.deploy(tenant, 'probe', `export default { async fetch(request, { DB }) {
-    try {
-      if (new URL(request.url).searchParams.has('exec')) {
-        await DB.exec("INSERT INTO ledger VALUES (5, x'05')\\n" +
-          ${JSON.stringify(oversizedInsert + '\n')} +
-          "INSERT INTO ledger VALUES (7, x'07')");
-      } else {
-        await DB.batch([DB.prepare("INSERT INTO ledger VALUES (4, x'04')"),
-          DB.prepare(${JSON.stringify(insert)}).bind(6, ${253 * 4092})]);
-      }
-      return Response.json({ success: true });
-    } catch (error) {
-      return Response.json({ message: error.message, cause: error.cause?.message });
-    }
-  } };`, { wrangler: { d1_databases: [{ binding: 'DB', database_name: db.name }] } });
   const binding = async (suffix = '') => json(await request(cluster.urls[ingress],
     `/${tenant.name}/probe${suffix}`), 200, 'D1 transaction limit');
   assert.deepEqual(await binding(), { message: `D1_ERROR: ${failure}`, cause: failure });
