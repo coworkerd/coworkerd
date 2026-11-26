@@ -240,16 +240,20 @@ async function databaseDispatches(cluster, db, owner) {
     .filter(row => row.nodeId === owner && row.namespaceId === db.namespaceId.slice(0, 12) && row.status === 200);
 }
 
-async function threadedSqlCliParity(cluster) {
-  // An early call can claim a shard while a peer is still appearing in other
-  // nodes' membership views. Wait before relying on the first-owner order.
-  await eventually('all nodes see every durable candidate before the CLI test opens a database', async () => {
+async function waitForDurableMembership(cluster) {
+  // An early call can claim a shard or confirm a write using an incomplete
+  // membership view.
+  await eventually('all nodes see every durable candidate', async () => {
     await Promise.all(cluster.nodes.map(async node => {
       const { membership } = await cluster.state(node);
       const active = membership.members.filter(member => member.durableProcesses > 0 && member.state === 'active');
       assert.deepEqual(active.map(member => member.nodeId).sort(), cluster.nodes, node);
     }));
   });
+}
+
+async function threadedSqlCliParity(cluster) {
+  await waitForDurableMembership(cluster);
   const ledger = await sqlAtomicity(cluster);
   const tenant = await cluster.tenant('sql-cli');
   const cwd = join(cluster.directory, 'd1-cli');
@@ -662,7 +666,8 @@ async function threadedSqlTransactionLimit(cluster) {
 }
 
 async function threadedDatabaseAdmission(cluster) {
-  const [owner] = cluster.nodes;
+  await waitForDurableMembership(cluster);
+  const [owner, ...peers] = cluster.nodes;
   const tenant = await cluster.tenant('sql-admission', { durableObjectNamespaces: 48 });
   const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 5]]));
   const [first, blocked, oldestIdle, newcomer, overflow] = databases.get(owner);
@@ -694,6 +699,11 @@ async function threadedDatabaseAdmission(cluster) {
   await observe('three exclusive homes have settled', {
     workerThreads: 3, homes: 3, residentRoots: 3, running: 0, waiting: 0, idleRetirements: 0,
   });
+  await eventually('the database owner has both WAL confirmation streams', async () => {
+    const { durableLog } = await cluster.state(owner);
+    assert.equal(durableLog.peers.want, peers.length);
+    assert.ok(peers.every(peer => durableLog.peers.streams.some(stream => stream.nodeId === peer && stream.open)));
+  });
   // Keep the warmed roots younger than the normal retirement threshold for the pressure test.
   const realClock = join(cluster.durableLifecycleGate, 'idle-offset-next');
   await writeFile(realClock, '0');
@@ -708,6 +718,10 @@ async function threadedDatabaseAdmission(cluster) {
   try {
     trackWrite(blocked);
     await observe('one database is waiting for WAL confirmation', { running: 1, pendingCommits: 1 });
+    await eventually('both WAL peers are holding acknowledgements', async () => {
+      const states = await Promise.all(peers.map(node => cluster.state(node)));
+      assert.ok(states.every(state => state.durableLog.peers.heldAcksForTest > 0));
+    }, { timeout: 3000, interval: 25 });
     queuedRead = read(blocked).catch(error => ({ error }));
     await observe('the protected database also has a queued SQL request', { pendingCommits: 1, waiting: 1 });
     assert.deepEqual(json(await sql(newcomer, probe), 200, newcomer.name).results, [{ value: 17 }]);
