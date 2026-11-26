@@ -192,7 +192,7 @@ async function createDatabaseHomes(cluster, tenant, counts, { limit = 36, succes
     const { database, revision: createdAt } = await cluster.api(path, { method: 'POST', token: tenant.token });
     revision = Math.max(revision, createdAt);
     // Rendezvous order determines the first owner and the successor used in takeover tests.
-    const [owner, successor] = databaseOwnerOrder(cluster, database.namespaceId);
+    const [owner, successor] = shardOwnerOrder(cluster, database.namespaceId, 0);
     const selected = databases.get(owner);
     const expectedSuccessor = successors?.get(owner);
     if (selected && selected.length < counts.get(owner) && (!expectedSuccessor || expectedSuccessor === successor)) {
@@ -225,9 +225,9 @@ async function threadedDatabaseRelease(cluster) {
   });
 }
 
-function databaseOwnerOrder(cluster, namespaceId) {
+function shardOwnerOrder(cluster, namespaceId, shard) {
   const scores = cluster.nodes.map(node => [node, createHash('sha256')
-    .update(`${namespaceId}/0\0${node}`).digest().readBigUInt64BE()]);
+    .update(`${namespaceId}/${shard}\0${node}`).digest().readBigUInt64BE()]);
   scores.sort((a, b) => a[1] > b[1] ? -1 : a[1] < b[1] ? 1 : a[0].localeCompare(b[0]));
   return scores.map(([node]) => node);
 }
@@ -241,7 +241,7 @@ async function threadedDatabaseAlarm(cluster) {
     const path = `${tenant.path}/databases/db-${i}`;
     const created = await cluster.api(path, { method: 'POST', token: tenant.token });
     revision = Math.max(revision, created.revision);
-    const [owner] = databaseOwnerOrder(cluster, created.database.namespaceId);
+    const [owner] = shardOwnerOrder(cluster, created.database.namespaceId, 0);
     const backend = owner === threaded ? 'threaded' : 'upstream';
     if (!databases.has(backend)) databases.set(backend, { ...created.database, path, owner });
   }
@@ -342,8 +342,8 @@ async function threadedDatabasePlacement(cluster) {
     return logs.split('\n').filter(line => line.includes('[do] ')).map(line => JSON.parse(line.split('[do] ')[1]))
       .filter(row => row.nodeId === owner && row.namespaceId === db.namespaceId.slice(0, 12) && row.status === 200);
   };
-  const assertMapping = (call, owner, generation) => {
-    assert.equal(call.workerId, owner === threaded ? `${tenant.name}/:platform` : `${tenant.name}/__databases`);
+  const assertMapping = (call, generation) => {
+    assert.equal(call.workerId, `${tenant.name}/__databases`);
     assert.equal(call.className, '__coworkerdSqlDatabase');
     assert.equal(call.processId, generation.processId);
     assert.equal(call.processGeneration, generation.generation);
@@ -400,7 +400,7 @@ async function threadedDatabasePlacement(cluster) {
       for (const caller of ['node', 'worker']) {
         const call = calls.find(row => row.caller === caller);
         assert.ok(call, `${from} forwarded ${caller} to ${db.owner}`);
-        assertMapping(call, db.owner, ownerProcess);
+        assertMapping(call, ownerProcess);
         assert.ok(BigInt(call.shardEpoch) > 0n);
         epochs.set(db.name, BigInt(call.shardEpoch));
       }
@@ -429,7 +429,7 @@ async function threadedDatabasePlacement(cluster) {
         const call = calls.find(row => row.caller === 'node' && (row.route === 'local' || row.route === 'received') &&
           BigInt(row.shardEpoch) > epochs.get(db.name));
         assert.ok(call, `${successor} served ${db.name} at a later epoch than ${original}`);
-        assertMapping(call, successor, await durableGeneration(cluster, successor));
+        assertMapping(call, await durableGeneration(cluster, successor));
         console.log(`Database ${db.name} takeover: ${original} -> ${successor}, epoch ${epochs.get(db.name)} -> ${call.shardEpoch}`);
       }, { timeout: 100000, interval: 500 });
     }
@@ -534,6 +534,81 @@ async function threadedSqlTransactionLimit(cluster) {
   const final = await log();
   assert.equal(final.threadedHomeIo.openSamples, before.threadedHomeIo.openSamples, 'the same database stayed open');
   assert.equal(final.objects.repairs, before.objects.repairs, 'the connection needed no repair');
+}
+
+async function threadedDatabaseAccounting(cluster) {
+  const [threaded, upstream] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-accounting', { durableObjectNamespaces: 48 });
+  const databaseWorker = `${tenant.name}/__databases`;
+  const platformWorker = `${tenant.name}/:platform`;
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[upstream, 1], [threaded, 1]]));
+  await cluster.deploy(tenant, 'object', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Echo extends DurableObject {
+      fetch() { return new Response('expected the platform class', { status: 500 }); }
+    }
+    export default { fetch(request, env) {
+      return env.ECHO.getByName(new URL(request.url).searchParams.get('name')).fetch(request);
+    } };
+  `, { wrangler: {
+    durable_objects: { bindings: [{ name: 'ECHO', class_name: 'Echo' }] },
+    migrations: [{ tag: 'v1', new_sqlite_classes: ['Echo'] }],
+  } });
+  const { namespaceId, shards } = await cluster.api(`${tenant.path}/workers/object/namespaces/Echo`, { token: tenant.token });
+  const candidate = Array.from({ length: 64 }, (_, index) => `object-${index}`).find(name => {
+    const id = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update(name).digest();
+    const shard = Number(id.readBigUInt64BE() % BigInt(shards));
+    return shardOwnerOrder(cluster, namespaceId, shard)[0] === threaded;
+  });
+  assert.ok(candidate, 'the platform object is assigned to the threaded database owner');
+  assert.equal((await durableGeneration(cluster, threaded)).lifecycle.durableServer, 'threaded');
+
+  for (const [node, [db]] of databases) {
+    await eventually(`public SQL serves the database on ${node}`, async () => {
+      const reply = await cluster.api(`${db.path}/query`, {
+        method: 'POST', token: tenant.token, body: { sql: 'SELECT 42 AS value' },
+      });
+      assert.deepEqual(reply.results, [{ value: 42 }]);
+    });
+  }
+  await eventually('the same tenant loads the non-database platform class on the threaded owner', async () => {
+    const response = await workerCall(cluster, threaded, tenant, `object?name=${candidate}`);
+    assert.deepEqual(json(response, 200, 'platform control request'), { service: 'echo', build: threaded });
+  });
+
+  for (const [node, [db]] of databases) {
+    const expected = new Map([[db.namespaceId.slice(0, 12), databaseWorker]]);
+    if (node === threaded) expected.set(namespaceId.slice(0, 12), platformWorker);
+    await eventually(`dispatch logs for the accounting requests on ${node}`, async () => {
+      const logs = await cluster.compose(['logs', '--no-color', node]);
+      const dispatches = logs.split('\n').filter(line => line.includes('[do] '))
+        .map(line => JSON.parse(line.split('[do] ')[1]))
+        .filter(row => row.status === 200 && expected.has(row.namespaceId));
+      const { executions } = await cluster.state(node);
+      for (const [namespace, worker] of expected) {
+        const call = dispatches.find(row => row.namespaceId === namespace);
+        assert.ok(call, `${node} served namespace ${namespace}`);
+        assert.equal(call.workerId, worker, 'dispatch log Worker');
+        const admitted = executions.find(row => row.invocationId === call.invocationId);
+        assert.equal(admitted?.dispatched, true, 'the event was admitted for execution');
+        assert.equal(admitted.target, `${worker}@${call.versionId}`, 'admitted Worker and version');
+      }
+    });
+
+    await eventually(`native metering rows and tenant usage on ${node}`, async () => {
+      const { processes, usage } = await cluster.state(node);
+      if (node === threaded) {
+        // The native host's completion rows carry the Worker and peak memory.
+        // The upstream database uses a static runtime class.
+        for (const worker of expected.values()) {
+          assert.ok(processes.workerMemoryStats.some(row => row.workerId === worker && row.peakUsedBytes > 0),
+            `native usage row for ${worker}`);
+        }
+      }
+      const requestCount = Object.values(usage.hours).reduce((count, hour) => count + (hour[tenant.name]?.requests ?? 0), 0);
+      assert.ok(requestCount >= expected.size, `durable requests are counted for ${tenant.name}`);
+    });
+  }
 }
 
 async function threadedSqlDeadline(cluster) {
@@ -3109,6 +3184,10 @@ export const durableGatedCases = {
     test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNode: 'node-1',
     publishPeerPorts: true, controlDurableLifecycle: true, holdPeerAcks: false,
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
+  'durable-threaded-database-accounting': {
+    test: threadedDatabaseAccounting, nodes: ['node-1'], databaseFixtureNode: 'node-1', holdPeerAcks: false,
+    platformFixture: () => [{ worker: 'sql-accounting/object', bindingClass: 'Echo', className: 'PlatformEcho' }],
   },
   'threaded-sql-deadline': {
     test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNode: 'node-1',
