@@ -182,23 +182,27 @@ A write past the object or tenant cap is refused at confirmation with `413 DO_OB
 ### Threaded object admission
 
 On a node running the experimental `durableObjects.threadedStorage` backend, while one event is
-executing, up to **four more events** can wait in the object's mailbox. The root and its facets share
-that capacity. The home frees an entry when it begins delivery. Events already delivered, including
-events suspended at an `await`, are outside the waiting count.
+executing, up to **512 events** can wait in the object's mailbox, each bounded by its existing request
+deadline. The root and its facets share that capacity. The home frees an entry when it begins delivery,
+or when the queued event expires or is canceled. Events already delivered, including events suspended
+at an `await`, are outside the waiting count.
 
-Those entries share **64 KiB (65,536 bytes)** for encoded invocation descriptors and any
+Those entries share **2 MiB (2,097,152 bytes)** for encoded invocation descriptors and any
 node-delivered WebSocket message payloads. HTTP bodies stream separately. A large descriptor or
 message can fill the byte allowance with fewer events. The child can also refuse while the mailbox
 has room if it cannot reserve memory or descriptors from the shared budget, it cannot place a cold
 tree, or the assigned home is resetting. Node admission limits can refuse a call before it reaches
 the child.
 
-These are the release binaries' threaded-backend defaults. The node leaves `threadedStorage` off by
-default. The [cluster fixture](../../tests/cluster/cluster.mjs) sets `COWORKERD_DO_TEST_MAILBOX_EVENTS=32`
-on its threaded nodes, including in `durable-threaded-hibernation`, and leaves the byte limit at
-64 KiB. The node passes that variable and `COWORKERD_DO_TEST_MAILBOX_BYTES` to the threaded durable
-child as test overrides. The [node's JSON configuration](install.md#durable-objects-and-local-storage)
-offers no mailbox settings.
+The node leaves `threadedStorage` off by default. The cluster suite exercises these mailbox limits
+with separate bursts of 128 concurrent single-row reads through public HTTP SQL and a Worker D1
+binding to one threaded database. The Worker runs on a peer of the database owner. Worker roots
+and local binding calls share the node's root admission threshold when they run on the same node.
+The test uses the experimental database placement executable.
+The hosted Linux x86-64 and ARM64 clusters each served all 128 reads on both routes at the
+compiled defaults.
+[Cluster test](../../tests/cluster/README.md#threaded-sql-default-mailbox) ·
+[Measurement environment](../threaded-durable-processes.md#per-object-admission-mailbox).
 
 ## 7. When ownership changes
 

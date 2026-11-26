@@ -9,7 +9,7 @@ native bootstrap failure. The one-shot fixture exercises that path without
 retiring another copy.
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index f676810d53511142b686177f7362e90f848fc913..81ec2e44df8280a3c408e417bbf3bbc2b8d0ba19 100644
+index cca899fe5587696686ccf4b5bb8f2b1b9ecebf00..1f0b19e4318b5b4ccd4aef2ab06271d72923f2fe 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -637,6 +637,8 @@ void noSandboxRoom(ResourceBudget &budget) {
@@ -67,7 +67,7 @@ index f676810d53511142b686177f7362e90f848fc913..81ec2e44df8280a3c408e417bbf3bbc2
    return now;
  }
  
-@@ -4265,9 +4283,11 @@ struct ThreadedServer {
+@@ -4269,9 +4287,11 @@ struct ThreadedServer {
      const bool platformDatabase = definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
      auto reservation = std::make_shared<ResourceReservation>(
          resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), platformDatabase);
