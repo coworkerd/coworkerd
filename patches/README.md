@@ -85,6 +85,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0177 reclaims the least recently used eligible database when opening another
   needs a home or a process reservation. The home closes the actor and releases its copy
   before admission retries.
+  Patch 0178 settles platform SQL interruptions and removes any WAL tail spilled by the aborted
+  transaction. It keeps SQLite storage failures on the critical error path.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
