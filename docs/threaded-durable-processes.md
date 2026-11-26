@@ -335,10 +335,15 @@ A threaded database can also retire under admission pressure before its idle tim
 The process ranks eligible database trees across its homes by the last completed call.
 The selected home rechecks the mailbox, active calls, tracked background work and WAL
 confirmation before closing the tree. The admission retry follows the normal close and
-copy release. The home remains available to a database for 100 ms after a routing
-retirement, giving the preface retry time to return even when tenant objects are arriving.
+copy release. After a routing retirement, the home and one routing tree credit give
+databases 100 ms to retry at the native preface. Existing tenant trees can continue
+serving calls during that interval.
 A cold load that cannot register its initial reservation may retire one database whose
-charge would cover the shortfall. It waits for that reservation to return before one retry.
+charge would cover the shortfall. One preparation credit is held for a database while
+the reservation returns and for up to 100 ms afterward. The cold load retries once.
+If retirement cannot return the reservation within one second, the process clears the
+victim, counts an overload and logs its home and tree. Capacity waiters receive a refusal
+and the process can use the home once its normal close is complete.
 [Admission measurements](database-home-benchmark.md#database-admission-at-the-ceiling)
 
 Use the node's WebSocket registry and transport loop for parked connections. The handoff carries the

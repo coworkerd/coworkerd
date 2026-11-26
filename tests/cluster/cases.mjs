@@ -668,6 +668,7 @@ async function threadedDatabaseAdmission(cluster) {
     assert.equal(latest.generation, original.generation);
     const admission = latest.lifecycle.durableAdmission;
     for (const [field, value] of Object.entries(expected)) assert.equal(admission[field], value, field);
+    return admission;
   };
   const observe = (label, expected) => eventually(label, () => sample(expected), { interval: 25 });
 
@@ -733,7 +734,82 @@ async function threadedDatabaseAdmission(cluster) {
   if (queued.error) throw queued.error;
   assert.deepEqual(queued, [{ id: 1 }, { id: 2 }]);
   assert.deepEqual(json(await sql(overflow, probe), 200, 'retry after drain').results, [{ value: 17 }]);
+
+  const beforeDeadline = await observe('three homes are idle before the next admission',
+    { residentRoots: 3, running: 0, waiting: 0, pendingCommits: 0 });
+  const holdReservation = join(cluster.durableLifecycleGate, 'hold-database-reservation');
+  await writeFile(holdReservation, '');
+  try {
+    assert.deepEqual(json(await sql(newcomer, probe), 200, 'retry after a retirement deadline').results,
+      [{ value: 17 }]);
+    await observe('the stranded reservation produces one refusal without pinning its home', {
+      admissionRetirements: beforeDeadline.admissionRetirements + 1,
+      overloaded: beforeDeadline.overloaded + 1, residentRoots: 3, idleRetirements: 0,
+    });
+  } finally {
+    await unlink(holdReservation);
+  }
   console.log('Three busy homes refused a fourth database. Idle admission preserved the queued read and confirmed rows.');
+}
+
+async function threadedDatabaseAdmissionMixed(cluster) {
+  const [owner] = cluster.nodes;
+  const homes = 4;
+  const count = 36;
+  const competitorCount = 6;
+  const sqlTenant = await cluster.tenant('sql-mixed', { durableObjectNamespaces: count });
+  const objectTenant = await cluster.tenant('sql-mixed-objects', {
+    workers: competitorCount, durableObjectNamespaces: competitorCount,
+  });
+  const workers = Array.from({ length: competitorCount }, (_, index) => 'object-' + index);
+  for (const name of workers) {
+    await cluster.deploy(objectTenant, name, `
+      export class Service { fetch() { return new Response('admitted'); } }
+      export default { fetch(request, env) { return env.SERVICE.getByName('one').fetch(request); } };
+    `, { wrangler: {
+      durable_objects: { bindings: [{ name: 'SERVICE', class_name: 'Service' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['Service'] }],
+    } });
+  }
+  const { databases } = await createDatabaseHomes(cluster, sqlTenant, new Map([[owner, count]]));
+  const names = databases.get(owner);
+  const query = db => request(cluster.urls.apiserver, db.path + '/query', {
+    method: 'POST', token: sqlTenant.token, body: { sql: 'SELECT 1 AS value' },
+  });
+  const expectQuery = async db => assert.deepEqual(
+    json(await query(db), 200, db.name).results, [{ value: 1 }]);
+  for (const db of names.slice(0, homes)) await expectQuery(db);
+  const before = await eventually('four homes hold settled databases before the scan', async () => {
+    const state = await durableGeneration(cluster, owner);
+    assert.equal(state.lifecycle.durableAdmission.residentRoots, homes);
+    assert.equal(state.lifecycle.durableAdmission.running, 0);
+    return state;
+  }, { interval: 25 });
+  let scanning = true;
+  let attempts = 0;
+  const traffic = Promise.allSettled(workers.map(async name => {
+    while (scanning) {
+      await request(cluster.urls[owner], '/' + objectTenant.name + '/' + name);
+      ++attempts;
+    }
+  }));
+  try {
+    await eventually('the tenant Workers contend for new homes before the scan', () => {
+      assert.ok(attempts >= competitorCount);
+    }, { interval: 10 });
+    for (const db of names.slice(homes)) await expectQuery(db);
+  } finally {
+    scanning = false;
+    for (const result of await traffic) {
+      if (result.status === 'rejected') throw result.reason;
+    }
+  }
+  await eventually('the same process retires databases for the scan while tenant Workers compete', async () => {
+    const after = await durableGeneration(cluster, owner);
+    assert.equal(after.pid, before.pid);
+    assert.equal(after.generation, before.generation);
+    assert.ok(after.lifecycle.durableAdmission.admissionRetirements >= count - homes);
+  }, { interval: 25 });
 }
 
 async function threadedDatabaseAccounting(cluster) {
@@ -3389,6 +3465,10 @@ export const durableGatedCases = {
     test: threadedDatabaseAdmission, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
     controlDurableLifecycle: true, confirmTimeoutMs: 15000,
     nodeEnvironment: () => ({ COWORKERD_DO_TEST_HOME_COUNT: '3' }),
+  },
+  'durable-threaded-database-admission-mixed': {
+    test: threadedDatabaseAdmissionMixed, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    singleNode: true, holdPeerAcks: false,
   },
   'durable-threaded-database-accounting': {
     test: threadedDatabaseAccounting, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,

@@ -444,9 +444,18 @@ The memory probe runs 125 queries with a 448 MiB process budget and 192 homes. I
 that a new copy can reclaim a memory reservation while unused homes are still available.
 The busy probes hold a long SQL read on each default home, observe the running count
 per process, and submit one additional query per process to verify its capacity refusal.
-The mixed probe runs the same admission path with six competing tenant definitions arriving
-as the SQL scan opens distinct databases. Before the freed-home preference, four tenant
-definitions filled all four homes and only one of the 116 subsequent SQL reads succeeded.
+The mixed probes run the same admission path with six competing tenant definitions arriving
+as the SQL scan opens distinct databases. The default process reaches its four-home limit
+first. Before the freed-home preference, four tenant definitions filled those homes and
+only one of the 116 subsequent SQL reads succeeded.
+
+The mixed memory probe raises the home count to 768 while retaining the default process
+budget and routing tree limit. Its fixture holds the idle clock near the starting time
+during warm-up so the timed release does not lower resident counts before the scan. It
+restores the clock before offering competing definitions. The mixed tree probe leaves
+homes available by setting 12 homes and `residentObjects: 4`. It prewarms a tenant copy
+and requests distinct object keys, so a tenant can claim a released tree credit without
+needing a new copy.
 
 ### Verification with patch 0177
 
@@ -475,11 +484,12 @@ daemon, launcher and runtime sources. The default memory budget was derived from
 
 ```sh
 export COWORKERD_CLUSTER_BIN_DIR="$PWD/build"
-for mode in unpaced memory mixed busy-one busy-two; do
+for mode in unpaced memory mixed mixed-memory mixed-resident busy-one busy-two; do
   node tests/cluster/database-home-benchmark.mjs \
     object "$PWD" "$KERNEL_DIR" "$PWD/admission-$mode.jsonl" "--idle-admission-$mode"
 done
 node tests/cluster/run.mjs "$KERNEL_DIR" durable-threaded-database-admission
+node tests/cluster/run.mjs "$KERNEL_DIR" durable-threaded-database-admission-mixed
 ```
 
 ## Reproduce
