@@ -54,6 +54,8 @@ cell() {
   local side=$1 tier=$2 binaries=$3 root=$4
   local path="$root/$side" objects="$runner/$side-$tier-objects"
   sudo install -d -o 10001 -g 10001 -m 0755 "$path" "$objects" "$objects/log"
+  # A nested bind makes the otherwise empty object root appear initialized.
+  printf 'coworkerd-do-root-1\n' | sudo tee "$objects/format" >/dev/null
   COWORKERD_CLUSTER_BIN_DIR="$binaries" node "$trace_source/measure.mjs" "$kernel" \
     "$reports/$side-$tier.jsonl" "$path" "$runner/trace.so" "$objects"
 }
