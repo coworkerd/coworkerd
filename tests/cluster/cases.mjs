@@ -669,6 +669,13 @@ async function threadedSqlDefaultMailbox(cluster) {
   // each use their node's default admission budget.
   const d1 = async () => json(await workerCall(cluster, ingress, tenant, 'read', { timeout: 35000 }), 200, 'D1 read');
 
+  await eventually('each peer sees every active database owner', async () => {
+    const states = await Promise.all(cluster.nodes.map(node => cluster.state(node)));
+    for (const { membership } of states) {
+      const candidates = membership.members.filter(member => member.durableProcesses > 0 && member.state === 'active');
+      assert.deepEqual(candidates.map(member => member.nodeId).sort(), cluster.nodes);
+    }
+  });
   const seed = await sql([
     { sql: 'CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)' },
     { sql: 'INSERT INTO records VALUES (?, ?)', params: [1, db.name] },
