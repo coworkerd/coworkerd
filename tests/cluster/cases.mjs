@@ -2504,7 +2504,8 @@ async function durableCopyReservationRefusal(cluster) {
     }
     assert.equal(await executedSql(), before, 'the refusal did not count as an executed SQL request');
     assert.deepEqual(await rows(), expected, 'the refused insert left the ledger unchanged');
-    json(await write(), 200, `SQL caller ${index + 1} retries once`);
+    const retried = json(await write(), 200, `SQL caller ${index + 1} retries once`);
+    if (index === 0) assert.equal(retried.success, true, retried.error);
     expected.push({ value: index + 1 });
     assert.deepEqual(await rows(), expected, 'one row per retried operation');
   }
