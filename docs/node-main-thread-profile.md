@@ -80,6 +80,35 @@ A plain root sends an execution descriptor and bridges HTTP to the ordinary runt
 
 The unscaled sampling periods agree with independently measured CPU within 0.005 ms per reply. Relative to direct windows, sampled median throughput varied by −3.2% to +1.8%, and profiled CPU per reply differed by at most 0.042 ms. All variants ran the tracing build.
 
+### Ordinary Release and tracing build
+
+The primary runner was recycled after the first run. A second standard Ubuntu 24.04 VM ran both builds with the same node source, published workerd kernel, Compose topology, and 16-client load. GitHub Actions instance **1000001549** (`runnervm0j63q`) had four vCPUs on an AMD EPYC 7763, 16,760,320,000 bytes of RAM, Linux `7.0.0-1020-azure`, and ext4. Two windows of the ordinary Release build bracketed three traced windows per workload. The CPU comparison uses unsampled windows for both builds. Another three traced windows per workload captured stacks for the shared-object table. All 32 windows passed reply and insert checks with zero warm-up or timed failures. [Control runner and recording](node-main-thread-profile/controls) · [Control run and raw stacks](https://github.com/coworkerd/coworkerd/actions/runs/45834753741)
+
+| Workload | Plain before / after CPU ms/reply | Plain pooled CPU ms/reply | Traced CPU ms/reply | Traced minus plain ms/reply | Plain / traced replies/s |
+| --- | --- | --- | --- | --- | --- |
+| Worker response | 0.646 / 0.639 | 0.643 | 0.678 | +0.035 | 1,425 / 1,391 |
+| No-op Durable Object | 1.737 / 1.725 | 1.731 | 1.770 | +0.039 | 524 / 527 |
+| One-row read | 1.949 / 1.941 | 1.945 | 1.960 | +0.015 | 450 / 459 |
+| Confirmed one-row insert | 2.127 / 2.066 | 2.095 | 2.142 | +0.047 | 361 / 369 |
+
+The traced build added 0.015–0.047 ms of main-thread CPU per reply on this paired control. This measures the combined effect of the trace patch and profiling build flags. The no-op and read in the primary run cost 1.282 and 1.429 ms, compared with 1.00–1.12 and 1.24–1.33 ms in #94. The paired build deltas for those paths were 0.039 and 0.015 ms. They explain only a fraction of the gap. The first experiment and #94 also used different runner instances, node revisions and workerd archive pins. [#94 throughput and CPU measurements](database-throughput.md)
+
+### Shared objects in the residual samples
+
+The second runner also kept the shared object (DSO) of the sampled instruction for the three residual buckets. Each DSO's sample periods are scaled to measured thread CPU using the same per-window method as the stage table.
+
+| Residual DSO (CPU ms/reply) | Worker response | No-op Durable Object | One-row read | Confirmed one-row insert |
+| --- | --- | --- | --- | --- |
+| glibc | 0.139 | 0.361 | 0.442 | 0.447 |
+| Linux kernel and modules | 0.071 | 0.193 | 0.216 | 0.215 |
+| Node executable | 0.040 | 0.093 | 0.112 | 0.122 |
+| libstdc++ | 0.008 | 0.013 | 0.012 | 0.015 |
+| Other userspace objects | 0.034 | 0.061 | 0.050 | 0.059 |
+| Unknown mapping | 0.000 | 0.000 | 0.000 | 0.000 |
+| Total residual | 0.292 | 0.720 | 0.832 | 0.858 |
+
+On the control runner, glibc and the kernel together held 72–79% of the residual, including 0.554 ms out of 0.720 ms on a no-op object call. The remaining node-executable samples include statically linked KJ and Cap’n Proto. A DSO identifies where the instruction ran. Attribution to an individual request phase still depends on its caller frames.
+
 ### Waiting for local WAL confirmation
 
 | Confirmed replies | Flush calls | Elapsed ms/flush | CPU ms/flush | Off-CPU ms/reply | Largest elapsed ms |
@@ -132,6 +161,7 @@ The report tables can be regenerated from the checked-in recording. Run the stac
 
 ```sh
 python3 tests/cluster/main-thread-profile/tables.py docs/node-main-thread-profile/measurement.jsonl
+python3 tests/cluster/main-thread-profile/tables.py --controls docs/node-main-thread-profile/controls
 node tests/cluster/main-thread-profile/perf.mjs /path/to/stacks.jsonl
 ```
 
