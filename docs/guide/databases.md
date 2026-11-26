@@ -369,9 +369,10 @@ A bookmark identifies one immutable revision and can only be used with its sourc
 
 The restore command displays the resolved revision and its publication time **before** asking for confirmation or
 starting (`--yes` skips the question). `--timestamp` accepts ISO time with timezone or Unix milliseconds. It selects the
-highest published revision whose generation time is no later than T. A time before all matching history fails.
-A time after the latest publication selects that latest revision. If clocks differ at an owner takeover, revision
-order wins. The lookup searches revision numbers with exact GETs, splitting owner epochs before searching their times.
+highest published revision whose generation time is no later than T. A write made before T can be absent if its
+records were still unpublished at T. A time before all matching history fails. A time after the latest publication selects that
+latest revision. If clocks differ at an owner takeover, revision order wins. The lookup searches revision numbers
+with exact GETs, splitting owner epochs before searching their times.
 A lookup is limited to 128 history reads (up to 256 HTTP attempts if each read retries once). Exceeding this returns
 422 `HISTORY_READ_LIMIT`; retry the same request to continue from the cached owner intervals. A bookmark needs at
 most one history read. The control plane retains up to 64 library caches, each with 256 revision records, 128 owner
