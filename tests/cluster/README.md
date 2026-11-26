@@ -58,6 +58,13 @@ including writes with a connected client. It checks the complete reply on a half
 connection and terminates an active HTTP writer with a TCP reset. Reads already queued behind
 the interrupted writes must return the earlier confirmed value, with no additional SQLite opens.
 
+### Threaded SQLite memory limit
+
+Run `node tests/cluster/run.mjs "$kernel" threaded-sql-memory-limit` with the matching Linux
+binaries. The threaded owner uses a 1 MiB SQLite heap budget. The case checks repeated queries
+below and above the budget, HTTP and D1 rollback, the confirmed `exec()` prefix, and recovery
+on the same SQLite connection after sort, value size and reply size errors.
+
 ### Threaded SQL and CLI parity
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-cli-parity` to run `sql-atomicity` with the

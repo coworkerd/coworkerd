@@ -107,3 +107,4 @@
 0176-attribute-platform-databases-to-database-worker.patch
 0177-retire-idle-databases-at-admission.patch
 0178-keep-platform-databases-open-after-sql-interruption.patch
+0182-bound-platform-sqlite-memory.patch
