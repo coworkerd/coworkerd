@@ -246,6 +246,18 @@ function shardOwnerOrder(cluster, namespaceId, shard) {
   return scores.map(([node]) => node);
 }
 
+async function databaseShardOwner(cluster, db) {
+  // The first request can fall back when the preferred node lacks this database's catalog.
+  const holders = await Promise.all(cluster.nodes.map(async node => {
+    const { durableShards } = await cluster.state(node);
+    const namespace = durableShards.held.namespaces[db.namespaceId];
+    return namespace?.shards.some(({ shard }) => shard === 0) ? node : null;
+  }));
+  const owners = holders.filter(Boolean);
+  assert.equal(owners.length, 1, `${db.name} has exactly one shard owner`);
+  return owners[0];
+}
+
 async function databaseDispatches(cluster, db, owner) {
   const logs = await cluster.compose(['logs', '--no-color', owner]);
   return logs.split('\n').filter(line => line.includes('[do] ')).map(line => JSON.parse(line.split('[do] ')[1]))
@@ -316,13 +328,14 @@ INSERT INTO books VALUES (1, 'One');
   assert.equal(schema.length, 3);
   assert.deepEqual(await execute(source.name, rowsSql), rows);
 
-  const sourceOwner = shardOwnerOrder(cluster, source.namespaceId, 0)[0];
+  const sourceOwner = await databaseShardOwner(cluster, source);
   const log = async () => (await cluster.state(sourceOwner)).durableLog.log;
   const publishedPoint = async () => {
-    const confirmed = BigInt((await log()).nextSeq);
-    assert.ok(confirmed > 0n);
-    await eventually('the owner publishes the confirmed source writes', async () => {
-      assert.ok(BigInt((await log()).sealedSeq) >= confirmed);
+    const throughSeq = BigInt((await log()).nextSeq);
+    assert.ok(throughSeq > 0n);
+    // The write has returned, and the owner's seal advances after manifest publication.
+    await eventually(`${sourceOwner} publishes the source writes through sequence ${throughSeq}`, async () => {
+      assert.ok(BigInt((await log()).sealedSeq) >= throughSeq);
     });
     return (await cli('time-travel', 'info', source.name)).point;
   };
@@ -366,7 +379,8 @@ INSERT INTO books VALUES (1, 'One');
   })) } });
   const withWrite = [...rows, { id: 4, title: 'D1 write' }];
   for (const [index, db] of [backup, historical].entries()) {
-    const [, ingress] = shardOwnerOrder(cluster, db.namespaceId, 0);
+    const owner = await databaseShardOwner(cluster, db);
+    const ingress = cluster.nodes.find(node => node !== owner);
     const call = async method => json(await workerCall(cluster, ingress, tenant, `read-write?db=DB${index}`, { method }),
       200, `${db.name} D1 ${method}`);
     await eventually(`${db.name} is readable through its D1 binding`, async () => assert.deepEqual(await call('GET'), rows));
@@ -376,7 +390,7 @@ INSERT INTO books VALUES (1, 'One');
   assert.deepEqual(await execute(source.name, rowsSql), [...rows, { id: 3, title: 'After bookmark' }]);
 
   for (const db of [ledger, source, backup, historical]) {
-    const [owner] = shardOwnerOrder(cluster, db.namespaceId, 0);
+    const owner = await databaseShardOwner(cluster, db);
     const process = await durableGeneration(cluster, owner);
     assert.equal(process.lifecycle.durableServer, 'threaded');
     const callers = db === backup || db === historical ? ['node', 'worker'] : ['node'];
