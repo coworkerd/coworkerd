@@ -241,6 +241,13 @@ async function databaseDispatches(cluster, db, owner) {
 }
 
 async function threadedSqlCliParity(cluster) {
+  await eventually('each node sees every durable owner candidate before the first SQL write', async () => {
+    await Promise.all(cluster.nodes.map(async node => {
+      const { membership } = await cluster.state(node);
+      const candidates = membership.members.filter(member => member.durableProcesses > 0 && member.state === 'active');
+      assert.deepEqual(candidates.map(member => member.nodeId).sort(), cluster.nodes, `${node} durable membership`);
+    }));
+  });
   const ledger = await sqlAtomicity(cluster);
   const tenant = await cluster.tenant('sql-cli');
   const cwd = join(cluster.directory, 'd1-cli');
