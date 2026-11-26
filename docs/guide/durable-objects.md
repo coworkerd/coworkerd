@@ -179,6 +179,27 @@ An ordinary class exception leaves the instance available; fetch returns `500 EX
 
 A write past the object or tenant cap is refused at confirmation with `413 DO_OBJECT_TOO_LARGE` or `422 QUOTA_EXCEEDED`; reads and transactions that do not grow the database remain possible, including deleting rows. The size estimate can lag. A refusal immediately marks the object for repair; later requests wait for one consistent recovered history. The SQL statement may already have executed locally. A failed response alone does not prove rollback: records without a persistent exclusion remain possible writes. See [error codes](errors.md).
 
+### Threaded object admission
+
+On a node running the experimental `durableObjects.threadedStorage` backend, while one event is
+executing, up to **four more events** can wait in the object's mailbox. The root and its facets share
+that capacity. The home frees an entry when it begins delivery. Events already delivered, including
+events suspended at an `await`, are outside the waiting count.
+
+Those entries share **64 KiB (65,536 bytes)** for encoded invocation descriptors and any
+node-delivered WebSocket message payloads. HTTP bodies stream separately. A large descriptor or
+message can fill the byte allowance with fewer events. The child can also refuse while the mailbox
+has room if it cannot reserve memory or descriptors from the shared budget, it cannot place a cold
+tree, or the assigned home is resetting. Node admission limits can refuse a call before it reaches
+the child.
+
+These are the release binaries' threaded-backend defaults. The node leaves `threadedStorage` off by
+default. The [cluster fixture](../../tests/cluster/cluster.mjs) sets `COWORKERD_DO_TEST_MAILBOX_EVENTS=32`
+on its threaded nodes, including in `durable-threaded-hibernation`, and leaves the byte limit at
+64 KiB. The node passes that variable and `COWORKERD_DO_TEST_MAILBOX_BYTES` to the threaded durable
+child as test overrides. The [node's JSON configuration](install.md#durable-objects-and-local-storage)
+offers no mailbox settings.
+
 ## 7. When ownership changes
 
 A class namespace has 1024 shards; the first eight ID bytes, interpreted big-endian, modulo the shard count select the shard. A live owner keeps it; it is not moved merely to balance load. Any eligible node may acquire the next immutable ownership epoch after release or confirmed expiry. A node with `durableObjects.processes: 0` forwards calls but owns no shards. A store without atomic create-if-absent serves no objects.
