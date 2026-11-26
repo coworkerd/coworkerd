@@ -82,6 +82,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   the threaded server and tests the home-reservation guard.
   Patch 0176 reserves `<tenant>/__databases` for the product SQL class's execution and metering
   while the platform definition still supplies its code and isolate copy key.
+  Patch 0179 sizes the default object mailbox for ordinary request bursts in
+  `src/workerd/threaded/threaded-server.c++`.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

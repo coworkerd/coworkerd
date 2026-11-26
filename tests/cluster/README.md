@@ -52,6 +52,17 @@ connection and terminates an active HTTP writer with a TCP reset. The case check
 queued HTTP and D1 reads during the write resets, followed by a fresh SQLite open in the same
 process and a read of the earlier confirmed value.
 
+### Threaded SQL default mailbox
+
+Run `node tests/cluster/run.mjs "$kernel" threaded-sql-default-mailbox` on Linux x86-64 or arm64
+with the matching kernel and `coworkerd-platform-test` binaries. The three-node Compose fixture
+enables threaded database placement on one owner. It uses the compiled mailbox limits, the default
+process in-flight limit, and ordinary request deadlines. The case warms one database, launches 128
+concurrent HTTP SQL requests through the control plane, and then launches 128 concurrent Worker
+requests through a D1 binding to the same database. Each request reads one seeded row by primary
+key. The case reports the success count for each route and requires all replies to contain the row,
+with the original threaded process generation and no admission overloads.
+
 ### Threaded SQL and CLI parity
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-cli-parity` to run `sql-atomicity` with the
