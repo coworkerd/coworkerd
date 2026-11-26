@@ -51,6 +51,14 @@ including writes with a connected client. It checks the complete reply on a half
 connection and terminates an active HTTP writer with a TCP reset. Reads already queued behind
 the interrupted writes must return the earlier confirmed value, with no additional SQLite opens.
 
+### Threaded SQL and CLI parity
+
+Run `node tests/cluster/run.mjs "$kernel" threaded-sql-cli-parity` to run `sql-atomicity` with the
+`coworkerd-platform-test` executable on all three threaded nodes. The case applies a `cowctl d1` migration,
+imports a small SQL file, and restores both a SQL export and a published bookmark into new databases. It compares
+the schema, migration ledger and confirmed rows, then writes through a D1 binding and reads the result through the
+CLI. Owner dispatch records verify that the SQL calls reached the platform database in a threaded process.
+
 ### Database placement across builds
 
 `threaded-sql-transaction-limit` uses the test executable on the threaded owner. It sets the peer
