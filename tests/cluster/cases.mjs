@@ -2060,6 +2060,11 @@ async function durableCopyReservationRefusal(cluster) {
   const tenant = await cluster.tenant('copy-reservation-refusal', { durableObjectNamespaces: 48 });
   const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 1]]));
   const [db] = databases.get(owner);
+  const { storage: { tenantsRevision } } = await cluster.api('/v1/status');
+  await eventually('each node applies the tenant index containing the ledger', async () => {
+    const states = await Promise.all(cluster.nodes.map(node => cluster.state(node)));
+    assert.ok(states.every(state => BigInt(state.storage.appliedTenantsRevision) >= BigInt(tenantsRevision)));
+  });
   const sql = sql => request(cluster.urls.apiserver, `${db.path}/query`, {
     method: 'POST', token: tenant.token, body: { sql }, timeout: 10000,
   });
