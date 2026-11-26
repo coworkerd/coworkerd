@@ -32,6 +32,8 @@ export function summarizeTrace(bytes, windowNs) {
   const flush = { calls: 0, elapsedNs: 0, cpuNs: 0, maxElapsedNs: 0 };
   let previous;
   let peak = { roots: 0, nested: 0, total: 0 };
+  const rootArrivals = new Map();
+  let arrivals = 0;
   function addInterval(until) {
     assert.ok(previous, 'trace wrapped within the timed window');
     const [timestamp, roots, nested] = previous;
@@ -55,7 +57,16 @@ export function summarizeTrace(bytes, windowNs) {
     if (kind === 0) {
       if (timestamp >= end) break;
       if (timestamp >= begin) addInterval(timestamp);
-      if (previous) assert.ok(timestamp >= previous[0], 'admission timestamps must be ordered');
+      if (previous) {
+        const [previousTime, roots, nested] = previous;
+        assert.ok(timestamp >= previousTime, 'admission timestamps must be ordered');
+        if (timestamp >= begin && first === roots + 1) {
+          assert.equal(second, nested, 'only one admission slot changes at a time');
+          const active = roots + nested;
+          rootArrivals.set(active, (rootArrivals.get(active) ?? 0) + 1);
+          ++arrivals;
+        }
+      }
       previous = [timestamp, first, second];
     } else {
       assert.equal(kind, 1, 'trace event kind');
@@ -72,7 +83,8 @@ export function summarizeTrace(bytes, windowNs) {
   for (const distribution of durations)
     assert.equal([...distribution.values()].reduce((a, b) => a + b, 0), window);
   const [roots, nested, total] = durations.map(distribution => weightedStats(distribution, window));
-  return { occupancy: { roots, nested, total, peak }, flush };
+  const atRootAdmission = { count: arrivals, ...weightedStats(rootArrivals, arrivals) };
+  return { occupancy: { roots, nested, total, peak, atRootAdmission }, flush };
 }
 
 const operations = ['worker-only', 'object-noop', 'read', 'insert'];
@@ -84,7 +96,15 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
   const forwarder = join(binaries, 'coworkerd-bench-http-forwarder');
   const observePerf = process.env.COWORKERD_PROFILE_PERF !== '0';
   const stackOutput = process.env.COWORKERD_PROFILE_STACKS;
-  const hostPid = async name => Number(await cluster.command('docker', ['inspect', '-f', '{{.State.Pid}}', name]));
+  async function nodeHostPid() {
+    // Compose starts the daemon below its PID 1 init process.
+    const processes = await cluster.command('docker', ['top', container, '-eo', 'pid,comm']);
+    const pids = processes.split('\n').map(line => line.trim().split(/\s+/))
+      .filter(([, command]) => command === 'coworkerd').map(([pid]) => Number(pid));
+    assert.equal(pids.length, 1, 'one coworkerd daemon in the Docker container');
+    assert.ok(Number.isInteger(pids[0]) && pids[0] > 0);
+    return pids[0];
+  }
   const trace = join(cluster.directory, 'node-trace.bin');
   const perfData = join(cluster.directory, 'perf.data');
   const perfScript = join(cluster.directory, 'perf.txt');
@@ -105,7 +125,7 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
       'for candidate in /proc/[0-9]*/comm; do if read -r name < "$candidate" && [[ "$name" = http-forwarder ]]; then dir=${candidate%/comm}; echo "${dir##*/}"; fi; done',
     ]));
     assert.ok(Number.isInteger(proxyPid) && proxyPid > 0, 'forwarder PID in the node namespace');
-    const pid = observePerf ? await hostPid(container) : 0;
+    const pid = observePerf ? await nodeHostPid() : 0;
 
     async function measure(operation, clients, profileMode, round) {
       const result = await runCell({ operation, clients, profileMode, round,
