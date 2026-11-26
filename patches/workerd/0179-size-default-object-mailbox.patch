@@ -6,10 +6,10 @@ Subject: [PATCH] Size the default object mailbox for ordinary request bursts
 Use the node process in-flight default as the waiting-event ceiling and allow an average of 4 KiB in declared bytes per slot. Keep charging the shared memory and descriptor budgets for each admitted event.
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index fbae87c6f5f828f9f312a94b7f30ece160c927a8..7d22c1d169679b6132756c87aae3581f57442fb9 100644
+index f676810d53511142b686177f7362e90f848fc913..cca899fe5587696686ccf4b5bb8f2b1b9ecebf00 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -2655,6 +2655,10 @@ struct ThreadedServer {
+@@ -2780,6 +2780,10 @@ struct ThreadedServer {
            boundedDurableSetting("COWORKERD_DO_TEST_FD_HEADROOM", 256, 65536) + uint64_t(limit) * 5;
        KJ_REQUIRE(
            files.rlim_cur > fdHeadroom, "durable test descriptors leave no admission headroom");
@@ -20,7 +20,7 @@ index fbae87c6f5f828f9f312a94b7f30ece160c927a8..7d22c1d169679b6132756c87aae3581f
        durableAdmission.emplace(
            server::DurableAdmission::Limits{
              .capacity = {.threads = limit,
-@@ -2663,9 +2667,9 @@ struct ThreadedServer {
+@@ -2788,9 +2792,9 @@ struct ThreadedServer {
              .tree = {.descriptors = 4, .memory = 16 * 1024},
              .event = {.descriptors = 1, .memory = 4096},
              .residentTarget = uint32_t(configuredCount("COWORKERD_DO_RESIDENT_OBJECTS", 4096)),
