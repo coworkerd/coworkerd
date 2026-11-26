@@ -82,6 +82,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   the threaded server and tests the home-reservation guard.
   Patch 0176 reserves `<tenant>/__databases` for the product SQL class's execution and metering
   while the platform definition still supplies its code and isolate copy key.
+  Patch 0177 reclaims the least recently used eligible database when opening another
+  needs a home or a process reservation. The home closes the actor and releases its copy
+  before admission retries.
   Patch 0181 marks a refused cold-copy reservation on the private threaded durable bootstrap. The node
   uses that detail before it receives an event dispatcher to confirm that the operation never ran.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.

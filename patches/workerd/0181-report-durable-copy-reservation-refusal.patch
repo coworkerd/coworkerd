@@ -3,13 +3,16 @@ From: maslow <wangfugen@126.com>
 Date: Thu, 26 Nov 2026 14:39:07 +0800
 Subject: [PATCH] Report a refused durable copy reservation before dispatch
 
-Tag the final cold-copy reservation refusal before package loading or handler dispatch. Carry the capacity error detail only on this native bootstrap failure, so the node can report the known outcome. Use a one-shot marker in the existing durable lifecycle fixture to exercise it without memory pressure.
+Tag the final cold-copy reservation refusal after any eligible reclamation,
+before package loading or handler dispatch. Carry the detail only on this
+native bootstrap failure. The one-shot fixture exercises that path without
+retiring another copy.
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index fbae87c6f5f828f9f312a94b7f30ece160c927a8..0046730402ea2aa390bd2577587d01d0a465eb23 100644
+index f676810d53511142b686177f7362e90f848fc913..81ec2e44df8280a3c408e417bbf3bbc2b8d0ba19 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -555,6 +555,8 @@ void noSandboxRoom(ResourceBudget &budget) {
+@@ -637,6 +637,8 @@ void noSandboxRoom(ResourceBudget &budget) {
  }
  
  constexpr kj::Exception::DetailTypeId CAPACITY_DETAIL = 0x9f232974b0ac7143ull;
@@ -18,7 +21,7 @@ index fbae87c6f5f828f9f312a94b7f30ece160c927a8..0046730402ea2aa390bd2577587d01d0
  enum class CapacityScope { PROCESS, TENANT };
  bool isCapacityError(const kj::Exception &error) {
    return error.getDetail(CAPACITY_DETAIL) != kj::none;
-@@ -1796,20 +1798,36 @@ const char *durableLifecycleTestDirectory() {
+@@ -1878,20 +1880,36 @@ const char *durableLifecycleTestDirectory() {
    return directory;
  }
  
@@ -64,16 +67,17 @@ index fbae87c6f5f828f9f312a94b7f30ece160c927a8..0046730402ea2aa390bd2577587d01d0
    return now;
  }
  
-@@ -3940,7 +3958,11 @@ struct ThreadedServer {
-     auto input = document.get();
+@@ -4265,9 +4283,11 @@ struct ThreadedServer {
+     const bool platformDatabase = definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
      auto reservation = std::make_shared<ResourceReservation>(
-         resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"));
--    if (!reservation->registerPreparation()) kj::throwRecoverableException(capacityError());
-+    if (refuseCopyReservationForTest() || !reservation->registerPreparation()) {
+         resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), platformDatabase);
+-    if (!(co_await registerDurablePreparation(
++    if (refuseCopyReservationForTest() || !(co_await registerDurablePreparation(
+             *reservation, platformDatabase, [this] { return reclaimIdleDatabase(); }))) {
+-      kj::throwRecoverableException(capacityError());
 +      auto error = capacityError();
 +      error.setDetail(DURABLE_COPY_RESERVATION_REFUSED, kj::heapArray<kj::byte>(0));
 +      kj::throwRecoverableException(kj::mv(error));
-+    }
+     }
      auto slot = std::make_shared<Slot>();
      slot->reservation = std::move(reservation);
-     slot->instance = ++nextInstance;

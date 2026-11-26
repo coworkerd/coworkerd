@@ -160,10 +160,22 @@ async function webSocketAdmission(cluster) {
   }
 }
 
+async function waitForDatabaseCatalog(cluster) {
+  const { storage } = await cluster.api('/v1/status');
+  const revision = BigInt(storage.tenantsRevision);
+  await eventually('every node has applied the database catalog', async () => {
+    await Promise.all(cluster.nodes.map(async node => {
+      const { storage } = await cluster.state(node);
+      assert.ok(BigInt(storage.appliedTenantsRevision) >= revision, node);
+    }));
+  });
+}
+
 async function sqlAtomicity(cluster) {
   const { path, token } = await cluster.tenant('sql-test');
   const database = `${path}/databases/ledger`;
   const { database: created } = await cluster.api(database, { method: 'POST', token });
+  await waitForDatabaseCatalog(cluster);
   const query = (body) => cluster.api(`${database}/query`, { method: 'POST', token, body, timeout: 35000 });
   // The database's namespace can take time to become visible on the nodes.
   await eventually('database serves SELECT', async () => {
@@ -234,6 +246,18 @@ function shardOwnerOrder(cluster, namespaceId, shard) {
   return scores.map(([node]) => node);
 }
 
+async function databaseShardOwner(cluster, db) {
+  // The first request can fall back when the preferred node lacks this database's catalog.
+  const holders = await Promise.all(cluster.nodes.map(async node => {
+    const { durableShards } = await cluster.state(node);
+    const namespace = durableShards.held.namespaces[db.namespaceId];
+    return namespace?.shards.some(({ shard }) => shard === 0) ? node : null;
+  }));
+  const owners = holders.filter(Boolean);
+  assert.equal(owners.length, 1, `${db.name} has exactly one shard owner`);
+  return owners[0];
+}
+
 async function databaseDispatches(cluster, db, owner) {
   const logs = await cluster.compose(['logs', '--no-color', owner]);
   return logs.split('\n').filter(line => line.includes('[do] ')).map(line => JSON.parse(line.split('[do] ')[1]))
@@ -273,7 +297,9 @@ async function threadedSqlCliParity(cluster) {
   const cli = async (...args) => JSON.parse(await cluster.command(process.execPath,
     [cowctl, 'd1', ...args, '--json'], { cwd, token: tenant.token, env: { HOME: cwd } }));
 
-  const { database: source } = await cli('create', 'books');
+  // Let the fixture wait on the tenant index before any SQL claims the shard.
+  const { database: source } = await cli('create', 'books', '--no-wait');
+  await waitForDatabaseCatalog(cluster);
   const migration = await cli('migrations', 'create', source.name, 'create books');
   await writeFile(join(migration.directory, migration.created), `CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
 CREATE UNIQUE INDEX book_title ON books(title);
@@ -302,13 +328,14 @@ INSERT INTO books VALUES (1, 'One');
   assert.equal(schema.length, 3);
   assert.deepEqual(await execute(source.name, rowsSql), rows);
 
-  const sourceOwner = shardOwnerOrder(cluster, source.namespaceId, 0)[0];
+  const sourceOwner = await databaseShardOwner(cluster, source);
   const log = async () => (await cluster.state(sourceOwner)).durableLog.log;
   const publishedPoint = async () => {
-    const confirmed = BigInt((await log()).nextSeq);
-    assert.ok(confirmed > 0n);
-    await eventually('the owner publishes the confirmed source writes', async () => {
-      assert.ok(BigInt((await log()).sealedSeq) >= confirmed);
+    const throughSeq = BigInt((await log()).nextSeq);
+    assert.ok(throughSeq > 0n);
+    // The write has returned, and the owner's seal advances after manifest publication.
+    await eventually(`${sourceOwner} publishes the source writes through sequence ${throughSeq}`, async () => {
+      assert.ok(BigInt((await log()).sealedSeq) >= throughSeq);
     });
     return (await cli('time-travel', 'info', source.name)).point;
   };
@@ -318,7 +345,8 @@ INSERT INTO books VALUES (1, 'One');
   const exported = await cli('export', source.name, '--output', 'backup.sql');
   assert.equal(exported.success, true);
   assert.equal(exported.mode, 'atomic');
-  const { database: backup } = await cli('create', 'books-backup');
+  const { database: backup } = await cli('create', 'books-backup', '--no-wait');
+  await waitForDatabaseCatalog(cluster);
   await importFile(backup.name, 'backup.sql');
 
   await execute(source.name, "INSERT INTO books VALUES (3, 'After bookmark')");
@@ -330,6 +358,7 @@ INSERT INTO books VALUES (1, 'One');
   assert.equal(restored.database, 'books-restored');
   assert.equal(restored.point.bookmark, point.bookmark);
   assert.notEqual(restored.namespaceId, source.namespaceId);
+  await waitForDatabaseCatalog(cluster);
   const historical = { name: restored.database, namespaceId: restored.namespaceId };
   for (const db of [backup, historical]) {
     await eventually(`${db.name} serves the restored schema`, async () => {
@@ -350,7 +379,8 @@ INSERT INTO books VALUES (1, 'One');
   })) } });
   const withWrite = [...rows, { id: 4, title: 'D1 write' }];
   for (const [index, db] of [backup, historical].entries()) {
-    const [, ingress] = shardOwnerOrder(cluster, db.namespaceId, 0);
+    const owner = await databaseShardOwner(cluster, db);
+    const ingress = cluster.nodes.find(node => node !== owner);
     const call = async method => json(await workerCall(cluster, ingress, tenant, `read-write?db=DB${index}`, { method }),
       200, `${db.name} D1 ${method}`);
     await eventually(`${db.name} is readable through its D1 binding`, async () => assert.deepEqual(await call('GET'), rows));
@@ -360,7 +390,7 @@ INSERT INTO books VALUES (1, 'One');
   assert.deepEqual(await execute(source.name, rowsSql), [...rows, { id: 3, title: 'After bookmark' }]);
 
   for (const db of [ledger, source, backup, historical]) {
-    const [owner] = shardOwnerOrder(cluster, db.namespaceId, 0);
+    const owner = await databaseShardOwner(cluster, db);
     const process = await durableGeneration(cluster, owner);
     assert.equal(process.lifecycle.durableServer, 'threaded');
     const callers = db === backup || db === historical ? ['node', 'worker'] : ['node'];
@@ -673,6 +703,174 @@ async function threadedSqlTransactionLimit(cluster) {
   const final = await log();
   assert.equal(final.threadedHomeIo.openSamples, before.threadedHomeIo.openSamples, 'the same database stayed open');
   assert.equal(final.objects.repairs, before.objects.repairs, 'the connection needed no repair');
+}
+
+async function threadedDatabaseAdmission(cluster) {
+  await waitForDurableMembership(cluster);
+  const [owner] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-admission', { durableObjectNamespaces: 48 });
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 5]]));
+  const [first, blocked, oldestIdle, newcomer, overflow] = databases.get(owner);
+  const sql = (db, body) => request(cluster.urls.apiserver, `${db.path}/query`,
+    { method: 'POST', token: tenant.token, body, timeout: 25000 });
+  const read = async db => json(await sql(db, { sql: 'SELECT id FROM ledger ORDER BY id' }), 200, db.name).results;
+  const insert = (db, id) => sql(db, { sql: 'INSERT INTO ledger VALUES (?)', params: [id] });
+  const original = await durableGeneration(cluster, owner);
+  const sample = async expected => {
+    const latest = await durableGeneration(cluster, owner);
+    assert.equal(latest.pid, original.pid);
+    assert.equal(latest.generation, original.generation);
+    const admission = latest.lifecycle.durableAdmission;
+    for (const [field, value] of Object.entries(expected)) assert.equal(admission[field], value, field);
+    return admission;
+  };
+  const observe = (label, expected) => eventually(label, () => sample(expected), { interval: 25 });
+
+  const clock = join(cluster.durableLifecycleGate, 'idle-offset-ms');
+  await writeFile(clock, '180000');
+  for (const db of [first, blocked, oldestIdle]) {
+    await eventually(`${db.name} can reach its owner`, async () => {
+      assert.equal(json(await sql(db, { sql: 'CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY)' }),
+        200, db.name).success, true);
+    });
+    assert.equal(json(await insert(db, 1), 200, db.name).success, true);
+  }
+  assert.deepEqual(await read(first), [{ id: 1 }], 'refresh the database on the first home');
+  await observe('three exclusive homes have settled', {
+    workerThreads: 3, homes: 3, residentRoots: 3, running: 0, waiting: 0, idleRetirements: 0,
+  });
+  const peers = await waitForWalPeers(cluster, owner);
+  // Keep the warmed roots younger than the normal retirement threshold for the pressure test.
+  const realClock = join(cluster.durableLifecycleGate, 'idle-offset-next');
+  await writeFile(realClock, '0');
+  await rename(realClock, clock);
+
+  const gate = join(cluster.peerAckGate, 'hold');
+  const writes = [];
+  let queuedRead;
+  const trackWrite = db => writes.push(insert(db, 2).catch(error => ({ error })));
+  const probe = { sql: 'SELECT 17 AS value' };
+  await writeFile(gate, '');
+  try {
+    trackWrite(blocked);
+    await observe('one database is waiting for WAL confirmation', { running: 1, pendingCommits: 1 });
+    await eventually('both WAL peers are holding acknowledgements', async () => {
+      const states = await Promise.all(peers.map(node => cluster.state(node)));
+      assert.ok(states.every(state => state.durableLog.peers.heldAcksForTest > 0));
+    }, { timeout: 3000, interval: 25 });
+    queuedRead = read(blocked).catch(error => ({ error }));
+    await observe('the protected database also has a queued SQL request', { pendingCommits: 1, waiting: 1 });
+    assert.deepEqual(json(await sql(newcomer, probe), 200, newcomer.name).results, [{ value: 17 }]);
+    await observe('pressure retired exactly one database', {
+      admissionRetirements: 1, idleRetirements: 0, residentRoots: 3, pendingCommits: 1, waiting: 1,
+    });
+
+    assert.deepEqual(await read(first), [{ id: 1 }]);
+    await sample({ admissionRetirements: 1, idleRetirements: 0 });
+    assert.deepEqual(await read(oldestIdle), [{ id: 1 }], 'reopen the reclaimed database with its confirmed row');
+    await observe('reopening needed a second retirement', {
+      admissionRetirements: 2, idleRetirements: 0, residentRoots: 3, overloaded: 0,
+    });
+
+    trackWrite(first);
+    trackWrite(oldestIdle);
+    await observe('all three homes are busy with confirmations outstanding', {
+      running: 3, pendingCommits: 3, waiting: 1,
+    });
+    const refused = await sql(overflow, probe);
+    const overload = json(refused, 503, 'all three homes refuse the new database');
+    assert.equal(overload.code, 'OVERLOADED');
+    assert.equal(overload.dispatched, false);
+    assert.equal(overload.retryable, true);
+    await sample({ admissionRetirements: 2, running: 3, pendingCommits: 3 });
+  } finally {
+    await unlink(gate);
+    await Promise.all([...writes, queuedRead]);
+  }
+  for (const result of await Promise.all(writes)) {
+    if (result.error) throw result.error;
+    assert.equal(json(result, 200, 'held write').success, true);
+  }
+  const queued = await queuedRead;
+  if (queued.error) throw queued.error;
+  assert.deepEqual(queued, [{ id: 1 }, { id: 2 }]);
+  assert.deepEqual(json(await sql(overflow, probe), 200, 'retry after drain').results, [{ value: 17 }]);
+
+  const beforeDeadline = await observe('three homes are idle before the next admission',
+    { residentRoots: 3, running: 0, waiting: 0, pendingCommits: 0 });
+  const holdReservation = join(cluster.durableLifecycleGate, 'hold-database-reservation');
+  await writeFile(holdReservation, '');
+  try {
+    assert.deepEqual(json(await sql(newcomer, probe), 200, 'retry after a retirement deadline').results,
+      [{ value: 17 }]);
+    await observe('the stranded reservation produces one refusal without pinning its home', {
+      admissionRetirements: beforeDeadline.admissionRetirements + 1,
+      overloaded: beforeDeadline.overloaded + 1, residentRoots: 3, idleRetirements: 0,
+    });
+  } finally {
+    await unlink(holdReservation);
+  }
+  console.log('Three busy homes refused a fourth database. Idle admission preserved the queued read and confirmed rows.');
+}
+
+async function threadedDatabaseAdmissionMixed(cluster) {
+  const [owner] = cluster.nodes;
+  const homes = 4;
+  const count = 36;
+  const competitorCount = 6;
+  const sqlTenant = await cluster.tenant('sql-mixed', { durableObjectNamespaces: count });
+  const objectTenant = await cluster.tenant('sql-mixed-objects', {
+    workers: competitorCount, durableObjectNamespaces: competitorCount,
+  });
+  const workers = Array.from({ length: competitorCount }, (_, index) => 'object-' + index);
+  for (const name of workers) {
+    await cluster.deploy(objectTenant, name, `
+      export class Service { fetch() { return new Response('admitted'); } }
+      export default { fetch(request, env) { return env.SERVICE.getByName('one').fetch(request); } };
+    `, { wrangler: {
+      durable_objects: { bindings: [{ name: 'SERVICE', class_name: 'Service' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['Service'] }],
+    } });
+  }
+  const { databases } = await createDatabaseHomes(cluster, sqlTenant, new Map([[owner, count]]));
+  const names = databases.get(owner);
+  const query = db => request(cluster.urls.apiserver, db.path + '/query', {
+    method: 'POST', token: sqlTenant.token, body: { sql: 'SELECT 1 AS value' },
+  });
+  const expectQuery = async db => assert.deepEqual(
+    json(await query(db), 200, db.name).results, [{ value: 1 }]);
+  for (const db of names.slice(0, homes)) await expectQuery(db);
+  const before = await eventually('four homes hold settled databases before the scan', async () => {
+    const state = await durableGeneration(cluster, owner);
+    assert.equal(state.lifecycle.durableAdmission.residentRoots, homes);
+    assert.equal(state.lifecycle.durableAdmission.running, 0);
+    return state;
+  }, { interval: 25 });
+  let scanning = true;
+  let attempts = 0;
+  const traffic = Promise.allSettled(workers.map(async name => {
+    while (scanning) {
+      await request(cluster.urls[owner], '/' + objectTenant.name + '/' + name);
+      ++attempts;
+    }
+  }));
+  try {
+    await eventually('the tenant Workers contend for new homes before the scan', () => {
+      assert.ok(attempts >= competitorCount);
+    }, { interval: 10 });
+    for (const db of names.slice(homes)) await expectQuery(db);
+  } finally {
+    scanning = false;
+    for (const result of await traffic) {
+      if (result.status === 'rejected') throw result.reason;
+    }
+  }
+  await eventually('the same process retires databases for the scan while tenant Workers compete', async () => {
+    const after = await durableGeneration(cluster, owner);
+    assert.equal(after.pid, before.pid);
+    assert.equal(after.generation, before.generation);
+    assert.ok(after.lifecycle.durableAdmission.admissionRetirements >= count - homes);
+  }, { interval: 25 });
 }
 
 async function threadedDatabaseAccounting(cluster) {
@@ -3643,6 +3841,15 @@ export const durableGatedCases = {
     test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
     publishPeerPorts: true, controlDurableLifecycle: true, holdPeerAcks: false,
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
+  'durable-threaded-database-admission': {
+    test: threadedDatabaseAdmission, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    controlDurableLifecycle: true, confirmTimeoutMs: 15000,
+    nodeEnvironment: () => ({ COWORKERD_DO_TEST_HOME_COUNT: '3' }),
+  },
+  'durable-threaded-database-admission-mixed': {
+    test: threadedDatabaseAdmissionMixed, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    singleNode: true, holdPeerAcks: false,
   },
   'durable-threaded-database-accounting': {
     test: threadedDatabaseAccounting, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
