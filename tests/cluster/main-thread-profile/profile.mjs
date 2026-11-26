@@ -132,7 +132,7 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
         ...(profileMode === 'forwarded' && { site: proxy, extraPids: { forwarder: proxyPid } }),
         observe: async drive => {
           const profile = profileMode === 'profiled' && observePerf;
-          const row = profile ? await recordPerf({ pid, data: perfData, script: perfScript, drive }) : await drive();
+          const row = profile ? await recordPerf({ pid, data: perfData, script: perfScript, drive, seconds: smoke ? 5 : 14 }) : await drive();
           await cluster.command('docker', ['cp', container + ':' + traceInContainer, trace]);
           const counters = summarizeTrace(await readFile(trace), row.windowNs);
           assert.ok(counters.occupancy.roots.max > 0, 'window admitted at least one root');

@@ -71,24 +71,22 @@ export async function summarizeStacks(path, [begin, end]) {
   return { samples, histogram, stacks };
 }
 
-export async function recordPerf({ pid, data, script, drive }) {
-  const child = spawn('sudo', ['-n', 'perf', 'record', '--control=fd:0', '--clockid', 'mono',
-    '-e', 'cpu-clock', '-F', '499', '--call-graph', 'dwarf,8192', '-t', String(pid), '-o', data],
-  { stdio: ['pipe', 'ignore', 'pipe'] });
+export async function recordPerf({ pid, data, script, drive, seconds }) {
+  const child = spawn('sudo', ['-n', 'perf', 'record', '--clockid', 'mono',
+    '-e', 'cpu-clock', '-F', '499', '--call-graph', 'dwarf,8192', '-t', String(pid), '-o', data,
+    '--', 'sleep', String(seconds)],
+  { stdio: ['ignore', 'ignore', 'pipe'] });
   const closed = once(child, 'close');
   let stderr = '';
   child.stderr.setEncoding('utf8').on('data', chunk => { stderr += chunk; });
-  child.stdin.on('error', error => { stderr += error.message; });
   let result;
   try {
     await Promise.race([
       eventually('perf event is open', () => access(data), { timeout: 10000 }),
       closed.then(([code]) => { throw new Error(`perf record exited (${code}) before measurement\n${stderr}`); }),
     ]);
-    child.stdin.write('enable\n');
     result = await drive();
   } finally {
-    child.stdin.end('stop\n');
     const [code] = await closed;
     assert.equal(code, 0, stderr);
   }
