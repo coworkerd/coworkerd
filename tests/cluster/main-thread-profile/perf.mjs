@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { access, open, rm, stat } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { eventually } from '../cluster.mjs';
@@ -10,28 +11,35 @@ import { eventually } from '../cluster.mjs';
 // their own, so defer those until all named frames in the stack have been considered.
 const stages = [
   ['durableLog', /DurableLog::|DurableChannel::|DurableShip::|DurableReceiver::|appendToLogFile/],
-  ['loggingMetering', /TenantUsage::|WorkerdOutput::|AsyncLog::|LogSink::|SourceService::.*(?:post|log|usage)|ServerCore::(?:\w*Log|\w*Debit|debitObjectCall|observeRuntimeCpu|noteCpu|charge|usage|recordExecution|recordRelay|recordForward)|tenantLineText|cleanReason/],
-  ['leaseAdmission', /ServerCore::(?:rootDeadline|allocateRoot|allocateChild|executeAllocated|reserve|admission\w*|admit\w*|addLease|expireLeases|reapExpiredLeases|releaseLease|holdLease|renewLease|whenLeaseExpires|confirmCapacityRejection)|AdmissionSlot|InvocationLeaseState|LeaseMembrane|remainingLeaseMs|initialPlacementAdmission|tenantAdmission/],
+  ['loggingMetering', /TenantUsage::|WorkerdOutput::|AsyncLog::|LogSink::|SourceService::.*(?:post|log|usage)|ServerCore::(?:\w*Log|\w*Debit|debitObjectCall|observeRuntimeCpu|noteCpu|charge|usage|recordExecution|recordRelay|recordForward)|tenantLineText|cleanReason|std::(?:basic_ostream|__ostream_insert)|AdmissionSlot::report|AdmissionHttpService::limitCode/],
+  ['nodeToRuntime', /ServerCore::encodeDescriptor\(/],
+  ['leaseAdmission', /ServerCore::(?:rootDeadline|allocateRoot|allocateChild|executeAllocated|reserve|admission\w*|admit\w*|addLease|expireLeases|reapExpiredLeases|releaseLease|holdLease|renewLease|whenLeaseExpires|confirmCapacityRejection)|AdmissionSlot|InvocationLeaseState|LeaseMembrane|runLeaseReaper\(|remainingLeaseMs|initialPlacementAdmission|tenantAdmission/],
   ['runtimeToNode', /BindingBootstrap::|BindingRpcService::|BindingDispatch::|RpcBindTarget::|DurableDispatch::|DeferredObjectDispatcher::|PeerForwarder::(?:allocate|dispatch|place|start|openBinding)|ServerCore::(?:recordBinding|resolveDefinition|durableTarget)/],
   ['nodeToRuntime', /HttpForwarder::|AdmissionHttpService::|AdmissionDispatcher::|ExecutionResponse::|RuntimeConnection::|::ensureRuntime\(|::openRuntimeEvent\(|ServerCore::(?:execute\(|open\(|loadCheck|selectProcess|selectDurableProcess|ensureCode|ensureDefinition|descriptor\()/],
   ['receiveRoute', /GatewayService::|TrackingHttpResponse::|ServerCore::(?:route\(|ingressBegin|ingressEnd)|DeploymentState::(?:select|route)|hostWithoutPort|kj::(?:\(anonymous namespace\)::)?Http(?:InputStream|Server|Header)/],
 ];
-const sharedProtocol = /capnp::.*(?:Rpc|rpc|TwoParty|HttpOverCapnp|HttpService|ByteStream|Message|Segment|copyToUnchecked)|CoarseTwoParty/;
-const stageNames = [...stages.map(([name]) => name), 'sharedProtocol', 'other'];
+const sharedProtocol = /capnp::.*(?:Rpc|rpc|TwoParty|HttpOverCapnp|HttpService|ByteStream|Message|Segment|Membrane|Pipeline|Capability|ClientHook|copyToUnchecked)|CoarseTwoParty/;
+const allocation = /^(?:malloc|cfree|free|__libc_calloc|operator delete\(|operator new\()/;
+const stageNames = [...new Set(stages.map(([name]) => name)), 'sharedProtocol', 'allocation', 'unresolved', 'other'];
+
+function emptyHistogram() {
+  return Object.fromEntries(stageNames.map(stage => [stage, { samples: 0, periodNs: 0 }]));
+}
 
 function classify(stack) {
   for (const frame of stack) {
     const match = stages.find(([, pattern]) => pattern.test(frame));
-    if (match) return [match[0], frame];
+    if (match) return match[0];
   }
-  const protocol = stack.find(frame => sharedProtocol.test(frame));
-  return protocol ? ['sharedProtocol', protocol] : ['other', stack.find(frame => frame !== '[unknown]') ?? '[unknown]'];
+  if (stack.some(frame => sharedProtocol.test(frame))) return 'sharedProtocol';
+  if (stack.some(frame => allocation.test(frame))) return 'allocation';
+  return stack.some(frame => frame !== '[unknown]') ? 'other' : 'unresolved';
 }
 
 export async function summarizeStacks(path, [begin, end]) {
   const start = BigInt(begin);
   const stop = BigInt(end);
-  const histogram = Object.fromEntries(stageNames.map(stage => [stage, { samples: 0, periodNs: 0 }]));
+  const histogram = emptyHistogram();
   const stacks = {};
   let period = 0;
   let stack = [];
@@ -40,7 +48,7 @@ export async function summarizeStacks(path, [begin, end]) {
   let select = false;
   function finish() {
     if (!select) return;
-    const [stage] = classify(stack);
+    const stage = classify(stack);
     ++histogram[stage].samples;
     histogram[stage].periodNs += period;
     const signature = JSON.stringify([stage, ...stack]);
@@ -71,11 +79,11 @@ export async function summarizeStacks(path, [begin, end]) {
   return { samples, histogram, stacks };
 }
 
-export async function recordPerf({ pid, data, script, drive, seconds }) {
+export async function recordPerf({ pid, data, script, drive, seconds, callGraph }) {
   const ready = data + '.ready';
   // perf releases its child when events are open. The data file can appear well before that.
   const child = spawn('sudo', ['-n', 'perf', 'record', '--clockid', 'mono',
-    '-e', 'cpu-clock', '-F', '499', '--call-graph', 'fp', '--buildid-all', '-t', String(pid), '-o', data,
+    '-e', 'cpu-clock', '-F', '499', '--call-graph', callGraph, '--buildid-all', '-t', String(pid), '-o', data,
     '--', 'sh', '-c', 'touch "$1"; exec sleep "$2"', 'perf-recording', ready, String(seconds)],
   { stdio: ['ignore', 'ignore', 'pipe'] });
   const closed = once(child, 'close');
@@ -106,4 +114,23 @@ export async function recordPerf({ pid, data, script, drive, seconds }) {
   const bytes = (await stat(script)).size;
   assert.ok(bytes > 0, 'perf produced no stack dump for TID ' + pid + '\n' + stderr);
   return { ...result, perfCapture: { tid: pid, scriptBytes: bytes, recordLog: stderr.trim() } };
+}
+
+// Reapply the same classifier to an archived stack-signature artifact.
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  const [path] = process.argv.slice(2);
+  assert.ok(path, 'usage: node perf.mjs <stacks.jsonl>');
+  const rows = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
+  for await (const line of rows) {
+    const { operation, clients, round, samples, stacks } = JSON.parse(line);
+    const histogram = emptyHistogram();
+    for (const [key, count] of Object.entries(stacks)) {
+      const [, ...stack] = JSON.parse(key);
+      const bucket = histogram[classify(stack)];
+      bucket.samples += count.samples;
+      bucket.periodNs += count.periodNs;
+    }
+    assert.equal(Object.values(histogram).reduce((sum, bucket) => sum + bucket.samples, 0), samples);
+    console.log(JSON.stringify({ operation, clients, round, samples, histogram }));
+  }
 }

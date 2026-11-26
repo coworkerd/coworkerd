@@ -21,7 +21,9 @@ STAGES = {
     "sharedProtocol": "Shared Cap’n Proto protocol",
     "loggingMetering": "Logging, execution records and metering",
     "durableLog": "Durable log",
-    "other": "Other and unassigned",
+    "allocation": "Allocation without an assigned caller",
+    "other": "Event loop, system and other resolved stacks",
+    "unresolved": "Unresolved stacks",
 }
 
 
