@@ -49,6 +49,11 @@ mailbox on another. It checks Worker and object calls through fetch and RPC, plu
 binding. The child records the refusals without dispatching the writes. After capacity returns, each caller
 retries once and the stored counter or row confirms one write per retry.
 
+`durable-threaded-copy-reservation-refusal` consumes a one-shot marker at the cold-copy reservation step
+after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` each confirm that the write
+did not start and that one retry applies it once. A Durable Object exception after writing and a SQL
+constraint failure retain their ordinary error results.
+
 ### Threaded SQL deadline and disconnect
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matching Linux
@@ -134,6 +139,10 @@ kernels through stateless Worker bindings. Its driver starts a single-node clust
 latency, throughput, CPU time, live database counts and idle memory.
 
 ### Database throughput and CPU attribution
+
+For the node main-thread stack profile, bare KJ HTTP comparison and in-flight
+call measurement on the same four one-Worker paths, see the
+[main-thread report and reproduction commands](../../docs/node-main-thread-profile.md).
 
 The throughput mode of the database home benchmark runs the load generator inside the Compose frontend
 network. It uses one node, one ordinary workerd process and one threaded durable child. Each trial starts

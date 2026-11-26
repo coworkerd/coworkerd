@@ -89,6 +89,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   transaction. It keeps SQLite storage failures on the critical error path.
   Patch 0179 sizes the default object mailbox for ordinary request bursts in
   `src/workerd/threaded/threaded-server.c++`.
+  Patch 0181 marks a refused cold-copy reservation on the private threaded durable bootstrap. The node
+  uses that detail before it receives an event dispatcher to confirm that the operation never ran.
   Patch 0180 recognizes recorded database reservation returns at expiry, protects the returned
   preparation credit after routing retirement, and counts lent heap headroom in the replacement band.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
