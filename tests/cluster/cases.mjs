@@ -705,6 +705,137 @@ async function threadedSqlTransactionLimit(cluster) {
   assert.equal(final.objects.repairs, before.objects.repairs, 'the connection needed no repair');
 }
 
+const sqlDatabaseSpillBytes = 4 * 1024 * 1024;
+const sqlProcessSpillBytes = 5 * 1024 * 1024;
+
+async function threadedSqlSpillLimit(cluster) {
+  const [owner, ingress] = cluster.nodes;
+  await waitForDurableMembership(cluster);
+  const tenant = await cluster.tenant('sql-spill-limit', { durableObjectNamespaces: 48 });
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 2]]));
+  const [db, other] = databases.get(owner);
+  const query = (database, body, status = 200) => cluster.api(`${database.path}/query`,
+    { method: 'POST', token: tenant.token, body, status, timeout: 10000 });
+  const log = async () => (await cluster.state(owner)).durableLog;
+  const generation = await durableGeneration(cluster, owner);
+  const admission = async () => {
+    const process = await durableGeneration(cluster, owner);
+    assert.equal(process.pid, generation.pid);
+    assert.equal(process.generation, generation.generation);
+    const stats = process.lifecycle.durableAdmission;
+    assert.equal(stats.sqlSpillMaximum, sqlProcessSpillBytes);
+    return stats;
+  };
+  const noSpill = label => eventually(label, async () => {
+    assert.equal((await admission()).sqlSpillBytes, 0);
+  });
+  const walBytes = async () => {
+    const sizes = await cluster.compose(['exec', '-T', owner, 'find',
+      `/var/lib/coworkerd/do/coworkerd-do-root-v1-${db.namespaceId}`,
+      '-maxdepth', '1', '-name', '*.sqlite-wal', '-printf', '%s\n']);
+    return sizes.trim().split('\n').reduce((total, size) => total + Number(size), 0);
+  };
+
+  const limitCode = 'SQL_SPILL_LIMIT_EXCEEDED';
+  const reason = 'uncommitted WAL and temporary files exceeded a SQLite spill budget';
+  const failure = `${limitCode}: ${reason}`;
+  const insert = 'INSERT INTO ledger VALUES (?, zeroblob(?))';
+  const read = { sql: 'SELECT id, length(value) AS bytes FROM ledger ORDER BY id' };
+  const oversized = `INSERT INTO ledger VALUES (6, zeroblob(${sqlDatabaseSpillBytes + 262144}))`;
+  await cluster.deploy(tenant, 'probe', `export default { async fetch(request, { DB }) {
+    try {
+      const params = new URL(request.url).searchParams;
+      if (params.has('read')) {
+        return Response.json((await DB.prepare(${JSON.stringify(read.sql)}).all()).results);
+      }
+      if (params.has('exec')) {
+        await DB.exec("INSERT INTO ledger VALUES (5, x'05')\\n" +
+          ${JSON.stringify(oversized + '\n')} + "INSERT INTO ledger VALUES (7, x'07')");
+      } else {
+        await DB.batch([DB.prepare("INSERT INTO ledger VALUES (4, x'04')"), DB.prepare(${JSON.stringify(oversized)})]);
+      }
+      return Response.json({ success: true });
+    } catch (error) {
+      return Response.json({ message: error.message, cause: error.cause?.message });
+    }
+  } };`,
+  { wrangler: { d1_databases: [{ binding: 'DB', database_name: db.name }] } });
+  const binding = (suffix = '') => request(cluster.urls[ingress], `/${tenant.name}/probe${suffix}`)
+    .then(response => json(response, 200, 'D1 spill limit'));
+  assert.equal((await query(db, { sql: 'CREATE TABLE ledger (id INTEGER PRIMARY KEY, value BLOB)' })).success, true);
+  for (const id of [1, 2]) {
+    assert.equal((await query(db, { sql: insert, params: [id, 2 * 1024 * 1024] })).success, true);
+  }
+  const committed = [1, 2].map(id => ({ id, bytes: 2 * 1024 * 1024 }));
+  await noSpill('commits return the WAL charge');
+  const before = await log();
+  assert.equal(before.threadedHomeIo.openSamples, 1);
+  const beforeWal = await walBytes();
+  assert.ok(beforeWal > sqlDatabaseSpillBytes, 'the committed WAL alone exceeds the spill budget');
+  for (const [sql, expected] of [
+    ['SELECT * FROM missing_table', /no such table: missing_table/i],
+    ["INSERT OR ROLLBACK INTO ledger VALUES (1, x'01')", /UNIQUE constraint failed/i],
+  ]) {
+    const sqlError = await query(db, [{ sql: insert, params: [3, 3 * 1024 * 1024] }, { sql }]);
+    assert.equal(sqlError[0].success, false);
+    assert.match(sqlError[0].error, expected);
+    assert.equal((await log()).log.records, before.log.records, 'a SQL rollback added no replication record');
+    assert.equal(await walBytes(), beforeWal, 'the rollback returned the abandoned WAL extent');
+    await noSpill('the rollback returns the WAL charge');
+  }
+  const refused = await query(db, [
+    { sql: "INSERT INTO ledger VALUES (3, x'03')" }, { sql: oversized },
+  ], 507);
+  assert.deepEqual(refused, { success: false, error: failure, reason, code: limitCode });
+  assert.equal((await log()).log.records, before.log.records, 'the refused batch added no replication record');
+  assert.equal(await walBytes(), beforeWal, 'rollback returned the abandoned WAL extent');
+  assert.deepEqual((await query(db, read)).results, committed);
+
+  assert.deepEqual(await binding(), { message: `D1_ERROR: ${failure}`, cause: failure });
+  assert.deepEqual(await binding('?read'), committed, 'D1 reused the database after the refused batch');
+  const execFailure = `Error in line 2: ${oversized}: ${failure}`;
+  assert.deepEqual(await binding('?exec'), { message: `D1_EXEC_ERROR: ${execFailure}`, cause: execFailure });
+  const withPrefix = [...committed, { id: 5, bytes: 1 }];
+  assert.deepEqual((await query(db, read)).results, withPrefix, 'D1 exec kept the confirmed prefix');
+  await noSpill('refused WAL work returns its charge');
+  assert.equal((await query(other, { sql: 'SELECT 1 AS ready' })).success, true);
+  const beforeSort = await log();
+  assert.equal(beforeSort.threadedHomeIo.openSamples, before.threadedHomeIo.openSamples + 1);
+
+  const fromSorted = `FROM (SELECT x FROM seq ORDER BY
+      printf('%06d', 901-x) || hex(zeroblob(1400)) LIMIT 900) AS ordered LIMIT 1`;
+  const seq = 'WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<900)';
+  // The correlated computation keeps the completed sort open at its first row.
+  const slow = `${seq} SELECT ordered.x,
+      (WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n<20000000)
+       SELECT sum(n) + ordered.x FROM r) AS total ${fromSorted}`;
+  const quick = { sql: `${seq} SELECT ordered.x ${fromSorted}` };
+  const pending = query(db, { sql: slow });
+  void pending.catch(() => {});
+  const held = await eventually('a live sorter holds part of the process budget', async () => {
+    const stats = await admission();
+    assert.ok(stats.sqlSpillBytes > sqlProcessSpillBytes / 2, `sort held ${stats.sqlSpillBytes} bytes`);
+    assert.ok(stats.sqlSpillBytes <= sqlDatabaseSpillBytes, `sort held ${stats.sqlSpillBytes} bytes`);
+    const fds = await cluster.compose(['exec', '-T', owner, 'ls', '-l', `/proc/${generation.pid}/fd`]);
+    const files = fds.split('\n').map(line => line.split(' -> ')[1] ?? '')
+      .filter(path => /\/(?:\.kj-tmp\.[^/ ]+|#\d+) \(deleted\)$/.test(path));
+    assert.ok(files.length > 0, fds);
+    assert.ok(files.every(path => path.startsWith('/var/lib/coworkerd/do/')), files.join('\n'));
+    return stats.sqlSpillBytes;
+  }, { timeout: 8000, interval: 50 });
+  assert.deepEqual(await query(other, quick, 507),
+    { success: false, error: failure, reason, code: limitCode });
+  console.log(`SQLite sorter held ${held} of ${sqlProcessSpillBytes} process spill bytes on durable storage`);
+  assert.deepEqual((await pending).results, [{ x: 900, total: 200000010000900 }]);
+  await noSpill('completed and refused sorters close their temporary files');
+  assert.deepEqual((await query(other, quick)).results, [{ x: 900 }]);
+  await noSpill('successful sort returns its temporary-file charge');
+  assert.deepEqual((await query(db, read)).results, withPrefix);
+  const final = await log();
+  assert.equal(final.threadedHomeIo.openSamples, beforeSort.threadedHomeIo.openSamples);
+  assert.equal(final.objects.repairs, before.objects.repairs);
+}
+
 async function threadedDatabaseAdmission(cluster) {
   await waitForDurableMembership(cluster);
   const [owner] = cluster.nodes;
@@ -4152,6 +4283,14 @@ export const durableGatedCases = {
       durableObjects: { threadedStorage: true, checkpointBytes: 65536 },
     }) : ({}),
     nodeEnvironment: node => node === 'node-1' ? { COWORKERD_DO_TEST_SQL_MEMORY_BYTES: '1048576' } : {},
+  },
+  'threaded-sql-spill-limit': {
+    test: threadedSqlSpillLimit, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
+    configureNode: node => node === 'node-1' ? ({
+      sandbox: { mode: 'off' },
+      durableObjects: { threadedStorage: true, sqlDatabaseSpillBytes, sqlProcessSpillBytes,
+        checkpointBytes: 32 * 1024 * 1024 },
+    }) : ({}),
   },
   'threaded-sql-process-memory': {
     test: threadedSqlProcessMemory, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],

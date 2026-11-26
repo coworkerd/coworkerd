@@ -8,10 +8,10 @@ Reserve the connection's SQLite allocations in 1 MiB steps through the copy's ex
 Part of coworkerd/coworkerd#81
 
 diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.c++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
-index b295761d0a3033b2c37dd896348b8be344636f3e..abfb3fb52c9fee3a621059725c2ee059ce544f87 100644
+index 2b2b935a2aed1fa15597b2e832bb27bc6f4d02ef..1035bb028f064145a8273f66632b43169847c8da 100644
 --- a/src/workerd/server/factory/coworkerd-durable-test-storage.c++
 +++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
-@@ -48,7 +48,8 @@ kj::Own<SqliteDatabase> DurableStorage::open(kj::StringPtr uniqueKey,
+@@ -55,7 +55,8 @@ kj::Own<SqliteDatabase> DurableStorage::open(kj::StringPtr uniqueKey,
      SqliteObserver& observer,
      uint facet,
      uint64_t sqlWalFrameLimitBytes,
@@ -21,7 +21,7 @@ index b295761d0a3033b2c37dd896348b8be344636f3e..abfb3fb52c9fee3a621059725c2ee059
    ensureNamespace(uniqueKey, storageId);
    const auto mode = kj::WriteMode::CREATE | kj::WriteMode::MODIFY;
    if (sqlWalFrameLimitBytes != 0) {
-@@ -57,7 +58,8 @@ kj::Own<SqliteDatabase> DurableStorage::open(kj::StringPtr uniqueKey,
+@@ -65,7 +66,8 @@ kj::Own<SqliteDatabase> DurableStorage::open(kj::StringPtr uniqueKey,
          kj::heap<SqliteDatabase::Vfs>(*directory, SqliteDatabase::VfsOptions{
            .walTransactionLimit = limit.get()});
      auto database = kj::heap<SqliteDatabase>(*guardedVfs, databasePath(uniqueKey, storageId, facet),
@@ -32,10 +32,10 @@ index b295761d0a3033b2c37dd896348b8be344636f3e..abfb3fb52c9fee3a621059725c2ee059
    }
    return kj::heap<SqliteDatabase>(
 diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.h b/src/workerd/server/factory/coworkerd-durable-test-storage.h
-index ab1c425f085204c56b0360d3797bc324ad45a271..c86ec438bdd66300ece8f18bf792d85622018069 100644
+index b03e958d5b8dd371d31e3d775374fef9691404b2..cf9f554ed3a6b79172e1bcba4cce594f718b1e13 100644
 --- a/src/workerd/server/factory/coworkerd-durable-test-storage.h
 +++ b/src/workerd/server/factory/coworkerd-durable-test-storage.h
-@@ -23,7 +23,8 @@ class DurableStorage {
+@@ -29,7 +29,8 @@ class DurableStorage {
        SqliteObserver& observer = SqliteObserver::DEFAULT,
        uint facet = 0,
        uint64_t sqlWalFrameLimitBytes = 0,
@@ -184,7 +184,7 @@ index f5029f64355bb091fee49f6d92ff9f3aae09d959..63344e6fcc263f43831f15e97a14e1b2
    int fds[2];
    KJ_SYSCALL(pipe(fds));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..8ea9e7598725c12034f90d78ef48ca500c6509ac 100644
+index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d8d16e5e0 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -350,7 +350,7 @@ struct ResourceBudget {
@@ -291,7 +291,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..8ea9e7598725c12034f90d78ef48ca50
    }
    Slot &slot;
    Measurement &measurement;
-@@ -3719,6 +3740,9 @@ struct ThreadedServer {
+@@ -3723,6 +3744,9 @@ struct ThreadedServer {
          ",\"isolateResets\":" + std::to_string(durableIsolateResets.load()) +
          ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
          ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
@@ -301,7 +301,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..8ea9e7598725c12034f90d78ef48ca50
          ",\"overloaded\":" + std::to_string(state.overloads) +
          ",\"expired\":" + std::to_string(state.expired) + "}}";
      if (publish) {
-@@ -7037,8 +7061,14 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7041,8 +7065,14 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
                SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES,
                SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES)
          : kj::maxValue;
@@ -566,7 +566,7 @@ index 225a55559600052098f407390cb03b853315147c..9493f881755256dd28b2261841dc966f
    // Thread-local pointer to the active scope. Set to this on construction (if not already set),
    // cleared on destruction (if we set it).
 diff --git a/src/workerd/util/sqlite.c++ b/src/workerd/util/sqlite.c++
-index a02a64c7df22b19241b58f4339b0a6fd7beb66b7..342dd29359ffff3a4bebdc2c99b1a311f66b5520 100644
+index 99de48236684d499496dfa21e8fbb4cef7997d85..b6fd2866f51dc6c712c67de6bd17f86031d5d53d 100644
 --- a/src/workerd/util/sqlite.c++
 +++ b/src/workerd/util/sqlite.c++
 @@ -816,11 +816,13 @@ SqliteDatabase::SqliteDatabase(const Vfs& vfs,
@@ -584,20 +584,20 @@ index a02a64c7df22b19241b58f4339b0a6fd7beb66b7..342dd29359ffff3a4bebdc2c99b1a311
        sqliteMaxMemoryBytes(sqliteMaxMemoryBytes),
        sqliteMaxMemoryPerProcessBytes(sqliteMaxMemoryPerProcessBytes),
        actorAccountLimits(actorAccountLimits) {
-@@ -883,6 +885,12 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
+@@ -884,9 +886,9 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
  SqliteDatabase::~SqliteDatabase() noexcept(false) {
    sqlite3* db = &KJ_UNWRAP_OR(maybeDb, return);
  
-+  if (processMemoryBudget != nullptr) {
-+    // Finalize tracked statements and close while the allocator charge is still live.
-+    close();
-+    KJ_IF_SOME(closed, afterCloseCallback) closed();
-+    return;
-+  }
-   auto memoryScope = enterMemoryScope();
- 
-   sqlite3_progress_handler(db, 0, nullptr, nullptr);
-@@ -910,7 +918,7 @@ SqliteDatabase::operator sqlite3*() {
+-  if (getWalTransactionLimit() != nullptr) {
+-    // Guarded files borrow the VFS and its limit. Finalize every tracked
+-    // statement and close the SQLite handle before either can be destroyed.
++  if (getWalTransactionLimit() != nullptr || processMemoryBudget != nullptr) {
++    // Finalize tracked statements and close the handle while the VFS, its limit,
++    // and the SQLite heap reservation are still live.
+     close();
+     KJ_IF_SOME(closed, afterCloseCallback) closed();
+     return;
+@@ -919,7 +921,7 @@ SqliteDatabase::operator sqlite3*() {
  }
  
  SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
@@ -606,7 +606,7 @@ index a02a64c7df22b19241b58f4339b0a6fd7beb66b7..342dd29359ffff3a4bebdc2c99b1a311
  }
  
  bool SqliteDatabase::observedCriticalError() {
-@@ -925,7 +933,8 @@ void SqliteDatabase::rollbackWalTransaction() {
+@@ -949,7 +951,8 @@ void SqliteDatabase::rollbackWalTransaction() {
    // A failed statement may have left little headroom. Account for cleanup
    // allocations while allowing the trusted rollback to finish. The platform
    // transaction calls this after leaving the failed SQLite call's memory scope.
@@ -616,7 +616,7 @@ index a02a64c7df22b19241b58f4339b0a6fd7beb66b7..342dd29359ffff3a4bebdc2c99b1a311
    if (!sqlite3_get_autocommit(*this)) {
      run("ROLLBACK TRANSACTION");
    } else {
-@@ -1436,7 +1445,9 @@ void SqliteDatabase::close() noexcept {
+@@ -1536,7 +1539,9 @@ void SqliteDatabase::close() noexcept {
    KJ_ASSERT(currentStatement == kj::none, "close() called while a query is executing");
    KJ_ASSERT(currentRegulator == kj::none, "close() called while a query is compiling");
  
@@ -628,10 +628,10 @@ index a02a64c7df22b19241b58f4339b0a6fd7beb66b7..342dd29359ffff3a4bebdc2c99b1a311
    KJ_IF_SOME(db, maybeDb) {
      for (auto& listener: resetListeners) {
 diff --git a/src/workerd/util/sqlite.h b/src/workerd/util/sqlite.h
-index e09cd8c9b9f7f46f4b21874191a2d9d58d2ce135..c016a026c9deb2eedbe608cce2870dacfec6d031 100644
+index e348784b4b4b2053632b0dce4026fd630fe02bca..d724ed911ebbf2ec2ddc551fb7c465015e7ff517 100644
 --- a/src/workerd/util/sqlite.h
 +++ b/src/workerd/util/sqlite.h
-@@ -154,7 +154,8 @@ class SqliteDatabase {
+@@ -155,7 +155,8 @@ class SqliteDatabase {
        size_t sqliteMaxMemoryBytes = kj::maxValue,
        size_t sqliteMaxMemoryPerProcessBytes = kj::maxValue,
        SqliteObserver& sqliteObserver = SqliteObserver::DEFAULT,
@@ -641,7 +641,7 @@ index e09cd8c9b9f7f46f4b21874191a2d9d58d2ce135..c016a026c9deb2eedbe608cce2870dac
  
    // Returns the current value of the per-actor SQLite memory byte counter for metrics reporting.
    size_t getSqliteMemoryBytes() const {
-@@ -459,6 +460,7 @@ class SqliteDatabase {
+@@ -465,6 +466,7 @@ class SqliteDatabase {
  
    // The amount of memory in bytes used by this database for use by sqlite3_mem_methods.
    size_t sqliteMemoryBytes = 0;
