@@ -41,6 +41,12 @@ Once the Worker accepted a WebSocket (`101`), the connection ends with a close c
 
 **Durable Object calls**: what a stub's `fetch()` answers when the object's request fails -- the Worker decides what its own client gets. The refusals of the table above apply as well (`WORKER_INVALID`, `TENANT_UNAVAILABLE`, `VERSION_UNAVAILABLE`, `SECRET_UNAVAILABLE`, `OVERLOADED`, `SUBREQUEST_BUDGET_EXHAUSTED`, and `LEASE_EXPIRED`). A call to an object goes to the node that owns the object's shard ([cluster state](../cluster-state.md), section 11); when that node refuses it, or cannot be reached, the node of the caller looks for the owner once more and sends it once more, and answers the second refusal: `PEER_UNAVAILABLE` (`503`) when the owner could not be reached, the owner's own code otherwise; once sent, a call whose answer did not come back is `RESULT_UNCERTAIN`. While a shard has no owner a node can reach, its objects' calls fail this way until another node takes the shard over.
 
+If the threaded durable child explicitly refuses admission, `stub.fetch()` returns HTTP 503 with `code: "OVERLOADED"`,
+`dispatched: false` and `retryable: true`. The object never ran the operation, so the caller can retry a write.
+This applies to both Worker and object callers, including calls forwarded to another node.
+The owner returns this refusal after routing the call, so the existing owner lookup retry has already ended.
+A caller's retry is a new binding call and uses its own subrequest and, for D1, query allowance.
+
 | HTTP | `code` | Meaning | Executed? | What to do |
 | --- | --- | --- | --- | --- |
 | 500 | `EXECUTION_FAILED` | The object's class threw; `reason` has the exception's message. The object stays as it was: the same instance takes the next request | Partly executed | Fix the class; retry what is safe to retry |
@@ -172,6 +178,7 @@ A `d1_databases` Binding speaks D1's protocol, so its errors are D1's: statement
 | `D1_ERROR: <SQLite's message>` | The statement itself failed: a table that does not exist, a constraint, a type | Fix the statement |
 | `D1_ERROR: D1_QUERY_BUDGET_EXHAUSTED: ...` | The invocation used its D1 allowance across its bindings. A batch counts once. The refused request does not reach the database | Make fewer database requests in this invocation |
 | `D1_ERROR: SUBREQUEST_BUDGET_EXHAUSTED: ...` | The invocation has no subrequests left. The refused request does not reach the database | Make fewer subrequests in this invocation |
+| `D1_ERROR: OVERLOADED: The durable process refused the call before it started. The operation did not execute and can be retried.` | The threaded child refused the database request before it ran. Native D1 carries the same text without `D1_ERROR:` in `error.cause.message`. `exec()` carries it inside `D1_EXEC_ERROR` and no line ran | Retry when capacity is available |
 | `D1_ERROR: D1_RESULT_TOO_LARGE: query response exceeds 7340032 bytes; use LIMIT to fetch results in smaller batches` | The complete UTF-8 JSON reply exceeds 7 MiB, including columns, `meta`, all array entries and framing, and expanded BLOB number arrays | Fetch smaller batches with `LIMIT`; a single `/query` object, an array `/query` and `batch()` all roll back their writes |
 | `D1_ERROR: SQL_TRANSACTION_TOO_LARGE: …` | The transaction exceeds the recoverable WAL record capacity and rolls back. A failing `exec()` line carries this code inside its `D1_EXEC_ERROR` and earlier confirmed lines stay committed | Split the work into smaller transactions |
 | `D1_ERROR: DO_OBJECT_TOO_LARGE: ...` | The write would take the database past 10 GiB (section 1); the statement is not durable, and reads go on | Delete rows, or ask the administrator to raise the object limit; transactions that do not grow the database remain permitted |
@@ -188,6 +195,9 @@ the control plane's own `{"code","reason"}` when the database does not exist (`4
 (`503 STORAGE_UNAVAILABLE`). An internal object reply larger than 8 MiB returns `502 RESPONSE_TOO_LARGE`
 (the object's response exceeds the node's 8,388,608-byte limit); it may have executed and is not replayed. This node
 buffer also serves alarms: an overflow is reported as unavailable, never parsed as a partial alarm result. Node statuses and bodies pass through, including 200 with `success:false`, 413, 422 and 503. A dispatch refusal returns its original code and body without waiting for the rejected request body to be consumed. Another member is tried only if connection establishment failed, or a node refused with `PEER_UNAVAILABLE`, `SERVER_DRAINING`, `DO_UNAVAILABLE`, `DO_OWNER_EXPIRED`, `DO_OWNER_DRAINING` or `DO_SHARD_EPOCH_MISMATCH` before execution. A lost reply after connecting returns `503 RESULT_UNCERTAIN` without replay. The JavaScript binding preserves the platform error prefix.
+
+An explicit capacity refusal from the threaded durable child reaches HTTP SQL as `503 OVERLOADED` with
+`dispatched: false` and `retryable: true`. The control plane returns it to the caller, who can retry the whole request.
 
 For `D1_RESULT_TOO_LARGE`, HTTP SQL returns **200** with `success:false` and the error text starting at
 `D1_RESULT_TOO_LARGE:`; an array request contains one failure object. No partial result is returned. The SQL Worker
@@ -214,6 +224,7 @@ not cause the runtime to add `.code`.
 | `CPU_LIMIT_EXCEEDED: ...`, `MEMORY_LIMIT_EXCEEDED: ...` | the same | A limit ended the method, as it would a request (section 1) | Do less per call |
 | `VERSION_UNAVAILABLE: ...`, `VERSION_PIN_MISMATCH: ...` | the same | The deployment changed during the call (section 1) | Retry |
 | `DO_HOP_LIMIT: ...`, `DO_OWNER_EXPIRED: ...`, `DO_SHARD_EPOCH_MISMATCH: ...`, `DO_RECOVERING: ...` | the same | The object could not be reached or run, as for a `fetch` to it (section 1) | As in section 1 |
+| `OVERLOADED: {…}` | `OVERLOADED` | For a threaded durable admission refusal, the JSON in the message contains `dispatched: false` and `retryable: true`. The object never ran the method | Retry when capacity is available |
 | `Network connection lost.` and the like | absent | The node that ran the target went away while the caller still held one of its capabilities | Retry; the call tree is over |
 
 A value a method sends or returns is at most 32 MiB serialized (workerd's own limit), and a value that is not
