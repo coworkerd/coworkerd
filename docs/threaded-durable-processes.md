@@ -399,10 +399,11 @@ A D1 call can continue to its SQL deadline after the Worker’s HTTP caller disc
 that outer disconnect to the binding call depends on [#66](https://github.com/coworkerd/coworkerd/pull/66).
 
 An expected SQLite interruption or a failed deadline or disconnect check before commit rolls back
-the current transaction. A queued HTTP or D1 query can read the last confirmed rows on the same open
-database. Storage failures still follow the existing storage error handling. SQLite functions and
-file operations without progress callbacks remain release blockers wherever they can outlast the
-deadline. The database placement fixture selects this behavior in the test build.
+the current transaction and removes its spilled WAL tail. A queued HTTP or D1 query can read the last
+confirmed rows on the same open database. Storage failures still follow the existing storage error
+handling. SQLite functions and file operations without progress callbacks remain release blockers
+wherever they can outlast the deadline. The database placement fixture selects this behavior in the
+test build.
 
 ### Decisions taken in review
 

@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Thu, 26 Nov 2026 10:17:58 +0800
+Date: Thu, 26 Nov 2026 10:47:05 +0800
 Subject: [PATCH] Keep platform databases open after an expected SQL
  interruption
 
@@ -8,8 +8,39 @@ Let the active platform transaction settle an SQLite auto-rollback caused by the
 
 Refs coworkerd/coworkerd#81
 
+diff --git a/src/workerd/api/actor-state.c++ b/src/workerd/api/actor-state.c++
+index 8263b382a8cd2ff4d7fe157b7e40ba3bd12f23d9..932c5630ddb3f3066e2f3ebe3fd704575ee0c5fd 100644
+--- a/src/workerd/api/actor-state.c++
++++ b/src/workerd/api/actor-state.c++
+@@ -751,6 +751,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
+       // The actor still owns WAL confirmation and locks its output gate.
+       limit->begin();
+       KJ_DEFER(limit->abandon(sqlite));
++      auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
+       auto started = cache->startTransaction();
+       auto& txn = KJ_REQUIRE_NONNULL(started.tryGet<kj::Own<ActorCacheInterface::Transaction>>());
+       StoredExternalHandler::SyncNestedTransaction syncExternalTxn(
+@@ -759,7 +760,6 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
+         auto result = callback(js);
+         JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
+             "Cannot commit transaction due to an earlier SQL critical error");
+-        auto budget = context.getLimitEnforcer().getSqlExecutionBudget();
+         if (budget && budget->hasDeadline() && budget->checkDeadline()) {
+           static constexpr SqlStorageRegulator regulator;
+           kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
+@@ -776,6 +776,10 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
+               KJ_EXCEPTION(FAILED, "jsg.Error: the transaction exceeds one recoverable WAL record"),
+               "SQL_TRANSACTION_TOO_LARGE"));
+         }
++        if (!sqlite.observedCriticalError() && budget && budget->hasDeadline() &&
++            budget->getCause() != SqlExecutionBudget::Cause::NONE) {
++          limit->end(sqlite, /*rolledBack=*/true);
++        }
+         js.throwException(kj::mv(exception));
+       });
+     }
 diff --git a/src/workerd/util/sqlite-test.c++ b/src/workerd/util/sqlite-test.c++
-index 1daa4a94357740c2aca1b587616b0595967fbd98..7d2eafd6f6e1277d04d8b05604b1af6ad198f944 100644
+index 1daa4a94357740c2aca1b587616b0595967fbd98..388dad4828de3c936748c43d9646d1185054e071 100644
 --- a/src/workerd/util/sqlite-test.c++
 +++ b/src/workerd/util/sqlite-test.c++
 @@ -163,14 +163,16 @@ class DefaultRegulatorForTest: public SqliteDatabase::Regulator {
@@ -35,7 +66,7 @@ index 1daa4a94357740c2aca1b587616b0595967fbd98..7d2eafd6f6e1277d04d8b05604b1af6a
    KJ_DEFER(regulator.budget.reset());
    auto dir = kj::newInMemoryDirectory(kj::nullClock());
    SqliteDatabase::Vfs vfs(*dir);
-@@ -193,6 +195,51 @@ KJ_TEST("SQLite deadline covers multiple statements and interrupts an active cur
+@@ -193,6 +195,57 @@ KJ_TEST("SQLite deadline covers multiple statements and interrupts an active cur
    KJ_EXPECT(db.run(options, "SELECT 3").getInt(0) == 3);
  }
  
@@ -47,16 +78,21 @@ index 1daa4a94357740c2aca1b587616b0595967fbd98..7d2eafd6f6e1277d04d8b05604b1af6a
 +  SqliteDatabase::WalTransactionLimit limit(1024 * 1024);
 +  SqliteDatabase::Vfs vfs(*dir, {.walTransactionLimit = &limit});
 +  SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
-+  db.run("PRAGMA page_size = 4096; PRAGMA journal_mode = WAL; CREATE TABLE ledger(id INTEGER)");
++  db.run("PRAGMA page_size = 4096; PRAGMA journal_mode = WAL; "
++         "CREATE TABLE ledger(id INTEGER, payload BLOB)");
 +  limit.setPageSize(4096);
-+  db.run("INSERT INTO ledger VALUES (1)");
++  db.run("INSERT INTO ledger(id) VALUES (1)");
++  const auto walPath = kj::Path({"db-wal"});
++  const auto confirmedWal = dir->openFile(walPath)->readAllBytes();
 +  db.onCriticalError([](kj::StringPtr message, kj::Maybe<kj::Exception>) {
 +    KJ_FAIL_EXPECT("an expected SQL interruption marked the database broken", message);
 +  });
 +
 +  for (auto cause: {Cause::WALL, Cause::DISCONNECTED}) {
 +    limit.begin();
-+    db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (2)");
++    db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (2, zeroblob(65536))");
++    KJ_REQUIRE(sqlite3_db_cacheflush(db) == SQLITE_OK);
++    KJ_ASSERT(dir->openFile(walPath)->stat().size > confirmedWal.size(), "the write must spill");
 +    bool rolledBack = false;
 +    db.onRollback([&] { rolledBack = true; });
 +    uint32_t checks = 0;
@@ -68,18 +104,19 @@ index 1daa4a94357740c2aca1b587616b0595967fbd98..7d2eafd6f6e1277d04d8b05604b1af6a
 +        : "SQL client disconnected";
 +    KJ_EXPECT_THROW_MESSAGE(message, db.run(options,
 +        "WITH RECURSIVE r(n) AS (VALUES(3) UNION ALL SELECT n+1 FROM r WHERE n < 1000000) "
-+        "INSERT INTO ledger SELECT n FROM r"));
++        "INSERT INTO ledger(id) SELECT n FROM r"));
 +    KJ_ASSERT(sqlite3_get_autocommit(db), "SQLite should have rolled back the whole transaction");
 +    KJ_EXPECT(!db.observedCriticalError());
 +    db.rollbackWalTransaction();
-+    limit.end(db);
++    limit.end(db, /*rolledBack=*/true);
 +    KJ_EXPECT(rolledBack);
++    KJ_EXPECT(dir->openFile(walPath)->readAllBytes() == confirmedWal.asPtr());
 +    KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 1);
 +    KJ_EXPECT(db.run("SELECT id FROM ledger").getInt(0) == 1);
 +  }
 +
 +  limit.begin();
-+  db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (3); RELEASE ledger");
++  db.run("SAVEPOINT ledger; INSERT INTO ledger(id) VALUES (3); RELEASE ledger");
 +  limit.end(db);
 +  KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 2);
 +}
@@ -87,7 +124,7 @@ index 1daa4a94357740c2aca1b587616b0595967fbd98..7d2eafd6f6e1277d04d8b05604b1af6a
  KJ_TEST("SQLite backed by in-memory directory") {
    auto dir = kj::newInMemoryDirectory(kj::nullClock());
    SqliteDatabase::Vfs vfs(*dir);
-@@ -1985,7 +2032,8 @@ void testCriticalError(const char* expectedErrorMessage,
+@@ -1985,7 +2038,8 @@ void testCriticalError(const char* expectedErrorMessage,
  
  KJ_TEST("SQLite critical error handling for SQLITE_IOERR") {
    auto dir = kj::atomicRefcounted<ErrorInjectableDirectory>();
@@ -97,7 +134,7 @@ index 1daa4a94357740c2aca1b587616b0595967fbd98..7d2eafd6f6e1277d04d8b05604b1af6a
    SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
  
    // Create a tracker to verify our callback is called
-@@ -2011,6 +2059,9 @@ KJ_TEST("SQLite critical error handling for SQLITE_IOERR") {
+@@ -2011,6 +2065,9 @@ KJ_TEST("SQLite critical error handling for SQLITE_IOERR") {
      INSERT INTO things(value) VALUES (123);
    )"));
  
@@ -108,7 +145,7 @@ index 1daa4a94357740c2aca1b587616b0595967fbd98..7d2eafd6f6e1277d04d8b05604b1af6a
  
    // Now arrange for an error on write().
 diff --git a/src/workerd/util/sqlite.c++ b/src/workerd/util/sqlite.c++
-index ef7e275c4dffcda5f94b4a5dce07b88bdccd4ec6..3a447c26bbdbbf165749378866d14d400124ccbc 100644
+index ef7e275c4dffcda5f94b4a5dce07b88bdccd4ec6..64f7fd986581e5e7b9c0d68eb7e56b7be4872ca3 100644
 --- a/src/workerd/util/sqlite.c++
 +++ b/src/workerd/util/sqlite.c++
 @@ -924,7 +924,7 @@ void SqliteDatabase::rollbackWalTransaction() {
@@ -120,6 +157,30 @@ index ef7e275c4dffcda5f94b4a5dce07b88bdccd4ec6..3a447c26bbdbbf165749378866d14d40
      clearRolledBackTransaction();
    }
  }
+@@ -968,11 +968,12 @@ int SqliteDatabase::WalTransactionLimit::checkWrite(
+   return SQLITE_OK;
+ }
+ 
+-void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db) {
++void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db, bool rolledBack) {
+   if (!active) return;
+   active = false;
+-  if (!refused) return;
+-  KJ_REQUIRE(sqlite3_get_autocommit(db), "the refused SQL transaction must be rolled back");
++  if (!refused && !rolledBack) return;
++  KJ_REQUIRE(sqlite3_get_autocommit(db), "the SQL transaction must be rolled back before WAL cleanup");
++  const auto before = KJ_UNWRAP_OR(originalSize, return);
+   sqlite3_file* wal = nullptr;
+   KJ_REQUIRE(sqlite3_file_control(db, "main", SQLITE_FCNTL_JOURNAL_POINTER, &wal) == SQLITE_OK);
+   if (wal == nullptr || wal->pMethods == nullptr) return;
+@@ -980,7 +981,6 @@ void SqliteDatabase::WalTransactionLimit::end(SqliteDatabase& db) {
+   // any space it added, preserving the file's entire pre-transaction extent.
+   sqlite3_int64 now = 0;
+   KJ_REQUIRE(wal->pMethods->xFileSize(wal, &now) == SQLITE_OK);
+-  const auto before = KJ_ASSERT_NONNULL(originalSize);
+   if (now > before) {
+     KJ_REQUIRE(wal->pMethods->xTruncate(wal, before) == SQLITE_OK);
+   }
 @@ -1019,15 +1019,22 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
        sqlite3* db = *this;
        // We are in a transaction
@@ -150,10 +211,10 @@ index ef7e275c4dffcda5f94b4a5dce07b88bdccd4ec6..3a447c26bbdbbf165749378866d14d40
                cb(description, kj::mv(error));
                return;
 diff --git a/src/workerd/util/sqlite.h b/src/workerd/util/sqlite.h
-index 1ce805b0021f9e30e63cdeb80a44c4c4c682027c..635e0fdbfbf2ce2689201e20ff09c0e3c0d77988 100644
+index 1ce805b0021f9e30e63cdeb80a44c4c4c682027c..0d53011538cac7e0d226bfb5201aebf3c4b3302c 100644
 --- a/src/workerd/util/sqlite.h
 +++ b/src/workerd/util/sqlite.h
-@@ -943,6 +943,7 @@ class SqliteDatabase::WalTransactionLimit {
+@@ -943,10 +943,11 @@ class SqliteDatabase::WalTransactionLimit {
   public:
    explicit WalTransactionLimit(uint64_t frameBytes): frameBytes(frameBytes) {}
    uint64_t capacity() const { return frameBytes; }
@@ -161,3 +222,8 @@ index 1ce805b0021f9e30e63cdeb80a44c4c4c682027c..635e0fdbfbf2ce2689201e20ff09c0e3
    bool wasRefused() const { return active && refused; }
    void setPageSize(uint32_t pageSize);
    void begin();
+-  void end(SqliteDatabase& db);
++  void end(SqliteDatabase& db, bool rolledBack = false);
+   void abandon(SqliteDatabase& db) noexcept;
+   int checkWrite(sqlite3_file* file, int64_t offset, int length) noexcept;
+ 
