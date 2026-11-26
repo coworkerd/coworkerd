@@ -4,7 +4,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { Agent, request } from 'node:http';
 
 const [base, input] = process.argv.slice(2);
-const { operation, clients, targets, ids, warmMs, measureMs, pids } = JSON.parse(input);
+const { operation, clients, targets, ids, warmMs, measureMs, pids, host, clockWindow } = JSON.parse(input);
 const hz = Number(execFileSync('getconf', ['CLK_TCK'], { encoding: 'utf8' }));
 assert.ok(hz > 0);
 const agent = new Agent({ keepAlive: true, maxSockets: clients });
@@ -13,7 +13,8 @@ const expectedBody = inserting ? '1' : '[{"value":1}]';
 
 function send(url) {
   return new Promise((resolve, reject) => {
-    const req = request(url, { agent, method: inserting ? 'POST' : 'GET' }, response => {
+    const req = request(url, { agent, method: inserting ? 'POST' : 'GET',
+      ...(host && { headers: { host } }) }, response => {
       response.setEncoding('utf8');
       let body = '';
       response.on('data', chunk => { body += chunk; });
@@ -22,7 +23,7 @@ function send(url) {
         if (response.statusCode !== 200 || body !== expectedBody) {
           reject(new Error('HTTP ' + response.statusCode + ' ' + body.slice(0, 300)));
         } else {
-          resolve();
+          resolve(req.reusedSocket);
         }
       });
     });
@@ -97,6 +98,7 @@ function cpuDelta(before, after, elapsedMs) {
 async function drive(durationMs, samples, start) {
   const completed = targets.map(() => 0);
   let failures = 0;
+  let newConnections = 0;
   const errorExamples = [];
   await Promise.all(Array.from({ length: clients }, async (_, lane) => {
     const index = lane % targets.length;
@@ -104,7 +106,7 @@ async function drive(durationMs, samples, start) {
     while (performance.now() - start < durationMs) {
       const sent = performance.now();
       try {
-        await send(inserting ? url + '?id=' + (++ids[index]) : url);
+        if (!await send(inserting ? url + '?id=' + (++ids[index]) : url)) ++newConnections;
         completed[index]++;
         samples?.push(performance.now() - sent);
       } catch (error) {
@@ -113,22 +115,25 @@ async function drive(durationMs, samples, start) {
       }
     }
   }));
-  return { completed, failures, errorExamples };
+  return { completed, failures, errorExamples, ...(clockWindow && { newConnections }) };
 }
 
 try {
   const warmup = await drive(warmMs, null, performance.now());
   const clientCpuMax = optionalFile('/sys/fs/cgroup/cpu.max');
   const before = cpuSample();
+  const beginNs = process.hrtime.bigint();
   const start = performance.now();
   const samples = [];
   const measurement = await drive(measureMs, samples, start);
+  const endNs = process.hrtime.bigint();
   const elapsedMs = performance.now() - start;
   const after = cpuSample();
   samples.sort((a, b) => a - b);
   const percentile = fraction => samples[Math.ceil(samples.length * fraction) - 1] ?? null;
   console.log(JSON.stringify({
     clientNode: process.version, clientCpuMax, clients, targets, elapsedMs,
+    ...(clockWindow && { windowNs: [beginNs.toString(), endNs.toString()] }),
     n: samples.length, perSecond: samples.length * 1000 / elapsedMs,
     p50Ms: percentile(0.5), p99Ms: percentile(0.99),
     warmup, measurement, cpu: cpuDelta(before, after, elapsedMs),

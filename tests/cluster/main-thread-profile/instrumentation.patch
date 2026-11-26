@@ -1,0 +1,75 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ba88bf7..1af47d7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -32,6 +32,10 @@ if(NOT patch_check EQUAL 0)
+     WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+ endif()
+ 
++add_executable(coworkerd-bench-http-forwarder EXCLUDE_FROM_ALL
++  tests/cluster/main-thread-profile/http-forwarder.c++)
++target_link_libraries(coworkerd-bench-http-forwarder PRIVATE kj-http)
++
+ set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+ file(MAKE_DIRECTORY "${GENERATED_DIR}")
+ 
+diff --git a/node/durable-log.c++ b/node/durable-log.c++
+index b77c262..01a8525 100644
+--- a/node/durable-log.c++
++++ b/node/durable-log.c++
+@@ -1,4 +1,5 @@
+ #include "durable-log.h"
++#include "../tests/cluster/main-thread-profile/node-trace.h"
+ #include "event-loop-trace.h"
+ #include "background-value.h"
+ #include "recovery-history.h"
+@@ -2985,11 +2986,13 @@ void DurableLog::checkConfirmations() {
+     }
+     if (want == 0 && !flushed) {
+       flushed = true;
++      coworkerd::benchmarkTrace::LocalFlush flushTrace;
+ #ifdef __APPLE__
+       const auto result = ::fsync(logFd);
+ #else
+       const auto result = ::fdatasync(logFd);
+ #endif
++      flushTrace.finish();
+       if (!slowFlushForTest.empty()) slowFlushOnceForTest();
+       flushOk = result == 0;
+       if (!flushOk) {
+diff --git a/node/main.c++ b/node/main.c++
+index 6af8fe7..1b155dc 100644
+--- a/node/main.c++
++++ b/node/main.c++
+@@ -7,6 +7,7 @@
+ #include "placement-contract.h"
+ #include "reasons.h"
+ #include "event-loop-trace.h"
++#include "../tests/cluster/main-thread-profile/node-trace.h"
+ #include "background-value.h"
+ #include "rpc-error.h"
+ #include "coworkerd.capnp.h"
+@@ -1987,6 +1988,7 @@ public:
+       auto& count = root ? inFlightRoots : inFlightNested;
+       KJ_ASSERT(count > 0, "admission count underflow");
+       --count;
++      coworkerd::benchmarkTrace::admission(inFlightRoots, inFlightNested);
+       if (tenant != tenantAdmissions.end()) {
+         auto& active = tenant->second.active(root);
+         KJ_ASSERT(active > 0, "tenant admission count underflow");
+@@ -1995,6 +1997,7 @@ public:
+       }
+     });
+     if (root) ++inFlightRoots; else ++inFlightNested;
++    coworkerd::benchmarkTrace::admission(inFlightRoots, inFlightNested);
+     if (tenant != tenantAdmissions.end()) ++tenant->second.active(root);
+     slot->server = this;
+     slot->root = root;
+@@ -10474,6 +10477,7 @@ int run(Launch launch) {
+   auto& waitScope = io.waitScope;
+   auto& timer = io.provider->getTimer();
+   coworkerd::eventLoopTrace::openTrace();
++  coworkerd::benchmarkTrace::open();
+ 
+   capnp::ByteStreamFactory byteStreamFactory;
+   kj::HttpHeaderTable::Builder headerTableBuilder;

@@ -3,15 +3,23 @@ name: Node main-thread measurement
 on:
   push:
     branches: [codex/95-main-thread-profile]
-    paths: [.github/workflows/main-thread-profile-measure.yml]
+    paths:
+      - .github/workflows/main-thread-profile-measure.yml
+      - tests/cluster/main-thread-profile/**
+      - tests/cluster/database-home-benchmark.mjs
+      - tests/cluster/database-throughput-client.mjs
 
 permissions:
   contents: read
 
+concurrency:
+  group: node-main-thread-measurement
+  cancel-in-progress: true
+
 jobs:
-  build:
+  measure:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       CC: clang-19
       CXX: clang++-19
@@ -20,28 +28,58 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+          package-manager-cache: false
       - name: Install build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git
-      - name: Build Release daemons with symbol and frame information
+      - name: Fetch and verify the pinned public kernel
+        id: kernel
         run: |
+          kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64)
+          printf 'path=%s\n' "$kernel" >> "$GITHUB_OUTPUT"
+      - name: Build the benchmark node and forwarder
+        run: |
+          git apply tests/cluster/main-thread-profile/instrumentation.patch
           bash scripts/build.sh -DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG -g1 -fno-omit-frame-pointer'
-          tar -C build -cf "$RUNNER_TEMP/profile-daemons.tar" coworkerd coworkerd-apiserver coworkerd-launcher
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
-        with:
-          name: profile-daemons
-          path: ${{ runner.temp }}/profile-daemons.tar
-          compression-level: 0
-          if-no-files-found: error
-  runner-check:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Verify Linux profiling tools
+          cmake --build build --target coworkerd-bench-http-forwarder
+      - name: Record runner details
         run: |
-          uname -a
-          sudo perf --version
-          sudo perf record --clockid mono -e cpu-clock -F 499 --call-graph dwarf,8192 -o /tmp/perf-test.data -- openssl speed -seconds 1 sha256
-          sudo perf script -i /tmp/perf-test.data --ns -F comm,tid,time,event,period,ip,sym,dso | head -100
-          sudo perf list 'syscalls:*fdatasync*'
+          mkdir -p reports
+          {
+            uname -a
+            lscpu
+            free -b
+            cat /etc/os-release
+            docker version
+            docker compose version
+            df -T "$PWD" /var/lib/docker
+            lsblk -o NAME,SIZE,TYPE,FSTYPE,MODEL,ROTA
+            printf 'Runner image %s %s\n' "$ImageOS" "$ImageVersion"
+            sudo perf --version
+            clang++-19 --version
+          } | tee reports/runner.txt
+      - name: Verify workloads, trace and profiler
+        env:
+          KERNEL: ${{ steps.kernel.outputs.path }}
+        run: |
+          COWORKERD_PROFILE_STACKS="$PWD/reports/smoke-stacks.jsonl" \
+            node tests/cluster/database-home-benchmark.mjs object "$PWD" "$KERNEL" \
+            "$PWD/reports/smoke.jsonl" --main-thread-profile-smoke
+      - name: Measure each path serially on the same runner
+        env:
+          KERNEL: ${{ steps.kernel.outputs.path }}
+        run: |
+          COWORKERD_PROFILE_STACKS="$PWD/reports/stacks.jsonl" \
+            node tests/cluster/database-home-benchmark.mjs object "$PWD" "$KERNEL" \
+            "$PWD/reports/measurement.jsonl" --main-thread-profile
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: node-main-thread-profile-${{ github.run_attempt }}
+          path: reports/
+          if-no-files-found: warn
