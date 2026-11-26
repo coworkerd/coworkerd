@@ -354,6 +354,12 @@ def allowed_path(name, path):
                           name == '0174-release-idle-platform-database-copies.patch' and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0182-bound-platform-sqlite-memory.patch' and path in {
+                              'src/workerd/api/actor-state.c++', 'src/workerd/io/actor-sqlite.c++',
+                              'src/workerd/threaded/BUILD.bazel', 'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite-metering.c++', 'src/workerd/util/sqlite-metering.h',
+                              'src/workerd/util/sqlite-test.c++', 'src/workerd/util/sqlite.c++',
+                              'src/workerd/util/sqlite.h'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or
