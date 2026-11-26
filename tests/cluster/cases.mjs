@@ -302,13 +302,20 @@ INSERT INTO books VALUES (1, 'One');
   assert.equal(schema.length, 3);
   assert.deepEqual(await execute(source.name, rowsSql), rows);
 
-  const sourceOwner = shardOwnerOrder(cluster, source.namespaceId, 0)[0];
+  // The first request can fall back to another node. A preferred node's log
+  // can contain unrelated writes even when it never held the source shard.
+  const states = await Promise.all(cluster.nodes.map(async node => [node, await cluster.state(node)]));
+  const owners = states.filter(([, { durableShards }]) =>
+    durableShards.held.namespaces[source.namespaceId]?.shards.some(({ shard }) => shard === 0));
+  assert.equal(owners.length, 1, `${source.name} has exactly one shard owner`);
+  const [sourceOwner] = owners[0];
   const log = async () => (await cluster.state(sourceOwner)).durableLog.log;
   const publishedPoint = async () => {
-    const confirmed = BigInt((await log()).nextSeq);
-    assert.ok(confirmed > 0n);
-    await eventually('the owner publishes the confirmed source writes', async () => {
-      assert.ok(BigInt((await log()).sealedSeq) >= confirmed);
+    const throughSeq = BigInt((await log()).nextSeq);
+    assert.ok(throughSeq > 0n);
+    // The write has returned, and the owner's seal advances after manifest publication.
+    await eventually(`${sourceOwner} publishes the source writes through sequence ${throughSeq}`, async () => {
+      assert.ok(BigInt((await log()).sealedSeq) >= throughSeq);
     });
     return (await cli('time-travel', 'info', source.name)).point;
   };
@@ -360,7 +367,7 @@ INSERT INTO books VALUES (1, 'One');
   assert.deepEqual(await execute(source.name, rowsSql), [...rows, { id: 3, title: 'After bookmark' }]);
 
   for (const db of [ledger, source, backup, historical]) {
-    const [owner] = shardOwnerOrder(cluster, db.namespaceId, 0);
+    const owner = db === source ? sourceOwner : shardOwnerOrder(cluster, db.namespaceId, 0)[0];
     const process = await durableGeneration(cluster, owner);
     assert.equal(process.lifecycle.durableServer, 'threaded');
     const callers = db === backup || db === historical ? ['node', 'worker'] : ['node'];
