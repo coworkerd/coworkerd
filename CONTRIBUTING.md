@@ -225,12 +225,22 @@ runner to check a change on Linux, with all cases or a single case. Linux pull-r
   for any reader on any machine: no names of your own hosts or paths, no references to notes kept outside this
   repository.
 - After a review, add commits to the same branch instead of force-pushing it. A maintainer merges the pull request.
-- A change to workerd is a commit on the fork's branch and the same change exported to `patches/workerd/` (`python3
-  scripts/workerd-patches.py export`, which takes one commit per patch named in `patches/workerd/series`, so a new
-  patch is named there first; it works on the checkout `workerd/`, or the one `--checkout` names, which must be clean
-  and hold `UPSTREAM`'s tag at its commit) in this repository; patches stay in `src/workerd/server/` (with the two documented exceptions in
-  [patches/README.md](patches/README.md)), with the logic in our own files and only hooks in upstream files.
 - The `/v1` API changes only by adding fields and endpoints until 1.0; changing or removing something in it needs a
   discussion first.
 - Never commit credentials, keys or tokens, including test values that look real.
 - Security issues are not reported in public issues: see [SECURITY.md](SECURITY.md).
+
+## Sending a kernel change
+
+1. Read `tag=` in [patches/workerd/UPSTREAM](patches/workerd/UPSTREAM) on product `main`. The per-tag base on
+   [coworkerd/workerd](https://github.com/coworkerd/workerd) is `coworkerd-<tag>`, including the `v` in the tag.
+   During the [branch cutover](https://github.com/coworkerd/coworkerd/issues/4), confirm the active fork base there.
+   Start your topic branch from that base and open the kernel PR against it. Keep the implementation in our own
+   files and upstream hooks within the [documented patch scope](patches/README.md#how-the-series-is-maintained).
+2. Open a companion PR against `main` of [coworkerd/coworkerd](https://github.com/coworkerd/coworkerd). Record
+   new patch names in `patches/workerd/series` in replay order and export the corresponding fork changes to
+   `patches/workerd/` using the [series tools](patches/README.md#working-on-the-series). Put a link to the other PR
+   in each description.
+3. [Verify the fork tree](patches/README.md#verifying-a-kernel-pull-request) from the product PR checkout. Record
+   the full fork commit SHA and matching tree ID on the product PR, and rerun the check if either revision changes.
+   Follow the [kernel publishing steps](#publishing-a-changed-kernel-series) for the changed series and its archive pins.
