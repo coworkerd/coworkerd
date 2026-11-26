@@ -117,14 +117,9 @@ limits.
 In a three-node Docker cluster on Linux ARM64 (10 vCPUs, 7.75 GiB of RAM, Node.js 26.2
 driving the load from macOS), a local build of the ordered series through 0179 returned the row
 to all 128 HTTP SQL callers and all 128 D1 callers from a peer. The owner kept its process
-generation without counting any admission overloads. Both runs used the compiled mailbox
-limits and completed in under a quarter second each.
-
-In an earlier run with the Worker and database on the same node, the pinned 0176 kernel with
-its 4-event and 64 KiB defaults returned the row to 15 of 128 HTTP SQL callers and 6 of 128
-D1 callers. An initial explicit 512-event and 2 MiB rehearsal served all 128 on each route.
-A subsequent run with the 0179 defaults served all 128 HTTP SQL calls and 121 D1 calls. The
-other seven D1 requests were refused at the node's root admission threshold.
+generation without counting any admission overloads. The two bursts took 201 ms and 228 ms
+respectively. The same case with the published 0176 kernel and its 4-event and 64 KiB defaults
+returned the row to 9 of 128 HTTP SQL callers and 5 of 128 D1 callers.
 
 At `f1e41d5`, the hibernation cluster fixture already allowed 32 waiting events with the default
 64 KiB byte bound. The diagnostics for the parallel batch of 16 facet calls recorded a refusal
