@@ -198,18 +198,16 @@ async function sqlAtomicity(cluster) {
   return created;
 }
 
-async function createDatabaseHomes(cluster, tenant, counts, { limit = 36, successors } = {}) {
+async function createDatabaseHomes(cluster, tenant, counts, { limit = 36, candidates = cluster.nodes } = {}) {
   const databases = new Map([...counts.keys()].map(node => [node, []]));
   let revision = 0;
   for (let i = 0; i < limit && [...counts].some(([node, count]) => databases.get(node).length < count); i++) {
     const path = `${tenant.path}/databases/db-${i}`;
     const { database, revision: createdAt } = await cluster.api(path, { method: 'POST', token: tenant.token });
     revision = Math.max(revision, createdAt);
-    // Rendezvous order determines the first owner and the successor used in takeover tests.
-    const [owner, successor] = shardOwnerOrder(cluster, database.namespaceId, 0);
+    const [owner] = shardOwnerOrder(candidates, database.namespaceId, 0);
     const selected = databases.get(owner);
-    const expectedSuccessor = successors?.get(owner);
-    if (selected && selected.length < counts.get(owner) && (!expectedSuccessor || expectedSuccessor === successor)) {
+    if (selected && selected.length < counts.get(owner)) {
       selected.push({ ...database, path, owner });
     }
   }
@@ -239,8 +237,8 @@ async function threadedDatabaseRelease(cluster) {
   });
 }
 
-function shardOwnerOrder(cluster, namespaceId, shard) {
-  const scores = cluster.nodes.map(node => [node, createHash('sha256')
+function shardOwnerOrder(nodes, namespaceId, shard) {
+  const scores = nodes.map(node => [node, createHash('sha256')
     .update(`${namespaceId}/${shard}\0${node}`).digest().readBigUInt64BE()]);
   scores.sort((a, b) => a[1] > b[1] ? -1 : a[1] < b[1] ? 1 : a[0].localeCompare(b[0]));
   return scores.map(([node]) => node);
@@ -264,14 +262,15 @@ async function databaseDispatches(cluster, db, owner) {
     .filter(row => row.nodeId === owner && row.namespaceId === db.namespaceId.slice(0, 12) && row.status === 200);
 }
 
-async function waitForDurableMembership(cluster) {
+async function waitForDurableMembership(cluster, candidates = cluster.nodes) {
   // An early call can claim a shard or confirm a write using an incomplete
   // membership view.
+  const expected = candidates.toSorted();
   await eventually('all nodes see every durable candidate', async () => {
     await Promise.all(cluster.nodes.map(async node => {
       const { membership } = await cluster.state(node);
       const active = membership.members.filter(member => member.durableProcesses > 0 && member.state === 'active');
-      assert.deepEqual(active.map(member => member.nodeId).sort(), cluster.nodes, node);
+      assert.deepEqual(active.map(member => member.nodeId).sort(), expected, node);
     }));
   });
 }
@@ -415,7 +414,7 @@ async function threadedDatabaseAlarm(cluster) {
     const path = `${tenant.path}/databases/db-${i}`;
     const created = await cluster.api(path, { method: 'POST', token: tenant.token });
     revision = Math.max(revision, created.revision);
-    const [owner] = shardOwnerOrder(cluster, created.database.namespaceId, 0);
+    const [owner] = shardOwnerOrder(cluster.nodes, created.database.namespaceId, 0);
     const backend = owner === threaded ? 'threaded' : 'upstream';
     if (!databases.has(backend)) databases.set(backend, { ...created.database, path, owner });
   }
@@ -492,9 +491,10 @@ async function threadedDatabasePlacement(cluster) {
     console.log(`Database compatibility binaries (SHA-256): upstream=${previous}, threaded=${current}`);
   }
   const tenant = await cluster.tenant('sql-placement', { durableObjectNamespaces: 128 });
-  const { databases, revision } = await createDatabaseHomes(cluster, tenant, new Map([[threaded, 2], [upstream, 1]]), {
-    limit: 96, successors: new Map([[threaded, upstream], [upstream, threaded]]),
-  });
+  const candidates = [threaded, upstream];
+  await waitForDurableMembership(cluster, candidates);
+  const counts = new Map([[threaded, 2], [upstream, 1]]);
+  const { databases, revision } = await createDatabaseHomes(cluster, tenant, counts, { candidates });
   const selected = [...databases.values()].flat();
   const peerUrls = new Map(await Promise.all([threaded, upstream].map(async node => {
     const address = await cluster.compose(['port', node, '8934']);
@@ -895,7 +895,7 @@ async function threadedDatabaseAccounting(cluster) {
   const candidate = Array.from({ length: 64 }, (_, index) => `object-${index}`).find(name => {
     const id = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update(name).digest();
     const shard = Number(id.readBigUInt64BE() % BigInt(shards));
-    return shardOwnerOrder(cluster, namespaceId, shard)[0] === threaded;
+    return shardOwnerOrder(cluster.nodes, namespaceId, shard)[0] === threaded;
   });
   assert.ok(candidate, 'the platform object is assigned to the threaded database owner');
   assert.equal((await durableGeneration(cluster, threaded)).lifecycle.durableServer, 'threaded');
@@ -2132,7 +2132,7 @@ async function durableAdmissionRefusal(cluster) {
   const { namespaceId, shards } = await cluster.api(`${tenant.path}/workers/counter/namespaces/Counter`, { token: tenant.token });
   const names = node => Array.from({ length: 64 }, (_, i) => `counter-${i}`).filter(name => {
     const id = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update(name).digest();
-    return shardOwnerOrder(cluster, namespaceId, Number(id.readBigUInt64BE() % BigInt(shards)))[0] === node;
+    return shardOwnerOrder(cluster.nodes, namespaceId, Number(id.readBigUInt64BE() % BigInt(shards)))[0] === node;
   });
   const [blocker, target] = names(objectOwner);
   const [caller] = names(databaseOwner);
@@ -3681,6 +3681,8 @@ export const durableGatedCases = {
   'durable-threaded-database-placement': {
     test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
     publishPeerPorts: true, controlDurableLifecycle: true, holdPeerAcks: false,
+    // Keep a third node for ingress and leave exactly one eligible owner after either kill.
+    configureNode: node => node === 'node-3' ? { durableObjects: { processes: 0 } } : {},
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
   },
   'durable-threaded-database-admission': {
