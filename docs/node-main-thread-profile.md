@@ -191,3 +191,57 @@ COWORKERD_PROFILE_CONTROL=plain COWORKERD_CLUSTER_BIN_DIR="$PWD/build/plain" \
   "$PWD/reports/plain-after.jsonl" --main-thread-profile
 python3 "$report_checkout/tests/cluster/main-thread-profile/tables.py" --controls reports
 ```
+
+## Durable log I/O
+
+The append worker owns the active log descriptor. A completed append makes a record eligible for replication. With no selected peer, a successful local flush makes the covered prefix eligible for confirmation. The node rechecks the lease before each positive reply and preserves confirmation order within each database. Writes queued during I/O can share a flush. Epoch rotation drains the old file's queue before switching descriptors and refuses its outstanding confirmations under the old identity. The append queue is bounded by `durableObjects.peerBufferBytes` in encoded bytes.
+
+### Measurement
+
+This comparison uses one standalone node with the same published kernel in both builds. Each client inserts one row per request through a Worker and its SQLite Durable Object. The driver checks every reply and verifies the final count, including the warm-up writes. Each insert-only result is the median of three five-second windows at the stated concurrency. The mixed window lasts seven seconds with one insert client and one client reading a warm SQLite Durable Object belonging to a distinct tenant.
+
+The slow volume is ext4 on a private loop device with a device-mapper target that adds 20 ms to block flushes. The node's Durable Object SQLite files use the ordinary filesystem. A shared probe records the actual `fdatasync` interval and uses the daemon's Linux TID to identify the threads that append and flush. A read overlaps a flush when the entire HTTP request, from client submission through receipt of the response body, fits within one recorded syscall interval. [Linux `dm-delay` documentation](https://docs.kernel.org/admin-guide/device-mapper/delay.html)
+
+A main-thread stall here is the longest interval between returning from one `epoll_wait` or `epoll_pwait` and entering the next. It includes time spent in calls such as `fdatasync` and time the thread was descheduled between polls. Idle waits inside the polling syscall and cluster setup are outside this measure.
+
+### Results
+
+Both builds ran in one job on `runnervm0j63q`, an Ubuntu 24.04 x86-64 VM with four vCPUs on an AMD EPYC 9V74 and Linux `7.0.0-1020-azure`. The runner image was `ubuntu24 20261122.23.1`. The ordinary volume was the runner's ext4 root filesystem. All four cells verified their row counts, covering 32,200 confirmed inserts including warm-up. [Runner record](node-main-thread-profile/durable-log-io/runner.txt) · [Candidate and baseline revisions](node-main-thread-profile/durable-log-io/revisions.txt) · [Actions job and recording](https://github.com/coworkerd/coworkerd/actions/runs/45907925121)
+
+| Log volume | Insert clients | Baseline confirmed inserts/s | Worker confirmed inserts/s |
+| --- | ---: | ---: | ---: |
+| Ordinary ext4 | 1 | 274.8 | 256.4 |
+| Ordinary ext4 | 16 | 395.0 | 441.6 |
+| Delayed ext4 | 1 | 38.4 | 28.8 |
+| Delayed ext4 | 16 | 40.6 | 204.8 |
+
+The 16-client rate on the delayed volume rose 5.04× as writes shared flushes. The one-client rates fell in this run. The ordinary volume also had intermittent long flushes. Its largest measured flush was 468.50 ms in the baseline and 393.41 ms with the worker.
+
+| Log volume | Baseline longest main-thread stall | Worker longest main-thread stall | Baseline reads wholly inside a flush | Worker reads wholly inside a flush |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary ext4 | 468.813 ms | 5.035 ms | 0 / 1,011 | 722 / 1,907 |
+| Delayed ext4 | 154.108 ms | 2.878 ms | 0 / 261 | 2,178 / 2,562 |
+
+The stall column takes the maximum across all seven timed windows per cell. The read counts come from the seven-second mixed windows. The delayed volume passed the 5 ms threshold. In one recorded example, a 2.52 ms read began 0.54 ms into a 21.34 ms flush and ended 3.06 ms into it. Across both volumes, all 14,751 candidate append calls and all 8,786 candidate flushes observed in the timed windows ran outside the main thread. All observed baseline appends and flushes ran on it.
+
+The tables can be checked from the recorded windows in the repository.
+
+```sh
+node tests/cluster/durable-log-io/verify.mjs docs/node-main-thread-profile/durable-log-io
+```
+
+### Reproduce the log comparison
+
+Use one quiet Ubuntu 24.04 x86-64 machine with the [build dependencies](../CONTRIBUTING.md#building), Docker Compose, Node.js 22, and root access for the private loop mount. The driver creates fresh clusters and removes its test volume when done.
+
+```sh
+git fetch origin refs/pull/122/head
+git worktree add --detach ../coworkerd-log-before 01a9af30fdca886e1cc4ae3b82399c202099fe78
+git worktree add --detach ../coworkerd-log-after 08e439c0584a86d3e630307bb86afa33f2ffba73
+export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4
+(cd ../coworkerd-log-before && bash scripts/build.sh)
+(cd ../coworkerd-log-after && bash scripts/build.sh && npm ci --prefix cli)
+cd ../coworkerd-log-after
+kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64)
+bash tests/cluster/durable-log-io/run.sh ../coworkerd-log-before/build build "$kernel" reports/durable-log-io
+```
