@@ -56,9 +56,7 @@ seconds, the next woken tree of that Worker goes to another copy. A tree and its
 Choose placement before constructing the actor, and reserve thread, address space, heap and native charges
 before publishing it. Count initializing and closing trees against the backstop until their reservations
 are released. Include native databases in the process backstop, as database objects count today. Preserve the
-version pin and actor input/output gates, including supported
-interleaving across awaits. The mailbox bounds waiting events, rather than turning every event into a
-run-to-completion lock.
+version pin and actor input/output gates, including supported interleaving across awaits.
 
 An isolate-wide V8 interrupt needs a stricter contract for object-local CPU reset than the ordinary path
 does. Consume CPU only while that event executes (including its synchronous SQLite work). Once an interrupt
@@ -74,6 +72,44 @@ Choose the 30 s default and resolve the existing Worker `limits.cpuMs` and tenan
 admitting the event. The threaded durable ceiling is 300,000 ms. A higher per-Worker setting
 still needs room under the tenant's `maxWorkerCpuMs`, which defaults to 30,000 ms.
 [Worker limits](control-plane-api.md) · [Tenant defaults](../common/tenancy.h).
+
+### Per-object admission mailbox
+
+The threaded durable child keeps one FIFO of waiting events per root object tree, shared by the
+root and its facets for events admitted through the child. The release binaries use a depth of
+**4 waiting events** (`mailboxDepth`) and **64 KiB of waiting bytes** (`mailboxBytes`) when the
+experimental `durableObjects.threadedStorage` backend is enabled. The normal release configuration
+leaves that backend off. During a synchronous event, up to four more events can wait for that tree,
+provided their combined byte charge fits and the child can reserve them. Admission refuses an event
+when the count is already full or its addition would exceed the byte limit.
+
+The child charges a mailbox entry on accepting the routing preface and frees its waiting count and
+bytes when the home begins delivery, or when the queued event is canceled, expires or is refused.
+The node declares the byte charge as the encoded invocation descriptor size plus the payload bytes
+of a node-delivered WebSocket message, when present. HTTP bodies stream separately after admission.
+Delivered events, including those suspended at an `await` or waiting at an actor input gate, can
+still hold process resources. The input and output gates govern execution and allow supported
+interleaving across awaits. See [kernel admission](../patches/workerd/0045-threaded-durable-admission.patch)
+and [node routing](../node/main.c++).
+
+Each admitted event reserves a descriptor and 4 KiB of metadata plus its declared bytes from the
+child's shared budget. The per-tree bounds limit how much of that budget one busy tree can hold in
+waiting connections and metadata. The original queue profiles measured those costs before body
+reads and supported the initial four-event and 64 KiB settings. Admission can refuse earlier if
+the child lacks memory or descriptor reservations, a cold tree hits the resident limit or cannot
+reserve a home, or its assigned home is resetting. These conditions can produce the same `R`
+receipt as a full mailbox.
+See the [original queue profiles](https://github.com/coworkerd/coworkerd/pull/43) and the
+[operator guide](guide/durable-objects.md#threaded-object-admission).
+
+At `f1e41d5`, the hibernation cluster fixture already allowed 32 waiting events with the default
+64 KiB byte bound. The diagnostics for the parallel batch of 16 facet calls recorded a refusal
+before execution, with the same child PID and generation, zero actor or isolate resets, and further
+events delivered on the same home. Each deletion also schedules a close event on that home, and
+#93 changed the fixture to issue deletions one at a time. The recorded receipt and overload count
+leave the specific admission condition undetermined. See the
+[failure record](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7161010583) and
+[fixture change](https://github.com/coworkerd/coworkerd/pull/93).
 
 ## Node and child protocol
 

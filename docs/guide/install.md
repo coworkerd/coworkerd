@@ -601,6 +601,9 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
 | `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
 
+See [threaded object admission](durable-objects.md#threaded-object-admission) for the experimental
+backend's per-object waiting limits.
+
 A single encoded WAL record is limited to `min(64 MiB, 256 MiB, peerBufferBytes, UInt32 message limit) - 4 KiB`
 (67,104,768 bytes with defaults), so an acknowledged record fits the existing peer recovery RPC. The normal
 32 MiB page budget permits one larger record by itself. `durableLog.settings.recordLimitBytes` reports the
