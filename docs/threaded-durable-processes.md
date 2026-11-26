@@ -108,6 +108,12 @@ Worker requests through a D1 binding. Each request selects the same seeded row b
 one threaded database. The test uses the database placement executable and checks all results and
 the owner process generation.
 
+In a three-node Docker cluster on Linux ARM64 (10 vCPUs, 7.75 GiB of RAM, Node.js 26.2
+driving the load from macOS), the pinned 0176 kernel with its 4-event and 64 KiB defaults returned
+the row to 15 of 128 HTTP SQL callers and 6 of 128 D1 callers. With the same binaries and explicit
+512-event and 2 MiB test settings, both routes returned 128 of 128. The owner kept its process
+generation without counting any admission overloads in that run.
+
 At `f1e41d5`, the hibernation cluster fixture already allowed 32 waiting events with the default
 64 KiB byte bound. The diagnostics for the parallel batch of 16 facet calls recorded a refusal
 before execution, with the same child PID and generation, zero actor or isolate resets, and further
