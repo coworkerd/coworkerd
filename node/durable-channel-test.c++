@@ -481,8 +481,13 @@ struct DurableLogChannelTest {
     std::optional<LeaseTracker::Judgment> forced;
     uint32_t lost = 0;
     double judgedAt = 0;
+    bool throwAfterAppend = name == "completion-error";
     log.setLeaseHooks([&](uint64_t epoch, double now) {
           judgedAt = now;
+          if (throwAfterAppend && log.appendedSeq == 1) {
+            throwAfterAppend = false;
+            KJ_FAIL_REQUIRE("fixture failed the first post-append lease check");
+          }
           return forced ? *forced : tracker.judge(epoch, now);
         }, [&](std::string) { ++lost; });
     const int peer = log.openChannel("d0");
@@ -563,6 +568,13 @@ struct DurableLogChannelTest {
       KJ_REQUIRE(answers().at(44) == 1 && confirmed() == 0 && lost == 1 && tracker.fenced(1),
           "a lease that ended during the local flush must refuse the confirmation");
       KJ_REQUIRE(log.isolated.size() == 1 && log.inFlight.empty(), "the refused record is excluded like any other");
+    } else if (name == "completion-error") {
+      take(61);
+      KJ_REQUIRE(!answers().contains(61) && !log.logWriting && !throwAfterAppend,
+          "an error after I/O must release the batch slot");
+      take(62);
+      KJ_REQUIRE(answers().at(61) == 0 && answers().at(62) == 0 && confirmed() == 2,
+          "a later batch progresses and confirms both writes");
     } else if (name == "rotate") {
       const auto original = log.logPath;
       const auto trigger = std::filesystem::path(temp) / "slow-flush";

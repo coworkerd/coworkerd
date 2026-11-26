@@ -2537,7 +2537,6 @@ void DurableLog::driveLogWrites() {
     return;
   }
   pendingLogAppends.clear();
-  queuedLogBytes = 0;
   logFlushRequested = false;
   if (logDrained) {
     logDrainFulfiller->fulfill();
@@ -2549,10 +2548,8 @@ void DurableLog::driveLogWrites() {
 kj::Promise<void> DurableLog::writeLogBatch(std::vector<LogAppend> batch, bool flush) {
   const auto before = appendedSeq;
   auto through = appendedSeq;
-  size_t bytes = 0;
   for (const auto& append : batch) {
     if (append.sequence) through = append.sequence;
-    bytes += append.encoded->size();
   }
   struct Outcome {
     int error = 0;
@@ -2606,29 +2603,33 @@ kj::Promise<void> DurableLog::writeLogBatch(std::vector<LogAppend> batch, bool f
     }
     return result;
   }).catch_([](kj::Exception&&) { return Outcome{EIO, 0, false, std::nullopt}; });
-  queuedLogBytes -= bytes;
-  if (outcome.testDelayMs) log("slow-flush-for-test", "\"ms\":" + std::to_string(*outcome.testDelayMs));
-  if (outcome.error) {
-    log(outcome.flushFailed ? "log-flush-failed" : "log-write-failed",
-        "\"errno\":" + std::to_string(outcome.error) + ",\"partialBytes\":\"" +
-        std::to_string(outcome.partialBytes) + "\"");
-    failLogWrites(outcome.flushFailed ? "the local log could not be flushed" : "the node's append log could not accept this write");
-  } else {
-    appendedSeq = through;
-    if (flush) {
-      flushedSeq = through;
-      // Requests made while this flush was in flight only cover sequences
-      // the event loop already saw appended. This flush covers them all.
-      logFlushRequested = false;
+  // Run the event-loop work before releasing the batch slot. A callback
+  // failure still has to let the next batch and drain waiters make progress.
+  auto completionError = kj::runCatchingExceptions([&]() {
+    if (outcome.testDelayMs) log("slow-flush-for-test", "\"ms\":" + std::to_string(*outcome.testDelayMs));
+    if (outcome.error) {
+      log(outcome.flushFailed ? "log-flush-failed" : "log-write-failed",
+          "\"errno\":" + std::to_string(outcome.error) + ",\"partialBytes\":\"" +
+          std::to_string(outcome.partialBytes) + "\"");
+      failLogWrites(outcome.flushFailed ? "the local log could not be flushed" : "the node's append log could not accept this write");
+    } else {
+      appendedSeq = through;
+      if (flush) {
+        flushedSeq = through;
+        // Requests made while this flush was in flight only cover sequences
+        // the event loop already saw appended. This flush covers them all.
+        logFlushRequested = false;
+      }
+      if (!epochChanging && !stopped && !recoveryWriteFailed) {
+        checkConfirmations();
+        if (!recoveryWriteFailed) sendAppendedRecords(before, through);
+        if (recordBytes >= settings.config.segmentBytes) tasks.add(sealNow("bytes"));
+      }
     }
-    if (!epochChanging && !stopped && !recoveryWriteFailed) {
-      checkConfirmations();
-      if (!recoveryWriteFailed) sendAppendedRecords(before, through);
-      if (recordBytes >= settings.config.segmentBytes) tasks.add(sealNow("bytes"));
-    }
-  }
+  });
   logWriting = false;
   driveLogWrites();
+  KJ_IF_SOME(error, completionError) { kj::throwRecoverableException(kj::mv(error)); }
 }
 
 void DurableLog::failLogWrites(const std::string& reason) {
@@ -2643,8 +2644,8 @@ void DurableLog::failLogWrites(const std::string& reason) {
 }
 
 uint64_t DurableLog::recordLimitBytes() const {
-  // The local FD uses UInt32 lengths. The fragment cap, append queue and peer
-  // RPC reader are tighter bounds.
+  // The local FD uses UInt32 lengths. The fragment cap and peer RPC reader
+  // are tighter bounds.
   const auto rawLimit = std::min({uint64_t(capnp::ReaderOptions().traversalLimitInWords * sizeof(capnp::word)),
       uint64_t(RECORD_BYTES_LIMIT), settings.config.peerBufferBytes, uint64_t(UINT32_MAX)});
   return rawLimit > TAIL_RPC_HEADROOM_BYTES ? rawLimit - TAIL_RPC_HEADROOM_BYTES : 0;
@@ -2764,7 +2765,7 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     markRepair(*object, reason);
     return;
   }
-  if (!logWorker || logAppendFailed || queuedLogBytes + encoded.size() > settings.config.peerBufferBytes) {
+  if (!logWorker || logAppendFailed) {
     ++confirmFailures;
     // As with an append error, the WAL already contains this unlogged commit.
     markRepair(*object, "the node's append log could not accept this write");
@@ -2831,7 +2832,6 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
   flight.endsAtFrame = record.kind == LogRecordKind::FRAMES ? record.firstFrame + record.frames - 1 : 0;
   flight.generation = record.generation;
   flight.peers = peersOf(object->namespaceId, object->shard);
-  queuedLogBytes += bytes;
   pendingLogAppends.push_back({std::move(payload), record.nodeSeq, flight.peers.empty()});
   inFlight.emplace(record.nodeSeq, std::move(flight));
   driveLogWrites();
@@ -3581,7 +3581,6 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   marker.nodeEpoch = nodeEpoch;
   marker.segment = header.segment;
   const auto markerBytes = std::make_shared<const std::string>(encodeLogRecord(marker));
-  queuedLogBytes += markerBytes->size();
   pendingLogAppends.push_back({markerBytes, 0, false});
   driveLogWrites();
   for (auto& [id, peer] : peers) {

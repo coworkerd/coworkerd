@@ -58,7 +58,7 @@ export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
-    budgetLifetime, nodeEnvironment, nodeVolumes, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
+    budgetLifetime, nodeEnvironment, nodeVolumes, binariesDirectory, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
     databaseFixtureNodes = [], databaseAlarmFixture = false, previousProduct, previousKernel,
   } = {}) {
     this.directory = directory;
@@ -90,6 +90,7 @@ export class Cluster {
     this.configureNode = configureNode;
     this.nodeEnvironment = nodeEnvironment;
     this.nodeVolumes = nodeVolumes;
+    this.binariesDirectory = binariesDirectory;
     this.productRoot = productRoot;
     this.publishPeerPorts = publishPeerPorts;
     this.platformFixture = platformFixture;
@@ -126,7 +127,7 @@ export class Cluster {
   async start() {
     const context = join(this.directory, 'image');
     await Promise.all(['bin', 'docker', 'runtime'].map(dir => mkdir(join(context, dir), { recursive: true })));
-    const binaries = process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(this.productRoot, 'build');
+    const binaries = this.binariesDirectory ?? process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(this.productRoot, 'build');
     const files = Object.fromEntries(['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher']
       .map(file => [`bin/${file}`, join(binaries, file)]));
     if (this.platformFixture || this.databaseAlarmFixture) {

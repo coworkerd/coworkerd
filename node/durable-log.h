@@ -1053,7 +1053,7 @@ private:
   std::unique_ptr<LogWorker> logWorker;
   bool epochChanging = false, logWriting = false, logFlushRequested = false;
   bool logAppendFailed = false;     // no more appends after a possibly partial record
-  uint64_t appendedSeq = 0, flushedSeq = 0, queuedLogBytes = 0;
+  uint64_t appendedSeq = 0, flushedSeq = 0;
   std::vector<LogAppend> pendingLogAppends;
   std::optional<kj::ForkedPromise<void>> epochChange, logDrained;
   kj::Own<kj::PromiseFulfiller<void>> logDrainFulfiller;
