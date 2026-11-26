@@ -102,11 +102,12 @@ receipt as a full mailbox.
 See the [original queue profiles](https://github.com/coworkerd/coworkerd/pull/43) and the
 [operator guide](guide/durable-objects.md#threaded-object-admission).
 
-The [cluster suite](../tests/cluster/README.md#threaded-sql-default-mailbox) uses the compiled
-mailbox defaults. Its database test runs separate bursts of 128 public HTTP SQL requests and 128
+The cluster suite uses the compiled mailbox defaults. Its database test runs separate bursts of
+128 public HTTP SQL requests and 128
 Worker requests through a D1 binding from a peer of the database owner. Each request selects the
 same seeded row by primary key in one threaded database. The test uses the database placement
 executable and checks all results and the owner process generation.
+[Cluster test](../tests/cluster/README.md#threaded-sql-default-mailbox).
 
 The node's default root admission threshold of 128 counts both active roots and nested calls on
 that node. A colocated D1 Worker and database share this accounting, so existing binding calls
@@ -121,8 +122,9 @@ generation without counting any admission overloads. The two bursts took 201 ms 
 respectively. The same case with the published 0176 kernel and its 4-event and 64 KiB defaults
 returned the row to 9 of 128 HTTP SQL callers and 5 of 128 D1 callers.
 
-The [hosted kernel build](https://github.com/coworkerd/coworkerd/actions/runs/45765527350)
-also ran both 128-client bursts on Ubuntu 24.04 with the compiled 0179 defaults.
+The hosted kernel build also ran both 128-client bursts on Ubuntu 24.04 with the compiled
+0179 defaults. [Hosted build](https://github.com/coworkerd/coworkerd/actions/runs/45765527350) ·
+[Verified kernel archives](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-a572c9630e5c-run-45765527350-1).
 
 | Hosted runner | HTTP SQL reads | D1 reads from a peer |
 | --- | ---: | ---: |
