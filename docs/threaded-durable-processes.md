@@ -336,49 +336,83 @@ depends on the database deadline, cancellation, WAL, temporary-file and SQLite m
 bounds required in [#81](https://github.com/coworkerd/coworkerd/issues/81). The upstream
 backend continues to serve databases during this stage.
 
-### Databases: original native execution proposal
+### Databases
 
-The comparison in [#79](https://github.com/coworkerd/coworkerd/issues/79#issuecomment-7155649275)
-selected the Durable Object path for databases. The original proposal below records the reasons
-for evaluating native execution.
+**Decided.** A stateful platform service runs on the object path as a Durable Object class owned by
+the platform. Native execution requires a measured reason recorded in the design. For threaded
+databases, the class is `SqlDatabase` from the shared `coworkerd:platform` definition, outside
+the runtime isolate. Each open database has an exclusive isolate copy and home because SQLite
+runs synchronously and a long statement would delay any other object sharing its copy. A
+single query and an entire batch each have a 30 s wall deadline. [Decision](https://github.com/coworkerd/coworkerd/issues/79#issuecomment-7155649275) ·
+[Platform definition (#82)](https://github.com/coworkerd/coworkerd/issues/82) ·
+[Database scope and acceptance (#81)](https://github.com/coworkerd/coworkerd/issues/81) ·
+[Database placement and activation](#database-placement)
 
-A database could instead stay a Durable Object of the JavaScript `SqlDatabase` class with an isolate copy, and
-so a home, of its own. That would reuse steps 1 to 3, and Cloudflare describes D1 as built on SQLite in Durable
-Objects. Native execution is kept. The reasons first given, the resident memory of an isolate and a smaller
-shared lock, are weak: a minimal isolate measured about 2 MiB (about 2.8 MiB with the V8 sandbox), small next to
-the 64 MiB of SQLite memory a database home reserves, and a database runs one statement at a time either way.
-The reasons that decide it:
+The object path reuses loading, admission and retirement. A node can spread isolates across
+several durable processes through `durableObjects.processes`, so a single process's isolate
+limit alone did not justify a separate path. The native prototype added about 1,450 lines
+specific to native execution outside tests, including a second SQL service and idle-home
+retirement. Upstream workerd's D1, KV, queues and workflows use Durable Object classes.
+Queues, workflows and KV are future uses of the platform definition. [Design rationale](https://github.com/coworkerd/coworkerd/issues/79)
 
-- **Isolates are what a process runs short of.** In the default build all isolates of a process share one
-  4 GiB pointer cage; with the V8 sandbox each reserves about 136 GiB of address space ([CHANGELOG](../CHANGELOG.md)).
-  Measured on x86_64 Linux, a process held about 1,400 minimal isolates in the default build and about 650
-  with the sandbox. A database with an isolate of its own takes one of them from the objects of its process;
-  a native database takes none. Threads are not the limit: about 97.5 KiB each, one per working database in
-  both arrangements.
-- **No V8 on the data path.** Stopping a statement works the same way in both, through SQLite's progress
-  callback and the execution budget in `util/sqlite` ([patch 0021](../patches/workerd/0021-sql-execution-limit.patch)),
-  because `ctx.storage.sql` runs SQLite synchronously on the isolate's thread. An isolate per database adds
-  V8 work that native execution does not have: `JSON.parse` of the request, rows held as JavaScript values and
-  `JSON.stringify` of the answer, on the isolate's heap and under V8's interrupts and heap limit. Native
-  execution meters a database's memory in one place, SQLite's metered memory, and fails with SQLite's codes.
-- **A deadline of its own.** A D1 query and a batch have a 30 s wall deadline; a Durable Object event has a
-  CPU budget that each request refills. An isolate per database would need a wall deadline the object path
-  does not have.
-- **The native code is mostly our own.** Step 4's patches, 0110 and following, put nearly all of their code
-  in files of their own (`coworkerd-native-sql.*` and the threaded server); a few dozen changed lines are in
-  upstream's `util/sqlite`. Upstream changed `util/sqlite` about four times a month in the half year before this review,
-  and those changes reach the JavaScript class too, through `ctx.storage.sql`. The lasting cost is a second
-  implementation of the D1 contract while the JavaScript class exists; step 4's comparison tests cover it.
+#### Measurements behind the decision
 
-Not measured yet: how long a native database takes to open, against a new isolate. The baseline's cold reopen
-(about 70 ms p50 against 15 ms with the isolate warm) restarted the whole durable process, so it is not the
-cost of creating one isolate.
+The paired run used one threaded node in the same ARM64 Linux Docker VM, with both paths
+called through stateless Worker bindings and inserts confirmed by local WAL flush. The
+Object fixture gave a `SqlDatabase` stand-in its own isolate copy. Native execution needed
+to clear at least one of the three criteria set before the run. It cleared none.
+[Builds, paths and workload](database-home-benchmark.md#builds-and-paths) ·
+[Decision criteria](database-home-benchmark.md#predeclared-decision-criteria)
 
-**Fallback.** Databases use `SqlDatabase` in the runtime isolate on the upstream backend today.
-[#82](https://github.com/coworkerd/coworkerd/issues/82) provides the shared platform definition and
-loader for threaded homes. [#81](https://github.com/coworkerd/coworkerd/issues/81) will move
-`SqlDatabase` to that definition, give each open database its own copy, and enforce the 30 s
-wall deadline on the object path.
+| Criterion | Predeclared bar for native execution | Result at the ruling |
+| --- | --- | --- |
+| Warm latency | At least 5 ms and at least 30% lower at p50 or p99 for a one-row read or confirmed one-row insert. | Native reads were 0.26 ms (17%) lower at p50 and 0.50 ms (15%) lower at p99. Native inserts were 0.28 ms lower at p50 and 0.14 ms higher at p99. |
+| Throughput of one database | At least 2× the one-row reads or confirmed one-row inserts per second. | Native reached at most 1.53× with one client reading and 0.97× to 1.03× across the eight-client read and insert cells. |
+| Density | At least 4 MiB more per warm idle database as an object, and a cold open with a new copy at least 20 ms slower at p50. | The 0–500 warm RSS slopes were 2.49 MiB per database on Object and 0.23 MiB on Native, a gap of 2.26 MiB. The memory result alone ruled out this line. |
+
+The eight-client read cells reached about 1,300 reads/s through the measured route on both
+paths. The durable child was below saturation, and the shared limiting stage was unresolved
+at the ruling. A later Linux-runner study identified the node main thread as the limit on
+the Object read path in its own setup. [Original throughput](database-home-benchmark.md#what-the-throughput-measures) ·
+[Linux follow-up (#85)](database-throughput.md)
+
+For one-row reads, the durable child spent 0.57 ms of CPU per query on Object and 0.33 ms
+on Native, a difference of 0.24 ms. The roughly 1 MiB read had a Native p99 of 18 ms versus
+48 ms on Object, with a higher p50 (11.9 versus 9.4 ms) and about twice the durable-child
+CPU (5.56 versus 2.71 ms per query). The large read was outside the latency criterion.
+In a separate 1.55 GiB
+process-budget sweep with 520 test homes, Native held 519 live homes. Object reached
+372 live roots and validated 365 of 388 reads. Native's measured reservation was about
+0.24 MiB per home including its root, and the Object budget upper bound was 4.27 MiB
+per live root.
+These are admission charges and bounds. The density line uses RSS.
+[Latency](database-home-benchmark.md#end-to-end-latency-in-the-original-pair) ·
+[CPU](database-home-benchmark.md#durable-child-cpu) ·
+[Admission](database-home-benchmark.md#default-budget-admission)
+
+The original unpaced cold opens were about 62 ms at p50 on both paths. A shared WAL-tail
+recovery gate dominated that reading. After the ruling, #84 paced requests with the same
+builds and measured cold-new p50 at 26.173 ms on Object and 23.997 ms on Native, a gap of
+2.176 ms. [Cold-open follow-up](database-home-benchmark.md#cold-open-follow-up)
+
+A later test of the platform class measured an RSS slope of 2.88 MiB per database from
+1 to 64 open databases. It also measured reopening previously confirmed data in the same
+epoch with the 10 s idle release. The first read after full release took an extra 9.46 ms
+at p50 and 14.38 ms at p99 compared with its immediate warm repeat.
+[Idle-window verification](database-home-benchmark.md#verification-with-patch-0174)
+
+#### Databases: original native execution proposal
+
+The decision table above and the original migration steps record the native-home proposal.
+It expected native SQLite homes to save isolate capacity and avoid JavaScript parsing and
+serialization on the SQL path. On x86_64 Linux, one process held about 1,400 minimal
+isolates with the shared 4 GiB pointer cage and about 650 with the V8 sandbox, which
+reserved about 136 GiB of address space per isolate. Both paths could interrupt SQLite
+through its progress callback. The proposal also identified the need for a SQL wall
+deadline in addition to the Durable Object CPU budget. Its early cold-reopen baseline
+included a whole-process restart. [Original design](https://github.com/coworkerd/coworkerd/blob/7f0f6bb9a54d3cbf9c1bef2df5b2c171818eaa92/docs/threaded-durable-processes.md#databases-native-execution-not-an-isolate-per-database) ·
+[V8 sandbox notes](../CHANGELOG.md) ·
+[Original SQL execution limits](../patches/workerd/0021-sql-execution-limit.patch)
 
 ### Lifecycle and alarms
 
