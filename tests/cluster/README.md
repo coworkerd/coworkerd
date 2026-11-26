@@ -73,17 +73,20 @@ node tests/cluster/long-sql-isolation.mjs "$kernel" "$PWD/long-sql-isolation.jso
 ```
 
 The driver provisions a fresh single-node Compose cluster and uses `cowctl` to deploy the object
-probe. On the Compose frontend network it offers 40 requests/s per probe in each of six warmed
-30-second windows. Two probe paths read seeded rows through HTTP SQL on different databases.
+probe. On the Compose frontend network it offers 40 requests/s per probe in alternating quiet
+and busy windows, three per condition. Each 30-second window starts with the same warm-up.
+Two probe paths read seeded rows through HTTP SQL on different databases.
 One belongs to the tenant running the long statement and one belongs to a second tenant. The
 third path calls a Worker Durable Object. Each busy window runs one SQL batch with a single
 statement that reaches the wall deadline. A follow-up query checks that the batch rolled back.
 
-The JSONL report includes client timings, missed offers and errors, owner dispatch records,
-thread CPU samples, process identity, and WAL confirmation counters sampled outside the timed
-workload. The driver checks that each busy probe completed during the statement and that all four
-targets ran in the same durable process generation. It compares the p99s pooled by condition for
-each probe against the 5 ms gate in the [design](../../docs/threaded-durable-processes.md#final-acceptance-gates).
+The JSONL report includes client CPU and scheduling samples, owner dispatch records, durable thread
+CPU samples, process identity, and WAL confirmation counters. The driver checks that each busy
+probe completed during the statement and that all four targets ran in the same durable process
+generation. It measures latency from the planned send time. Missed offers and errors rank above
+successful requests, and extra misses or errors in the busy window fail the comparison. Each busy
+window is compared with its adjacent quiet windows against the 5 ms gate in the
+[design](../../docs/threaded-durable-processes.md#final-acceptance-gates).
 
 ### Threaded SQL default mailbox
 

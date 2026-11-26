@@ -78,8 +78,43 @@ function verifyDispatches(rows, windows, child) {
   }
 }
 
-function p99(values) {
-  return values.toSorted((a, b) => a - b)[Math.ceil(values.length * 0.99) - 1] ?? null;
+function p99(values, failures = 0) {
+  // Missed offers and failed requests have no successful completion at any latency.
+  const rank = Math.ceil((values.length + failures) * 0.99);
+  return values.toSorted((a, b) => a - b)[rank - 1] ?? null;
+}
+
+function summarize(probes) {
+  const samples = probes.flatMap(probe => probe.samples);
+  const errors = probes.reduce((total, probe) => total + probe.errors.length, 0);
+  const missed = probes.reduce((total, probe) => total + probe.misses.length, 0);
+  return { p99Ms: p99(samples.map(sample => sample.scheduledElapsedMs), errors + missed),
+    responseP99Ms: p99(samples.map(sample => sample.elapsedMs)), samples: samples.length, errors, missed };
+}
+
+function compare(quiet, busy) {
+  const deltaMs = quiet.p99Ms === null || busy.p99Ms === null ? null : busy.p99Ms - quiet.p99Ms;
+  return { quiet, busy, deltaMs, pass: deltaMs !== null && deltaMs <= 5 &&
+    busy.errors <= quiet.errors && busy.missed <= quiet.missed };
+}
+
+function summarizeWindows(windows) {
+  return Object.keys(windows[0].probes).map(role => {
+    const quiet = summarize(windows.filter(window => window.condition === 'quiet').map(window => window.probes[role]));
+    const busy = summarize(windows.filter(window => window.condition === 'busy').map(window => window.probes[role]));
+    const adjacent = [];
+    for (let i = 1; i < windows.length; i += 2) {
+      const running = windows[i];
+      assert.equal(running.condition, 'busy');
+      for (const baseline of [windows[i - 1], windows[i + 1]].filter(Boolean)) {
+        assert.equal(baseline.condition, 'quiet');
+        adjacent.push({ quietWindow: baseline.index, busyWindow: running.index,
+          ...compare(summarize([baseline.probes[role]]), summarize([running.probes[role]])) });
+      }
+    }
+    return { role, ...compare(quiet, busy), adjacent,
+      pass: quiet.samples >= 1000 && busy.samples >= 1000 && adjacent.every(pair => pair.pass) };
+  });
 }
 
 async function run() {
@@ -141,24 +176,12 @@ async function run() {
   await record('owner-dispatches', { dispatches });
   verifyDispatches(dispatches, windows, identity);
 
-  const summary = Object.keys(windows[0].probes).map(role => {
-    const summarize = condition => {
-      const probes = windows.filter(window => window.condition === condition).map(window => window.probes[role]);
-      const values = probes.flatMap(({ samples }) => samples.map(sample => sample.elapsedMs));
-      return { p99Ms: p99(values), samples: values.length, errors: probes.flatMap(probe => probe.errors),
-        missed: probes.reduce((total, probe) => total + probe.misses.length, 0) };
-    };
-    const quiet = summarize('quiet');
-    const busy = summarize('busy');
-    const deltaMs = quiet.p99Ms === null || busy.p99Ms === null ? null : busy.p99Ms - quiet.p99Ms;
-    return { role, quiet, busy, deltaMs,
-      pass: quiet.samples >= 1000 && busy.samples >= 1000 &&
-        busy.errors.length <= quiet.errors.length && busy.missed <= quiet.missed && deltaMs <= 5 };
-  });
+  const summary = summarizeWindows(windows);
   await record('summary', { thresholdMs: 5, summary });
-  console.table(summary.map(({ role, quiet, busy, deltaMs, pass }) => ({ role,
-    quietSamples: quiet.samples, busySamples: busy.samples, quietP99Ms: quiet.p99Ms?.toFixed(3),
-    busyP99Ms: busy.p99Ms?.toFixed(3), deltaMs: deltaMs?.toFixed(3), pass })));
+  console.table(summary.flatMap(({ role, adjacent }) => adjacent.map(pair => ({ role,
+    quietWindow: pair.quietWindow, busyWindow: pair.busyWindow, quietP99Ms: pair.quiet.p99Ms?.toFixed(3),
+    busyP99Ms: pair.busy.p99Ms?.toFixed(3), deltaMs: pair.deltaMs?.toFixed(3),
+    quietMissed: pair.quiet.missed, busyMissed: pair.busy.missed, pass: pair.pass }))));
   if (summary.some(row => !row.pass)) process.exitCode = 1;
 }
 
