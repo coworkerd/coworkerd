@@ -134,7 +134,7 @@ int runDrainTool(int argc, char** argv) {
   if (status != 200) {
     std::cerr << "the Server did not start draining (HTTP " << status << ")"
               << (status == 401 ? ": it requires the management token (--token or COWORKERD_MANAGEMENT_TOKEN)"
-                                : "; a Server before v38 has no drain") << std::endl;
+                                : "; check that the server supports the drain endpoint") << std::endl;
     return 1;
   }
   if (!wait) return 0;

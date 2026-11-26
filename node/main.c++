@@ -6,7 +6,7 @@
 #include "trial-verdict.h"
 #include "placement-contract.h"
 #include "reasons.h"
-#include "r47-trace.h"
+#include "event-loop-trace.h"
 #include "background-value.h"
 #include "rpc-error.h"
 #include "coworkerd.capnp.h"
@@ -495,6 +495,8 @@ struct InvocationRejection {
 
 constexpr std::string_view TENANT_ADMISSION_LIMIT = "tenant-concurrency";
 constexpr std::string_view PROCESS_TENANT_LIMIT = "process-tenant-concurrency";
+constexpr const char* DURABLE_CAPACITY_REASON =
+    "The durable process refused the call before it started. The operation did not execute and can be retried.";
 constexpr const char* PROCESS_TENANT_REASON = "tenant execution concurrency limit reached in process";
 bool processTenantRefusal(const InvocationRejection& refusal) {
   return refusal.code == "OVERLOADED" && refusal.category == PROCESS_TENANT_LIMIT;
@@ -565,7 +567,7 @@ struct AdmissionSlot {
   NativeProps nativeProps;
 };
 
-std::string refusalBody(const InvocationRejection& refusal, double deadline);
+std::string refusalBody(const InvocationRejection& refusal, double deadline, bool d1Error = false);
 
 rpc::EventDispatcher::Client trackAdmission(rpc::EventDispatcher::Client dispatcher,
     std::shared_ptr<AdmissionSlot> slot, capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headers);
@@ -2957,8 +2959,11 @@ private:
     const bool ingress = executions.back()->kind == "ingress";
     const bool peerIngress = ingress && !ingressServerId.empty() && ingressServerId != serverConfig.serverId;
     const auto deferredCpu = slot && durable == nullptr ? coworkerd::deferPreparedCpuUsage(process) : std::function<void(bool)>();
+    const bool threadedDurable = durable && process->threadedDurableRole();
     auto decision = [this, lifetime = std::weak_ptr<int>(executionLifetime), slotRef = std::weak_ptr<AdmissionSlot>(slot), version, process, invocationId, treeId = std::move(treeId),
-                     ingress, peerIngress, deferredCpu](bool executed) {
+                     ingress, peerIngress, deferredCpu, threadedDurable](bool executed) {
+      // Preserve durable accounting on a lost reply. Only the child's explicit admission refusal cancels the charge.
+      if (threadedDurable) executed = !process->capacityRejected;
       if (deferredCpu) deferredCpu(executed);
       if (lifetime.expired()) return;
       pendingDispatchDecisions.erase(invocationId);
@@ -2970,9 +2975,11 @@ private:
         process->snapshotAfterFailure();
         leases.erase(invocationId);
         const auto current = slotRef.lock();
-        const auto refusal = this->refusal(current && !current->rejectionCode.empty() ? current->rejectionCode : "CODE_UNAVAILABLE",
-            current && !current->rejectionReason.empty() ? current->rejectionReason : "Worker unavailable before execution", 503, ingress);
-        observeLocalRefusal(refusal, ingress ? (peerIngress ? "peerIngress" : "localIngress") : "localBinding");
+        const auto refusal = threadedDurable ? this->refusal("OVERLOADED", DURABLE_CAPACITY_REASON) :
+            this->refusal(current && !current->rejectionCode.empty() ? current->rejectionCode : "CODE_UNAVAILABLE",
+                current && !current->rejectionReason.empty() ? current->rejectionReason : "Worker unavailable before execution", 503, ingress);
+        if (!threadedDurable)
+          observeLocalRefusal(refusal, ingress ? (peerIngress ? "peerIngress" : "localIngress") : "localBinding");
         std::cout << "[execution-rejected] {\"invocationId\":\"" << invocationId
                   << "\",\"treeId\":\"" << treeId << "\",\"target\":\"" << version->key()
                   << "\",\"dispatched\":false,\"code\":\"" << refusal.code << "\",\"observedAtUnixMs\":"
@@ -2981,9 +2988,9 @@ private:
       }
       if (usage) usage->request(coworkerd::tenantOf(version->workerId));
     };
-    if (slot && durable == nullptr) {
+    if (slot && (durable == nullptr || threadedDurable)) {
       slot->executionDecision = std::move(decision);
-      pendingDispatchDecisions[invocationId] = slot;
+      if (!threadedDurable) pendingDispatchDecisions[invocationId] = slot;
     } else {
       decision(true);
     }
@@ -3004,7 +3011,7 @@ private:
               << ",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
     auto started = monotonicTimeMs();
     pathMark(timing, "execution-logs");
-    if (slot) process->onCapacityRejected = [this, lifetime = std::weak_ptr<int>(executionLifetime),
+    if (slot && !durable) process->onCapacityRejected = [this, lifetime = std::weak_ptr<int>(executionLifetime),
         invocation = invocationId, receipt = slot->dispatchReceipt] {
       if (!lifetime.expired()) confirmCapacityRejection(invocation, receipt, "capacity-rejected", "process admission budget is full");
     };
@@ -3198,11 +3205,11 @@ public:
     while (buildingState) co_await timer.afterDelay(1 * kj::MILLISECONDS);
     buildingState = true;
     const auto release = kj::defer([this]() { buildingState = false; });
-    const auto started = coworkerd::r47::trace ? coworkerd::r47::clockNs(CLOCK_MONOTONIC) : 0;
-    coworkerd::r47::Span expiry(coworkerd::r47::STATE_EXPIRY);
+    const auto started = coworkerd::eventLoopTrace::trace ? coworkerd::eventLoopTrace::clockNs(CLOCK_MONOTONIC) : 0;
+    coworkerd::eventLoopTrace::Span expiry(coworkerd::eventLoopTrace::STATE_EXPIRY);
     expireForState();
     expiry.finish();
-    coworkerd::r47::Span snapshot(coworkerd::r47::STATE_SNAPSHOT);
+    coworkerd::eventLoopTrace::Span snapshot(coworkerd::eventLoopTrace::STATE_SNAPSHOT);
     std::set<const VersionPins*> pinTables;
     size_t pinReferences = 0;
     std::vector<std::pair<std::string, InvocationLeaseState>> stateLeases;
@@ -3238,7 +3245,7 @@ public:
     auto memorySection = co_await memoryStateJson();
     output << ",\"memory\":" << memorySection;
     co_await timer.afterDelay(1 * kj::MICROSECONDS);
-    coworkerd::r47::Span coreFields(coworkerd::r47::STATE_CORE_FIELDS);
+    coworkerd::eventLoopTrace::Span coreFields(coworkerd::eventLoopTrace::STATE_CORE_FIELDS);
     output << ",\"logging\":" << coworkerd::AsyncLog::stateJson()
            << ",\"cpuLimitMs\":" << runtime.cpuLimitMs()
            << ",\"memoryLimitMiB\":" << runtime.memoryLimitMiB()
@@ -3312,7 +3319,7 @@ public:
     co_await timer.afterDelay(1 * kj::MICROSECONDS);
     constexpr size_t RECORD_SLICE = 32;
     for (size_t begin = 0; begin < stateLeases.size(); begin += RECORD_SLICE) {
-      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      coworkerd::eventLoopTrace::Span span(coworkerd::eventLoopTrace::STATE_SLICE);
       for (size_t index = begin; index < std::min(stateLeases.size(), begin + RECORD_SLICE); ++index) {
         const auto& [invocationId, lease] = stateLeases[index];
         if (index > 0) output << ',';
@@ -3329,7 +3336,7 @@ public:
     }
     output << "],\"debits\":[";
     for (size_t begin = 0; begin < stateDebits.size(); begin += RECORD_SLICE) {
-      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      coworkerd::eventLoopTrace::Span span(coworkerd::eventLoopTrace::STATE_SLICE);
       for (size_t index = begin; index < std::min(stateDebits.size(), begin + RECORD_SLICE); ++index) {
       if (index > 0) output << ',';
       const auto& record = *stateDebits[index];
@@ -3356,7 +3363,7 @@ public:
     }
     output << "},\"executions\":[";
     for (size_t begin = 0; begin < stateExecutions.size(); begin += RECORD_SLICE) {
-      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      coworkerd::eventLoopTrace::Span span(coworkerd::eventLoopTrace::STATE_SLICE);
       for (size_t index = begin; index < std::min(stateExecutions.size(), begin + RECORD_SLICE); ++index) {
       if (index > 0) output << ',';
       const auto& record = *stateExecutions[index];
@@ -3382,18 +3389,18 @@ public:
     output << "]";
     uint64_t index = 0;
     for (const auto& [name, section] : stateSections) {
-      const auto partStart = coworkerd::r47::trace ? output.tellp() : std::streampos{};
-      coworkerd::r47::Span partTrace(coworkerd::r47::STATE_SECTION_BASE + index++);
+      const auto partStart = coworkerd::eventLoopTrace::trace ? output.tellp() : std::streampos{};
+      coworkerd::eventLoopTrace::Span partTrace(coworkerd::eventLoopTrace::STATE_SECTION_BASE + index++);
       output << ",\"" << name << "\":" << section();
-      if (coworkerd::r47::trace) partTrace.finish(static_cast<uint64_t>(output.tellp() - partStart));
+      if (coworkerd::eventLoopTrace::trace) partTrace.finish(static_cast<uint64_t>(output.tellp() - partStart));
       co_await timer.afterDelay(1 * kj::MICROSECONDS);
     }
     output << "}";
-    coworkerd::r47::Span flatten(coworkerd::r47::STATE_FLATTEN);
+    coworkerd::eventLoopTrace::Span flatten(coworkerd::eventLoopTrace::STATE_FLATTEN);
     auto result = output.str();
     flatten.finish(result.size());
-    if (started) coworkerd::r47::record(coworkerd::r47::STATE_ASYNC, started,
-        coworkerd::r47::clockNs(CLOCK_MONOTONIC), 0, result.size());
+    if (started) coworkerd::eventLoopTrace::record(coworkerd::eventLoopTrace::STATE_ASYNC, started,
+        coworkerd::eventLoopTrace::clockNs(CLOCK_MONOTONIC), 0, result.size());
     co_return result;
   }
 
@@ -4198,18 +4205,22 @@ std::string hostWithoutPort(const std::string& host) {
   return colon == std::string::npos ? host : host.substr(0, colon);
 }
 
-std::string refusalBody(const InvocationRejection& refusal, double deadline) {
+std::string refusalBody(const InvocationRejection& refusal, double deadline, bool d1Error) {
   auto body = refusal.json();
   body.pop_back();
-  body += std::string(",\"error\":\"") + ((refusal.code == "RESULT_UNCERTAIN" || refusal.code == "PROCESS_MEMORY_PRESSURE") ? "execution result uncertain" : "execution rejected before start") + "\",\"observedAtUnixMs\":" +
+  // Native D1 carries the error text into the exception's message and cause.
+  const auto error = d1Error ? refusal.code + ": " + cleanReason(refusal.reason) :
+      (refusal.code == "RESULT_UNCERTAIN" || refusal.code == "PROCESS_MEMORY_PRESSURE") ?
+          "execution result uncertain" : "execution rejected before start";
+  body += ",\"error\":\"" + jsonEscape(error) + "\",\"observedAtUnixMs\":" +
       std::to_string(wallTimeMsForTest()) + ",\"expiresAtMonotonicMs\":" + std::to_string(deadline) + "}";
   return body;
 }
 
 rpc::EventDispatcher::Client rejectedDispatcher(capnp::HttpOverCapnpFactory& factory,
-    const kj::HttpHeaderTable& headers, const InvocationRejection& refusal, double deadline) {
+    const kj::HttpHeaderTable& headers, const InvocationRejection& refusal, double deadline, bool d1Error = false) {
   return rpc::EventDispatcher::Client(kj::heap<LeaseRejectionEventDispatcher>(
-      factory, headers, refusal.status, statusText(refusal.status), refusalBody(refusal, deadline), refusal.code));
+      factory, headers, refusal.status, statusText(refusal.status), refusalBody(refusal, deadline, d1Error), refusal.code));
 }
 
 void writeRefusal(rpc::InvocationOpenResult::Builder result, const InvocationRejection& value) {
@@ -7489,6 +7500,19 @@ private:
       slot->outcome = [this, line, target, process = slot->process, started](uint status, const std::string& code) {
         log(line, target, process.get(), status, code, started);
       };
+      if (slot->process->threadedDurableRole()) {
+        // Only a native 'R' sets this bit, before the node sends any Cap'n Proto request to the child.
+        if (co_await kj::mv(opened.capacityRejected)) {
+          slot->outcome = {};
+          slot->decide(false);
+          auto refusal = server.refusal("OVERLOADED", DURABLE_CAPACITY_REASON);
+          refusal.notExecuted = refusal.retryable = true;
+          server.observeLocalRefusal(refusal, "durableObject");
+          log(line, target, slot->process.get(), refusal.status, refusal.code, started);
+          co_return Ran{std::nullopt, {rejectedDispatcher(factory, headerTable, refusal, deadline, target.isDatabase())}};
+        }
+        slot->decide(true);
+      }
       co_return Ran{std::nullopt, BindingDispatch::Dispatched{std::move(opened.dispatcher), std::move(opened.ready)}};
     } catch (const DurableDispatchRefused& failure) {
       co_return refused(server.refusal(failure.result.code, failure.result.reason, failure.result.status));
@@ -7516,7 +7540,7 @@ private:
   // line on the owner.
   void log(const Line& line, const DurableTarget& target, const coworkerd::ProcessCall* process, uint status, const std::string& code,
       double started) {
-    if (process != nullptr && !process->threadedDurableTestRole() && status >= 500)
+    if (process != nullptr && !process->capacityRejected && !process->threadedDurableTestRole() && status >= 500)
       durableLog.objectFailed(target.namespaceId, target.objectId, target.shardEpoch, "request",
           code.empty() ? "HTTP " + std::to_string(status) : code);
     std::cout << std::setprecision(17) << "[do] {\"nodeId\":\"" << jsonEscape(server.placementConfig().serverId) << "\",\"workerId\":\""
@@ -10449,7 +10473,7 @@ int run(Launch launch) {
   const auto joinBackgroundValues = kj::defer([]() { coworkerd::backgroundValues.join(); });
   auto& waitScope = io.waitScope;
   auto& timer = io.provider->getTimer();
-  coworkerd::r47::openTrace();
+  coworkerd::eventLoopTrace::openTrace();
 
   capnp::ByteStreamFactory byteStreamFactory;
   kj::HttpHeaderTable::Builder headerTableBuilder;
@@ -10763,14 +10787,14 @@ int run(Launch launch) {
       -> kj::Promise<std::string> {
     std::string containers;
     {
-      coworkerd::r47::Span trace(coworkerd::r47::STATE_MEMORY);
+      coworkerd::eventLoopTrace::Span trace(coworkerd::eventLoopTrace::STATE_MEMORY);
       containers = "{\"durableLog\":" + durableLog.memoryJson() +
           ",\"membership\":{\"members\":{\"entries\":" + std::to_string(membership->view().members.size()) + "}}" +
           ",\"usage\":" + tenantUsage.memoryJson() + ",\"peerAuth\":" + peerAuth.memoryJson();
     }
     co_await timer.afterDelay(1 * kj::MICROSECONDS);
     {
-      coworkerd::r47::Span trace(coworkerd::r47::STATE_MEMORY);
+      coworkerd::eventLoopTrace::Span trace(coworkerd::eventLoopTrace::STATE_MEMORY);
       containers += ",\"asyncLog\":" + coworkerd::WorkerdOutput::memoryJson() + ",\"processPool\":" + runtime.memoryJson() +
           ",\"serverCore\":" + server.retainedMemoryJson() + '}';
     }
@@ -10900,7 +10924,7 @@ int run(Launch launch) {
       .exclusiveJoin(membership->run())
       .exclusiveJoin(watchShardOwnership(server, runtime, shards, *membership, timer, leaseDroppedShards))
       .exclusiveJoin(durableLog.run())
-      .exclusiveJoin(coworkerd::r47::runTimer(timer))
+      .exclusiveJoin(coworkerd::eventLoopTrace::runTimer(timer))
       .exclusiveJoin(watchDurableEpoch(durableLog, *membership, timer))
       // A draining Server applies no further deployment change: the desired state's poll stops at the announcement.
       .exclusiveJoin(desiredState->run().exclusiveJoin(drain.started())

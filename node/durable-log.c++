@@ -1,5 +1,5 @@
 #include "durable-log.h"
-#include "r47-trace.h"
+#include "event-loop-trace.h"
 #include "background-value.h"
 #include "recovery-history.h"
 #include "durable-shards.h"
@@ -1967,7 +1967,7 @@ bool DurableLog::consumeChannelInbox(Channel& channel, bool sliced) {
   constexpr size_t FRAMES_PER_SLICE = 16;
   constexpr double SLICE_MS = 0.5;
   const auto began = sliced ? monotonicTimeMs() : 0;
-  r47::Span slice(r47::DURABLE_CHANNEL_SLICE);
+  eventLoopTrace::Span slice(eventLoopTrace::DURABLE_CHANNEL_SLICE);
   size_t at = 0, frames = 0;
   // At every suspension the inbox starts at the first unprocessed frame. Close can cancel
   // the reader and drain this same inbox without replaying its already processed prefix.
@@ -2172,8 +2172,8 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       facet.facetName = facetName;
       facet.databaseBytes = databaseBytes;
       sized(*object);
-      // The position this node confirmed is the one the files must be at: a process that committed a transaction and
-      // died before its frames arrived leaves frames nobody knows, and nothing may read them (experiment 25, B.6).
+      // Refuse to open a copy with WAL frames the node has never received. This can happen if the process dies
+      // after committing a transaction but before sending its frames.
       const bool sameGeneration = facet.salt1 == salt1 && facet.salt2 == salt2;
       const bool past = frames > (sameGeneration ? facet.lastFrame : 0);
       if (past && frames > 0) {
@@ -2468,8 +2468,8 @@ uint64_t DurableLog::sqlWalFrameLimitBytes(const RootStorageRef& storage) const 
   return limit - overhead;
 }
 
-// One record of this node's log: it goes to the peers of its object's shard, and the answer to the request that
-// carried it waits for them. Nothing here touches the disk or the object store (experiment 25, D.2).
+// Append the record to the local log and send it to the object's shard peers. Confirmation waits for peer
+// acknowledgments or, if no peers were selected, a local log flush. It can complete before segment upload.
 void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t request) {
   if (stopped || recoveryWriteFailed || (startupAttempted && !startupReady)) {
     if (request) answer(channel, request, ACK_UNAVAILABLE);
@@ -3202,8 +3202,8 @@ void DurableLog::isolateObjectPending(Object& object, const std::string& reason)
   isolateRecords(dropped, object.objectName, reason);
 }
 
-// The object is not to be served until its files have been thrown away and rebuilt from the replicated history
-// (experiment 25, D.5): every object of this node's durable processes is closed, which is what shuts the files.
+// Withhold the object until its files are rebuilt from replicated history. The rebuild closes any live holders
+// before replacing the files, closing all durable objects as a fallback if it cannot close just this one.
 void DurableLog::markRepair(Object& object, const std::string& reason) {
   beginRepair(object);
   if (object.state == ObjectState::REPAIR) return;
@@ -3271,7 +3271,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   // Keep the isolated records until this succeeds, so a failed manifest write is retried on the next seal.
   for (const auto sequence : isolated) {
     {
-      r47::Span build(r47::SEAL_BUILD);
+      eventLoopTrace::Span build(eventLoopTrace::SEAL_BUILD);
       auto found = parsed.find(sequence);
       if (found != parsed.end()) touched.insert(hostNameOf(found->second));
     }
@@ -3285,7 +3285,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   for (const auto& [sequence, record] : records) {
     if (sequence > selectionEnd) break;
     {
-      r47::Span build(r47::SEAL_BUILD);
+      eventLoopTrace::Span build(eventLoopTrace::SEAL_BUILD);
       if (isolated.contains(sequence)) {
         if (!first) first = sequence;
         last = sequence;
@@ -3391,7 +3391,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   }
   // The records are on the object store and every manifest names them: this node drops them, the peers are told to,
   // and each database may now checkpoint the frames the segment covers.
-  r47::Span commit(r47::SEAL_COMMIT);
+  eventLoopTrace::Span commit(eventLoopTrace::SEAL_COMMIT);
   for (uint64_t sequence = (first ? first : last); sequence <= last; ++sequence) {
     auto found = records.find(sequence);
     if (found != records.end()) {
@@ -3423,7 +3423,7 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   auto slice = monotonicTimeMs();
   for (const auto& name : touched) {
     {
-      r47::Span position(r47::SEAL_POSITION);
+      eventLoopTrace::Span position(eventLoopTrace::SEAL_POSITION);
       auto* object = objectOf(name);
       if (object != nullptr) writePosition(*object);
     }
@@ -3435,8 +3435,8 @@ kj::Promise<void> DurableLog::sealNow(std::string reason) {
   }
 }
 
-// A segment is immutable and created only if absent; a failed upload is tried again with a growing wait, because
-// the peers hold the records until it is there (requirement 7).
+// Segments are immutable and created only if absent. Upload failures are retried with increasing delays.
+// Peers are asked to trim the records only after the segment and its manifests are published.
 bool DurableLog::sealDrainExpired() const {
   return sealDrainDeadlineMs && monotonicTimeMs() >= *sealDrainDeadlineMs;
 }
@@ -3926,7 +3926,7 @@ kj::Promise<void> DurableLog::checkpointIdleObjects(double now) {
   auto began = monotonicTimeMs();
   while (!idleCheckpoints.empty() && idleCheckpoints.begin()->first <= now) {
     {
-      r47::Span scan(r47::CHECKPOINT_SCAN);
+      eventLoopTrace::Span scan(eventLoopTrace::CHECKPOINT_SCAN);
       auto due = idleCheckpoints.extract(idleCheckpoints.begin());
       if (auto* object = objectOf(due.value().second)) {
         object->checkpointDueMs = 0;
@@ -4038,7 +4038,7 @@ kj::Promise<void> DurableLog::cleanupClosedEpoch() {
     const auto original = logDirectory() / (wide(epoch) + ".log");
     std::error_code code;
     if (!std::filesystem::is_regular_file(original, code) || code) continue;
-    std::optional<r47::Span> cleanup(std::in_place, r47::CLOSED_EPOCH_CLEANUP);  // the loop's part only
+    std::optional<eventLoopTrace::Span> cleanup(std::in_place, eventLoopTrace::CLOSED_EPOCH_CLEANUP);  // the loop's part only
     std::vector<RecoveryEvent> carry;
     std::vector<std::string> carried;
     // Snapshot aggregate object state once per destination epoch. Later live
@@ -4512,7 +4512,7 @@ kj::Promise<void> DurableLog::publishEarlierObject(uint64_t epoch, const Segment
 void DurableLog::accountCacheSize(Object& object) {
   std::error_code code;
   uint64_t bytes = 0;
-  r47::Span disk(r47::COLD_OBJECT_FILES);
+  eventLoopTrace::Span disk(eventLoopTrace::COLD_OBJECT_FILES);
   for (const auto& [facetId, facet] : object.facets) {
     const auto database = std::filesystem::file_size(databasePath(object, facetId), code);
     if (!code) bytes += database;
@@ -4543,7 +4543,7 @@ kj::Promise<void> DurableLog::dropColdFiles(uint64_t reservedBytes) {
   auto resetSlice = [&] { items = 0; began = monotonicTimeMs(); };
   for (const auto& entry : std::filesystem::directory_iterator(logDirectory(), code)) {
     {
-      r47::Span logFiles(r47::COLD_LOG_FILES);
+      eventLoopTrace::Span logFiles(eventLoopTrace::COLD_LOG_FILES);
       if (entry.is_regular_file(code)) {
         const auto bytes = entry.file_size(code);
         if (!code) logBytes += bytes;
@@ -4610,7 +4610,7 @@ kj::Promise<void> DurableLog::dropColdFiles(uint64_t reservedBytes) {
       ++coldFilesSkippedLive;
       continue;
     }
-    r47::Span removal(r47::COLD_REMOVE);
+    eventLoopTrace::Span removal(eventLoopTrace::COLD_REMOVE);
     uint64_t freed = 0;
     for (const auto& [facetId, facet] : object->facets) {
       for (const char* suffix : {"", "-wal", "-shm"}) {
@@ -5319,7 +5319,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
   const auto historyName = object->namespaceId + "/" + object->objectId;
   std::set<std::pair<uint64_t, uint64_t>> localUnsealed;
   {
-    r47::Span local(r47::RECOVERY_LOCAL_HISTORY);
+    eventLoopTrace::Span local(eventLoopTrace::RECOVERY_LOCAL_HISTORY);
     size_t decodedCount = 0;
     // The encoded unsealed log is node-wide. Decode only this object's sequences, in the
     // same order as the log, from the same event-loop turn as before. Do not hold a view
@@ -6675,8 +6675,8 @@ kj::Promise<void> DurableLog::measureRecoveryLoop() {
   measuringRecovery = false;
 }
 
-// The facet tree index beside an object's databases: workerd writes it itself and no transaction covers it, so a
-// rebuild writes the names and parents the records carry (experiment 25, D.6).
+// Workerd writes the facet tree index beside the object's databases outside the database transaction.
+// A rebuild recreates the index from the facet names and parent IDs carried in the recovered history.
 void DurableLog::writeFacetIndex(const RootStorageRef& ref, const std::vector<ManifestFacet>& facets) {
   const auto path = ref.facetIndexPath(settings.stackDirectory);
   auto removeIndex = [&]() {
@@ -7574,7 +7574,7 @@ kj::Promise<void> DurableLog::usageLoop() {
 
 kj::Promise<void> DurableLog::publishUsage() {
   if (!enabled()) co_return;
-  r47::Span build(r47::USAGE_BUILD);
+  eventLoopTrace::Span build(eventLoopTrace::USAGE_BUILD);
   std::map<std::string, uint64_t> mine;
   for (const auto& [name, object] : objects) {
     if (object.tenant.empty() || object.state == ObjectState::GONE) continue;
@@ -7812,7 +7812,7 @@ DurableLog::AppendResult DurableLog::appendIncoming(uint64_t streamId, std::stri
     std::string reason;
     auto record = decodeLogRecord(encoded, &reason);
     if (!record) {
-      // A record that does not add up is refused here rather than at a rebuild (experiment 25, B.7).
+      // Reject corrupt or malformed records before they enter the peer buffer used for rebuilds.
       result.accepted = buffer.answeredSeq();
       result.refusal = "a record does not add up: " + reason;
       log("record-refused", "\"owner\":" + quote(buffer.nodeId) + ",\"reason\":" + quote(reason));
@@ -7958,11 +7958,11 @@ DurableTailAnswer DurableLog::tailFor(const DurableTailAsk& ask, bool remote) {
 // at least this one, is never fenced by it. The answer is computed after the raise: an append taken before it is in
 // the answer; one after it is refused. A request this node cannot check (store error or slowness, no such object, an
 // object that is another epoch) is answered as before and raises nothing; the floor only grows. The requests of one
-// epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS. A request
-// for this node's own older tail (an owner proof) is not checked here: tailForPage fences for it as before, except
-// that a restored epoch answers a request naming an object for that object without fencing (the shard is
-// fenced when a proof is given for all of it). Checking an owner proof needs a wire signal or a new rule;
-// that check is in the backlog.
+// epoch of a shard share one read (checkPeerFence), and a failed one is not read again for OWNER_REREAD_MS.
+// When serving its own older tail (an owner proof), tailForPage can fence ownership below the requested epoch
+// without verifying that epoch in the object store. For a restored epoch, it can answer for one object once
+// that object's records are published. It fences only when giving a proof after all records for that shard
+// in the restored epoch are published.
 kj::Promise<void> DurableLog::raisePeerFence(DurableTailAsk ask) {
   if (!enabled() || ask.shardEpoch < 2 || ask.namespaceId.empty() || ask.ownerNodeId == settings.nodeId) co_return;
   co_await raiseFloor(ask.namespaceId, ask.shard, ask.shardEpoch, "a newer epoch of the shard asked for a tail");

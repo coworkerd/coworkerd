@@ -64,13 +64,13 @@ ALWAYS = {
     # depends on when the window happened to fall; both are always allowed, and a serving process may make a
     # thread either way (what the filter is there to stop -- execve above all -- stays out of the steady set).
     "clone": "a thread is created with it; V8 starts a platform worker when it first needs one, after the process serves",
-    "clone3": "glibc's thread creation on a kernel that has it, the same operation as clone (v49)",
+    "clone3": "glibc's thread creation on a kernel that has it, the same operation as clone",
     "getrandom": "a tenant asks for entropy while the process serves (crypto.getRandomValues, randomUUID, a Map's "
-                 "seed); whether a profile window holds one depends on what the profile's Workers do (v49)",
+                 "seed); whether a profile window holds one depends on what the profile's Workers do",
 }
 STARTUP_ONLY_ALWAYS = {
     "execve": "the launcher installs the filter, then execve's the payload",
-    "seccomp": "the in-process tightening (v47) installs the steady filter with it",
+    "seccomp": "the in-process tightening installs the steady filter with it",
     "sendmsg": "the launcher sends its record, and in the observe mode the notification listener, to the "
                "Server after the filter is in force",
 }
@@ -171,7 +171,7 @@ def main() -> int:
     parser.add_argument("--profile", action="append", required=True, help="a profile summary (scripts/syscall-profile.mjs)")
     parser.add_argument("--cc", default=os.environ.get("CC", "cc"))
     parser.add_argument("--relax", default="", help="calls to add, with the reason recorded as the operator's")
-    parser.add_argument("--drop", default="", help="calls to leave out (v45's artificial denial)")
+    parser.add_argument("--drop", default="", help="comma-separated calls to omit from both lists")
     options = parser.parse_args()
     if not shutil.which(options.cc):
         raise SystemExit(f"{options.cc} is needed to resolve this architecture's call numbers")

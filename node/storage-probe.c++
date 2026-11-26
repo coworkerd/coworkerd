@@ -43,7 +43,7 @@ int runStorageCheck(int argc, char** argv) {
     if (auto key = std::getenv("COWORKERD_READ_ACCESS_KEY")) readerConfig.accessKey = key;
     if (auto key = std::getenv("COWORKERD_READ_SECRET_KEY")) readerConfig.secretKey = key;
     coworkerd::ObjectStore reader(readerConfig, io.provider->getNetwork(), io.provider->getTimer());
-    const std::string bytes = "coworkerd-v22-signature-probe\n";
+    const std::string bytes = "coworkerd-storage-signature-probe\n";
     const auto digest = coworkerd::objectSha256(bytes);
     const std::string key = "bundles/" + digest;
     auto execute = [&](kj::HttpMethod method, std::string target, std::string payload, bool signedRequest) {
