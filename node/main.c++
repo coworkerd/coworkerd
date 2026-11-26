@@ -496,7 +496,7 @@ struct InvocationRejection {
 constexpr std::string_view TENANT_ADMISSION_LIMIT = "tenant-concurrency";
 constexpr std::string_view PROCESS_TENANT_LIMIT = "process-tenant-concurrency";
 constexpr const char* DURABLE_CAPACITY_REASON =
-    "process admission budget is full. The operation did not execute and can be retried.";
+    "The durable process refused the call before it started. The operation did not execute and can be retried.";
 constexpr const char* PROCESS_TENANT_REASON = "tenant execution concurrency limit reached in process";
 bool processTenantRefusal(const InvocationRejection& refusal) {
   return refusal.code == "OVERLOADED" && refusal.category == PROCESS_TENANT_LIMIT;

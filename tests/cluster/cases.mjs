@@ -1929,6 +1929,7 @@ async function durableAdmissionRefusal(cluster) {
     assert.equal(result.code, 'OVERLOADED');
     assert.equal(result.dispatched, false);
     assert.equal(result.retryable, true);
+    assert.equal(result.reason, 'The durable process refused the call before it started. The operation did not execute and can be retried.');
   };
   await eventually('the blocker and relay are resident on separate nodes', async () => {
     assert.deepEqual(json(await read(objectOwner, blocker), 200, 'blocker'), zero);
@@ -2005,7 +2006,6 @@ async function durableAdmissionRefusal(cluster) {
     const binding = json(await d1(), 503, 'D1 refused before dispatch');
     assert.equal(binding.cause, `OVERLOADED: ${http.reason}`);
     assert.equal(binding.message, `D1_ERROR: ${binding.cause}`);
-    assert.match(binding.cause, /did not execute and can be retried/);
     const exec = json(await d1('exec'), 503, 'D1 exec refused before dispatch');
     assert.equal(exec.cause, `Error in line 1: INSERT INTO ledger VALUES (3): ${binding.cause}`);
     assert.equal(exec.message, `D1_EXEC_ERROR: ${exec.cause}`);
