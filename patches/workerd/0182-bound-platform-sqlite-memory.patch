@@ -8,7 +8,7 @@ Charge database allocations by usable size and grow existing allocations by thei
 Refs coworkerd/coworkerd#81
 
 diff --git a/src/workerd/api/actor-state.c++ b/src/workerd/api/actor-state.c++
-index 932c5630ddb3f3066e2f3ebe3fd704575ee0c5fd..434ee678f86e89c8b3e4a7e3b49412fec3738fc7 100644
+index 932c5630ddb3f3066e2f3ebe3fd704575ee0c5fd..e0375c35ed8dea0bd57945541ff7aaa05899fe30 100644
 --- a/src/workerd/api/actor-state.c++
 +++ b/src/workerd/api/actor-state.c++
 @@ -752,11 +752,13 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
@@ -27,7 +27,7 @@ index 932c5630ddb3f3066e2f3ebe3fd704575ee0c5fd..434ee678f86e89c8b3e4a7e3b49412fe
          auto result = callback(js);
          JSG_REQUIRE(!sqlite.observedCriticalError(), Error,
              "Cannot commit transaction due to an earlier SQL critical error");
-@@ -764,18 +766,27 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
+@@ -764,20 +766,31 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
            static constexpr SqlStorageRegulator regulator;
            kj::throwRecoverableException(regulator.sqlExecutionLimitException(*budget));
          }
@@ -45,6 +45,8 @@ index 932c5630ddb3f3066e2f3ebe3fd704575ee0c5fd..434ee678f86e89c8b3e4a7e3b49412fe
                KJ_EXCEPTION(FAILED, "jsg.Error: the transaction exceeds one recoverable WAL record"),
                "SQL_TRANSACTION_TOO_LARGE"));
          }
+-        if (!sqlite.observedCriticalError() && budget && budget->hasDeadline() &&
+-            budget->getCause() != SqlExecutionBudget::Cause::NONE) {
 +        if (!sqlite.observedCriticalError() && limit->wasMemoryRefused()) {
 +          limit->end(sqlite, /*rolledBack=*/true);
 +          sqlite.releaseCachedMemory();
@@ -53,9 +55,13 @@ index 932c5630ddb3f3066e2f3ebe3fd704575ee0c5fd..434ee678f86e89c8b3e4a7e3b49412fe
 +                  FAILED, "jsg.Error: the statement exceeds the database SQLite memory limit"),
 +              "SQL_MEMORY_LIMIT_EXCEEDED"));
 +        }
-         if (!sqlite.observedCriticalError() && budget && budget->hasDeadline() &&
-             budget->getCause() != SqlExecutionBudget::Cause::NONE) {
++        if (!sqlite.observedCriticalError() &&
++            (limit->isRefusingWrites() ||
++                (budget && budget->hasDeadline() &&
++                    budget->getCause() != SqlExecutionBudget::Cause::NONE))) {
            limit->end(sqlite, /*rolledBack=*/true);
+         }
+         js.throwException(kj::mv(exception));
 diff --git a/src/workerd/io/actor-sqlite.c++ b/src/workerd/io/actor-sqlite.c++
 index d52e628d5d6ee1946050d22564d73a8328244006..a9fad6b15915875f292b57b20d822f7fb2a65d2a 100644
 --- a/src/workerd/io/actor-sqlite.c++
@@ -131,6 +137,23 @@ index 605b785795fe709926b920ea631051bf4e8dcb37..ab1c425f085204c56b0360d3797bc324
  
    kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
        DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
+diff --git a/src/workerd/server/factory/coworkerd-wal-shipper.c++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+index 7322e843d394af515a78b2ae1d28e6bd02d57b7e..bf632d528b7c2fc9d3a0d7e97e92a6e4303803f4 100644
+--- a/src/workerd/server/factory/coworkerd-wal-shipper.c++
++++ b/src/workerd/server/factory/coworkerd-wal-shipper.c++
+@@ -850,7 +850,11 @@ void DurableLogShipper::maybeCheckpoint(kj::StringPtr reason) {
+   if (hookFrames != readFrames) return;
+   int64_t start = monoNs();
+   int logFrames = -1, checkpointed = -1;
+-  int rc = sqlite3_wal_checkpoint_v2(handle, "main", SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointed);
++  int rc;
++  {
++    auto memoryScope = db->enterMemoryScope();
++    rc = sqlite3_wal_checkpoint_v2(handle, "main", SQLITE_CHECKPOINT_TRUNCATE, &logFrames, &checkpointed);
++  }
+   int64_t took = monoNs() - start;
+   if (rc != SQLITE_OK) {
+     logRow(kj::str("{\"event\":\"checkpoint-failed\",\"object\":", jsonString(key), ",\"rc\":", rc,
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
 index e05a3275d2077123fecb09891f9578d2708c66b4..1174e5a0fdea79713a88256b94006969f77212e0 100644
 --- a/src/workerd/threaded/BUILD.bazel
@@ -144,7 +167,7 @@ index e05a3275d2077123fecb09891f9578d2708c66b4..1174e5a0fdea79713a88256b94006969
      "@capnp-cpp//src/capnp/compat:http-over-capnp",
      "@capnp-cpp//src/capnp/compat:json",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index f676810d53511142b686177f7362e90f848fc913..b84561828320498b4f8224be6a73c50ffce21dab 100644
+index cca899fe5587696686ccf4b5bb8f2b1b9ecebf00..e819eb97a66e64dcae549bca5d9b51f16c2c4bd0 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -36,6 +36,7 @@
@@ -155,7 +178,7 @@ index f676810d53511142b686177f7362e90f848fc913..b84561828320498b4f8224be6a73c50f
  #include <workerd/util/stream-utils.h>
  
  #include <arpa/inet.h>
-@@ -7007,7 +7008,13 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7011,7 +7012,13 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
                         ActorCache::Hooks &,
                         SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
      const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
@@ -170,7 +193,7 @@ index f676810d53511142b686177f7362e90f848fc913..b84561828320498b4f8224be6a73c50f
      if (tree->state.wal) {
        auto shipper = tree->storage().ship(tree->uniqueKey,
            {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),
-@@ -7905,6 +7912,7 @@ int main(int argc, char **argv) {
+@@ -7909,6 +7916,7 @@ int main(int argc, char **argv) {
      kj::Own<const kj::Directory> directory;
      kj::Own<server::ThreadedWalLog> wal;
      if (persistent) {
@@ -313,7 +336,7 @@ index f6eb7f0ba3f9b016a7f8e214d726ebf950e0d392..225a55559600052098f407390cb03b85
    // Thread-local pointer to the active scope. Set to this on construction (if not already set),
    // cleared on destruction (if we set it).
 diff --git a/src/workerd/util/sqlite-test.c++ b/src/workerd/util/sqlite-test.c++
-index 388dad4828de3c936748c43d9646d1185054e071..e40d3f4b9935be2afdf5b4dab5c56f9e243b4b4e 100644
+index 388dad4828de3c936748c43d9646d1185054e071..aefe8d7232d7e5c4107c9d9ad97001de679e3472 100644
 --- a/src/workerd/util/sqlite-test.c++
 +++ b/src/workerd/util/sqlite-test.c++
 @@ -216,7 +216,10 @@ KJ_TEST("SQL deadline and client disconnect leave a rolled-back WAL transaction
@@ -437,7 +460,7 @@ index 388dad4828de3c936748c43d9646d1185054e071..e40d3f4b9935be2afdf5b4dab5c56f9e
  KJ_TEST("SQLite memory metering enforces SQLITE_NOMEM when limit is exceeded") {
    auto dir = kj::newInMemoryDirectory(kj::nullClock());
    SqliteDatabase::Vfs vfs(*dir);
-@@ -1914,6 +2005,148 @@ KJ_TEST("SQLite memory metering enforces SQLITE_NOMEM when limit is exceeded") {
+@@ -1914,6 +2005,183 @@ KJ_TEST("SQLite memory metering enforces SQLITE_NOMEM when limit is exceeded") {
    KJ_EXPECT_THROW_MESSAGE("out of memory: SQLITE_NOMEM", db.run("SELECT hex(zeroblob(65536))"));
  }
  
@@ -476,6 +499,41 @@ index 388dad4828de3c936748c43d9646d1185054e071..e40d3f4b9935be2afdf5b4dab5c56f9e
 +  limit.begin();
 +  db.run("SAVEPOINT ledger; INSERT INTO ledger(id) VALUES (3); RELEASE ledger");
 +  KJ_EXPECT(!limit.wasMemoryRefused());
++  limit.end(db);
++  KJ_EXPECT(db.run("SELECT sum(id) FROM ledger").getInt(0) == 4);
++}
++
++KJ_TEST("SQLite conflict rollback blocks later writes until the platform transaction ends") {
++  auto dir = kj::newInMemoryDirectory(kj::nullClock());
++  SqliteDatabase::WalTransactionLimit limit(1024 * 1024);
++  SqliteDatabase::Vfs vfs(*dir, {.walTransactionLimit = &limit});
++  SqliteDatabase db(vfs, kj::Path({"db"}), kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
++  db.run("PRAGMA page_size = 4096; PRAGMA journal_mode = WAL; "
++         "CREATE TABLE ledger(id INTEGER PRIMARY KEY, payload BLOB); INSERT INTO ledger(id) VALUES (1)");
++  limit.setPageSize(4096);
++  auto walPath = kj::Path({"db-wal"});
++  auto before = dir->openFile(walPath)->readAllBytes();
++
++  limit.begin();
++  db.run("SAVEPOINT ledger; INSERT INTO ledger VALUES (2, zeroblob(65536))");
++  {
++    auto memoryScope = db.enterMemoryScope();
++    KJ_REQUIRE(sqlite3_db_cacheflush(db) == SQLITE_OK);
++  }
++  KJ_ASSERT(dir->openFile(walPath)->stat().size > before.size());
++  KJ_EXPECT_THROW_MESSAGE(
++      "UNIQUE constraint failed", db.run("INSERT OR ROLLBACK INTO ledger(id) VALUES (1)"));
++  KJ_ASSERT(sqlite3_get_autocommit(db));
++  KJ_EXPECT(limit.isRefusingWrites() && !limit.wasRefused() && !limit.wasMemoryRefused());
++  KJ_EXPECT_THROW_MESSAGE("database or disk is full", db.run("INSERT INTO ledger(id) VALUES (99)"));
++  KJ_EXPECT(!db.observedCriticalError());
++  db.rollbackWalTransaction();
++  limit.end(db, /*rolledBack=*/true);
++  KJ_EXPECT(dir->openFile(walPath)->readAllBytes() == before.asPtr());
++  KJ_EXPECT(db.run("SELECT count(*) FROM ledger").getInt(0) == 1);
++
++  limit.begin();
++  db.run("SAVEPOINT ledger; INSERT INTO ledger(id) VALUES (3); RELEASE ledger");
 +  limit.end(db);
 +  KJ_EXPECT(db.run("SELECT sum(id) FROM ledger").getInt(0) == 4);
 +}
@@ -586,7 +644,7 @@ index 388dad4828de3c936748c43d9646d1185054e071..e40d3f4b9935be2afdf5b4dab5c56f9e
  KJ_TEST("SQLite PRAGMA quick_check succeeds on a schema with many tables") {
    auto dir = kj::newInMemoryDirectory(kj::nullClock());
    SqliteDatabase::Vfs vfs(*dir);
-@@ -2083,6 +2316,53 @@ KJ_TEST("SQLite critical error handling for SQLITE_IOERR") {
+@@ -2083,6 +2351,53 @@ KJ_TEST("SQLite critical error handling for SQLITE_IOERR") {
    KJ_EXPECT(db.observedCriticalError());
  }
  
@@ -641,7 +699,7 @@ index 388dad4828de3c936748c43d9646d1185054e071..e40d3f4b9935be2afdf5b4dab5c56f9e
  // trigger it in a way that causes an auto-rollback. It seems like an auto-rollback would only
  // happen if the transaction had already included other writes before hitting SQLITE_BUSY,
 diff --git a/src/workerd/util/sqlite.c++ b/src/workerd/util/sqlite.c++
-index 64f7fd986581e5e7b9c0d68eb7e56b7be4872ca3..c38cdb8bd6dd77d38e0d56f9272c3f82057c45a2 100644
+index 64f7fd986581e5e7b9c0d68eb7e56b7be4872ca3..a02a64c7df22b19241b58f4339b0a6fd7beb66b7 100644
 --- a/src/workerd/util/sqlite.c++
 +++ b/src/workerd/util/sqlite.c++
 @@ -435,6 +435,7 @@ void reportVfsErrorCaught(kj::Exception&& e) {
@@ -747,15 +805,16 @@ index 64f7fd986581e5e7b9c0d68eb7e56b7be4872ca3..c38cdb8bd6dd77d38e0d56f9272c3f82
      });
    }
  }
-@@ -1008,8 +1020,16 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
+@@ -1008,40 +1020,43 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
      kj::StringPtr errorMessage,
      kj::Maybe<const kj::Exception&> maybeException) {
    KJ_IF_SOME(code, errorCode) {
 -    if (code == SQLITE_FULL) {
 -      if (auto* limit = getWalTransactionLimit(); limit != nullptr && limit->wasRefused()) return;
++    if (code == SQLITE_OK) return;
 +    auto* limit = getWalTransactionLimit();
-+    const bool platformCanSettle =
-+        limit != nullptr && limit->isActive() && maybeException == kj::none;
++    const bool platformTransaction = limit != nullptr && limit->isActive();
++    const bool platformCanSettle = platformTransaction && maybeException == kj::none;
 +    if (platformCanSettle) {
 +      if (code == SQLITE_FULL && limit->isRefusingWrites()) return;
 +      if (code == SQLITE_NOMEM && SqliteMemoryScope::wasLimitRefused()) {
@@ -764,29 +823,63 @@ index 64f7fd986581e5e7b9c0d68eb7e56b7be4872ca3..c38cdb8bd6dd77d38e0d56f9272c3f82
 +        return;
 +      }
      }
-     // Only errors listed in https://www.sqlite.org/lang_transaction.html#response_to_errors_within_a_transaction
-     // should be considered here as SQLITE auto rollbacks the transaction when we hit these errors
-@@ -1025,15 +1045,15 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
-               activeExecutionScope == nullptr ? nullptr : activeExecutionScope->budget.get();
-           const bool budgetInterrupted = code == SQLITE_INTERRUPT && budget != nullptr &&
-               budget->getCause() != SqlExecutionBudget::Cause::NONE;
+-    // Only errors listed in https://www.sqlite.org/lang_transaction.html#response_to_errors_within_a_transaction
+-    // should be considered here as SQLITE auto rollbacks the transaction when we hit these errors
++    // A failed statement can have already rolled back the whole transaction, including
++    // through a conflict clause or trigger. The platform still owns its savepoints.
++    if ((!inTransaction && savepoints.empty()) || sqlite3_get_autocommit(*this) == 0) return;
++    auto* budget = activeExecutionScope == nullptr ? nullptr : activeExecutionScope->budget.get();
++    const bool budgetInterrupted = code == SQLITE_INTERRUPT && budget != nullptr &&
++        budget->getCause() != SqlExecutionBudget::Cause::NONE;
++    if (platformCanSettle && budgetInterrupted && budget->hasDeadline()) {
++      limit->noteInterruption();
++      return;
++    }
++    if (platformTransaction && !savepoints.empty()) {
++      limit->noteStatementRollback();
++    }
++    // Preserve the critical path for the errors SQLite can roll back unexpectedly.
+     if (code == SQLITE_FULL || code == SQLITE_IOERR || code == SQLITE_NOMEM ||
+         code == SQLITE_INTERRUPT) {
+-
+-      sqlite3* db = *this;
+-      // We are in a transaction
+-      if (inTransaction || !savepoints.empty()) {
+-        // SQLite automatically rolled back the whole transaction.
+-        if (sqlite3_get_autocommit(db) != 0) {
+-          auto* budget =
+-              activeExecutionScope == nullptr ? nullptr : activeExecutionScope->budget.get();
+-          const bool budgetInterrupted = code == SQLITE_INTERRUPT && budget != nullptr &&
+-              budget->getCause() != SqlExecutionBudget::Cause::NONE;
 -          if (auto* limit = getWalTransactionLimit();
 -              budgetInterrupted && budget->hasDeadline() && limit != nullptr && limit->isActive()) {
-+          if (platformCanSettle && budgetInterrupted && budget->hasDeadline()) {
-             // The platform's explicit transaction will clear the rolled-back savepoints
+-            // The platform's explicit transaction will clear the rolled-back savepoints
 -            // and callbacks. Report the interruption to its caller without breaking the actor.
-+            // and callbacks. Keep writes blocked while the actor settles the refusal.
-+            limit->noteInterruption();
-             return;
-           }
-           criticalErrorOccurred = true;
-           KJ_IF_SOME(cb, onCriticalErrorCallback) {
+-            return;
+-          }
+-          criticalErrorOccurred = true;
+-          KJ_IF_SOME(cb, onCriticalErrorCallback) {
 -            if (budgetInterrupted) {
-+            if (budgetInterrupted && maybeException == kj::none) {
-               auto error = KJ_REQUIRE_NONNULL(currentRegulator)->sqlExecutionLimitException(*budget);
-               auto description = kj::str(error.getDescription());
-               cb(description, kj::mv(error));
-@@ -2151,6 +2171,14 @@ void SqliteDatabase::Query::nextRow(bool first) {
+-              auto error = KJ_REQUIRE_NONNULL(currentRegulator)->sqlExecutionLimitException(*budget);
+-              auto description = kj::str(error.getDescription());
+-              cb(description, kj::mv(error));
+-              return;
+-            }
+-            cb(errorMessage, maybeException.map([](const kj::Exception& e) { return e.clone(); }));
+-          }
++      criticalErrorOccurred = true;
++      KJ_IF_SOME(cb, onCriticalErrorCallback) {
++        if (budgetInterrupted && maybeException == kj::none) {
++          auto error = KJ_REQUIRE_NONNULL(currentRegulator)->sqlExecutionLimitException(*budget);
++          auto description = kj::str(error.getDescription());
++          cb(description, kj::mv(error));
++          return;
+         }
++        cb(errorMessage, maybeException.map([](const kj::Exception& e) { return e.clone(); }));
+       }
+     }
+   }
+@@ -2151,6 +2166,14 @@ void SqliteDatabase::Query::nextRow(bool first) {
      if (err == SQLITE_DONE) {
        done = true;
      } else if (err != SQLITE_ROW) {
@@ -801,7 +894,7 @@ index 64f7fd986581e5e7b9c0d68eb7e56b7be4872ca3..c38cdb8bd6dd77d38e0d56f9272c3f82
        SQLITE_CALL_FAILED("sqlite3_step()", err);
      }
    }
-@@ -2198,17 +2226,33 @@ kj::StringPtr SqliteDatabase::Query::getColumnName(uint column) {
+@@ -2198,17 +2221,33 @@ kj::StringPtr SqliteDatabase::Query::getColumnName(uint column) {
    return sqlite3_column_name(statement, column);
  }
  
@@ -836,7 +929,7 @@ index 64f7fd986581e5e7b9c0d68eb7e56b7be4872ca3..c38cdb8bd6dd77d38e0d56f9272c3f82
  }
  
 diff --git a/src/workerd/util/sqlite.h b/src/workerd/util/sqlite.h
-index 0d53011538cac7e0d226bfb5201aebf3c4b3302c..67968772fdda47fc6bd43abc3eccdf85d0ec632b 100644
+index 0d53011538cac7e0d226bfb5201aebf3c4b3302c..e09cd8c9b9f7f46f4b21874191a2d9d58d2ce135 100644
 --- a/src/workerd/util/sqlite.h
 +++ b/src/workerd/util/sqlite.h
 @@ -101,6 +101,7 @@ class SqliteDatabase {
@@ -864,7 +957,7 @@ index 0d53011538cac7e0d226bfb5201aebf3c4b3302c..67968772fdda47fc6bd43abc3eccdf85
    void nextRow(bool first);
  };
  
-@@ -944,7 +948,21 @@ class SqliteDatabase::WalTransactionLimit {
+@@ -944,7 +948,24 @@ class SqliteDatabase::WalTransactionLimit {
    explicit WalTransactionLimit(uint64_t frameBytes): frameBytes(frameBytes) {}
    uint64_t capacity() const { return frameBytes; }
    bool isActive() const { return active; }
@@ -884,15 +977,18 @@ index 0d53011538cac7e0d226bfb5201aebf3c4b3302c..67968772fdda47fc6bd43abc3eccdf85
 +  void noteInterruption() {
 +    noteRefusal(Refusal::INTERRUPTED);
 +  }
++  void noteStatementRollback() {
++    noteRefusal(Refusal::STATEMENT_ROLLBACK);
++  }
    void setPageSize(uint32_t pageSize);
    void begin();
    void end(SqliteDatabase& db, bool rolledBack = false);
-@@ -957,7 +975,12 @@ class SqliteDatabase::WalTransactionLimit {
+@@ -957,7 +978,12 @@ class SqliteDatabase::WalTransactionLimit {
    kj::Maybe<uint64_t> firstFrameByte;
    kj::Maybe<int64_t> originalSize;
    bool active = false;
 -  bool refused = false;
-+  enum class Refusal { NONE, WAL_LIMIT, MEMORY_LIMIT, INTERRUPTED };
++  enum class Refusal { NONE, WAL_LIMIT, MEMORY_LIMIT, INTERRUPTED, STATEMENT_ROLLBACK };
 +  Refusal refusal = Refusal::NONE;
 +
 +  void noteRefusal(Refusal cause) {
