@@ -75,14 +75,16 @@ async function snapshot() {
     opens: durableLog.threadedHomeIo.openSamples, at: Date.now() };
 }
 
-async function waitForRunning(running) {
+async function waitForRunning(running, residentRoots) {
   const end = performance.now() + 1200;
+  let state;
   do {
-    const state = await snapshot();
-    if (state.running === running && state.waiting === 0) return state;
+    state = await snapshot();
+    if (state.running === running && state.waiting === 0 &&
+        (residentRoots === undefined || state.residentRoots === residentRoots)) return state;
     await delay(15);
   } while (performance.now() < end);
-  assert.fail(`the durable process did not report ${running} running events`);
+  assert.fail(`expected ${JSON.stringify({ running, waiting: 0, residentRoots })}, observed ${JSON.stringify(state)}`);
 }
 
 async function readCpu() {
@@ -158,8 +160,8 @@ async function window(condition, index) {
   const warm = await drive(performance.now(), Date.now(), 60, 0);
   for (const item of Object.values(warm)) assert.equal(item.samples.length, item.offered, JSON.stringify(item.errors));
   await checkRead(blocking);
-  const before = await waitForRunning(0);
-  assert.equal(before.residentRoots, 4);
+  // The node can still report the state from before the blocker database's warm-up read.
+  const before = await waitForRunning(0, 4);
   const cpu = [await readCpu()];
   const startedAt = Date.now();
   const start = performance.now();
