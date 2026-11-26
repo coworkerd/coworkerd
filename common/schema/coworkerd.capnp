@@ -480,6 +480,10 @@ struct ServerConfig {
     threadedStorage @24 :Bool = false;
     # When a new definition first waits for a busy tree, bound the remaining drain time.
     versionDrainTimeoutMs @25 :UInt32 = 30000;
+    # Threaded platform database: current transaction's WAL plus live SQLite temporary files.
+    sqlDatabaseSpillBytes @26 :UInt64 = 1073741824;
+    # Total of those charges in one persistent durable process. 0 uses four times the database limit.
+    sqlProcessSpillBytes @27 :UInt64 = 0;
   }
 
   struct IngressConfig {

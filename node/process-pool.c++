@@ -2652,6 +2652,10 @@ public:
     if (p->durable && p->threaded && !p->durableTestStorage) {
       KJ_REQUIRE(durableLogFd >= 0, "cannot start a persistent durable home without a WAL channel");
       childEnvironment.push_back("COWORKERD_DO_STORAGE_DIR=" + durableDirectory());
+      childEnvironment.push_back("COWORKERD_DO_SQL_DATABASE_SPILL_BYTES=" +
+          std::to_string(durableLog.sqlDatabaseSpillBytes));
+      childEnvironment.push_back("COWORKERD_DO_SQL_PROCESS_SPILL_BYTES=" +
+          std::to_string(durableLog.sqlProcessSpillBytes));
     }
     // V8's collections (gc.*; workerd's patch coworkerd-gc.h): the budget the CPU limit does not charge, the long
     // pauses it names, the idle collection, and the runtime's heap.
