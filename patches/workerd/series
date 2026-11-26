@@ -104,4 +104,5 @@
 0173-bound-platform-sql-transactions.patch
 0175-harden-platform-sql-transaction-settlement.patch
 0174-release-idle-platform-database-copies.patch
+0176-attribute-platform-databases-to-database-worker.patch
 0178-keep-platform-databases-open-after-sql-interruption.patch
