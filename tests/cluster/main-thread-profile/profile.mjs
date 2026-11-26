@@ -96,9 +96,6 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
   const forwarder = join(binaries, 'coworkerd-bench-http-forwarder');
   const observePerf = process.env.COWORKERD_PROFILE_PERF !== '0';
   const stackOutput = process.env.COWORKERD_PROFILE_STACKS;
-  const callGraph = process.env.COWORKERD_PROFILE_CALL_GRAPH ?? 'fp';
-  const fixedClients = process.env.COWORKERD_PROFILE_CLIENTS;
-  if (fixedClients) assert.match(fixedClients, /^(?:1|4|8|16|32)$/);
   async function nodeHostPid() {
     // Compose starts the daemon below its PID 1 init process.
     const processes = await cluster.command('docker', ['top', container, '-eo', 'pid,comm']);
@@ -118,7 +115,7 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
     await cluster.command('sudo', ['-n', 'perf', 'buildid-cache', '--add', join(binaries, 'coworkerd')]);
   }
   await record('profile-tools', { perf: observePerf ? await cluster.command('sudo', ['-n', 'perf', '--version']) : null,
-    perfHz: observePerf ? 499 : null, callGraph: observePerf ? callGraph : null, forwarderSha256: sha256(await readFile(forwarder)) });
+    perfHz: observePerf ? 499 : null, forwarderSha256: sha256(await readFile(forwarder)) });
 
   await cluster.command('docker', ['run', '-d', '--rm', '--name', proxy,
     '--network', cluster.project + '_frontend', '--pid', 'container:' + container,
@@ -139,7 +136,7 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
         ...(profileMode === 'forwarded' && { site: proxy, extraPids: { forwarder: proxyPid } }),
         observe: async drive => {
           const profile = profileMode === 'profiled' && observePerf;
-          const row = profile ? await recordPerf({ pid, data: perfData, script: perfScript, drive, seconds: smoke ? 5 : 14, callGraph }) : await drive();
+          const row = profile ? await recordPerf({ pid, data: perfData, script: perfScript, drive, seconds: smoke ? 5 : 14 }) : await drive();
           await cluster.command('docker', ['cp', container + ':' + traceInContainer, trace]);
           const counters = summarizeTrace(await readFile(trace), row.windowNs);
           assert.ok(counters.occupancy.roots.max > 0, 'window admitted at least one root');
@@ -163,7 +160,7 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
     }
 
     const rounds = smoke ? 1 : 3;
-    const offered = smoke ? [2] : fixedClients ? [Number(fixedClients)] : [1, 4, 8, 16, 32];
+    const offered = smoke ? [2] : [1, 4, 8, 16, 32];
     const rates = Object.fromEntries(operations.map(operation => [operation,
       Object.fromEntries(offered.map(clients => [clients, []]))]));
     for (let round = 0; round < rounds; ++round) {

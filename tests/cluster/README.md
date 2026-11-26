@@ -118,6 +118,10 @@ latency, throughput, CPU time, live database counts and idle memory.
 
 ### Database throughput and CPU attribution
 
+For the node main-thread stack profile, bare KJ HTTP comparison and in-flight
+call measurement on the same four one-Worker paths, see the
+[main-thread report and reproduction commands](../../docs/node-main-thread-profile.md).
+
 The throughput mode of the database home benchmark runs the load generator inside the Compose frontend
 network. It uses one node, one ordinary workerd process and one threaded durable child. Each trial starts
 with a fresh cluster. Run the trial on an otherwise quiet Linux machine with the build tools above.

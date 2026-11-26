@@ -79,11 +79,11 @@ export async function summarizeStacks(path, [begin, end]) {
   return { samples, histogram, stacks };
 }
 
-export async function recordPerf({ pid, data, script, drive, seconds, callGraph }) {
+export async function recordPerf({ pid, data, script, drive, seconds }) {
   const ready = data + '.ready';
   // perf releases its child when events are open. The data file can appear well before that.
   const child = spawn('sudo', ['-n', 'perf', 'record', '--clockid', 'mono',
-    '-e', 'cpu-clock', '-F', '499', '--call-graph', callGraph, '--buildid-all', '-t', String(pid), '-o', data,
+    '-e', 'cpu-clock', '-F', '499', '--call-graph', 'fp', '--buildid-all', '-t', String(pid), '-o', data,
     '--', 'sh', '-c', 'touch "$1"; exec sleep "$2"', 'perf-recording', ready, String(seconds)],
   { stdio: ['ignore', 'ignore', 'pipe'] });
   const closed = once(child, 'close');
