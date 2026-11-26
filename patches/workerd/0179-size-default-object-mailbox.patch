@@ -6,7 +6,7 @@ Subject: [PATCH] Size the default object mailbox for ordinary request bursts
 Use the node process in-flight default as the waiting-event ceiling and allow an average of 4 KiB in declared bytes per slot. Keep charging the shared memory and descriptor budgets for each admitted event.
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index fbae87c6f5f828f9f312a94b7f30ece160c927a8..b71168cd3fe4b7c0e776f061b8965ff05d7e4624 100644
+index fbae87c6f5f828f9f312a94b7f30ece160c927a8..7d22c1d169679b6132756c87aae3581f57442fb9 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2655,6 +2655,10 @@ struct ThreadedServer {
@@ -20,7 +20,7 @@ index fbae87c6f5f828f9f312a94b7f30ece160c927a8..b71168cd3fe4b7c0e776f061b8965ff0
        durableAdmission.emplace(
            server::DurableAdmission::Limits{
              .capacity = {.threads = limit,
-@@ -2663,9 +2667,10 @@ struct ThreadedServer {
+@@ -2663,9 +2667,9 @@ struct ThreadedServer {
              .tree = {.descriptors = 4, .memory = 16 * 1024},
              .event = {.descriptors = 1, .memory = 4096},
              .residentTarget = uint32_t(configuredCount("COWORKERD_DO_RESIDENT_OBJECTS", 4096)),
@@ -29,8 +29,7 @@ index fbae87c6f5f828f9f312a94b7f30ece160c927a8..b71168cd3fe4b7c0e776f061b8965ff0
 -            .mailboxBytes = configuredCount("COWORKERD_DO_TEST_MAILBOX_BYTES", 64 * 1024),
 +            .mailboxDepth = uint32_t(boundedDurableSetting(
 +                "COWORKERD_DO_TEST_MAILBOX_EVENTS", defaultMailboxDepth, 65536)),
-+            .mailboxBytes =
-+                configuredCount("COWORKERD_DO_TEST_MAILBOX_BYTES", defaultMailboxBytes),
++            .mailboxBytes = configuredCount("COWORKERD_DO_TEST_MAILBOX_BYTES", defaultMailboxBytes),
            },
            durableNumber(std::string_view(this->identity).substr(colon + 1)));
      }
