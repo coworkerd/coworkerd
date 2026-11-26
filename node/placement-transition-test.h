@@ -11,7 +11,7 @@ inline void placementTransitions() {
   enum class Reply { Good, Red, Yellow, HotYellow, Saturated, Offline, Expired, Uncertain, Package, FatalLoad };
   using enum Reply;
   struct Row {
-    const char* old;
+    const char* name;
     std::array<Reply, 3> reply; // Home s1, ingress/parent s2, other s3
     const char* tried;
     const char* result;
@@ -26,56 +26,56 @@ inline void placementTransitions() {
     uint32_t nestedLimit = 9;
   };
   constexpr Row rows[] = {
-    {"v23-mechanism-4.1 / cold three members", {Good,Good,Good}, "1", "s1"},
-    {"v23-mechanism-4.1 / Home removed", {Good,Good,Good}, "3", "s3", 8,true,false,false,"","1"},
-    {"v23-mechanism-4.1 / Home rejoins", {Good,Good,Good}, "1", "s1"},
-    {"v23-mechanism-4.2 / cold binding", {Good,Good,Good}, "1", "s1", 8,false},
-    {"v23-mechanism-4.2 / hot binding", {Good,Good,Good}, "2", "s2", 8,false,true},
-    {"v23-mechanism-4.3 / Home offline", {Offline,Good,Good}, "12", "s2", 8,false},
-    {"v23-mechanism-4.3 / subsequent call avoids Home", {Offline,Good,Good}, "2", "s2", 8,false,false,false,"1"},
-    {"v23-mechanism-4.4 / red Home", {Red,Good,Good}, "12", "s2", 8,false},
-    {"v23-mechanism-4.4 / still avoided after recovery", {Good,Good,Good}, "2", "s2", 8,false,true,false,"1"},
-    {"v23-mechanism-4.4 / avoidance expired", {Good,Good,Good}, "1", "s1", 8,false},
-    {"v23-mechanism-4.5 / hot version at yellow Home", {HotYellow,Good,Good}, "1", "s1", 8,false},
-    {"v23-mechanism-4.5 / cold version at yellow Home", {Yellow,Good,Good}, "12", "s2", 8,false},
-    {"v23-mechanism-4.6 / uncertain result", {Uncertain,Good,Good}, "1", "RESULT_UNCERTAIN", 8,false},
-    {"v23-mechanism-4.7 / all reject", {Red,Red,Red}, "123", "PLACEMENT_EXHAUSTED", 8,false},
-    {"v23-mechanism-4.7-hops / only two attempts", {Red,Red,Red}, "12", "PLACEMENT_EXHAUSTED/hops", 2,false},
-    {"v23-mechanism-4.8-stale / stale Home in snapshot", {Offline,Good,Good}, "12", "s2", 8,false},
-    {"v23-mechanism-4.8-exit / peer ineligible", {Good,Good,Good}, "3", "s3", 8,false,false,false,"","1"},
-    {"v23-mechanism-4.10 / explicit failure before dispatch", {Offline,Good,Good}, "12", "s2", 8,false},
-    {"v23-mechanism-4.10 / committed dispatch", {Uncertain,Good,Good}, "1", "RESULT_UNCERTAIN", 8,false},
-    {"v23-all-avoided / still try candidates in order", {Offline,Good,Good}, "12", "s2", 8,false,false,false,"123"},
-    {"v23-epoch-refusal-backoff / retry after refusal", {Red,Good,Good}, "2", "s2", 8,false,false,false,"1"},
-    {"v23-contraction-formal / stable cold affinity", {Good,Good,Good}, "1", "s1", 8,false},
-    {"v23-contraction-saturation / unavailable Home", {Saturated,Good,Good}, "12", "s2", 8,false},
-    {"v25-4.1 / cold ingress uses Home", {Good,Good,Good}, "1", "s1"},
-    {"v25-4.2-p0 / hot local", {Good,Good,Good}, "2", "s2", 8,true,true},
-    {"v25-4.2-p1 / use Home", {Good,Good,Good}, "1", "s1", 8,true,true,true},
-    {"v25-4.2-p1 / Home turns red", {Red,Good,Good}, "12", "s2", 8,true,true,true},
-    {"v25-4.3-ingress-red / forwarded root", {Red,Red,Good}, "12", "s2"},
-    {"v25-4.3-ingress-saturation / root cap", {Saturated,Good,Good}, "12", "s2"},
-    {"v25-4.3-ingress-offline / failed connection", {Offline,Good,Good}, "12", "s2"},
-    {"v25-4.3-binding-red / nested on red", {Red,Good,Good}, "12", "s2", 8,false},
-    {"v25-4.3-binding-saturation / nested cap", {Saturated,Good,Good}, "12", "s2", 8,false},
-    {"v25-4.3-binding-offline / failed connection", {Offline,Good,Good}, "12", "s2", 8,false},
-    {"v25-4.4-next / Home red and local saturated", {Red,Saturated,Good}, "123", "s3"},
-    {"v25-4.4-all / Home red, local saturated, next offline", {Red,Saturated,Offline}, "123", "PLACEMENT_EXHAUSTED"},
-    {"v25-4.4-hops / Home red and local saturated", {Red,Saturated,Good}, "12", "PLACEMENT_EXHAUSTED/hops", 2},
-    {"v25-4.5-budget-1-forward / one successful hop", {Good,Good,Good}, "1", "s1", 1},
-    {"v25-4.5-budget-1-reroute / no fallback hop", {Red,Good,Good}, "1", "PLACEMENT_EXHAUSTED/hops", 1},
-    {"v25-4.5-budget-2-forward / two-hop input", {Good,Good,Good}, "1", "s1", 2},
-    {"v25-4.5-budget-2-reroute / fallback hop remains", {Red,Good,Good}, "12", "s2", 2},
-    {"v25-4.5-deadline / no retry after expiry", {Expired,Good,Good}, "1", "LEASE_EXPIRED"},
-    {"v25-4.5-unavailable / exact package missing", {Package,Good,Good}, "12", "s2"},
-    {"v25-4.5-uncertain / committed request never repeats", {Uncertain,Good,Good}, "1", "RESULT_UNCERTAIN"},
-    {"v25-4.6 ingress race / proven pre-dispatch failure", {Offline,Good,Good}, "12", "s2"},
-    {"v25-4.7-band / forwarded cold root on yellow", {Yellow,Good,Good}, "12", "s2"},
-    {"v25-4.7-band / forwarded hot root on yellow", {HotYellow,Good,Good}, "1", "s1"},
-    {"v25-4.7-headroom / root traffic using first band", {Saturated,Good,Good}, "12", "s2"},
-    {"v25-4.9 / cold copy uses stable Home", {Good,Good,Good}, "1", "s1"},
-    {"v25-4.10-formal / stale ingress loses hot-first", {Good,Good,Good}, "1", "s1", 8,true,true,false,"","",true},
-    {"v25-4.11 / equal root and nested limits", {Saturated,Saturated,Saturated}, "123", "PLACEMENT_EXHAUSTED", 8,false,false,false,"","",false,8,8},
+    {"cold placement with three members", {Good,Good,Good}, "1", "s1"},
+    {"placement after Home removal", {Good,Good,Good}, "3", "s3", 8,true,false,false,"","1"},
+    {"placement after Home rejoins", {Good,Good,Good}, "1", "s1"},
+    {"cold binding uses Home", {Good,Good,Good}, "1", "s1", 8,false},
+    {"hot binding stays local", {Good,Good,Good}, "2", "s2", 8,false,true},
+    {"binding falls back when Home is offline", {Offline,Good,Good}, "12", "s2", 8,false},
+    {"subsequent binding call avoids offline Home", {Offline,Good,Good}, "2", "s2", 8,false,false,false,"1"},
+    {"binding falls back when Home is red", {Red,Good,Good}, "12", "s2", 8,false},
+    {"binding still avoids Home after recovery", {Good,Good,Good}, "2", "s2", 8,false,true,false,"1"},
+    {"binding returns to Home after avoidance expires", {Good,Good,Good}, "1", "s1", 8,false},
+    {"yellow Home admits a hot binding version", {HotYellow,Good,Good}, "1", "s1", 8,false},
+    {"yellow Home refuses a cold binding version", {Yellow,Good,Good}, "12", "s2", 8,false},
+    {"binding stops after an uncertain result", {Uncertain,Good,Good}, "1", "RESULT_UNCERTAIN", 8,false},
+    {"all candidates reject the binding", {Red,Red,Red}, "123", "PLACEMENT_EXHAUSTED", 8,false},
+    {"binding stops after two failed hops", {Red,Red,Red}, "12", "PLACEMENT_EXHAUSTED/hops", 2,false},
+    {"binding falls back when snapshot Home is stale", {Offline,Good,Good}, "12", "s2", 8,false},
+    {"binding skips the ineligible peer", {Good,Good,Good}, "3", "s3", 8,false,false,false,"","1"},
+    {"binding retries after confirmed pre-dispatch failure", {Offline,Good,Good}, "12", "s2", 8,false},
+    {"binding stops when dispatch is uncertain", {Uncertain,Good,Good}, "1", "RESULT_UNCERTAIN", 8,false},
+    {"binding tries candidates in order when all are avoided", {Offline,Good,Good}, "12", "s2", 8,false,false,false,"123"},
+    {"binding starts with local while refused Home is avoided", {Red,Good,Good}, "2", "s2", 8,false,false,false,"1"},
+    {"cold binding keeps Home affinity", {Good,Good,Good}, "1", "s1", 8,false},
+    {"binding falls back when Home is saturated", {Saturated,Good,Good}, "12", "s2", 8,false},
+    {"cold ingress uses Home", {Good,Good,Good}, "1", "s1"},
+    {"hot ingress stays local", {Good,Good,Good}, "2", "s2", 8,true,true},
+    {"Home policy overrides hot local ingress", {Good,Good,Good}, "1", "s1", 8,true,true,true},
+    {"Home policy falls back to ingress when Home is red", {Red,Good,Good}, "12", "s2", 8,true,true,true},
+    {"red Home refuses forwarding and red ingress admits its own root", {Red,Red,Good}, "12", "s2"},
+    {"root falls back when Home reaches the root cap", {Saturated,Good,Good}, "12", "s2"},
+    {"root falls back after a failed connection", {Offline,Good,Good}, "12", "s2"},
+    {"nested call falls back from a red Home", {Red,Good,Good}, "12", "s2", 8,false},
+    {"nested call falls back when Home reaches the nested cap", {Saturated,Good,Good}, "12", "s2", 8,false},
+    {"nested call falls back after a failed connection", {Offline,Good,Good}, "12", "s2", 8,false},
+    {"third candidate runs after Home and ingress refuse", {Red,Saturated,Good}, "123", "s3"},
+    {"all candidates refuse or are offline", {Red,Saturated,Offline}, "123", "PLACEMENT_EXHAUSTED"},
+    {"hop budget runs out before the third candidate", {Red,Saturated,Good}, "12", "PLACEMENT_EXHAUSTED/hops", 2},
+    {"one hop is enough for a successful forward", {Good,Good,Good}, "1", "s1", 1},
+    {"one failed hop leaves no fallback", {Red,Good,Good}, "1", "PLACEMENT_EXHAUSTED/hops", 1},
+    {"forward succeeds on the first of two hops", {Good,Good,Good}, "1", "s1", 2},
+    {"two hops allow a fallback after refusal", {Red,Good,Good}, "12", "s2", 2},
+    {"expired lease stops retry", {Expired,Good,Good}, "1", "LEASE_EXPIRED"},
+    {"missing exact package allows fallback", {Package,Good,Good}, "12", "s2"},
+    {"uncertain root result stops retry", {Uncertain,Good,Good}, "1", "RESULT_UNCERTAIN"},
+    {"ingress race with confirmed pre-dispatch failure allows retry", {Offline,Good,Good}, "12", "s2"},
+    {"yellow Home refuses a forwarded cold root", {Yellow,Good,Good}, "12", "s2"},
+    {"yellow Home admits a forwarded hot root", {HotYellow,Good,Good}, "1", "s1"},
+    {"root traffic uses the root admission limit", {Saturated,Good,Good}, "12", "s2"},
+    {"cold copy uses stable Home", {Good,Good,Good}, "1", "s1"},
+    {"stale ingress loses hot-local priority", {Good,Good,Good}, "1", "s1", 8,true,true,false,"","",true},
+    {"equal limits leave no nested headroom", {Saturated,Saturated,Saturated}, "123", "PLACEMENT_EXHAUSTED", 8,false,false,false,"","",false,8,8},
   };
   static_assert(std::size(rows) == 50);
   struct Member { std::string state; };
@@ -112,7 +112,7 @@ inline void placementTransitions() {
     }
     if (result.empty()) result = std::string_view(placementExhaustionReason(hops)) == "placement hops exhausted" ?
         "PLACEMENT_EXHAUSTED/hops" : "PLACEMENT_EXHAUSTED";
-    KJ_REQUIRE(tried == row.tried && result == row.result, row.old, tried.c_str(), result.c_str(), lastRefusal.c_str(), unsigned(hops));
+    KJ_REQUIRE(tried == row.tried && result == row.result, row.name, tried.c_str(), result.c_str(), lastRefusal.c_str(), unsigned(hops));
   }
 }
 } // namespace coworkerd

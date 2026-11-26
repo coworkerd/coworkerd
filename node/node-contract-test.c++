@@ -225,7 +225,7 @@ void eventLoopProgress() {
       "ready I/O must be checked during a continuation burst, every so many turns", port.polls, port.largestBatch);
   // The interval itself: 32 to 128 turns, not the old 1 (a poll every other turn).
   KJ_REQUIRE(NODE_BUSY_POLL_INTERVAL >= 32 && NODE_BUSY_POLL_INTERVAL <= 128, NODE_BUSY_POLL_INTERVAL);
-  KJ_REQUIRE(port.largestBatch >= 8, "a poll every few turns is the waste v138 removed", port.largestBatch);
+  KJ_REQUIRE(port.largestBatch >= 8, "ready I/O polls must leave room for a batch of continuations", port.largestBatch);
 }
 
 // A line its server already cut (the threaded server forwards at most 4,096 bytes of a message, and its size) is

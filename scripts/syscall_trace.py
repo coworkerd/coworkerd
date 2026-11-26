@@ -2,9 +2,10 @@
 while profiling) and for anything that recomputes a profile from its stored traces.
 
 A trace is one workerd process: `strace -f -ttt -qq -yy -s 200 [-k]` attached to the wrapper shell, which
-then executes the workerd file the profile names (`program`, default the environment's COWORKERD_TRACE_PROGRAM). Only the threads of workerd count: from the main pid's execve of the
-workerd binary on, plus every thread a workerd thread creates (clone/clone3 results); the wrapper's own
-helpers (grep, sleep) are left out. Each call is put in a phase by its start time: startup (execve to the
+then executes the workerd file the profile names (`program`). The default is COWORKERD_TRACE_PROGRAM
+if set, otherwise /opt/coworkerd/bin/profile-target/workerd. Only the main thread from that execve
+onward and the threads created by workerd (clone/clone3 results) count. Each call is put in a
+phase by its start time: startup (execve to the
 time the Server saw the process ready), steady (after that), and the steady phase is further split by
 the profile run's workload windows. With -k every call is followed by its stack (" > " frame lines).
 """
@@ -18,7 +19,7 @@ RESUMED = re.compile(r'^<\.\.\. ([a-z0-9_]+) resumed>')
 RESULT = re.compile(r'\)\s+=\s+(-?\d+|\?|0x[0-9a-f]+)(?:\s+([A-Z][A-Z0-9_]+))?')
 FRAME = re.compile(r'^\s*> (.*)$')
 import os
-WORKERD = os.environ.get('COWORKERD_TRACE_PROGRAM', '/v45/bin/workerd')
+WORKERD = os.environ.get('COWORKERD_TRACE_PROGRAM', '/opt/coworkerd/bin/profile-target/workerd')
 # Calls whose first string argument is a path (the path that the call names).
 PATH_CALLS = {'open', 'openat', 'openat2', 'stat', 'lstat', 'newfstatat', 'statx', 'access', 'faccessat', 'faccessat2',
               'readlink', 'readlinkat', 'execve', 'execveat', 'mkdir', 'mkdirat', 'unlink', 'unlinkat', 'rename', 'renameat',
