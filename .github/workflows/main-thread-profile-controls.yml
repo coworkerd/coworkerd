@@ -1,0 +1,67 @@
+name: Node main-thread profiling controls
+on:
+  push:
+    branches: [codex/95-profile-controls]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      CC: clang-19
+      CXX: clang++-19
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Prepare the Linux tools and public runtime
+        id: kernel
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git
+          kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64)
+          printf 'path=%s\n' "$kernel" >> "$GITHUB_OUTPUT"
+      - name: Build both daemon variants before timing
+        run: |
+          bash scripts/build.sh
+          mkdir -p build/plain
+          cp build/coworkerd build/coworkerd-apiserver build/coworkerd-launcher build/plain/
+          git apply tests/cluster/main-thread-profile/instrumentation.patch
+          bash scripts/build.sh -DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG -g1 -fno-omit-frame-pointer'
+          cmake --build build --target coworkerd-bench-http-forwarder
+      - name: Record the runner and alternate the builds
+        env:
+          KERNEL: ${{ steps.kernel.outputs.path }}
+        run: |
+          mkdir -p reports
+          {
+            uname -a
+            lscpu
+            free -b
+            cat /etc/os-release
+            df -T "$PWD" /var/lib/docker
+            printf 'Runner image %s %s\n' "$ImageOS" "$ImageVersion"
+            sudo perf --version
+            clang++-19 --version
+          } | tee reports/runner.txt
+          COWORKERD_PROFILE_CONTROL=plain COWORKERD_CLUSTER_BIN_DIR="$PWD/build/plain" \
+            node tests/cluster/database-home-benchmark.mjs object "$PWD" "$KERNEL" \
+            "$PWD/reports/plain-before.jsonl" --main-thread-profile
+          COWORKERD_PROFILE_CONTROL=traced COWORKERD_PROFILE_STACKS="$PWD/reports/stacks.jsonl" \
+            node tests/cluster/database-home-benchmark.mjs object "$PWD" "$KERNEL" \
+            "$PWD/reports/traced.jsonl" --main-thread-profile
+          COWORKERD_PROFILE_CONTROL=plain COWORKERD_CLUSTER_BIN_DIR="$PWD/build/plain" \
+            node tests/cluster/database-home-benchmark.mjs object "$PWD" "$KERNEL" \
+            "$PWD/reports/plain-after.jsonl" --main-thread-profile
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: node-main-thread-controls-${{ github.run_attempt }}
+          path: reports/
+          if-no-files-found: warn
