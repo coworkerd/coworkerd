@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { appendFile, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, copyFile, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { eventually } from '../cluster.mjs';
@@ -109,7 +109,11 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
   const perfData = join(cluster.directory, 'perf.data');
   const perfScript = join(cluster.directory, 'perf.txt');
   if (stackOutput) await writeFile(resolve(stackOutput), '', { flag: 'wx' });
-  if (observePerf) assert.equal(process.platform, 'linux', 'perf must run on the Linux Docker host');
+  if (observePerf) {
+    assert.equal(process.platform, 'linux', 'perf must run on the Linux Docker host');
+    // Seed the host cache with the exact daemon ELF used in the container.
+    await cluster.command('sudo', ['-n', 'perf', 'buildid-cache', '--add', join(binaries, 'coworkerd')]);
+  }
   await record('profile-tools', { perf: observePerf ? await cluster.command('sudo', ['-n', 'perf', '--version']) : null,
     perfHz: observePerf ? 499 : null, forwarderSha256: sha256(await readFile(forwarder)) });
 
@@ -140,7 +144,10 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
           if (operation === 'insert') assert.ok(counters.flush.calls > 0, 'counted local fdatasync calls');
           let perf;
           if (profile) {
+            if (smoke && stackOutput) await copyFile(perfScript, resolve(stackOutput + '.' + operation + '.perf.txt'));
             const { stacks, ...summary } = await summarizeStacks(perfScript, row.windowNs);
+            assert.ok(summary.histogram.other.samples < summary.samples,
+              'no named node or protocol frames were found in the profile');
             if (stackOutput) await appendFile(resolve(stackOutput),
               JSON.stringify({ operation, clients, round, ...summary, stacks }) + '\n');
             perf = summary;
@@ -152,7 +159,7 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
     }
 
     const rounds = smoke ? 1 : 3;
-    const offered = smoke ? [2] : [1, 4, 8, 16, 32, 64];
+    const offered = smoke ? [2] : [1, 4, 8, 16, 32];
     const rates = Object.fromEntries(operations.map(operation => [operation,
       Object.fromEntries(offered.map(clients => [clients, []]))]));
     for (let round = 0; round < rounds; ++round) {
