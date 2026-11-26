@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   measure:
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       CC: clang-19
@@ -31,7 +31,7 @@ jobs:
           npm ci --prefix cli --registry=https://registry.npmjs.org
       - name: Build the platform test executable and fetch the pinned kernel
         run: |
-          python3 scripts/fetch-kernel.py --arch linux-arm64
+          python3 scripts/fetch-kernel.py --arch linux-x86_64
           bash scripts/build.sh
           cmake --build build --target coworkerd-platform-test coworkerd-launcher
       - name: Measure on the idle runner
@@ -41,13 +41,13 @@ jobs:
           lscpu > build/isolation-evidence/host.txt
           free -m >> build/isolation-evidence/host.txt
           docker ps >> build/isolation-evidence/host.txt
-          kernel=$(python3 scripts/fetch-kernel.py --arch linux-arm64 --installed)
+          kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64 --installed)
           node tests/cluster/long-sql-isolation.mjs "$kernel" build/isolation-evidence/report.jsonl \
             2>&1 | tee build/isolation-evidence/measurement.log
       - name: Preserve raw evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: long-sql-isolation-arm64
+          name: long-sql-isolation-x86_64
           path: build/isolation-evidence/
           if-no-files-found: ignore
