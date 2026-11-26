@@ -59,7 +59,7 @@ export class Cluster {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
     budgetLifetime, nodeEnvironment, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
-    databaseFixtureNode, databaseAlarmFixture = false, previousProduct, previousKernel,
+    databaseFixtureNodes = [], databaseAlarmFixture = false, previousProduct, previousKernel,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -92,17 +92,17 @@ export class Cluster {
     this.productRoot = productRoot;
     this.publishPeerPorts = publishPeerPorts;
     this.platformFixture = platformFixture;
-    this.databaseFixtureNode = databaseFixtureNode;
+    this.databaseFixtureNodes = new Set(databaseFixtureNodes);
     this.databaseAlarmFixture = databaseAlarmFixture;
     this.previousProduct = previousProduct;
     this.previousKernel = previousKernel;
   }
 
-  async command(program, args, { cwd = this.directory, token, cleanup = false, timeout = 60000,
+  async command(program, args, { cwd = this.directory, token, env, cleanup = false, timeout = 60000,
     maxBuffer = 4 * 1024 * 1024 } = {}) {
     try {
       return (await exec(program, args, {
-        cwd, env: token ? { ...this.env, COWCTL_TOKEN: token } : this.env,
+        cwd, env: { ...this.env, ...env, ...(token && { COWCTL_TOKEN: token }) },
         timeout, signal: cleanup ? undefined : this.signal, maxBuffer,
       })).stdout.trim();
     } catch (error) {
@@ -204,7 +204,7 @@ export class Cluster {
       };
       if (this.budgetLifetime) overrides[node].environment.COWORKERD_LEASE_TTL_MS = String(this.budgetLifetime.leaseMs);
       if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS = '32';
-      if (node === this.databaseFixtureNode) {
+      if (this.databaseFixtureNodes.has(node)) {
         overrides[node].environment.COWORKERD_TEST_THREADED_DATABASES = '1';
         if (!this.databaseAlarmFixture) {
           overrides[node].volumes.push({ type: 'bind', source: join(binaries, 'coworkerd-platform-test'),
