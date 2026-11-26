@@ -24,6 +24,8 @@ namespace coworkerd {
 struct OpenEvent {
   v1::rpc::EventDispatcher::Client dispatcher;
   kj::Promise<void> ready;
+  // The threaded durable child's raw admission reply, independent of the event opening afterward.
+  kj::Promise<bool> capacityRejected = false;
 };
 
 struct ProcessGeneration;
