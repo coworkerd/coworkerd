@@ -114,10 +114,10 @@ can cause the node to refuse new Worker requests during a burst. The cluster cas
 Worker roots on a peer and the 128 database calls on one owner. Both nodes use their default
 limits.
 
-In a three-node Docker cluster on Linux ARM64 (10 vCPUs, 7.75 GiB of RAM, Node.js 26.2
+In a three-node Docker cluster on Linux ARM64 (10 vCPUs, 7.75 GiB of RAM, Node.js 22.22.2
 driving the load from macOS), a local build of the ordered series through 0179 returned the row
 to all 128 HTTP SQL callers and all 128 D1 callers from a peer. The owner kept its process
-generation without counting any admission overloads. The two bursts took 201 ms and 228 ms
+generation without counting any admission overloads. The two bursts took 201 ms and 207 ms
 respectively. The same case with the published 0176 kernel and its 4-event and 64 KiB defaults
 returned the row to 9 of 128 HTTP SQL callers and 5 of 128 D1 callers.
 
