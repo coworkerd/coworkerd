@@ -56,6 +56,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0107 blocks socket mutation during the saved-state handoff, resolves interrupted adoption,
   and requires an HTTP upgrade for threaded hibernatable pairs. Forced session cancellation is scoped
   to a code-update reset.
+  Patch 0122 makes the home task set cancel before the actors and isolate copy are released, and keeps the
+  WAL Home alive through shipper deregistration and SQLite close. It changes only the threaded server and its tests.
   Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
   quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and

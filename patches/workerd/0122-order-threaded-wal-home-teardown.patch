@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Fri, 27 Nov 2026 07:46:45 +0800
+Subject: [PATCH] Keep the threaded WAL Home alive through teardown
+
+A pending home task can hold an actor whose shipper and SQLite close callback borrow the WAL channel. Cancel home tasks before releasing actors and the isolate copy, then release the channel. Own the thread spare descriptor until task cleanup ends.
+
+Exercise scope teardown with a real actor and SQLite connection, an unresolved task and lifetime markers that can report an early release safely.
+
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index d1164d9463d31ce41fce91019133458f2aac7308..b50e8eca1cff4bac2c9dc20f6448f5287361add8 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -4,6 +4,8 @@
+ #include "threaded-server.c++"
+ #undef main
+ 
++#include <workerd/server/factory/coworkerd-wal-wire.h>
++
+ #include <spawn.h>
+ #include <sys/wait.h>
+ 
+@@ -2139,6 +2141,114 @@ KJ_TEST("a call thread cancels background work that outlives the drain limit") {
+   KJ_EXPECT(BACKGROUND_BACKSTOP > WAIT_UNTIL_LIMIT);
+ }
+ 
++class TeardownWalChannel final: public server::DurableWalChannel {
++ public:
++  kj::Vector<kj::StringPtr> events;
++
++  bool enabled() const override {
++    return true;
++  }
++  uint64_t nextRequest() override {
++    return ++request;
++  }
++
++  uint64_t registerShipper(server::DurableLogShipper&) override {
++    events.add("register shipper"_kj);
++    return nextRequest();
++  }
++  void unregisterShipper(server::DurableLogShipper& shipper) override {
++    KJ_EXPECT(shipper.getOpenId() == 1);
++    events.add("unregister shipper"_kj);
++  }
++  void send(uint64_t openId, kj::Array<kj::byte> message) override {
++    KJ_REQUIRE(message.size() >= 13);
++    KJ_EXPECT(openId == 1 && server::wal::getLe64(message.begin() + 5) == openId);
++    switch (message[4]) {
++      case server::wal::MSG_OPEN:
++        events.add("OPEN"_kj);
++        break;
++      case server::wal::MSG_CLOSED:
++        events.add("CLOSED"_kj);
++        break;
++      default:
++        KJ_FAIL_ASSERT("unexpected WAL message", message[4]);
++    }
++  }
++  kj::Promise<void> sendFrames(
++      server::DurableLogShipper&, kj::Array<kj::byte>, uint64_t, kj::Timer&) override {
++    KJ_FAIL_ASSERT("the shutdown fixture does not write frames");
++  }
++
++ private:
++  uint64_t request = 0;
++};
++
++class TeardownLoopback final: public Worker::Actor::Loopback, public kj::Refcounted {
++ public:
++  kj::Own<WorkerInterface> getWorker(IoChannelFactory::SubrequestMetadata) override {
++    KJ_FAIL_ASSERT("the shutdown fixture does not deliver events");
++  }
++  kj::Own<Loopback> addRef() override {
++    return kj::addRef(*this);
++  }
++};
++
++KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing the WAL Home") {
++  ThreadedServer server{1, "", "", -1, {}, {}, &initializeV8()};
++  server::DurableStorage storage;
++  // The fixture owns the resources so it can record early handle release safely.
++  TeardownWalChannel channel;
++  auto& events = channel.events;
++  Slot slot;
++  {
++    ThreadState state;
++    state.durableSlot = std::shared_ptr<Slot>(&slot, [](Slot*) {});
++    std::weak_ptr<Slot> copy = state.durableSlot;
++    state.wal = kj::attachRef(channel, kj::defer([&events, copy] {
++      KJ_EXPECT(copy.expired());
++      events.add("release Home"_kj);
++    }));
++
++    constexpr auto source = "export default { fetch() { return new Response('ok'); } };"_kj;
++    JsonDoc descriptor(kj::str(R"({"workerId":"test/teardown","versionId":"v1",
++        "mainModule":"index.js","compatibilityDate":"2026-11-01","contentHash":")",
++        digest(source.asBytes()).c_str(), "\"}"));
++    slot.worker = server.compile(slot, descriptor.get(), source);
++    auto makeCache = [&](const ActorCache::SharedLru&, OutputGate& gate, ActorCache::Hooks&,
++                         SqliteObserver& observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
++      auto storageId = digest("teardown"_kj.asBytes());
++      auto uniqueKey = kj::str("coworkerd-do-root-v1-", storageId.c_str());
++      auto database = storage.open(uniqueKey, storageId.c_str(), observer);
++      auto shipper = storage.ship(uniqueKey,
++          {.objectName = kj::str("test/teardown/1"), .storageId = kj::str(storageId.c_str())},
++          *database, state.io.provider->getTimer(), *state.wal, {}, 0);
++      return kj::heap<ActorSqlite>(kj::mv(database), gate,
++          [shipper = kj::mv(shipper)](SpanParent) mutable { return shipper->onCommit(); });
++    };
++    // This observer only touches the recorder, so even a broken order can be reported safely.
++    auto observer = kj::refcounted<ActorObserver>().attach(kj::defer([&events, copy] {
++      KJ_EXPECT(!copy.expired());
++      events.add("release actor observer"_kj);
++    }));
++    auto actor = kj::refcounted<Worker::Actor>(*KJ_ASSERT_NONNULL(slot.worker), kj::none,
++        kj::str("teardown"), false, kj::mv(makeCache), kj::none, Frankenvalue(),
++        Worker::Actor::MakeStorageFunc(), kj::refcounted<TeardownLoopback>(), state.timer,
++        kj::mv(observer), kj::none, kj::none);
++    auto& root = state.durableRoots.emplace(1, ThreadState::DurableRoot{.actor = kj::mv(actor)})
++                     .first->second;
++    auto releaseOnCancel = kj::defer([&events, actor = kj::addRef(*root.actor)]() mutable {
++      actor = nullptr;
++      events.add("cancel task"_kj);
++    });
++    state.tasks.add(kj::Promise<void>(kj::NEVER_DONE).attach(kj::mv(releaseOnCancel)));
++    KJ_REQUIRE(!state.tasks.isEmpty());
++    KJ_EXPECT(events.asPtr() == kj::arr("register shipper"_kj, "OPEN"_kj).asPtr());
++  }
++  auto expected = kj::arr("register shipper"_kj, "OPEN"_kj, "cancel task"_kj,
++      "unregister shipper"_kj, "CLOSED"_kj, "release actor observer"_kj, "release Home"_kj);
++  KJ_EXPECT(events.asPtr() == expected.asPtr());
++}
++
+ KJ_TEST("a reclaim requested during maintenance never waits for that pass") {
+   initializeV8();
+   auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 1);
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index f391261748c3f980c6ea8760d1a0b7b6492ee342..67eeb57c94ef6629f1e0dd3f95969154c1b2a06c 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1937,13 +1937,12 @@ struct ThreadState {
+   ThreadContext context{io.provider->getTimer(), entropy, ids, http, bytes};
+   Timer timer{io.provider->getTimer()};
+   Errors errors;
+-  kj::TaskSet tasks{errors};
+-  int decisionSpare = open("/dev/null", O_RDONLY | O_CLOEXEC);
+-  ~ThreadState() {
+-    if (decisionSpare >= 0) close(decisionSpare);
+-  }
++  kj::AutoCloseFd decisionSpare{open("/dev/null", O_RDONLY | O_CLOEXEC)};
+   bool rejectOnly = false;
+   uint64_t durableHome = 0;
++  // Shippers and SQLite's deferred close callbacks borrow this channel. Keep it alive
++  // until the home has canceled its tasks and destroyed its actors and isolate copy.
++  kj::Own<server::DurableWalChannel> wal;
+   std::shared_ptr<Slot> durableSlot;
+   // The cold load in flight on this home. Its waiters all want its definition, and it
+   // ends with the last of them, so a canceled load is never left for a later tree.
+@@ -1954,7 +1953,6 @@ struct ThreadState {
+     bool settled = false;
+   };
+   std::optional<DurableLoad> durableLoad;
+-  kj::Own<server::DurableWalChannel> wal;
+   struct WalPreparation {
+     explicit WalPreparation(kj::Promise<server::DurableWalPosition> task): ready(task.fork()) {}
+     kj::ForkedPromise<server::DurableWalPosition> ready;
+@@ -1992,6 +1990,9 @@ struct ThreadState {
+   };
+   std::map<Worker::Actor *, uint64_t> durableActorTrees;
+   std::map<uint64_t, DurableRoot> durableRoots;
++  // Cancel sessions and background work before destroying the state they can access during
++  // cancellation, including the actor indexes and storage that their actor references use.
++  kj::TaskSet tasks{errors};
+ };
+ 
+ Frankenvalue readNativeProps(ThreadState &state, rpc::Frankenvalue::Reader value);
+@@ -2990,11 +2991,8 @@ struct ThreadedServer {
+       threaded::LoadStage loadStage) {
+     // One descriptor per event loop is held aside for this private proof path.
+     // Releasing it permits the receipt exchange even during process EMFILE.
+-    if (state.decisionSpare >= 0) {
+-      close(state.decisionSpare);
+-      state.decisionSpare = -1;
+-    }
+-    KJ_DEFER(state.decisionSpare = open("/dev/null", O_RDONLY | O_CLOEXEC));
++    state.decisionSpare = nullptr;
++    KJ_DEFER(state.decisionSpare = kj::AutoCloseFd(open("/dev/null", O_RDONLY | O_CLOEXEC)));
+     auto receipt = field(input, "dispatchReceipt");
+     KJ_REQUIRE(receipt.isString() && receipt.getString().size() == 32,
+         "missing private dispatch decision receipt");
