@@ -160,10 +160,22 @@ async function webSocketAdmission(cluster) {
   }
 }
 
+async function waitForDatabaseCatalog(cluster) {
+  const { storage } = await cluster.api('/v1/status');
+  const revision = BigInt(storage.tenantsRevision);
+  await eventually('every node has applied the database catalog', async () => {
+    await Promise.all(cluster.nodes.map(async node => {
+      const { storage } = await cluster.state(node);
+      assert.ok(BigInt(storage.appliedTenantsRevision) >= revision, node);
+    }));
+  });
+}
+
 async function sqlAtomicity(cluster) {
   const { path, token } = await cluster.tenant('sql-test');
   const database = `${path}/databases/ledger`;
   const { database: created } = await cluster.api(database, { method: 'POST', token });
+  await waitForDatabaseCatalog(cluster);
   const query = (body) => cluster.api(`${database}/query`, { method: 'POST', token, body, timeout: 35000 });
   // The database's namespace can take time to become visible on the nodes.
   await eventually('database serves SELECT', async () => {
@@ -273,7 +285,9 @@ async function threadedSqlCliParity(cluster) {
   const cli = async (...args) => JSON.parse(await cluster.command(process.execPath,
     [cowctl, 'd1', ...args, '--json'], { cwd, token: tenant.token, env: { HOME: cwd } }));
 
-  const { database: source } = await cli('create', 'books');
+  // Let the fixture wait on the tenant index before any SQL claims the shard.
+  const { database: source } = await cli('create', 'books', '--no-wait');
+  await waitForDatabaseCatalog(cluster);
   const migration = await cli('migrations', 'create', source.name, 'create books');
   await writeFile(join(migration.directory, migration.created), `CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
 CREATE UNIQUE INDEX book_title ON books(title);
@@ -318,7 +332,8 @@ INSERT INTO books VALUES (1, 'One');
   const exported = await cli('export', source.name, '--output', 'backup.sql');
   assert.equal(exported.success, true);
   assert.equal(exported.mode, 'atomic');
-  const { database: backup } = await cli('create', 'books-backup');
+  const { database: backup } = await cli('create', 'books-backup', '--no-wait');
+  await waitForDatabaseCatalog(cluster);
   await importFile(backup.name, 'backup.sql');
 
   await execute(source.name, "INSERT INTO books VALUES (3, 'After bookmark')");
@@ -330,6 +345,7 @@ INSERT INTO books VALUES (1, 'One');
   assert.equal(restored.database, 'books-restored');
   assert.equal(restored.point.bookmark, point.bookmark);
   assert.notEqual(restored.namespaceId, source.namespaceId);
+  await waitForDatabaseCatalog(cluster);
   const historical = { name: restored.database, namespaceId: restored.namespaceId };
   for (const db of [backup, historical]) {
     await eventually(`${db.name} serves the restored schema`, async () => {
