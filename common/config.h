@@ -229,6 +229,8 @@ struct DurableLogConfig {
   bool diskBytesDefault = true;
   uint64_t peerBufferBytes = 256u << 20;
   uint64_t objectBytes = 10ull << 30;
+  uint64_t sqlDatabaseSpillBytes = 1ull << 30;
+  uint64_t sqlProcessSpillBytes = 0; // Derive from sqlDatabaseSpillBytes.
   uint64_t checkpointBytes = 4u << 20;
   uint32_t idleCheckpointMs = 10000;
   uint32_t uploadRetryMs = 500, uploadRetryMaxMs = 30000;

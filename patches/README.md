@@ -93,6 +93,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   uses that detail before it receives an event dispatcher to confirm that the operation never ran.
   Patch 0182 uses SQLite's per-connection allocator meter for threaded platform databases.
   A local heap refusal rolls back the current transaction and preserves the open connection.
+  Patch 0183 bounds uncommitted WAL and live SQLite temporary files across each threaded
+  platform database and its durable process. The SQLite VFS charges write extents and the
+  platform transaction settles spill refusals on the open connection.
   Patch 0180 recognizes recorded database reservation returns at expiry, protects the returned
   preparation credit after routing retirement, and counts lent heap headroom in the replacement band.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.

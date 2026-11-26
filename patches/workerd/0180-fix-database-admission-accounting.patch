@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Fri, 27 Nov 2026 02:15:09 +0800
+Date: Fri, 27 Nov 2026 02:59:27 +0800
 Subject: [PATCH] Keep database admission credits through retirement
 
 Honor a recorded reservation return at expiry, reserve preparation capacity
@@ -351,7 +351,7 @@ index f5029f64355bb091fee49f6d92ff9f3aae09d959..d1164d9463d31ce41fce91019133458f
  
  // Each long operation below ended the process before v138 (exit 74 at the
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8ef0e04f3 100644
+index 5f8009232c1b74fa0662bc4879dc23a59811653c..f391261748c3f980c6ea8760d1a0b7b6492ee342 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -354,7 +354,7 @@ struct ResourceBudget {
@@ -519,8 +519,8 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
 +        sourceAddress(std::move(sourceAddress)),
          identity(std::move(identity)),
          durableStorage(durableDirectory
-                 ? std::make_unique<server::DurableStorage>(kj::mv(durableDirectory))
-@@ -2780,7 +2791,7 @@ struct ThreadedServer {
+                 ? std::make_unique<server::DurableStorage>(kj::mv(durableDirectory),
+@@ -2782,7 +2793,7 @@ struct ThreadedServer {
              configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
          parent(parent),
          subrequestBudget(limit, tenantBudget->limit) {
@@ -529,7 +529,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
      if (this->durableStorage) {
        KJ_REQUIRE(durableCommitDelayMs <= 1000, "invalid durable test commit delay");
        const auto refuseGroup = configuredCount("COWORKERD_DO_TEST_REFUSE_GROUP", 0);
-@@ -2817,6 +2828,11 @@ struct ThreadedServer {
+@@ -2819,6 +2830,11 @@ struct ThreadedServer {
            },
            durableNumber(std::string_view(this->identity).substr(colon + 1)));
      }
@@ -541,7 +541,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
      registerRoleFatalHandler(durableAdmission.has_value(), &v8::V8::SetFatalErrorHandler);
      // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker (exit 78).
      server::requireSecureSandbox();
-@@ -3089,7 +3105,7 @@ struct ThreadedServer {
+@@ -3091,7 +3107,7 @@ struct ThreadedServer {
  
    // Called with durableRoutingMutex held. The home still rechecks all the
    // prerequisites locally before it fences admission to the selected tree.
@@ -550,7 +550,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
      if (databaseVictim) {
        if (!needsPreparationBudget) databaseVictim->preferDatabase = true;
        if (needsPreparationBudget && !databaseVictim->preparationCeiling) {
-@@ -3100,7 +3116,8 @@ struct ThreadedServer {
+@@ -3102,7 +3118,8 @@ struct ThreadedServer {
        }
        return true;
      }
@@ -560,7 +560,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
      for (const auto& thread: threads) {
        const auto& home = *thread->home;
        if (!home.databaseCanRetire || home.reservedTrees != 1 || home.resident.size() != 1 ||
-@@ -3111,7 +3128,7 @@ struct ThreadedServer {
+@@ -3113,7 +3130,7 @@ struct ThreadedServer {
        const auto tree = *home.resident.begin();
        if (!durableAdmission->isIdleTree(tree, thread->homeId) ||
            (databaseVictim && home.databaseLastUse >= databaseVictim->lastUse)) continue;
@@ -569,7 +569,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
        if (!reservation) continue;
        const auto preparationCeiling =
            needsPreparationBudget ? reservation->replacementCeiling() : std::nullopt;
-@@ -3119,8 +3136,12 @@ struct ThreadedServer {
+@@ -3121,8 +3138,12 @@ struct ThreadedServer {
        databaseVictim =
            DatabaseRetirement{thread->homeId, tree, home.databaseLastUse, reservation->returned,
              deadline, !needsPreparationBudget, preparationCeiling};
@@ -582,7 +582,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
      wake(threads[databaseVictim->home - 1]->wake);
      return true;
    }
-@@ -3139,10 +3160,8 @@ struct ThreadedServer {
+@@ -3141,10 +3162,8 @@ struct ThreadedServer {
        durableAdmission->limitDatabaseTreePreference(
            outcome == Outcome::RELEASED ? now + DATABASE_ADMISSION_GRACE : now);
      }
@@ -595,7 +595,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
      if (outcome == Outcome::EXPIRED) {
        home.databaseCanRetire = false;
        durableAdmission->recordOverload();
-@@ -3166,23 +3185,23 @@ struct ThreadedServer {
+@@ -3168,23 +3187,23 @@ struct ThreadedServer {
      databaseCapacityWaiters.clear();
    }
  
@@ -629,7 +629,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
        std::erase_if(databaseCapacityWaiters, [](auto &waiter) { return !waiter->isWaiting(); });
        databaseCapacityWaiters.push_back(kj::mv(signal.fulfiller));
      }
-@@ -3192,12 +3211,12 @@ struct ThreadedServer {
+@@ -3194,12 +3213,12 @@ struct ThreadedServer {
    // durableRoutingMutex holds placement and event admission together, before
    // the accept loop acknowledges a connection or reads its dispatch bytes.
    bool reserveDurableHome(
@@ -644,7 +644,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
        for (size_t i = 0; i < threads.size(); ++i) {
          if (!threads[i]->home) continue;
          if (databaseVictim && databaseVictim->home == i + 1) continue;
-@@ -3227,15 +3246,17 @@ struct ThreadedServer {
+@@ -3229,15 +3248,17 @@ struct ThreadedServer {
    }
  
    server::DurableAdmission::Result queueDurable(
@@ -665,7 +665,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
        KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket, !database || !result.needsHome));
        durableAdmission->releaseUnassigned(result.ticket->tree);
        result = {.status = Admission::Status::OVERLOADED, .newTreeCapacityRefused = result.needsHome};
-@@ -3244,7 +3265,7 @@ struct ThreadedServer {
+@@ -3246,7 +3267,7 @@ struct ThreadedServer {
      }
      if (database && result.newTreeCapacityRefused) {
        // The existing pre-dispatch retry waits for idle retirement on its original lease.
@@ -674,7 +674,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
        durableAdmission->recordOverload();
      }
      return result;
-@@ -3450,6 +3471,40 @@ struct ThreadedServer {
+@@ -3452,6 +3473,40 @@ struct ThreadedServer {
      return true;
    }
  
@@ -715,7 +715,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
    void retireIdleDurableRoots(ThreadState &state) {
      const auto homeId = state.durableHome;
      const auto victim = [&]() -> std::optional<DatabaseRetirement> {
-@@ -3526,17 +3581,8 @@ struct ThreadedServer {
+@@ -3528,17 +3583,8 @@ struct ThreadedServer {
        }
        {
          std::lock_guard lock(durableRoutingMutex);
@@ -735,7 +735,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
          if (forAdmission) root.admissionClosing = true;
        }
        // Park the whole object's node transports before canceling I/O or
-@@ -3593,20 +3639,8 @@ struct ThreadedServer {
+@@ -3595,20 +3641,8 @@ struct ThreadedServer {
        state.durableRoots.erase(current);
        {
          std::lock_guard lock(durableRoutingMutex);
@@ -758,7 +758,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
        }
      }
      if (reclaimed) {
-@@ -7841,12 +7875,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7845,12 +7879,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
        }
      }
      if (server.durableAdmission) {
@@ -772,7 +772,7 @@ index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..55105573774306df7be4702f6e548fa8
        for (const auto &ticket: expired) {
          auto socket = durableWaiting.find(ticket.event);
          if (socket != durableWaiting.end()) closeConnection(connections.find(socket->second));
-@@ -7957,6 +7986,7 @@ int main(int argc, char **argv) {
+@@ -7961,6 +7990,7 @@ int main(int argc, char **argv) {
        directory = newDurableTestDirectory(listener);
      }
      server = new ThreadedServer(limit, argv[2], argv[3], parent, kj::mv(directory), kj::mv(wal));
