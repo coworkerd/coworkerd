@@ -15,7 +15,7 @@ jobs:
       CXX: clang++-19
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       WRANGLER_SEND_METRICS: 'false'
-      CANDIDATE: d1492c09bd5b52171f77c23cc5d814eba671f2a3
+      CANDIDATE: 08e439c0584a86d3e630307bb86afa33f2ffba73
       BASELINE: 01a9af30fdca886e1cc4ae3b82399c202099fe78
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
