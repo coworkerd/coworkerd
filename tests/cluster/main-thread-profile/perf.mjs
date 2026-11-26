@@ -67,14 +67,16 @@ export async function summarizeStacks(path, [begin, end]) {
   }
   finish();
   const samples = Object.values(histogram).reduce((sum, entry) => sum + entry.samples, 0);
-  assert.ok(samples > 0, `no in-window cpu-clock samples among ${available} records in ${path}\n${firstLines.join('\n')}`);
+  assert.ok(samples > 0, `no in-window cpu-clock samples among ${available} records for ${begin}–${end} ns in ${path}\n${firstLines.join('\n')}`);
   return { samples, histogram, stacks };
 }
 
 export async function recordPerf({ pid, data, script, drive, seconds }) {
+  const ready = data + '.ready';
+  // perf releases its child when events are open. The data file can appear well before that.
   const child = spawn('sudo', ['-n', 'perf', 'record', '--clockid', 'mono',
     '-e', 'cpu-clock', '-F', '499', '--call-graph', 'dwarf,8192', '-t', String(pid), '-o', data,
-    '--', 'sleep', String(seconds)],
+    '--', 'sh', '-c', 'touch "$1"; exec sleep "$2"', 'perf-recording', ready, String(seconds)],
   { stdio: ['ignore', 'ignore', 'pipe'] });
   const closed = once(child, 'close');
   let stderr = '';
@@ -82,7 +84,7 @@ export async function recordPerf({ pid, data, script, drive, seconds }) {
   let result;
   try {
     await Promise.race([
-      eventually('perf event is open', () => access(data), { timeout: 10000 }),
+      eventually('perf event is open', () => access(ready), { timeout: 15000 }),
       closed.then(([code]) => { throw new Error(`perf record exited (${code}) before measurement\n${stderr}`); }),
     ]);
     result = await drive();
@@ -99,7 +101,7 @@ export async function recordPerf({ pid, data, script, drive, seconds }) {
     assert.equal(code, 0, 'perf script failed');
   } finally {
     await fd.close();
-    await rm(data, { force: true });
+    await Promise.all([data, ready].map(path => rm(path, { force: true })));
   }
   const bytes = (await stat(script)).size;
   assert.ok(bytes > 0, 'perf produced no stack dump for TID ' + pid + '\n' + stderr);

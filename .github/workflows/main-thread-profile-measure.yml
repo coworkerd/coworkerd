@@ -41,11 +41,30 @@ jobs:
         run: |
           kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64)
           printf 'path=%s\n' "$kernel" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: daemons
+        with:
+          path: |
+            build/coworkerd
+            build/coworkerd-apiserver
+            build/coworkerd-launcher
+            build/coworkerd-bench-http-forwarder
+          key: profile-daemons-326bec7-${{ hashFiles('tests/cluster/main-thread-profile/*.c++', 'tests/cluster/main-thread-profile/*.h', 'tests/cluster/main-thread-profile/instrumentation.patch') }}
       - name: Build the benchmark node and forwarder
+        if: steps.daemons.outputs.cache-hit != 'true'
         run: |
           git apply tests/cluster/main-thread-profile/instrumentation.patch
           bash scripts/build.sh -DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG -g1 -fno-omit-frame-pointer'
           cmake --build build --target coworkerd-bench-http-forwarder
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        if: steps.daemons.outputs.cache-hit != 'true'
+        with:
+          path: |
+            build/coworkerd
+            build/coworkerd-apiserver
+            build/coworkerd-launcher
+            build/coworkerd-bench-http-forwarder
+          key: ${{ steps.daemons.outputs.cache-primary-key }}
       - name: Record runner details
         run: |
           mkdir -p reports
