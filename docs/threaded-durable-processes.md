@@ -411,18 +411,22 @@ copy release. After a routing retirement, the home and one routing tree credit g
 databases 100 ms to retry at the native preface. Existing tenant trees can continue
 serving calls during that interval.
 A cold load that cannot register its initial reservation may retire one database whose
-charge would cover the shortfall. One preparation credit is held for a database while
-the reservation returns and for up to 100 ms afterward. The cold load retries once.
+charge would cover the shortfall, then retry the reservation once. Retirement selected
+by routing or cold-load admission holds one preparation credit for a database while the
+reservation returns and for up to 100 ms afterward.
 Above the initial-admission ceiling, a database can only replace one idle database.
-Its first reservation must fit within the returned charge and leave the total within
-the hard process budget. In the memory probe the existing copies charged 1,974,448,702
+Its first reservation must fit within the returned charge and leave the reserved total
+at or below its pre-release value. In that band, reserved memory plus lent heap headroom
+must fit the hard process budget. In the memory probe the existing copies charged 1,974,448,702
 bytes against the initial-admission ceiling of 1,973,251,124 bytes. A typical copy
 returned 2,732,370 bytes, and the new copy's first reservation was 2,621,440 bytes.
-If retirement cannot return the reservation within one second, the process clears the
-victim, counts an overload and logs its home and tree. Capacity waiters receive a refusal
-and the process can use the home once its normal close is complete.
-A refused call can retire several databases over the node's five-second routing retry
-window, one per retry after each preceding retirement reaches its own one-second deadline.
+At the one-second deadline, the process honors a recorded release even if the home has
+yet to observe it. If the charge is still held, the process clears the victim, counts
+an overload, logs the home and tree, and refuses capacity waiters. The process can use
+the home once its normal close is complete.
+If every victim's reservation stays held, one refused call can retire several databases
+within the node's five-second routing retry window, with at most one victim per retry
+and each new selection waiting for the previous victim's one-second deadline.
 
 The earlier archive completed 1 of 116 queries with `residentObjects: 4` and
 105 of 116 at the default memory budget with extra homes. The revised kernel completed

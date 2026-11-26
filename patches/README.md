@@ -96,6 +96,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0183 bounds uncommitted WAL and live SQLite temporary files across each threaded
   platform database and its durable process. The SQLite VFS charges write extents and the
   platform transaction settles spill refusals on the open connection.
+  Patch 0180 recognizes recorded database reservation returns at expiry, protects the returned
+  preparation credit after routing retirement, and counts lent heap headroom in the replacement band.
   Patch 0184 adds each platform database's SQLite heap to its copy's process memory reservation
   in 1 MiB steps. The hooks use the existing allocator scope in `src/workerd/util/` and the copy
   accounting in `src/workerd/threaded/`.

@@ -46,11 +46,11 @@ index b03e958d5b8dd371d31e3d775374fef9691404b2..cf9f554ed3a6b79172e1bcba4cce594f
    kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
        DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index f5029f64355bb091fee49f6d92ff9f3aae09d959..63344e6fcc263f43831f15e97a14e1b209de97da 100644
+index d1164d9463d31ce41fce91019133458f2aac7308..0022657f86dc36a6445a68041b40fcc4a0cb7aeb 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -235,6 +235,133 @@ KJ_TEST("a returned preparation credit is available to the waiting database firs
-   KJ_EXPECT(competitor.registerPreparation());
+@@ -523,6 +523,133 @@ KJ_TEST("queueDurable holds the returned tree and preparation credits until a da
+   KJ_EXPECT(ordinary.registerPreparation());
  }
  
 +KJ_TEST("SQLite allocations share the copy reservation with V8 and return only their net change") {
@@ -184,7 +184,7 @@ index f5029f64355bb091fee49f6d92ff9f3aae09d959..63344e6fcc263f43831f15e97a14e1b2
    int fds[2];
    KJ_SYSCALL(pipe(fds));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d8d16e5e0 100644
+index f391261748c3f980c6ea8760d1a0b7b6492ee342..ee598497db95935e5390c4ba7597c9afa49e81f4 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -350,7 +350,7 @@ struct ResourceBudget {
@@ -196,7 +196,7 @@ index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d
    // Heap headroom near-heap-limit raises granted above what their isolates
    // used, until each call's termination takes effect (MemoryBudget::raise()):
    // two isolates raised at once never both count on the same remainder.
-@@ -473,7 +473,8 @@ struct ResourceBudget {
+@@ -482,7 +482,8 @@ struct ResourceBudget {
        uint64_t newAddress,
        bool admission = false,
        bool observe = false,
@@ -206,7 +206,7 @@ index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d
      std::lock_guard lock(mutex);
      const auto reserved = memoryReserved.load();
      if (memoryBeforeRelease != nullptr) *memoryBeforeRelease = reserved;
-@@ -485,13 +486,14 @@ struct ResourceBudget {
+@@ -494,13 +495,14 @@ struct ResourceBudget {
      if (!accepted && !observe) return false;
      memoryReserved.store(memory + newMemory);
      addressReserved.store(address + newAddress);
@@ -222,7 +222,7 @@ index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d
    static constexpr uint64_t MiB = ResourceBudget::MiB;
    // The capacity acquisition records heap and RSS deltas to validate this seed
    // and fixed native overhead separately from each isolate's own heap ceiling.
-@@ -502,7 +504,8 @@ struct ResourceReservation {
+@@ -511,7 +513,8 @@ struct ResourceReservation {
        : budget(std::move(budget)),
          maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB),
          returned(platformDatabase ? std::make_shared<DatabaseReservationReturn>() : nullptr) {}
@@ -232,7 +232,7 @@ index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d
      if (!registered) return;
      (void)budget->change(memoryCharge, 0, addressCharge, 0, false, false,
          returned ? &returned->memoryBeforeRelease : nullptr);
-@@ -513,8 +516,8 @@ struct ResourceReservation {
+@@ -522,8 +525,8 @@ struct ResourceReservation {
    const uint64_t maximumHeap;
    const std::shared_ptr<DatabaseReservationReturn> returned;
    std::mutex mutex;
@@ -243,7 +243,7 @@ index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d
    uint64_t memoryCharge = 0, addressCharge = 0;
    uint32_t preparing = 0;
    bool registered = false;
-@@ -522,10 +525,12 @@ struct ResourceReservation {
+@@ -531,10 +534,12 @@ struct ResourceReservation {
      std::lock_guard lock(mutex);
      return registered ? budget->replacementCeiling(memoryCharge, addressCharge) : std::nullopt;
    }
@@ -259,7 +259,7 @@ index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d
      if (fits || observe) {
        memoryCharge = memory;
        addressCharge = address;
-@@ -593,6 +598,21 @@ struct ResourceReservation {
+@@ -602,6 +607,21 @@ struct ResourceReservation {
      ownedExternal -= size;
      (void)resize(false, true);
    }
@@ -281,7 +281,7 @@ index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d
    bool retainLogs(uint64_t bytes) {
      std::lock_guard lock(mutex);
      logs += bytes;
-@@ -1795,7 +1815,8 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1799,7 +1819,8 @@ struct RequestLimits final: LimitEnforcer {
      return 0 * kj::SECONDS;
    }
    size_t getSqliteMemoryUsage() const override {
@@ -291,7 +291,7 @@ index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d
    }
    Slot &slot;
    Measurement &measurement;
-@@ -3723,6 +3744,9 @@ struct ThreadedServer {
+@@ -3757,6 +3778,9 @@ struct ThreadedServer {
          ",\"isolateResets\":" + std::to_string(durableIsolateResets.load()) +
          ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
          ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
@@ -301,7 +301,7 @@ index 5f8009232c1b74fa0662bc4879dc23a59811653c..c68f5b5fb01149069fb8a3d094a1906d
          ",\"overloaded\":" + std::to_string(state.overloads) +
          ",\"expired\":" + std::to_string(state.expired) + "}}";
      if (publish) {
-@@ -7041,8 +7065,14 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7075,8 +7099,14 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
                SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES,
                SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES)
          : kj::maxValue;
