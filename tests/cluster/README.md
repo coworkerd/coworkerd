@@ -57,10 +57,11 @@ Run `node tests/cluster/run.mjs "$kernel" threaded-sql-default-mailbox` on Linux
 with the matching kernel and `coworkerd-platform-test` binaries. The three-node Compose fixture
 enables threaded database placement on one owner. It uses the compiled mailbox limits, the default
 process in-flight limit, and ordinary request deadlines. The case warms one database, launches 128
-concurrent HTTP SQL requests through the control plane, and then launches 128 concurrent Worker
-requests through a D1 binding to the same database. Each request reads one seeded row by primary
-key. The case reports the success count for each route and requires all replies to contain the row,
-with the original threaded process generation and no admission overloads.
+concurrent HTTP SQL requests through the control plane, and then launches 128 concurrent requests
+to a Worker on a peer node. Its D1 binding routes all 128 calls to the same database owner. Each
+request reads one seeded row by primary key. The case starts each burst with idle node admission
+counters and requires all replies to contain the row, with the original threaded process generation
+and no admission overloads.
 
 ### Threaded SQL and CLI parity
 

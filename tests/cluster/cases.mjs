@@ -813,7 +813,7 @@ async function threadedDatabaseAdmissionMixed(cluster) {
 }
 
 async function threadedSqlDefaultMailbox(cluster) {
-  const [owner] = cluster.nodes;
+  const [owner, ingress] = cluster.nodes;
   const tenant = await cluster.tenant('sql-default-mailbox', { durableObjectNamespaces: 64 });
   const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 1]]));
   const [db] = databases.get(owner);
@@ -825,7 +825,9 @@ async function threadedSqlDefaultMailbox(cluster) {
     const row = await env.DB.prepare(${JSON.stringify(query.sql)}).bind(1).first();
     return Response.json(row);
   } };`, { wrangler: { d1_databases: [{ binding: 'DB', database_name: db.name }] } });
-  const d1 = async () => json(await workerCall(cluster, owner, tenant, 'read', { timeout: 35000 }), 200, 'D1 read');
+  // Exercise the binding across nodes so the Worker roots and database calls
+  // each use their node's default admission budget.
+  const d1 = async () => json(await workerCall(cluster, ingress, tenant, 'read', { timeout: 35000 }), 200, 'D1 read');
 
   const seed = await sql([
     { sql: 'CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)' },
@@ -850,6 +852,10 @@ async function threadedSqlDefaultMailbox(cluster) {
     }],
     ['D1', async () => assert.deepEqual(await d1(), row)],
   ]) {
+    await eventually(`${route} starts with idle node admission counters`, async () => {
+      const states = await Promise.all(cluster.nodes.map(node => cluster.state(node)));
+      for (const state of states) assert.equal(state.placement.inFlight.total, 0);
+    });
     const start = performance.now();
     const replies = await Promise.allSettled(Array.from({ length: clients }, () => read()));
     const rejected = replies.filter(reply => reply.status === 'rejected');
