@@ -41,7 +41,8 @@ Once the Worker accepted a WebSocket (`101`), the connection ends with a close c
 
 **Durable Object calls**: what a stub's `fetch()` answers when the object's request fails -- the Worker decides what its own client gets. The refusals of the table above apply as well (`WORKER_INVALID`, `TENANT_UNAVAILABLE`, `VERSION_UNAVAILABLE`, `SECRET_UNAVAILABLE`, `OVERLOADED`, `SUBREQUEST_BUDGET_EXHAUSTED`, and `LEASE_EXPIRED`). A call to an object goes to the node that owns the object's shard ([cluster state](../cluster-state.md), section 11); when that node refuses it, or cannot be reached, the node of the caller looks for the owner once more and sends it once more, and answers the second refusal: `PEER_UNAVAILABLE` (`503`) when the owner could not be reached, the owner's own code otherwise; once sent, a call whose answer did not come back is `RESULT_UNCERTAIN`. While a shard has no owner a node can reach, its objects' calls fail this way until another node takes the shard over.
 
-If the threaded durable child explicitly refuses admission, `stub.fetch()` returns HTTP 503 with `code: "OVERLOADED"`,
+If the threaded durable child explicitly refuses admission or cannot reserve the cold isolate copy for an admitted call,
+`stub.fetch()` returns HTTP 503 with `code: "OVERLOADED"`,
 `dispatched: false` and `retryable: true`. The object never ran the operation, so the caller can retry a write.
 This applies to both Worker and object callers, including calls forwarded to another node.
 The owner returns this refusal after routing the call, so the existing owner lookup retry has already ended.
@@ -226,7 +227,7 @@ not cause the runtime to add `.code`.
 | `CPU_LIMIT_EXCEEDED: ...`, `MEMORY_LIMIT_EXCEEDED: ...` | the same | A limit ended the method, as it would a request (section 1) | Do less per call |
 | `VERSION_UNAVAILABLE: ...`, `VERSION_PIN_MISMATCH: ...` | the same | The deployment changed during the call (section 1) | Retry |
 | `DO_HOP_LIMIT: ...`, `DO_OWNER_EXPIRED: ...`, `DO_SHARD_EPOCH_MISMATCH: ...`, `DO_RECOVERING: ...` | the same | The object could not be reached or run, as for a `fetch` to it (section 1) | As in section 1 |
-| `OVERLOADED: {…}` | `OVERLOADED` | For a threaded durable admission refusal, the JSON in the message contains `dispatched: false` and `retryable: true`. The object never ran the method | Retry when capacity is available |
+| `OVERLOADED: {…}` | `OVERLOADED` | When the threaded child explicitly refuses admission or cannot reserve the cold copy, the JSON in the message contains `dispatched: false` and `retryable: true`. The object never ran the method | Retry when capacity is available |
 | `Network connection lost.` and the like | absent | The node that ran the target went away while the caller still held one of its capabilities | Retry; the call tree is over |
 
 A value a method sends or returns is at most 32 MiB serialized (workerd's own limit), and a value that is not

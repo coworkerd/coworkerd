@@ -2246,6 +2246,13 @@ async function threadedPlatformDefinition(cluster) {
   await durableTakeover(cluster, tenants[0]);
 }
 
+function assertDurableCapacityRefusal(result) {
+  assert.equal(result.code, 'OVERLOADED');
+  assert.equal(result.dispatched, false);
+  assert.equal(result.retryable, true);
+  assert.equal(result.reason, 'The durable process refused the call before it started. The operation did not execute and can be retried.');
+}
+
 async function durableAdmissionRefusal(cluster) {
   await waitForDurableMembership(cluster);
   const [objectOwner, databaseOwner] = cluster.nodes;
@@ -2310,12 +2317,6 @@ async function durableAdmissionRefusal(cluster) {
   const call = (node, params) => workerCall(cluster, node, tenant, `counter?${new URLSearchParams(params)}`);
   const read = (node, target) => call(node, { target, op: 'read' });
   const zero = { count: 0, attempts: 0 };
-  const checkRefusal = result => {
-    assert.equal(result.code, 'OVERLOADED');
-    assert.equal(result.dispatched, false);
-    assert.equal(result.retryable, true);
-    assert.equal(result.reason, 'The durable process refused the call before it started. The operation did not execute and can be retried.');
-  };
   await eventually('the blocker and relay are resident on separate nodes', async () => {
     assert.deepEqual(json(await read(objectOwner, blocker), 200, 'blocker'), zero);
     assert.deepEqual(json(await read(databaseOwner, caller), 200, 'relay'), zero);
@@ -2337,8 +2338,8 @@ async function durableAdmissionRefusal(cluster) {
     if (rpc) {
       assert.equal(reply.code, 'OVERLOADED');
       assert.match(reply.message, /^OVERLOADED: /);
-      checkRefusal(JSON.parse(reply.message.slice('OVERLOADED: '.length)));
-    } else checkRefusal(reply);
+      assertDurableCapacityRefusal(JSON.parse(reply.message.slice('OVERLOADED: '.length)));
+    } else assertDurableCapacityRefusal(reply);
   }
   await eventually('only the child overload counter changed on the target owner', async () => {
     const after = await durableGeneration(cluster, objectOwner);
@@ -2388,7 +2389,7 @@ async function durableAdmissionRefusal(cluster) {
       return snapshot;
     });
     const http = json(await sql(insert), 503, 'public HTTP SQL refused before dispatch');
-    checkRefusal(http);
+    assertDurableCapacityRefusal(http);
     const binding = json(await d1(), 503, 'D1 refused before dispatch');
     assert.equal(binding.cause, `OVERLOADED: ${http.reason}`);
     assert.equal(binding.message, `D1_ERROR: ${binding.cause}`);
@@ -2412,6 +2413,176 @@ async function durableAdmissionRefusal(cluster) {
   assert.equal(json(await d1('exec'), 200, 'D1 exec retry').count, 1);
   assert.deepEqual(json(await sql(rows), 200, 'one row per retried insert').results,
     [0, 1, 2, 3].map(value => ({ value })));
+}
+
+async function durableCopyReservationRefusal(cluster) {
+  const [owner, ingress] = cluster.nodes;
+  await waitForDurableMembership(cluster);
+  const tenant = await cluster.tenant('copy-reservation-refusal', { durableObjectNamespaces: 48 });
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 1]]));
+  const [db] = databases.get(owner);
+  const { storage: { tenantsRevision } } = await cluster.api('/v1/status');
+  await eventually('each node applies the tenant index containing the ledger', async () => {
+    const states = await Promise.all(cluster.nodes.map(node => cluster.state(node)));
+    assert.ok(states.every(state => BigInt(state.storage.appliedTenantsRevision) >= BigInt(tenantsRevision)));
+  });
+  const sql = sql => request(cluster.urls.apiserver, `${db.path}/query`, {
+    method: 'POST', token: tenant.token, body: { sql }, timeout: 10000,
+  });
+  assert.equal(json(await sql('CREATE TABLE ledger(value INTEGER PRIMARY KEY)'), 200, 'create SQL ledger').success, true);
+  await waitForWalPeers(cluster, owner);
+  const marker = join(cluster.durableLifecycleGate, 'copy-reservation-refusal');
+  const recordedRefusals = async () =>
+    (await cluster.state(owner)).placement.observability.total['refusal|durableObject|OVERLOADED'] ?? 0;
+  let refusal = 0;
+  const refuseNext = async call => {
+    const initial = await durableGeneration(cluster, owner);
+    const before = await recordedRefusals();
+    const request = String(++refusal);
+    await writeFile(`${marker}-next`, request);
+    await rename(`${marker}-next`, marker);
+    // The child reads the bind mount inside the owner container.
+    await eventually('the owner container sees the new refusal marker', async () => {
+      const observed = await cluster.compose(['exec', '-T', owner, 'sh', '-c',
+        'cat "$COWORKERD_DO_TEST_LIFECYCLE_DIR/copy-reservation-refusal"']);
+      assert.equal(observed, request);
+    });
+    const reply = await call();
+    assert.equal(await recordedRefusals(), before + 1,
+      `the owner records one refusal for marker ${request} (received HTTP ${reply.status})`);
+    await eventually('the refused event released its mailbox credit in the same process', async () => {
+      const current = await durableGeneration(cluster, owner);
+      assert.equal(current.generation, initial.generation);
+      assert.equal(current.lifecycle.durableAdmission.overloaded, initial.lifecycle.durableAdmission.overloaded);
+      assert.equal(current.lifecycle.durableAdmission.running, 0);
+      assert.equal(current.lifecycle.durableAdmission.waiting, 0);
+    });
+    return reply;
+  };
+
+  const worker = `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Counter extends DurableObject {
+      attempts = 0;
+      async count() { return (await this.ctx.storage.get('count')) ?? 0; }
+      async write() {
+        ++this.attempts;
+        const count = 1 + await this.count();
+        await this.ctx.storage.put('count', count);
+        return { count, attempts: this.attempts };
+      }
+      async writeThenThrow() {
+        await this.write();
+        throw new Error('OVERLOADED: process admission budget is full');
+      }
+      async fetch(request) {
+        if (request.method === 'POST') return Response.json(await this.write());
+        return Response.json({ count: await this.count(), attempts: this.attempts });
+      }
+    }
+    export default { async fetch(request, env) {
+      const params = new URL(request.url).searchParams;
+      const op = params.get('op');
+      if (op === 'run' || op === 'exec') {
+        try {
+          return Response.json(op === 'run' ? await env.DB.prepare('INSERT INTO ledger VALUES (2)').run()
+            : await env.DB.exec('INSERT INTO ledger VALUES (3)'));
+        } catch (e) { return Response.json({ message: e.message, cause: e.cause?.message }, { status: 503 }); }
+      }
+      const stub = env.COUNTER.getByName(params.get('name'));
+      if (op === 'read') return stub.fetch('http://counter/');
+      if (op === 'fetch') return stub.fetch('http://counter/', { method: 'POST', body: '1' });
+      try { return Response.json(op === 'throw' ? await stub.writeThenThrow() : await stub.write()); }
+      catch (e) { return Response.json({ code: e.code, message: e.message }, { status: 503 }); }
+    } };
+  `;
+  const wrangler = {
+    durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] },
+    migrations: [{ tag: 'v1', new_sqlite_classes: ['Counter'] }],
+    d1_databases: [{ binding: 'DB', database_name: db.name }],
+  };
+  const callWorker = (workerName, op, name = '') => workerCall(cluster, ingress, tenant,
+    `${workerName}?${new URLSearchParams({ name, op })}`);
+  await cluster.deploy(tenant, 'counter-fetch', worker, { wrangler });
+
+  const rows = async () => json(await sql('SELECT value FROM ledger ORDER BY value'), 200, 'SQL ledger').results;
+  const executedSql = async () => (await cluster.state(owner)).executions
+    .filter(row => row.target.startsWith(`${tenant.name}/__databases@`) && row.dispatched === true).length;
+  let offset = 0;
+  const expected = [];
+  const writes = [
+    () => sql('INSERT INTO ledger VALUES (1)'),
+    () => callWorker('counter-fetch', 'run'),
+    () => callWorker('counter-fetch', 'exec'),
+  ];
+  const databaseCopyState = async () => (await durableGeneration(cluster, owner)).lifecycle.durableAdmission;
+  for (const [index, write] of writes.entries()) {
+    const resident = await eventually('the current database root and copy are reported resident', async () => {
+      const state = await databaseCopyState();
+      assert.equal(state.residentRoots, 1);
+      assert.equal(state.homes, 1);
+      return state;
+    });
+    offset += 180000;
+    const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
+    await writeFile(advance, String(offset));
+    await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
+    await eventually('a new idle retirement releases the database root and its exclusive home', async () => {
+      const state = await databaseCopyState();
+      assert.equal(state.idleRetirements, resident.idleRetirements + 1);
+      assert.equal(state.residentRoots, 0);
+      assert.equal(state.homes, 0);
+    });
+    const before = await executedSql();
+    const reply = json(await refuseNext(write), 503, `SQL caller ${index + 1} received refusal`);
+    if (index === 0) {
+      assertDurableCapacityRefusal(reply);
+    } else {
+      const reason = 'OVERLOADED: The durable process refused the call before it started. The operation did not execute and can be retried.';
+      assert.equal(reply.cause, index === 1 ? reason : `Error in line 1: INSERT INTO ledger VALUES (3): ${reason}`);
+      assert.equal(reply.message, `${index === 1 ? 'D1_ERROR' : 'D1_EXEC_ERROR'}: ${reply.cause}`);
+    }
+    assert.equal(await executedSql(), before, 'the refusal did not count as an executed SQL request');
+    assert.deepEqual(await rows(), expected, 'the refused insert left the ledger unchanged');
+    const retried = json(await write(), 200, `SQL caller ${index + 1} retries once`);
+    if (index === 0) assert.equal(retried.success, true, retried.error);
+    expected.push({ value: index + 1 });
+    assert.deepEqual(await rows(), expected, 'one row per retried operation');
+  }
+  const before = await executedSql();
+  const conflict = json(await writes[0](), 200, 'SQL handler attempts a duplicate insert');
+  assert.equal(conflict.success, false);
+  assert.match(conflict.error, /UNIQUE constraint failed/);
+  assert.equal(conflict.retryable, undefined);
+  assert.equal(await executedSql(), before + 1);
+  assert.deepEqual(await rows(), expected);
+
+  for (const op of ['fetch', 'rpc']) {
+    // Each definition has its own cold copy. The stateless caller runs on a peer.
+    const workerName = `counter-${op}`;
+    if (op === 'rpc') await cluster.deploy(tenant, workerName, worker, { wrangler });
+    const { namespaceId, shards } = await cluster.api(`${tenant.path}/workers/${workerName}/namespaces/Counter`, { token: tenant.token });
+    const name = Array.from({ length: 64 }, (_, i) => `counter-${i}`).find(candidate => {
+      const id = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update(candidate).digest();
+      return shardOwnerOrder(cluster.nodes, namespaceId, Number(id.readBigUInt64BE() % BigInt(shards)))[0] === owner;
+    });
+    assert.ok(name, `the ${op} target belongs to ${owner}`);
+    const call = operation => callWorker(workerName, operation, name);
+    const reply = json(await refuseNext(() => call(op)), 503, `${op} copy reservation refused`);
+    if (op === 'rpc') {
+      assert.equal(reply.code, 'OVERLOADED');
+      assert.match(reply.message, /^OVERLOADED: /);
+      assertDurableCapacityRefusal(JSON.parse(reply.message.slice('OVERLOADED: '.length)));
+    } else assertDurableCapacityRefusal(reply);
+    assert.deepEqual(json(await call('read'), 200, `${op} target after refusal`), { count: 0, attempts: 0 });
+    assert.deepEqual(json(await call(op), 200, `${op} retry`), { count: 1, attempts: 1 });
+    if (op === 'rpc') {
+      const error = json(await call('throw'), 503, 'application exception after the second write');
+      assert.equal(error.code, undefined);
+      assert.equal(error.message, 'OVERLOADED: process admission budget is full');
+      assert.deepEqual(json(await call('read'), 200, 'RPC target after the exception'), { count: 2, attempts: 2 });
+    }
+  }
 }
 
 async function durableSlowHolder(cluster) {
@@ -3875,6 +4046,10 @@ export const durableGatedCases = {
       durableObjects: { threadedStorage: true, residentObjects: 1, confirmTimeoutMs: 25000 },
     }) : ({}),
     nodeEnvironment: node => node === 'node-2' ? { COWORKERD_DO_TEST_MAILBOX_EVENTS: '1' } : {},
+  },
+  'durable-threaded-copy-reservation-refusal': {
+    test: durableCopyReservationRefusal, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    controlDurableLifecycle: true, holdPeerAcks: false,
   },
   'threaded-sql-deadline': {
     test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
