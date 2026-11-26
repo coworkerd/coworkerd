@@ -109,4 +109,5 @@
 0178-keep-platform-databases-open-after-sql-interruption.patch
 0179-size-default-object-mailbox.patch
 0181-report-durable-copy-reservation-refusal.patch
+0182-bound-platform-sqlite-memory.patch
 0180-fix-database-admission-accounting.patch

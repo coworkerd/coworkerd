@@ -36,6 +36,7 @@ export class SqlDatabase extends DurableObject {
     // Pending storage work can outlive an event, including implicit writes
     // from native alarm cleanup. Drain it before a threaded SQL transaction.
     if (deadline) await this.ctx.storage.sync();
+    const unprocessable = code => code === "SQL_TRANSACTION_TOO_LARGE" || code === "SQL_MEMORY_LIMIT_EXCEEDED";
     const failure = error => {
       if (error?.code === "SQL_CLIENT_DISCONNECTED") throw error;
       const message = String(error instanceof Error ? error.message : error);
@@ -43,13 +44,13 @@ export class SqlDatabase extends DurableObject {
         if (!deadline) this.ctx.storage.sql.abortExecutionLimit();
         return { success: false, error: message, code: error.code, reason: message };
       }
-      if (error?.code === "SQL_TRANSACTION_TOO_LARGE") {
+      if (unprocessable(error?.code)) {
         // D1 reads the error string and can discard the structured fields.
         return { success: false, error: `${error.code}: ${message}`, code: error.code, reason: message };
       }
       return { success: false, error: message };
     };
-    const failureStatus = answer => answer?.code === "SQL_TRANSACTION_TOO_LARGE" ? 422 : answer?.code ? 503 : 200;
+    const failureStatus = answer => unprocessable(answer?.code) ? 422 : answer?.code ? 503 : 200;
     const fail = (error, batch = false) => {
       const answer = failure(error);
       return Response.json(batch && !answer.code ? [answer] : answer, { status: failureStatus(answer) });
