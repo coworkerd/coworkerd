@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { appendFile, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, rename, writeFile } from 'node:fs/promises';
 import { arch, cpus, freemem, loadavg, platform, release, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -8,12 +8,26 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
 
 const [side, checkoutArg, kernelArg, outputArg, mode, ...extra] = process.argv.slice(2);
-const idleAdmission = mode === '--idle-window-admission';
+const memoryAdmission = mode === '--idle-admission-memory';
+const unpacedAdmission = mode === '--idle-admission-unpaced' || memoryAdmission;
+const mixedCeiling = {
+  '--idle-admission-mixed': 'homes',
+  '--idle-admission-mixed-memory': 'memory',
+  '--idle-admission-mixed-resident': 'residentObjects',
+}[mode];
+const mixedAdmission = mixedCeiling !== undefined;
+const residentObjects = mixedCeiling === 'residentObjects' ? 4 : undefined;
+const busyProcesses = { '--idle-admission-busy-one': 1, '--idle-admission-busy-two': 2 }[mode];
+const idleAdmission = mode === '--idle-window-admission' || unpacedAdmission || mixedAdmission || Boolean(busyProcesses);
+const defaultHomes = mode === '--idle-admission-unpaced' || mixedCeiling === 'homes' || Boolean(busyProcesses);
 const defaultIdleWindow = mode === '--idle-window-default';
 const patchedIdleWindow = mode === '--idle-window-patched';
 const idleWindow = mode === '--idle-window' || defaultIdleWindow || patchedIdleWindow || idleAdmission;
 const modes = ['--smoke', '--default-admission', '--cold-follow-up', '--throughput', '--throughput-smoke',
-  '--idle-window', '--idle-window-default', '--idle-window-patched', '--idle-window-admission'];
+  '--idle-window', '--idle-window-default', '--idle-window-patched', '--idle-window-admission',
+  '--idle-admission-unpaced', '--idle-admission-memory', '--idle-admission-mixed',
+  '--idle-admission-mixed-memory', '--idle-admission-mixed-resident',
+  '--idle-admission-busy-one', '--idle-admission-busy-two'];
 if (!['object', 'native'].includes(side) || !checkoutArg || !kernelArg || !outputArg ||
     (mode !== undefined && !modes.includes(mode)) || (idleWindow && side !== 'object') || extra.length) {
   console.error('Usage: node tests/cluster/database-home-benchmark.mjs <object|native> <product-checkout> <kernel-directory> <new-report.jsonl> [' + modes.join('|') + ']');
@@ -39,7 +53,9 @@ const BenchmarkCluster = idleWindow
   ? (await import(pathToFileURL(join(checkout, 'tests/cluster/cluster.mjs')).href)).Cluster
   : Cluster;
 const settings = {
-  homes: idleWindow && !idleAdmission ? 80 : smoke || throughput ? 16 : 520,
+  homes: mixedCeiling === 'memory' ? 768
+    : residentObjects ? 12 : memoryAdmission ? 192
+    : defaultHomes ? 4 : idleWindow && !idleAdmission ? 80 : smoke || throughput ? 16 : 520,
   density: idleWindow ? [0, 1, 32, 64] : smoke ? [0, 3, 8] : [0, 100, 500],
   coldSamples: smoke ? 6 : 200,
   warmSamples: smoke ? 20 : 1000,
@@ -51,7 +67,7 @@ const reopenRounds = defaultIdleWindow ? 1 : 4;
 // Shorten the copy's post-retirement grace period for the benchmark.
 const profileCopyIdleMs = mode === '--idle-window' ? 12000 : 300000;
 const admissionDatabases = 1000;
-const admissionSpacingMs = 50;
+const admissionSpacingMs = unpacedAdmission ? 0 : 50;
 const controller = new AbortController();
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => controller.abort(new Error('Interrupted by ' + signal)));
@@ -63,7 +79,13 @@ process.env.COWORKERD_CLUSTER_BIN_DIR = binaries;
 const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   singleNode: true,
   productRoot: checkout,
-  databaseFixtureNodes: idleWindow ? ['node-1'] : [],
+  controlDurableLifecycle: mixedCeiling === 'memory',
+  threadedNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
+  ...(idleWindow && {
+    databaseFixtureNodes: ['node-1'],
+    // The imported Cluster from a historical checkout uses the singular option.
+    databaseFixtureNode: 'node-1',
+  }),
   configureNode: () => ({
     quarantineProcesses: 1,
     // A completed HTTP reply can precede retirement of its invocation.
@@ -72,22 +94,32 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
     // The admission share derived from a small VM can refuse fewer than 500 copies.
     // Raise the planning budget while keeping an explicit, equal process cap.
     ...(!defaultAdmission && !idleWindow && { memoryBudgetBytes: 16 * 1024 ** 3 }),
-    processPool: { count: 1, inFlightLimit: throughput ? throughputInFlightLimit : 128,
+    processPool: { count: 1, ...(!unpacedAdmission && !mixedAdmission && !busyProcesses && {
+      inFlightLimit: throughput ? throughputInFlightLimit : 128,
+    }),
+      ...(memoryAdmission && { threadedMemoryBytes: 448 * 1024 ** 2 }),
       ...(!defaultAdmission && !idleWindow && { threadedMemoryBytes: 3 * 1024 ** 3 }) },
-    durableObjects: { processes: 1, threadedStorage: true, peers: 0 },
+    durableObjects: { processes: busyProcesses ?? 1, threadedStorage: true, peers: 0, residentObjects },
   }),
   nodeEnvironment: () => ({
-    COWORKERD_DO_TEST_HOME_COUNT: String(settings.homes),
+    ...(!defaultHomes && { COWORKERD_DO_TEST_HOME_COUNT: String(settings.homes) }),
     // Keep both mailbox limits above the offered concurrency and its routing bytes.
-    COWORKERD_DO_TEST_MAILBOX_EVENTS: String(throughput ? throughputMailbox.events : 32),
+    ...(!unpacedAdmission && !mixedAdmission && !busyProcesses && {
+      COWORKERD_DO_TEST_MAILBOX_EVENTS: String(throughput ? throughputMailbox.events : 32),
+    }),
+    ...(mixedCeiling === 'memory' && { COWORKERD_DO_TEST_MAILBOX_EVENTS: '4' }),
     ...(throughput && { COWORKERD_DO_TEST_MAILBOX_BYTES: String(throughputMailbox.bytes) }),
   }),
 });
 const [owner] = cluster.nodes;
-if (idleWindow) assert.ok(cluster.databaseFixtureNodes.has(owner), 'supply a database placement checkout');
+if (idleWindow) {
+  assert.ok(cluster.databaseFixtureNodes?.has(owner) ?? (cluster.databaseFixtureNode === owner),
+    'supply a database placement checkout');
+}
 const tenantName = 'database-benchmark';
 const workload = 'traffic';
-const databaseCount = idleAdmission ? admissionDatabases
+const databaseCount = mixedCeiling === 'memory' ? settings.homes + 120
+  : memoryAdmission ? 125 : mixedAdmission ? 120 : busyProcesses ? 64 : idleAdmission ? admissionDatabases
   : throughput ? 8 : defaultAdmission ? settings.homes + 1 : settings.density.at(-1);
 const databases = Array.from({ length: databaseCount },
   (_, index) => 'db-' + String(index).padStart(4, '0'));
@@ -279,26 +311,37 @@ async function parallel(items, clients, run) {
   }));
 }
 
-async function durable() {
+async function durableProcesses() {
   const state = await cluster.state(owner);
-  const entries = state.processes.entries.filter(entry => entry.processClass === 'durable');
-  assert.equal(entries.length, 1);
-  const entry = entries[0];
-  assert.equal(entry.sandbox.durableServer, 'threaded');
-  assert.ok(entry.pid > 0 && entry.lifecycle?.durableAdmission);
-  return { entry, log: state.durableLog, processPool: state.processes.configuration };
+  const entries = state.processes.entries.filter(entry => entry.processClass === 'durable' && entry.state === 'ready');
+  assert.equal(entries.length, busyProcesses ?? 1);
+  for (const entry of entries) {
+    assert.equal(entry.sandbox.durableServer, 'threaded');
+    assert.ok(entry.pid > 0 && entry.lifecycle?.durableAdmission);
+  }
+  return { entries, log: state.durableLog, processPool: state.processes.configuration };
+}
+
+async function durable() {
+  const { entries: [entry], log, processPool } = await durableProcesses();
+  return { entry, log, processPool };
 }
 
 async function identify(kernelHash) {
-  const { entry, processPool } = await eventually('threaded durable child is ready', async () => {
-    const snapshot = await durable();
-    assert.equal(snapshot.entry.binarySha256, kernelHash);
-    assert.equal(snapshot.entry.lifecycle.durableAdmission.workerThreads, settings.homes);
+  const { entries, processPool } = await eventually('threaded durable children are ready', async () => {
+    const snapshot = await durableProcesses();
+    for (const entry of snapshot.entries) {
+      assert.equal(entry.binarySha256, kernelHash);
+      assert.equal(entry.lifecycle.durableAdmission.workerThreads, settings.homes);
+    }
     return snapshot;
   }, { timeout: 30000 });
   if (idleWindow) assert.equal(processPool.idleEvictMs, profileCopyIdleMs);
-  child = { processId: entry.processId, generation: entry.generation, pid: entry.pid };
-  await record('child', { ...child, processPool });
+  for (const entry of entries) {
+    const identity = { processId: entry.processId, generation: entry.generation, pid: entry.pid };
+    child ??= identity;
+    await record('child', { ...identity, processPool });
+  }
 }
 
 async function validateConfirmation() {
@@ -697,24 +740,32 @@ async function runIdleReopen(lastReadCompleted) {
   }
 }
 
-async function runIdleAdmission() {
+async function provisionAdmissionDatabases() {
   const tenant = await cluster.tenant(tenantName, { durableObjectNamespaces: databases.length });
   let revision = 0;
+  const catalog = [];
   for (const name of databases) {
     const created = await cluster.api(tenant.path + '/databases/' + name, { method: 'POST', token: tenant.token });
     revision = Math.max(created.revision, revision);
+    catalog.push(created.database);
   }
   assert.ok(revision > 0, 'database creation returns a catalog revision');
   await eventually('owner applies the database catalog', async () => {
     const state = await cluster.state(owner);
     assert.ok(Number(state.storage.appliedTenantsRevision) >= revision);
   });
+  return { tenant, revision, catalog };
+}
+
+async function runIdleAdmission() {
+  const { tenant, revision } = await provisionAdmissionDatabases();
   await record('idle-admission-setup', { databases: databases.length, revision, admissionSpacingMs,
     guest: await hostSample() });
 
   const start = performance.now();
   let succeeded = 0;
   let peakRssBytes = 0;
+  let peakHomes = 0;
   const { processPool } = await durable();
   const memoryBudgetBytes = processPool.threadedMemoryBytes;
   const failures = [];
@@ -736,6 +787,7 @@ async function runIdleAdmission() {
       assert.equal(entry.pid, child.pid);
       assert.equal(entry.generation, child.generation);
       peakRssBytes = Math.max(peakRssBytes, entry.residentBytes);
+      peakHomes = Math.max(peakHomes, entry.lifecycle.durableAdmission.homes);
       await record('idle-admission-sample', { tried, succeeded, elapsedMs: performance.now() - start,
         rssBytes: entry.residentBytes, memoryBudgetBytes,
         firstFailure: failures[0], residency: entry.lifecycle.durableAdmission });
@@ -746,10 +798,213 @@ async function runIdleAdmission() {
   }
   const elapsedMs = performance.now() - start;
   assert.ok(elapsedMs < profileCopyIdleMs, 'serial scan finishes inside the copy window');
+  const { entry } = await durable();
+  const admissionRetirements = entry.lifecycle.durableAdmission.admissionRetirements;
   await record('idle-admission-result', { tried: databases.length, succeeded, elapsedMs, peakRssBytes,
-    memoryBudgetBytes, failures, guest: await hostSample() });
+    memoryBudgetBytes, peakHomes, admissionRetirements, failures, guest: await hostSample() });
   assert.equal(failures.length, 0, 'every idle-admission query succeeded');
   assert.ok(peakRssBytes < memoryBudgetBytes, 'sampled RSS remains below the child memory budget');
+  if (unpacedAdmission) assert.ok(admissionRetirements > 0, 'the scan exercised admission-time retirement');
+  // Every database in the probe could fit into an unused home. The lower process
+  // reservation, rather than the number of homes, must have triggered retirement.
+  if (memoryAdmission) assert.ok(databases.length < settings.homes && peakHomes < settings.homes);
+}
+
+async function runBusyAdmission() {
+  const { tenant, catalog } = await provisionAdmissionDatabases();
+  const { entries: initial } = await durableProcesses();
+  const slots = initial.map(entry => entry.processId);
+  const groups = new Map(slots.map(slot => [slot, []]));
+  for (const { name, namespaceId } of catalog) {
+    // Match the platform's canonical database ID and durable slot rendezvous.
+    const objectId = sha256(Buffer.concat([Buffer.from(namespaceId, 'hex'), Buffer.from('namedatabase')]));
+    const scores = slots.map(slot => [slot, sha256(`${namespaceId}/${objectId}\0${slot}`).slice(0, 16)]);
+    scores.sort(([a, x], [b, y]) => y.localeCompare(x) || a.localeCompare(b));
+    groups.get(scores[0][0]).push(name);
+  }
+  for (const group of groups.values()) assert.ok(group.length > settings.homes);
+  const queryUrl = name => tenant.path + '/databases/' + name + '/query';
+  const read = name => request(cluster.urls.apiserver, queryUrl(name), {
+    method: 'POST', token: tenant.token, body: { sql: 'SELECT 1 AS value' },
+  });
+  const active = [...groups.values()].flatMap(group => group.slice(0, settings.homes));
+  for (const name of active) {
+    assert.deepEqual(json(await read(name), 200, name).results, [{ value: 1 }]);
+  }
+  const abort = new AbortController();
+  const activeSql = { sql: 'WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n < 1000000000) SELECT sum(n) FROM r' };
+  const queries = active.map(name => fetch(cluster.urls.apiserver + queryUrl(name), {
+    method: 'POST',
+    headers: { authorization: `Bearer ${tenant.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(activeSql), signal: AbortSignal.any([abort.signal, controller.signal]),
+  }).then(async reply => ({ status: reply.status, text: await reply.text() })).catch(error => ({ error })));
+  try {
+    const { entries, processPool } = await eventually('the default homes in every durable process are busy', async () => {
+      const snapshot = await durableProcesses();
+      for (const entry of snapshot.entries) {
+        const before = initial.find(candidate => candidate.processId === entry.processId);
+        assert.equal(entry.pid, before.pid);
+        assert.equal(entry.generation, before.generation);
+        assert.equal(entry.lifecycle.durableAdmission.running, settings.homes);
+        assert.equal(entry.lifecycle.durableAdmission.admissionRetirements, 0);
+      }
+      return snapshot;
+    }, { timeout: 10000, interval: 25 });
+    const refused = [];
+    for (const [slot, names] of groups) {
+      const reply = await read(names[settings.homes]);
+      const overload = json(reply, 503, 'busy database process ' + slot);
+      if (overload.code === 'OVERLOADED') {
+        assert.equal(overload.dispatched, false);
+        assert.equal(overload.retryable, true);
+      } else {
+        // Older checkout daemons returned this envelope for the same refusal.
+        assert.equal(overload.code, 'RESULT_UNCERTAIN');
+        assert.match(overload.reason, /native invocation queue is full/);
+      }
+      refused.push({ slot, status: reply.status, reply: overload });
+    }
+    await record('busy-admission-result', {
+      processes: entries.map(({ processId, pid, generation, residentBytes, lifecycle }) => ({
+        processId, pid, generation, residentBytes, ...lifecycle.durableAdmission,
+      })),
+      totalBusy: active.length, refused, memoryBudgetBytes: processPool.threadedMemoryBytes,
+    });
+  } finally {
+    abort.abort();
+    await Promise.all(queries);
+  }
+}
+
+async function runMixedAdmission() {
+  const { tenant } = await provisionAdmissionDatabases();
+  const workers = Array.from({ length: 6 }, (_, index) => `object-${index}`);
+  const objects = await cluster.tenant('database-admission-objects', {
+    workers: workers.length, durableObjectNamespaces: workers.length,
+  });
+  for (const name of workers) {
+    // Separate definitions compete for new homes instead of sharing a warm copy.
+    await cluster.deploy(objects, name, `export class Service {
+      async fetch() {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        return new Response(${JSON.stringify(name)});
+      }
+    }
+    export default { async fetch(request, env) {
+      const id = new URL(request.url).searchParams.get('object') ?? 'one';
+      return env.SERVICE.getByName(id).fetch(request);
+    } };`,
+    { wrangler: {
+      durable_objects: { bindings: [{ name: 'SERVICE', class_name: 'Service' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['Service'] }],
+    } });
+  }
+  const sql = name => request(cluster.urls.apiserver, tenant.path + '/databases/' + name + '/query', {
+    method: 'POST', token: tenant.token, body: { sql: 'SELECT 1 AS value' },
+  });
+  const expectSql = async name => {
+    assert.deepEqual(json(await sql(name), 200, name).results, [{ value: 1 }]);
+  };
+  const readResidency = async () => (await durable()).entry.lifecycle.durableAdmission;
+  const objectPath = name => `/${objects.name}/${name}`;
+  let warmed = residentObjects ? residentObjects - 1 : settings.homes;
+  if (residentObjects) {
+    const name = workers[0];
+    const reply = await request(cluster.urls[owner], objectPath(name));
+    assert.equal(reply.status, 200, reply.text);
+  }
+  if (mixedCeiling === 'memory') {
+    // Keep the timed release clock near its initial value while filling hundreds
+    // of homes. Leave the process memory budget and routing tree limit at defaults.
+    const warmStart = performance.now();
+    const offset = join(cluster.durableLifecycleGate, 'idle-offset-ms');
+    const nextOffset = offset + '-next';
+    const setOffset = async milliseconds => {
+      await writeFile(nextOffset, String(milliseconds));
+      await rename(nextOffset, offset);
+    };
+    for (warmed = 0; warmed < settings.homes; ++warmed) {
+      if (warmed % 8 === 0) await setOffset(180000 - Math.floor(performance.now() - warmStart));
+      await expectSql(databases[warmed]);
+      if ((await readResidency()).admissionRetirements > 0) {
+        ++warmed;
+        break;
+      }
+    }
+    await setOffset(0);
+    const { entry, processPool, log } = await durable();
+    const treeLimit = log.settings.residentObjects;
+    await record('mixed-memory-warmup', {
+      warmed, elapsedMs: performance.now() - warmStart, rssBytes: entry.residentBytes,
+      memoryBudgetBytes: processPool.threadedMemoryBytes, isolateLimit: processPool.threadedResidentLimit,
+      treeLimit, residency: entry.lifecycle.durableAdmission,
+    });
+    assert.ok(warmed < settings.homes, 'memory admission started with spare homes');
+    assert.ok(warmed < processPool.threadedResidentLimit, 'isolate count has headroom');
+    assert.ok(warmed < treeLimit, 'routing tree count has headroom');
+    assert.equal(entry.lifecycle.durableAdmission.groupCreationRefusals, 0, 'isolate groups are available');
+  } else {
+    for (const name of databases.slice(0, warmed)) await expectSql(name);
+  }
+  const before = await eventually('databases settle at the chosen ceiling before competing traffic', async () => {
+    const residency = await readResidency();
+    assert.equal(residency.running, 0);
+    if (mixedCeiling === 'memory') {
+      assert.ok(residency.homes < settings.homes);
+      assert.ok(residency.admissionRetirements > 0);
+    } else {
+      assert.equal(residency.residentRoots, residentObjects ?? settings.homes);
+    }
+    return residency;
+  });
+  const scan = databases.slice(warmed, warmed + 116);
+  const start = performance.now();
+  let scanning = true;
+  let objectAttempts = 0;
+  const objectAdmissions = new Map();
+  const sqlStatuses = new Map();
+  let firstSqlFailure;
+  const objectTraffic = workers.map(async name => {
+    while (scanning && performance.now() - start < 20000) {
+      // At the tree ceiling a new key can claim the freed place through an
+      // already warm tenant copy, with no new home or isolate reservation.
+      const key = residentObjects ? '?object=candidate-' + objectAttempts : '';
+      const reply = await request(cluster.urls[owner], objectPath(name) + key);
+      ++objectAttempts;
+      if (reply.status === 200 && !objectAdmissions.has(name)) {
+        objectAdmissions.set(name, performance.now() - start);
+      }
+    }
+  });
+  // Capture early traffic failures immediately so they are reported after cleanup.
+  const objectResults = Promise.allSettled(objectTraffic);
+  try {
+    for (const name of scan) {
+      const reply = await sql(name);
+      sqlStatuses.set(reply.status, (sqlStatuses.get(reply.status) ?? 0) + 1);
+      if (reply.status === 200) assert.deepEqual(JSON.parse(reply.text).results, [{ value: 1 }]);
+      else firstSqlFailure ??= { name, status: reply.status, body: reply.text };
+    }
+  } finally {
+    scanning = false;
+    for (const result of await objectResults) {
+      if (result.status === 'rejected') throw result.reason;
+    }
+  }
+  const { entry, processPool } = await durable();
+  assert.equal(entry.pid, child.pid);
+  assert.equal(entry.generation, child.generation);
+  await record('mixed-admission-result', {
+    ceiling: mixedCeiling, warmed, databasesOffered: scan.length, before, residentObjects,
+    memoryBudgetBytes: processPool.threadedMemoryBytes, rssBytes: entry.residentBytes,
+    elapsedMs: performance.now() - start, objectsOffered: workers.length, objectAttempts,
+    objectAdmissions: Object.fromEntries(objectAdmissions), sqlStatuses: Object.fromEntries(sqlStatuses),
+    firstSqlFailure,
+    residency: entry.lifecycle.durableAdmission,
+  });
+  assert.ok(objectAttempts >= workers.length);
+  assert.equal(sqlStatuses.get(200), scan.length);
+  assert.ok(entry.lifecycle.durableAdmission.admissionRetirements > before.admissionRetirements);
 }
 
 async function runDefaultAdmission(kernelHash) {
@@ -798,7 +1053,11 @@ try {
   await cluster.start();
   if (!idleAdmission) await setup();
   await identify(kernelHash);
-  if (idleAdmission) {
+  if (busyProcesses) {
+    await runBusyAdmission();
+  } else if (mixedAdmission) {
+    await runMixedAdmission();
+  } else if (idleAdmission) {
     await runIdleAdmission();
   } else if (throughput) {
     await runNetworkThroughput();

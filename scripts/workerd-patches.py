@@ -354,6 +354,13 @@ def allowed_path(name, path):
                           name == '0174-release-idle-platform-database-copies.patch' and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0177-retire-idle-databases-at-admission.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0178-keep-platform-databases-open-after-sql-interruption.patch' and path in {
+                              'src/workerd/api/actor-state.c++',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h',
+                              'src/workerd/util/sqlite-test.c++'} or
                           name == '0182-bound-platform-sqlite-memory.patch' and path in {
                               'src/workerd/api/actor-state.c++', 'src/workerd/io/actor-sqlite.c++',
                               'src/workerd/threaded/BUILD.bazel', 'src/workerd/threaded/threaded-server.c++',

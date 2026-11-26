@@ -55,9 +55,8 @@ Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matchi
 kernel and product binaries. The case uses the `coworkerd-platform-test` executable from the
 database placement fixture on its threaded owner. It times HTTP and D1 statements and batches,
 including writes with a connected client. It checks the complete reply on a half-closed HTTP
-connection and terminates an active HTTP writer with a TCP reset. The case checks the refusal to
-queued HTTP and D1 reads during the write resets, followed by a fresh SQLite open in the same
-process and a read of the earlier confirmed value.
+connection and terminates an active HTTP writer with a TCP reset. Reads already queued behind
+the interrupted writes must return the earlier confirmed value, with no additional SQLite opens.
 
 ### Threaded SQLite memory limit
 
@@ -80,6 +79,16 @@ CLI. Owner dispatch records verify that the SQL calls reached the platform datab
 buffer to allow a 254-frame SQL transaction including the record envelope and RPC headroom. It
 checks peer confirmation at the limit, HTTP 422 one frame over the limit, D1 batch rollback and the
 confirmed `exec()` prefix. A follow-up write and read run on the same open database.
+
+`durable-threaded-database-admission` uses three homes on a threaded owner. SQL fills the homes and
+refreshes the first database. A new database displaces the least recently used eligible one while a
+third database waits for write confirmation with another query queued behind it. The case reopens the
+displaced database and reads its previously confirmed row. It then holds all three homes busy and
+checks the capacity refusal and recovery. A test fixture holds the final reservation past the
+one-second deadline so the case also verifies that the refusal is counted and the home is reusable.
+
+`durable-threaded-database-admission-mixed` fills the four default homes and runs a serial SQL scan
+while tenant objects from six definitions compete for the released homes in the same process.
 
 `durable-threaded-database-placement` uses the test executable on the threaded owner and the upstream
 database backend on the other nodes. It checks HTTP SQL and D1 in both directions, batch rollback, two

@@ -82,6 +82,11 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   the threaded server and tests the home-reservation guard.
   Patch 0176 reserves `<tenant>/__databases` for the product SQL class's execution and metering
   while the platform definition still supplies its code and isolate copy key.
+  Patch 0177 reclaims the least recently used eligible database when opening another
+  needs a home or a process reservation. The home closes the actor and releases its copy
+  before admission retries.
+  Patch 0178 settles platform SQL interruptions and removes any WAL tail spilled by the aborted
+  transaction. It keeps SQLite storage failures on the critical error path.
   Patch 0182 uses SQLite's per-connection allocator meter for threaded platform databases.
   A local heap refusal rolls back the current transaction and preserves the open connection.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.

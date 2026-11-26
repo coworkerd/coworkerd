@@ -432,6 +432,79 @@ Use `--idle-window-patched` on the kernel with 0174 to measure the released and 
 with the default copy settings. The probe checks that all exclusive copies disappear within
 15 seconds of a cohort's last reply and records their observed retirement times.
 
+## Database admission at the ceiling
+
+The unpaced workload issues a public SQL read against each of 1,000 distinct databases.
+It waits for each reply before sending the next query. It uses the default home count,
+memory budget and idle timers, records admission retirements, and checks that all queries
+succeed in the same durable process generation. The process budget is derived from the
+test node's memory budget.
+
+The memory probe runs 125 queries with a 448 MiB process budget and 192 homes. It checks
+that a new copy can reclaim a memory reservation while unused homes are still available.
+The busy probes hold a long SQL read on each default home, observe the running count
+per process, and submit one additional query per process to verify its capacity refusal.
+The mixed probes run the same admission path with six competing tenant definitions arriving
+as the SQL scan opens distinct databases. The default process reaches its four-home limit
+first. Before the freed-home preference, four tenant definitions filled those homes and
+only one of the 116 subsequent SQL reads succeeded.
+
+The mixed memory probe raises the home count to 768 while retaining the default process
+budget and routing tree limit. Its fixture holds the idle clock near the starting time
+during warm-up so the timed release does not lower resident counts before the scan. It
+restores the clock before offering competing definitions. The mixed tree probe leaves
+homes available by setting 12 homes and `residentObjects: 4`. It prewarms a tenant copy
+and requests distinct object keys, so a tenant can claim a released tree credit without
+needing a new copy.
+
+With the earlier published archive, the tree probe served 1 of 116 SQL queries and
+the mixed memory probe served 105 of 116 while five tenant definitions obtained copies.
+The revised local Linux ARM64 threaded executable served 116 of 116 in both probes.
+It had 1,893 competing attempts at the tree limit and 5,085 at the memory limit.
+[Recorded revision and test conditions](https://github.com/coworkerd/coworkerd/pull/101#issuecomment-7182027172)
+
+### Verification with patch 0177
+
+The public ARM64 archive was built from product `5eda3623d0cb172321942048ef028ec1d591b24e`
+and workerd tree `c81a3704a705e865b1e125a49a6ebc1f8dd9a81d`. The driver ran through the compile-time
+database fixture on a single Linux ARM64 Docker node at product revision
+`583b44ea4dc8502e3ef8e84d8b260e9f1795e962`. The Linux daemons and launcher were built from
+`2fc7460475c4edc1bf007f621cbc717619be42d5` with byte-identical daemon, launcher and runtime sources.
+The guest supplied the default memory budget.
+[Hosted build](https://github.com/coworkerd/coworkerd/actions/runs/45781070271) · [Verified release](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-c3fbec45d920-run-45781070271-1)
+
+| Workload | Result |
+| --- | --- |
+| Default homes, one process, no pacing | 1,000/1,000 queries in 17.00 s in the same generation. The final sample recorded 996 admission retirements. Peak sampled RSS was 73.51 MiB against a 2.33 GiB process budget. |
+| 192 homes, 448 MiB process budget | 125/125 queries in 1.44 s. The peak was 91 occupied homes and 433.82 MiB RSS. The final sample recorded 30 admission retirements. |
+| Mixed at the four-home limit | 116/116 SQL queries in 2.73 s while six tenant callers made a total of 4,655 attempts. |
+| Mixed at the default process admission budget | 116/116 SQL queries in 3.18 s while six tenant callers made a total of 4,882 attempts. |
+| Mixed at the four-tree routing limit | 116/116 SQL queries in 3.30 s while six tenant callers made a total of 1,969 attempts. |
+| One and two processes, default homes | Four busy databases in one process and eight across two, with four on each. The extra query to each full process returned HTTP 503 `OVERLOADED` with `dispatched: false` and `retryable: true`. |
+
+Across the three mixed probes, no competing request returned HTTP 200. The guest assigned
+2.33 GiB of admission memory to the single process and 1.87 GiB to each of the two processes.
+
+[Unpaced samples](database-home-benchmark/platform-database-admission-0177-unpaced.jsonl) ·
+[Memory samples](database-home-benchmark/platform-database-admission-0177-memory.jsonl) ·
+[Mixed homes samples](database-home-benchmark/platform-database-admission-0177-mixed.jsonl) ·
+[Mixed memory samples](database-home-benchmark/platform-database-admission-0177-mixed-memory.jsonl) ·
+[Mixed routing samples](database-home-benchmark/platform-database-admission-0177-mixed-resident.jsonl) ·
+[One process samples](database-home-benchmark/platform-database-admission-0177-busy-one.jsonl) ·
+[Two processes samples](database-home-benchmark/platform-database-admission-0177-busy-two.jsonl)
+
+### Reproduce admission
+
+```sh
+export COWORKERD_CLUSTER_BIN_DIR="$PWD/build"
+for mode in unpaced memory mixed mixed-memory mixed-resident busy-one busy-two; do
+  node tests/cluster/database-home-benchmark.mjs \
+    object "$PWD" "$KERNEL_DIR" "$PWD/admission-$mode.jsonl" "--idle-admission-$mode"
+done
+node tests/cluster/run.mjs "$KERNEL_DIR" durable-threaded-database-admission
+node tests/cluster/run.mjs "$KERNEL_DIR" durable-threaded-database-admission-mixed
+```
+
 ## Reproduce
 
 Run from a checkout containing the benchmark. Make two checkouts at the exact daemon source commits above. On
