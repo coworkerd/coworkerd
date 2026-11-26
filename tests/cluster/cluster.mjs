@@ -58,7 +58,7 @@ export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
-    budgetLifetime, nodeEnvironment, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
+    budgetLifetime, nodeEnvironment, nodeVolumes, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
     databaseFixtureNodes = [], databaseAlarmFixture = false, previousProduct, previousKernel,
   } = {}) {
     this.directory = directory;
@@ -89,6 +89,7 @@ export class Cluster {
     this.budgetLifetime = budgetLifetime;
     this.configureNode = configureNode;
     this.nodeEnvironment = nodeEnvironment;
+    this.nodeVolumes = nodeVolumes;
     this.productRoot = productRoot;
     this.publishPeerPorts = publishPeerPorts;
     this.platformFixture = platformFixture;
@@ -200,7 +201,7 @@ export class Cluster {
         // Keep a killed owner down so that only a different node can recover the object.
         restart: 'no',
         environment: { ...this.nodeEnvironment?.(node), COWORKERD_CONFIG: target },
-        volumes: [{ type: 'bind', source: config, target, read_only: true }],
+        volumes: [{ type: 'bind', source: config, target, read_only: true }, ...(this.nodeVolumes?.(node) ?? [])],
       };
       if (this.budgetLifetime) overrides[node].environment.COWORKERD_LEASE_TTL_MS = String(this.budgetLifetime.leaseMs);
       if (this.databaseFixtureNodes.has(node)) {

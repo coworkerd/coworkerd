@@ -469,8 +469,8 @@ struct DurableLogChannelTest {
     DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), clock, *io.lowLevelProvider,
         membership, {});
     log.settings.config.peers = 0;
-    log.setNodeEpoch(1);
-    KJ_REQUIRE(log.logFd >= 0, "the test log could not be opened");
+    log.setNodeEpoch(1).wait(io.waitScope);
+    KJ_REQUIRE(!log.logAppendFailed, "the test log could not be opened");
     // The real tracker, on the real lease clock, with a TTL the scenario sets (wide margins: a busy machine must not
     // make the setup itself outlive a lease that should still hold).
     const double ttl = name == "expired" || name == "stale-timer" ? 300 : name == "slow-flush" ? 2000 : 60000;
@@ -508,6 +508,7 @@ struct DurableLogChannelTest {
     // Every TO_ACK the log wrote to the durable process so far: request -> status.
     std::map<uint64_t, uint8_t> acks;
     auto answers = [&]() {
+      log.waitForLogWrites().wait(io.waitScope);
       io.waitScope.poll();
       char buffer[4096];
       std::string bytes;
@@ -553,6 +554,7 @@ struct DurableLogChannelTest {
       { std::ofstream out(trigger); out << "4000"; }
       log.slowFlushForTest = trigger.string();
       take(44);
+      log.waitForLogWrites().wait(io.waitScope);
       KJ_REQUIRE(!std::filesystem::exists(trigger), "the slow flush did not run");
       KJ_REQUIRE(answers().at(44) == 1 && confirmed() == 0 && lost == 1 && tracker.fenced(1),
           "a lease that ended during the local flush must refuse the confirmation");
@@ -942,8 +944,8 @@ struct DurableLogChannelTest {
     DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), clock, *io.lowLevelProvider,
         membership, std::move(hooks));
     log.settings.config.peers = 1;
-    log.setNodeEpoch(1);
-    KJ_REQUIRE(log.logFd >= 0);
+    log.setNodeEpoch(1).wait(io.waitScope);
+    KJ_REQUIRE(!log.logAppendFailed);
     const int process = log.openChannel("d0");
     KJ_REQUIRE(process >= 0);
     auto& channel = log.channels.at("d0");
@@ -981,9 +983,11 @@ struct DurableLogChannelTest {
       if (i == 1 && chunk) record.frameBytes = std::string(5u << 20, 'f');  // two pieces
       log.takeRecord(channel, std::move(record), 101 + i);
     }
+    log.waitForLogWrites().wait(io.waitScope);
     io.waitScope.poll();
     std::map<uint64_t, uint8_t> acks;
     auto answers = [&]() {
+      log.waitForLogWrites().wait(io.waitScope);
       io.waitScope.poll();
       char buffer[4096];
       std::string bytes;
@@ -1012,8 +1016,10 @@ struct DurableLogChannelTest {
       record.storageId = log.objects.at(hosts[i]).storageId;
       record.dataEpoch = 1;
       log.takeRecord(channel, std::move(record), request);
+      log.waitForLogWrites().wait(io.waitScope);
     };
     if (name == "unreachable") {
+      log.waitForLogWrites().wait(io.waitScope);
       clock.advanceTo(KJ_ASSERT_NONNULL(clock.nextEvent()));
       answers();
       KJ_REQUIRE(opened == 1 && calls.empty() && acks.empty() && log.confirmations == 0 &&
@@ -1226,7 +1232,7 @@ struct DurableLogChannelTest {
         record.objectName = object;
         log.rememberParsedRecord(record);
       };
-      log.setNodeEpoch(1);
+      log.setNodeEpoch(1).wait(io.waitScope);
       insert(1, "object-a");
       insert(2, "object-b");
       insert(3, "object-a");
@@ -1239,7 +1245,7 @@ struct DurableLogChannelTest {
       log.forgetParsedRecord(2);
       check();
       KJ_REQUIRE(!log.unsealedByObject.contains("object-b"));
-      log.setNodeEpoch(2);
+      log.setNodeEpoch(2).wait(io.waitScope);
       check();
       KJ_REQUIRE(log.parsed.empty() && log.unsealedByObject.empty());
       return;
@@ -1327,7 +1333,7 @@ struct DurableLogChannelTest {
     hooks.closeObjects = [&](std::string) -> kj::Promise<void> { ++closeCalls; co_return; };
     DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), timer,
         *io.lowLevelProvider, membership, std::move(hooks));
-    log.setNodeEpoch(1);
+    log.setNodeEpoch(1).wait(io.waitScope);
     const int old = log.openChannel("d0-1"), active = log.openChannel("d0-2");
     KJ_REQUIRE(old >= 0 && active >= 0);
     KJ_DEFER({ ::close(old); ::close(active); });
@@ -1376,7 +1382,7 @@ struct DurableLogChannelTest {
     MembershipView membership;
     DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), clock,
         *io.lowLevelProvider, membership, {});
-    log.setNodeEpoch(1);
+    log.setNodeEpoch(1).wait(io.waitScope);
     const int peer = log.openChannel("d0-7", 7);
     KJ_REQUIRE(peer >= 0);
     auto child = io.lowLevelProvider->wrapSocketFd(peer, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
