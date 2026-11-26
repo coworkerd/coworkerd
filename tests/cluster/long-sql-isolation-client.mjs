@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
+import { readFile, readdir } from 'node:fs/promises';
 import { Agent, request } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -84,19 +85,23 @@ async function waitForRunning(running) {
   assert.fail(`the durable process did not report ${running} running events`);
 }
 
-function readCpu() {
+async function readCpu() {
   const task = `/proc/${child.pid}/task`;
-  const threads = {};
-  for (const tid of readdirSync(task)) {
+  const client = { at: Date.now(), usage: process.cpuUsage(), eventLoop: performance.eventLoopUtilization() };
+  const [tids, schedstat] = await Promise.all([readdir(task), readFile('/proc/self/schedstat', 'utf8')]);
+  const threads = await Promise.all(tids.map(async tid => {
     try {
-      const stat = readFileSync(`${task}/${tid}/stat`, 'utf8');
+      const stat = await readFile(`${task}/${tid}/stat`, 'utf8');
       const fields = stat.slice(stat.lastIndexOf(')') + 2).split(/\s+/);
-      threads[tid] = Number(fields[11]) + Number(fields[12]);
+      return [tid, Number(fields[11]) + Number(fields[12])];
     } catch (error) {
       if (error.code !== 'ENOENT' && error.code !== 'ESRCH') throw error;
+      return null;
     }
-  }
-  return { at: Date.now(), threads };
+  }));
+  const [cpuTimeNs, runQueueWaitNs, timeslices] = schedstat.trim().split(/\s+/).map(Number);
+  return { at: Date.now(), threads: Object.fromEntries(threads.filter(Boolean)),
+    client: { ...client, scheduler: { cpuTimeNs, runQueueWaitNs, timeslices } } };
 }
 
 function executionEvidence(cpu, doneAt) {
@@ -120,7 +125,7 @@ async function at(when) {
   if (remaining > 0) await delay(Math.ceil(remaining));
 }
 
-async function drive(start, offers, offset) {
+async function drive(start, startedAt, offers, offset) {
   const entries = Object.entries(probes);
   return Object.fromEntries(await Promise.all(entries.map(async ([role, probe], phase) => {
     const samples = [];
@@ -128,17 +133,21 @@ async function drive(start, offers, offset) {
     const pending = [];
     const misses = [];
     for (let slot = 0; slot < offers; slot++) {
-      const scheduled = start + offset + slot * periodMs + phase * periodMs / entries.length;
+      const relative = offset + slot * periodMs + phase * periodMs / entries.length;
+      const scheduled = start + relative;
+      const intendedAt = startedAt + relative;
       await at(scheduled);
       const sent = performance.now();
       if (sent - scheduled >= periodMs) {
-        misses.push({ slot, schedulingDelayMs: sent - scheduled });
+        misses.push({ slot, intendedAt, schedulingDelayMs: sent - scheduled });
         continue;
       }
       const sentAt = Date.now();
-      pending.push(probe().then(() => samples.push({ slot, sentAt, finishedAt: Date.now(),
-        elapsedMs: performance.now() - sent, schedulingDelayMs: sent - scheduled }),
-      error => errors.push({ slot, sentAt, message: error.message })));
+      pending.push(probe().then(() => {
+        const finished = performance.now();
+        samples.push({ slot, intendedAt, sentAt, finishedAt: Date.now(), elapsedMs: finished - sent,
+          scheduledElapsedMs: finished - scheduled, schedulingDelayMs: sent - scheduled });
+      }, error => errors.push({ slot, intendedAt, sentAt, message: error.message })));
     }
     await Promise.all(pending);
     return [role, { samples, errors, misses, offered: offers }];
@@ -146,15 +155,24 @@ async function drive(start, offers, offset) {
 }
 
 async function window(condition, index) {
-  const warm = await drive(performance.now(), 60, 0);
+  const warm = await drive(performance.now(), Date.now(), 60, 0);
   for (const item of Object.values(warm)) assert.equal(item.samples.length, item.offered, JSON.stringify(item.errors));
   await checkRead(blocking);
   const before = await waitForRunning(0);
   assert.equal(before.residentRoots, 4);
-  const cpu = [readCpu()];
+  const cpu = [await readCpu()];
   const startedAt = Date.now();
   const start = performance.now();
-  const sampler = setInterval(() => cpu.push(readCpu()), 100);
+  const sampler = new AbortController();
+  const sampling = (async () => {
+    while (!sampler.signal.aborted) {
+      await delay(100, undefined, { signal: sampler.signal });
+      cpu.push(await readCpu());
+    }
+  })().catch(error => {
+    if (error.name !== 'AbortError') throw error;
+  });
+  void sampling.catch(() => {});
   let running;
   let deadline;
   let pending;
@@ -168,7 +186,7 @@ async function window(condition, index) {
       void pending.catch(() => {});
       running = await waitForRunning(1);
     }
-    const result = await drive(start, offersPerRole, marginMs);
+    const result = await drive(start, startedAt, offersPerRole, marginMs);
     await at(start + windowMs);
     let execution;
     if (pending) {
@@ -196,7 +214,8 @@ async function window(condition, index) {
       firstScheduledAt: startedAt + marginMs, lastReplyAt,
       before, after, runningAt: running?.at, deadline, ...execution, cpu, probes: result };
   } finally {
-    clearInterval(sampler);
+    sampler.abort();
+    await sampling;
     if (pending) await pending.catch(() => {});
   }
 }
@@ -215,7 +234,7 @@ try {
       }
     }
   }
-  for (const [index, condition] of ['quiet', 'busy', 'busy', 'quiet', 'quiet', 'busy'].entries()) {
+  for (const [index, condition] of ['quiet', 'busy', 'quiet', 'busy', 'quiet', 'busy'].entries()) {
     console.log(JSON.stringify(await window(condition, index + 1)));
   }
 } finally {
