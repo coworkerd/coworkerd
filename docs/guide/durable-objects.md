@@ -199,7 +199,8 @@ with separate bursts of 128 concurrent single-row reads through public HTTP SQL 
 binding to one threaded database. The Worker runs on a peer of the database owner. Worker roots
 and local binding calls share the node's root admission threshold when they run on the same node.
 The test uses the experimental database placement executable.
-In a Linux ARM64 cluster, all 128 reads succeeded on each route at the compiled defaults.
+The hosted Linux x86-64 and ARM64 clusters each served all 128 reads on both routes at the
+compiled defaults.
 [Cluster test](../../tests/cluster/README.md#threaded-sql-default-mailbox) ·
 [Measurement environment](../threaded-durable-processes.md#per-object-admission-mailbox).
 

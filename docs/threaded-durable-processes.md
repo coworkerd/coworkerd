@@ -121,6 +121,14 @@ generation without counting any admission overloads. The two bursts took 201 ms 
 respectively. The same case with the published 0176 kernel and its 4-event and 64 KiB defaults
 returned the row to 9 of 128 HTTP SQL callers and 5 of 128 D1 callers.
 
+The [hosted kernel build](https://github.com/coworkerd/coworkerd/actions/runs/45765527350)
+also ran both 128-client bursts on Ubuntu 24.04 with the compiled 0179 defaults.
+
+| Hosted runner | HTTP SQL reads | D1 reads from a peer |
+| --- | ---: | ---: |
+| Linux x86-64 | 128/128 in 309 ms | 128/128 in 397 ms |
+| Linux ARM64 | 128/128 in 418 ms | 128/128 in 515 ms |
+
 At `f1e41d5`, the hibernation cluster fixture already allowed 32 waiting events with the default
 64 KiB byte bound. The diagnostics for the parallel batch of 16 facet calls recorded a refusal
 before execution, with the same child PID and generation, zero actor or isolate resets, and further
