@@ -380,8 +380,8 @@ by routing or cold-load admission holds one preparation credit for a database wh
 reservation returns and for up to 100 ms afterward.
 Above the initial-admission ceiling, a database can only replace one idle database.
 Its first reservation must fit within the returned charge and leave the reserved total
-at or below its pre-release value. Reserved memory plus lent heap headroom must fit the
-hard process budget. In the memory probe the existing copies charged 1,974,448,702
+at or below its pre-release value. In that band, reserved memory plus lent heap headroom
+must fit the hard process budget. In the memory probe the existing copies charged 1,974,448,702
 bytes against the initial-admission ceiling of 1,973,251,124 bytes. A typical copy
 returned 2,732,370 bytes, and the new copy's first reservation was 2,621,440 bytes.
 At the one-second deadline, the process honors a recorded release even if the home has
