@@ -71,7 +71,11 @@ process.env.COWORKERD_CLUSTER_BIN_DIR = binaries;
 const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   singleNode: true,
   productRoot: checkout,
-  databaseFixtureNode: idleWindow ? 'node-1' : undefined,
+  ...(idleWindow && {
+    databaseFixtureNodes: ['node-1'],
+    // The imported Cluster from a historical checkout uses the singular option.
+    databaseFixtureNode: 'node-1',
+  }),
   configureNode: () => ({
     quarantineProcesses: 1,
     // A completed HTTP reply can precede retirement of its invocation.
@@ -97,7 +101,10 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   }),
 });
 const [owner] = cluster.nodes;
-if (idleWindow) assert.equal(cluster.databaseFixtureNode, owner, 'supply a database placement checkout');
+if (idleWindow) {
+  assert.ok(cluster.databaseFixtureNodes?.has(owner) ?? (cluster.databaseFixtureNode === owner),
+    'supply a database placement checkout');
+}
 const tenantName = 'database-benchmark';
 const workload = 'traffic';
 const databaseCount = memoryAdmission ? 125 : mixedAdmission ? 120 : busyProcesses ? 64 : idleAdmission ? admissionDatabases
