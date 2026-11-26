@@ -87,8 +87,10 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   before admission retries.
   Patch 0178 settles platform SQL interruptions and removes any WAL tail spilled by the aborted
   transaction. It keeps SQLite storage failures on the critical error path.
+  Patch 0179 sizes the default object mailbox for ordinary request bursts in
+  `src/workerd/threaded/threaded-server.c++`.
   Patch 0180 recognizes recorded database reservation returns at expiry, protects the returned
-  preparation credit after routing retirement, and counts lent heap headroom against replacement admission.
+  preparation credit after routing retirement, and counts lent heap headroom in the replacement band.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

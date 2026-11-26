@@ -107,4 +107,5 @@
 0176-attribute-platform-databases-to-database-worker.patch
 0177-retire-idle-databases-at-admission.patch
 0178-keep-platform-databases-open-after-sql-interruption.patch
+0179-size-default-object-mailbox.patch
 0180-fix-database-admission-accounting.patch
