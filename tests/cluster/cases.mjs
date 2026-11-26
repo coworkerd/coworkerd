@@ -2432,12 +2432,24 @@ async function durableCopyReservationRefusal(cluster) {
   assert.equal(json(await sql('CREATE TABLE ledger(value INTEGER PRIMARY KEY)'), 200, 'create SQL ledger').success, true);
   await waitForWalPeers(cluster, owner);
   const marker = join(cluster.durableLifecycleGate, 'copy-reservation-refusal');
+  const recordedRefusals = async () =>
+    (await cluster.state(owner)).placement.observability.total['refusal|durableObject|OVERLOADED'] ?? 0;
   let refusal = 0;
   const refuseNext = async call => {
     const initial = await durableGeneration(cluster, owner);
-    await writeFile(`${marker}-next`, String(++refusal));
+    const before = await recordedRefusals();
+    const request = String(++refusal);
+    await writeFile(`${marker}-next`, request);
     await rename(`${marker}-next`, marker);
+    // The child reads the bind mount inside the owner container.
+    await eventually('the owner container sees the new refusal marker', async () => {
+      const observed = await cluster.compose(['exec', '-T', owner, 'sh', '-c',
+        'cat "$COWORKERD_DO_TEST_LIFECYCLE_DIR/copy-reservation-refusal"']);
+      assert.equal(observed, request);
+    });
     const reply = await call();
+    assert.equal(await recordedRefusals(), before + 1,
+      `the owner records one refusal for marker ${request} (received HTTP ${reply.status})`);
     await eventually('the refused event released its mailbox credit in the same process', async () => {
       const current = await durableGeneration(cluster, owner);
       assert.equal(current.generation, initial.generation);
@@ -2503,18 +2515,24 @@ async function durableCopyReservationRefusal(cluster) {
     () => callWorker('counter-fetch', 'run'),
     () => callWorker('counter-fetch', 'exec'),
   ];
-  const waitForDatabaseCopy = (label, count) => eventually(label, async () => {
-    const { lifecycle } = await durableGeneration(cluster, owner);
-    assert.equal(lifecycle.durableAdmission.residentRoots, count);
-    assert.equal(lifecycle.durableAdmission.homes, count);
-  });
+  const databaseCopyState = async () => (await durableGeneration(cluster, owner)).lifecycle.durableAdmission;
   for (const [index, write] of writes.entries()) {
-    await waitForDatabaseCopy('the current database root and copy are reported resident', 1);
+    const resident = await eventually('the current database root and copy are reported resident', async () => {
+      const state = await databaseCopyState();
+      assert.equal(state.residentRoots, 1);
+      assert.equal(state.homes, 1);
+      return state;
+    });
     offset += 180000;
     const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
     await writeFile(advance, String(offset));
     await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
-    await waitForDatabaseCopy('the database root and its exclusive copy retire', 0);
+    await eventually('a new idle retirement releases the database root and its exclusive home', async () => {
+      const state = await databaseCopyState();
+      assert.equal(state.idleRetirements, resident.idleRetirements + 1);
+      assert.equal(state.residentRoots, 0);
+      assert.equal(state.homes, 0);
+    });
     const before = await executedSql();
     const reply = json(await refuseNext(write), 503, `SQL caller ${index + 1} received refusal`);
     if (index === 0) {
