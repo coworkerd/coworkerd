@@ -104,9 +104,15 @@ See the [original queue profiles](https://github.com/coworkerd/coworkerd/pull/43
 
 The [cluster suite](../tests/cluster/README.md#threaded-sql-default-mailbox) uses the compiled
 mailbox defaults. Its database test runs separate bursts of 128 public HTTP SQL requests and 128
-Worker requests through a D1 binding. Each request selects the same seeded row by primary key in
-one threaded database. The test uses the database placement executable and checks all results and
-the owner process generation.
+Worker requests through a D1 binding from a peer of the database owner. Each request selects the
+same seeded row by primary key in one threaded database. The test uses the database placement
+executable and checks all results and the owner process generation.
+
+The node's default root admission threshold of 128 counts both active roots and nested calls on
+that node. A colocated D1 Worker and database share this accounting, so existing binding calls
+can cause the node to refuse new Worker requests during a burst. The cluster case puts the
+Worker roots on a peer and the 128 database calls on one owner. Both nodes use their default
+limits.
 
 In a three-node Docker cluster on Linux ARM64 (10 vCPUs, 7.75 GiB of RAM, Node.js 26.2
 driving the load from macOS), the pinned 0176 kernel with its 4-event and 64 KiB defaults returned
