@@ -934,6 +934,86 @@ async function threadedSqlDefaultMailbox(cluster) {
   assert.equal(after.lifecycle.durableAdmission.overloaded, before.lifecycle.durableAdmission.overloaded);
 }
 
+async function threadedSqlProcessMemory(cluster) {
+  const MiB = 1024 ** 2;
+  const [owner] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-process-memory', { durableObjectNamespaces: 8 });
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 3]]));
+  const selected = databases.get(owner);
+  const query = (db, body, status = 200) => cluster.api(`${db.path}/query`, {
+    method: 'POST', token: tenant.token, body, status,
+  });
+  const read = { sql: 'SELECT value FROM ledger' };
+  const original = await durableGeneration(cluster, owner);
+  const snapshot = async () => {
+    const child = await durableGeneration(cluster, owner);
+    assert.equal(child.pid, original.pid);
+    assert.equal(child.generation, original.generation);
+    return child.lifecycle.durableAdmission;
+  };
+
+  for (const [index, db] of selected.entries()) {
+    await query(db, [
+      { sql: 'CREATE TABLE ledger (value INTEGER)' },
+      { sql: 'INSERT INTO ledger VALUES (?)', params: [index] },
+    ]);
+    await eventually(`${index + 1} open databases have separate SQLite heap reservations`, async () => {
+      const state = await snapshot();
+      assert.equal(state.residentRoots, index + 1);
+      assert.equal(state.sqliteHeapReservedBytes, (index + 1) * MiB);
+    });
+  }
+
+  const opens = async () => (await cluster.state(owner)).durableLog.threadedHomeIo.openSamples;
+  const allOpen = await snapshot();
+  const openSamples = await opens();
+  const room = allOpen.copyMemoryMaximum - allOpen.copyMemoryReservedBytes;
+  // SQLite evaluates all four arguments before entering printf. Each blob
+  // stays below the per-value limit, and only the small string goes to V8.
+  const blobBytes = (Math.ceil(room / MiB) + 2) * MiB / 4;
+  assert.ok(blobBytes >= MiB && blobBytes <= 7 * MiB,
+    `expected room for a process-only refusal, got ${room} bytes`);
+  const materialize = {
+    sql: "SELECT printf('fits', randomblob(?), randomblob(?), randomblob(?), randomblob(?)) AS value",
+    params: Array(4).fill(blobBytes),
+  };
+  const first = selected[0];
+  const refused = await query(first, materialize, 422);
+  assert.equal(refused.code, 'SQL_MEMORY_LIMIT_EXCEEDED');
+  assert.deepEqual((await query(first, read)).results, [{ value: 0 }]);
+  const afterRefusal = await snapshot();
+  assert.equal(afterRefusal.residentRoots, 3);
+  assert.equal(afterRefusal.sqliteHeapReservedBytes, 3 * MiB);
+  assert.equal(afterRefusal.actorResets, allOpen.actorResets);
+  assert.equal(await opens(), openSamples, 'the same database handled the next query');
+
+  const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
+  await writeFile(advance, '180000');
+  await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
+  const idle = await eventually('closing the three databases returns their heap and copy reservations', async () => {
+    const state = await snapshot();
+    assert.equal(state.residentRoots, 0);
+    assert.equal(state.homes, 0);
+    assert.equal(state.sqliteHeapReservedBytes, 0);
+    assert.ok(state.copyMemoryReservedBytes < allOpen.copyMemoryReservedBytes);
+    return state;
+  });
+
+  assert.deepEqual((await query(first, read)).results, [{ value: 0 }]);
+  assert.deepEqual((await query(first, materialize)).results, [{ value: 'fits' }]);
+  await eventually('the reopened database returns the temporary heap after executing the same query', async () => {
+    const state = await snapshot();
+    assert.equal(state.residentRoots, 1);
+    assert.equal(state.sqliteHeapReservedBytes, MiB);
+    assert.equal(await opens(), openSamples + 1);
+  });
+  const childLogs = await cluster.compose(['logs', '--no-color', owner], { maxBuffer: 8 * 1024 * 1024 });
+  assert.doesNotMatch(childLogs, /did not find a valid scope|memoryBytes underflow|SQL transaction refusal cleanup did not finish/);
+  console.log(`SQLite heap steps with 3 databases: ${allOpen.sqliteHeapReservedBytes} bytes, `
+    + `close returned ${allOpen.copyMemoryReservedBytes - idle.copyMemoryReservedBytes} copy bytes, `
+    + `${4 * blobBytes} bytes of SQLite arguments refused before close and accepted after reopen`);
+}
+
 async function threadedDatabaseAccounting(cluster) {
   const [threaded, upstream] = cluster.nodes;
   const tenant = await cluster.tenant('sql-accounting', { durableObjectNamespaces: 48 });
@@ -3956,6 +4036,14 @@ export const durableGatedCases = {
       durableObjects: { threadedStorage: true, peerBufferBytes: sqlWalPeerBufferBytes,
         checkpointBytes: 8 * 1024 * 1024 },
     }) : ({}),
+  },
+  'threaded-sql-process-memory': {
+    test: threadedSqlProcessMemory, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    singleNode: true, controlDurableLifecycle: true, holdPeerAcks: false,
+    configureNode: () => ({
+      processPool: { count: 1, inFlightLimit: 16, threadedMemoryBytes: 112 * 1024 ** 2 },
+      durableObjects: { threadedStorage: true, processes: 1, peers: 0 },
+    }),
   },
   'threaded-sql-cli-parity': {
     test: threadedSqlCliParity, nodes: ['node-1', 'node-2', 'node-3'],

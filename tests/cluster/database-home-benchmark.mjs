@@ -48,8 +48,13 @@ const throughputInFlightLimit = 512;
 const defaultAdmission = mode === '--default-admission';
 const coldFollowUp = mode === '--cold-follow-up';
 const native = side === 'native';
-const useD1Binding = native || idleWindow;
+const threadedSqlThroughput = process.env.COWORKERD_BENCHMARK_THREADED_SQL === '1';
+assert.ok(!threadedSqlThroughput || (!native && throughput && !mainThreadProfile),
+  'the threaded SQL benchmark requires object throughput mode');
+const useD1Binding = native || idleWindow || threadedSqlThroughput;
 const checkout = resolve(checkoutArg);
+const kernelCheckout = threadedSqlThroughput && process.env.COWORKERD_BENCHMARK_KERNEL_CHECKOUT
+  ? resolve(process.env.COWORKERD_BENCHMARK_KERNEL_CHECKOUT) : checkout;
 const kernel = resolve(kernelArg);
 const output = resolve(outputArg);
 const binaries = resolve(process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(checkout, 'build'));
@@ -86,7 +91,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   productRoot: checkout,
   controlDurableLifecycle: mixedCeiling === 'memory',
   threadedNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
-  ...(idleWindow && {
+  ...((idleWindow || threadedSqlThroughput) && {
     databaseFixtureNodes: ['node-1'],
     // The imported Cluster from a historical checkout uses the singular option.
     databaseFixtureNode: 'node-1',
@@ -147,14 +152,14 @@ const productFiles = ['docker/Dockerfile', 'docker/docker-compose.yml', 'docker/
 
 async function provenance() {
   const commit = await cluster.command('git', ['rev-parse', 'HEAD'], { cwd: checkout });
-  const pins = await jsonFile(join(checkout, 'patches/workerd/artifacts.json'));
+  const pins = await jsonFile(join(kernelCheckout, 'patches/workerd/artifacts.json'));
   const metadata = await jsonFile(join(kernel, 'kernel.json'));
   const pinned = metadata.patchSeriesSha256 === pins.patchSeriesSha256 && metadata.upstream === pins.upstream;
-  if (idleWindow) {
-    // A placement build may be profiled before its release pin lands. Match the actual patch bytes.
+  if (idleWindow || threadedSqlThroughput) {
+    // A kernel may be profiled before its release pin lands. Match the actual patch bytes.
     const series = await cluster.command('python3', ['-B', '-c',
       'import json, sys; sys.path.insert(0, "scripts"); from kernel_artifacts import series_identity; print(json.dumps(series_identity()))'],
-    { cwd: checkout });
+    { cwd: kernelCheckout });
     const [identity, names] = JSON.parse(series);
     for (const [key, value] of Object.entries(identity)) assert.equal(metadata[key], value, key);
     assert.deepEqual(metadata.patchSeries, names);
@@ -174,15 +179,18 @@ async function provenance() {
     productHashes[file] = sha256(await readFile(join(checkout, file)));
   }
   const executables = ['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher'];
-  if (idleWindow) executables.push('coworkerd-platform-test');
+  if (idleWindow || threadedSqlThroughput) executables.push('coworkerd-platform-test');
   for (const file of executables) {
     hashes[file] = sha256(await readFile(join(binaries, file)));
   }
   await record('provenance', {
     commit, archive: pinned ? pins.releaseTag : null, architecture: metadata.architecture, archiveSha256,
     hashes, productHashes, kernelBuildCommit: metadata.coworkerdCommit, kernelRun: metadata.githubActions?.url,
-    ...(idleWindow && { kernelPatchSeries: metadata.patchSeriesSha256, workerdTree: metadata.workerdTree,
-      reopenRounds, profileCopyIdleMs }),
+    ...((idleWindow || threadedSqlThroughput) && {
+      kernelPatchSeries: metadata.patchSeriesSha256, workerdTree: metadata.workerdTree,
+    }),
+    ...(idleWindow && { reopenRounds, profileCopyIdleMs }),
+    ...(threadedSqlThroughput && { databaseMapping: 'threaded-platform' }),
     settings: throughput ? { homes: settings.homes, mailbox: throughputMailbox,
       placement: throughputPlacement, inFlightLimit: throughputInFlightLimit, ...throughputSettings } : settings,
     mode: mode ?? 'full', node: process.version,
@@ -520,7 +528,15 @@ async function runNetworkThroughput() {
   await seed(mainThreadProfile ? [workload] : [workload, ...databases]);
   const rows = new Map([workload, ...databases].map(name => [name, 1]));
   const cells = [];
-  for (const operation of ['worker-only', 'object-noop', 'read', 'insert']) {
+  if (threadedSqlThroughput) {
+    await eventually('the SQL databases use separate threaded platform copies', async () => {
+      const { entry } = await durable();
+      assert.equal(entry.lifecycle.durableAdmission.residentRoots, databases.length + 1);
+      assert.equal(entry.lifecycle.durableAdmission.homes, databases.length + 1);
+    });
+  }
+  const operations = threadedSqlThroughput ? ['read', 'insert'] : ['worker-only', 'object-noop', 'read', 'insert'];
+  for (const operation of operations) {
     for (const clients of [1, 8, 32]) cells.push({ operation, clients, targets: [workload] });
     if (operation === 'read' || operation === 'insert') {
       for (const clients of [8, 32]) cells.push({ operation, clients, targets: databases });

@@ -365,6 +365,12 @@ def allowed_path(name, path):
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0181-report-durable-copy-reservation-refusal.patch' and
                               path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0184-charge-database-sqlite-heap-to-process.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++',
+                              'src/workerd/util/sqlite-metering.c++',
+                              'src/workerd/util/sqlite-metering.h',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or
