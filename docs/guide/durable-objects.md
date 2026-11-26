@@ -197,7 +197,9 @@ the child.
 The node leaves `threadedStorage` off by default. The cluster suite exercises these mailbox limits
 with separate bursts of 128 concurrent single-row reads through public HTTP SQL and a Worker D1
 binding to one threaded database. The test uses the experimental database placement executable.
-[Cluster test](../../tests/cluster/README.md#threaded-sql-default-mailbox).
+In a Linux ARM64 cluster rehearsal, all 128 reads succeeded on each route at these limits.
+[Cluster test](../../tests/cluster/README.md#threaded-sql-default-mailbox) ·
+[Measurement environment](../threaded-durable-processes.md#per-object-admission-mailbox).
 
 ## 7. When ownership changes
 
