@@ -74,6 +74,8 @@
 extern char** environ;
 namespace coworkerd {
 namespace {
+// Assigned by the durable copy reservation contract in the threaded kernel.
+constexpr kj::Exception::DetailTypeId DURABLE_COPY_RESERVATION_REFUSED = 0xe05c5dbb242a7eb4ull;
 // Supervisor cadence for reading limit events (status, exits and failures read on demand).
 constexpr double LIMIT_EVENT_SYNC_MS = 1000;
 // A finished invocation without a `completed` row is forgotten after this long, or sooner
@@ -406,6 +408,10 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
     KJ_REQUIRE(threadedProtocol == 3, "native invocation protocol 3 is required");
     auto retryDelay = 5 * kj::MILLISECONDS;
     const auto waitUntil = timer->now() + 5 * kj::SECONDS;
+    auto refuseForCapacity = [&] {
+      onCapacityRejected();
+      if (capacityRejected.get() != nullptr) capacityRejected->fulfill(true);
+    };
     for (;;) {
       if (idle.empty()) connection->stream = co_await address->connect();
       else { connection->stream = kj::mv(idle.back()); idle.pop_back(); }
@@ -417,8 +423,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
       KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
       if (decision == 'R') {
-        onCapacityRejected();
-        if (capacityRejected.get() != nullptr) capacityRejected->fulfill(true);
+        refuseForCapacity();
         kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, "native invocation queue is full; nothing executed"));
       }
       if (threadedDurable && decision == 'E') {
@@ -444,7 +449,6 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       break;
     }
     onDispatched();
-    if (capacityRejected.get() != nullptr) capacityRejected->fulfill(false);
     if (!threadedDurable) ready->fulfill();
     connection->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*connection->stream);
     connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
@@ -464,6 +468,16 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       }
     }
     v1::rpc::EventDispatcher::Client dispatcher = nullptr;
+    auto receiveDurableDispatcher = [&](auto response) -> kj::Promise<v1::rpc::EventDispatcher::Client> {
+      try {
+        auto result = co_await kj::mv(response);
+        KJ_REQUIRE(budgetTicket == 0 || result.getBudgetAccepted(), "durable kernel did not accept the budget ticket");
+        co_return result.getDispatcher();
+      } catch (const kj::Exception& error) {
+        if (error.getDetail(DURABLE_COPY_RESERVATION_REFUSED) != kj::none) refuseForCapacity();
+        throw;
+      }
+    };
     if (nativeProps) {
       auto request = connection->bootstrap.castAs<v1::rpc::ThreadedBootstrap>().startNativeEventRequest();
       request.setCfBlobJson(descriptor);
@@ -471,24 +485,19 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       request.setBudgetLifetime(kj::mv(budgetToken));
       request.setBudgetTicket(budgetTicket);
       auto response = request.send();
-      if (threadedDurable) {
-        auto result = co_await kj::mv(response);
-        KJ_REQUIRE(budgetTicket == 0 || result.getBudgetAccepted(), "durable kernel did not accept the budget ticket");
-        dispatcher = result.getDispatcher();
-      } else dispatcher = response.getDispatcher();
+      if (threadedDurable) dispatcher = co_await receiveDurableDispatcher(kj::mv(response));
+      else dispatcher = response.getDispatcher();
     } else {
       auto request = connection->bootstrap.startEventRequest();
       request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
       request.setBudgetLifetime(kj::mv(budgetToken));
       request.setBudgetTicket(budgetTicket);
       auto response = request.send();
-      if (threadedDurable) {
-        auto result = co_await kj::mv(response);
-        KJ_REQUIRE(budgetTicket == 0 || result.getBudgetAccepted(), "durable kernel did not accept the budget ticket");
-        dispatcher = result.getDispatcher();
-      } else dispatcher = response.getDispatcher();
+      if (threadedDurable) dispatcher = co_await receiveDurableDispatcher(kj::mv(response));
+      else dispatcher = response.getDispatcher();
     }
     auto result = capnp::membrane(dispatcher, kj::refcounted<InvocationConnection>(connection));
+    if (capacityRejected.get() != nullptr) capacityRejected->fulfill(false);
     if (threadedDurable) ready->fulfill();
     cancelBudget.cancel();
     co_return result;

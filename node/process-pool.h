@@ -24,7 +24,7 @@ namespace coworkerd {
 struct OpenEvent {
   v1::rpc::EventDispatcher::Client dispatcher;
   kj::Promise<void> ready;
-  // The threaded durable child's raw admission reply, independent of the event opening afterward.
+  // The threaded durable child confirmed a refusal at admission or while reserving a cold copy.
   kj::Promise<bool> capacityRejected = false;
 };
 

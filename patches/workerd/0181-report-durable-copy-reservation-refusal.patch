@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Thu, 26 Nov 2026 14:39:07 +0800
+Subject: [PATCH] Report a refused durable copy reservation before dispatch
+
+Tag the final cold-copy reservation refusal before package loading or handler dispatch. Carry the capacity error detail only on this native bootstrap failure, so the node can report the known outcome. Use a one-shot marker in the existing durable lifecycle fixture to exercise it without memory pressure.
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index fbae87c6f5f828f9f312a94b7f30ece160c927a8..0046730402ea2aa390bd2577587d01d0a465eb23 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -555,6 +555,8 @@ void noSandboxRoom(ResourceBudget &budget) {
+ }
+ 
+ constexpr kj::Exception::DetailTypeId CAPACITY_DETAIL = 0x9f232974b0ac7143ull;
++// The node reads this detail on the private durable bootstrap, before it has an event dispatcher.
++constexpr kj::Exception::DetailTypeId DURABLE_COPY_RESERVATION_REFUSED = 0xe05c5dbb242a7eb4ull;
+ enum class CapacityScope { PROCESS, TENANT };
+ bool isCapacityError(const kj::Exception &error) {
+   return error.getDetail(CAPACITY_DETAIL) != kj::none;
+@@ -1796,20 +1798,36 @@ const char *durableLifecycleTestDirectory() {
+   return directory;
+ }
+ 
+-server::DurableIdleLifecycle::Time durableIdleNow() {
+-  auto now = server::DurableAdmission::Clock::now();
++uint32_t readDurableLifecycleSetting(kj::StringPtr name) {
+   const auto *directory = durableLifecycleTestDirectory();
+-  if (directory == nullptr) return now;
+-  auto path = kj::str(directory, "/idle-offset-ms");
++  if (directory == nullptr) return 0;
++  auto path = kj::str(directory, "/", name);
+   int fd = open(path.cStr(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+-  if (fd < 0) return now;
++  if (fd < 0) return 0;
+   KJ_DEFER(close(fd));
+   char bytes[16];
+   auto size = read(fd, bytes, sizeof(bytes));
+-  if (size <= 0) return now;
+-  uint32_t offset = 0;
+-  auto parsed = std::from_chars(bytes, bytes + size, offset);
+-  if (parsed.ec == std::errc() && offset <= 86'400'000) now += std::chrono::milliseconds(offset);
++  if (size <= 0) return 0;
++  uint32_t value = 0;
++  auto parsed = std::from_chars(bytes, bytes + size, value);
++  return parsed.ec == std::errc() ? value : 0;
++}
++
++bool refuseCopyReservationForTest() {
++  const auto request = readDurableLifecycleSetting("copy-reservation-refusal");
++  static std::atomic<uint32_t> lastRefusal = 0;
++  auto last = lastRefusal.load();
++  // A fixture request is consumed once, even when several homes attempt a cold copy.
++  while (request > last) {
++    if (lastRefusal.compare_exchange_weak(last, request)) return true;
++  }
++  return false;
++}
++
++server::DurableIdleLifecycle::Time durableIdleNow() {
++  auto now = server::DurableAdmission::Clock::now();
++  const auto offset = readDurableLifecycleSetting("idle-offset-ms");
++  if (offset <= 86'400'000) now += std::chrono::milliseconds(offset);
+   return now;
+ }
+ 
+@@ -3940,7 +3958,11 @@ struct ThreadedServer {
+     auto input = document.get();
+     auto reservation = std::make_shared<ResourceReservation>(
+         resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"));
+-    if (!reservation->registerPreparation()) kj::throwRecoverableException(capacityError());
++    if (refuseCopyReservationForTest() || !reservation->registerPreparation()) {
++      auto error = capacityError();
++      error.setDetail(DURABLE_COPY_RESERVATION_REFUSED, kj::heapArray<kj::byte>(0));
++      kj::throwRecoverableException(kj::mv(error));
++    }
+     auto slot = std::make_shared<Slot>();
+     slot->reservation = std::move(reservation);
+     slot->instance = ++nextInstance;
