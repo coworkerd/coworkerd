@@ -74,6 +74,16 @@ buffer to allow a 254-frame SQL transaction including the record envelope and RP
 checks peer confirmation at the limit, HTTP 422 one frame over the limit, D1 batch rollback and the
 confirmed `exec()` prefix. A follow-up write and read run on the same open database.
 
+`durable-threaded-database-admission` uses three homes on a threaded owner. SQL fills the homes and
+refreshes the first database. A new database displaces the least recently used eligible one while a
+third database waits for write confirmation with another query queued behind it. The case reopens the
+displaced database and reads its previously confirmed row. It then holds all three homes busy and
+checks the capacity refusal and recovery. A test fixture holds the final reservation past the
+one-second deadline so the case also verifies that the refusal is counted and the home is reusable.
+
+`durable-threaded-database-admission-mixed` fills the four default homes and runs a serial SQL scan
+while tenant objects from six definitions compete for the released homes in the same process.
+
 `durable-threaded-database-placement` uses the test executable on the threaded owner and the upstream
 database backend on the other nodes. It checks HTTP SQL and D1 in both directions, batch rollback, two
 same-tenant databases in separate isolate copies of the same threaded process generation before and after
