@@ -20,7 +20,7 @@ cleanup() {
   if mountpoint -q "$mountpoint"; then sudo umount "$mountpoint"; fi
   if sudo dmsetup info "$name" >/dev/null 2>&1; then sudo dmsetup remove "$name"; fi
   if [[ -n "$loop" ]]; then sudo losetup -d "$loop"; fi
-  rm -rf "$runner"
+  sudo rm -rf -- "$runner"
 }
 trap cleanup EXIT
 mkdir "$mountpoint"
@@ -42,6 +42,7 @@ cc -Wall -Wextra -Werror -O2 -shared -fPIC "$trace_source/trace.c" -ldl -o "$run
   lscpu
   printf 'Runner image %s %s\n' "${ImageOS:-local}" "${ImageVersion:-local}"
   docker version --format 'Docker Engine {{.Server.Version}}'
+  findmnt -T "$runner"
   findmnt -T "$mountpoint"
   lsblk -o NAME,TYPE,SIZE,MOUNTPOINTS "$loop"
   sudo dmsetup table "$name"
@@ -52,7 +53,7 @@ cc -Wall -Wextra -Werror -O2 -shared -fPIC "$trace_source/trace.c" -ldl -o "$run
 cell() {
   local side=$1 tier=$2 binaries=$3 root=$4
   local path="$root/$side" objects="$runner/$side-$tier-objects"
-  sudo install -d -o 10001 -g 10001 -m 0755 "$path" "$objects/log"
+  sudo install -d -o 10001 -g 10001 -m 0755 "$path" "$objects" "$objects/log"
   COWORKERD_CLUSTER_BIN_DIR="$binaries" node "$trace_source/measure.mjs" "$kernel" \
     "$reports/$side-$tier.jsonl" "$path" "$runner/trace.so" "$objects"
 }
