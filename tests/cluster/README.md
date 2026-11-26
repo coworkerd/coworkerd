@@ -80,6 +80,14 @@ The other seven hit the node's root admission threshold, which counts both Worke
 and active database calls on that node. Running the Worker on a peer gives its roots their
 own default node admission budget. [Maintainer decision](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7183434485)
 
+### Threaded SQLite memory limit
+
+Run `node tests/cluster/run.mjs "$kernel" threaded-sql-memory-limit` with the matching Linux
+binaries. The threaded owner uses a 1 MiB SQLite heap budget. The case checks repeated queries
+below and above the budget, HTTP and D1 rollback, the confirmed `exec()` prefix, and recovery
+on the same SQLite connection after sort, value size and reply size errors. It also forces a
+WAL checkpoint and checks the child logs for allocator scope and accounting errors.
+
 ### Threaded SQL and CLI parity
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-cli-parity` to run `sql-atomicity` with the

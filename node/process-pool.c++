@@ -2644,7 +2644,8 @@ public:
                "COWORKERD_DO_TEST_PLACEMENT_BYTES", "COWORKERD_DO_TEST_BUSY_MS",
                "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",
                "COWORKERD_DO_TEST_FD_HEADROOM", "COWORKERD_DO_TEST_COMMIT_DELAY_MS",
-               "COWORKERD_DO_TEST_REFUSE_GROUP", "COWORKERD_DO_TEST_LIFECYCLE_DIR"}) {
+               "COWORKERD_DO_TEST_REFUSE_GROUP", "COWORKERD_DO_TEST_LIFECYCLE_DIR",
+               "COWORKERD_DO_TEST_SQL_MEMORY_BYTES"}) {
         if (const char* value = std::getenv(name)) childEnvironment.push_back(std::string(name) + "=" + value);
       }
     }

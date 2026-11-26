@@ -91,6 +91,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   `src/workerd/threaded/threaded-server.c++`.
   Patch 0181 marks a refused cold-copy reservation on the private threaded durable bootstrap. The node
   uses that detail before it receives an event dispatcher to confirm that the operation never ran.
+  Patch 0182 uses SQLite's per-connection allocator meter for threaded platform databases.
+  A local heap refusal rolls back the current transaction and preserves the open connection.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
