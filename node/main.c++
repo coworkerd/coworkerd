@@ -6,7 +6,7 @@
 #include "trial-verdict.h"
 #include "placement-contract.h"
 #include "reasons.h"
-#include "r47-trace.h"
+#include "event-loop-trace.h"
 #include "background-value.h"
 #include "rpc-error.h"
 #include "coworkerd.capnp.h"
@@ -3198,11 +3198,11 @@ public:
     while (buildingState) co_await timer.afterDelay(1 * kj::MILLISECONDS);
     buildingState = true;
     const auto release = kj::defer([this]() { buildingState = false; });
-    const auto started = coworkerd::r47::trace ? coworkerd::r47::clockNs(CLOCK_MONOTONIC) : 0;
-    coworkerd::r47::Span expiry(coworkerd::r47::STATE_EXPIRY);
+    const auto started = coworkerd::eventLoopTrace::trace ? coworkerd::eventLoopTrace::clockNs(CLOCK_MONOTONIC) : 0;
+    coworkerd::eventLoopTrace::Span expiry(coworkerd::eventLoopTrace::STATE_EXPIRY);
     expireForState();
     expiry.finish();
-    coworkerd::r47::Span snapshot(coworkerd::r47::STATE_SNAPSHOT);
+    coworkerd::eventLoopTrace::Span snapshot(coworkerd::eventLoopTrace::STATE_SNAPSHOT);
     std::set<const VersionPins*> pinTables;
     size_t pinReferences = 0;
     std::vector<std::pair<std::string, InvocationLeaseState>> stateLeases;
@@ -3238,7 +3238,7 @@ public:
     auto memorySection = co_await memoryStateJson();
     output << ",\"memory\":" << memorySection;
     co_await timer.afterDelay(1 * kj::MICROSECONDS);
-    coworkerd::r47::Span coreFields(coworkerd::r47::STATE_CORE_FIELDS);
+    coworkerd::eventLoopTrace::Span coreFields(coworkerd::eventLoopTrace::STATE_CORE_FIELDS);
     output << ",\"logging\":" << coworkerd::AsyncLog::stateJson()
            << ",\"cpuLimitMs\":" << runtime.cpuLimitMs()
            << ",\"memoryLimitMiB\":" << runtime.memoryLimitMiB()
@@ -3312,7 +3312,7 @@ public:
     co_await timer.afterDelay(1 * kj::MICROSECONDS);
     constexpr size_t RECORD_SLICE = 32;
     for (size_t begin = 0; begin < stateLeases.size(); begin += RECORD_SLICE) {
-      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      coworkerd::eventLoopTrace::Span span(coworkerd::eventLoopTrace::STATE_SLICE);
       for (size_t index = begin; index < std::min(stateLeases.size(), begin + RECORD_SLICE); ++index) {
         const auto& [invocationId, lease] = stateLeases[index];
         if (index > 0) output << ',';
@@ -3329,7 +3329,7 @@ public:
     }
     output << "],\"debits\":[";
     for (size_t begin = 0; begin < stateDebits.size(); begin += RECORD_SLICE) {
-      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      coworkerd::eventLoopTrace::Span span(coworkerd::eventLoopTrace::STATE_SLICE);
       for (size_t index = begin; index < std::min(stateDebits.size(), begin + RECORD_SLICE); ++index) {
       if (index > 0) output << ',';
       const auto& record = *stateDebits[index];
@@ -3356,7 +3356,7 @@ public:
     }
     output << "},\"executions\":[";
     for (size_t begin = 0; begin < stateExecutions.size(); begin += RECORD_SLICE) {
-      coworkerd::r47::Span span(coworkerd::r47::STATE_SLICE);
+      coworkerd::eventLoopTrace::Span span(coworkerd::eventLoopTrace::STATE_SLICE);
       for (size_t index = begin; index < std::min(stateExecutions.size(), begin + RECORD_SLICE); ++index) {
       if (index > 0) output << ',';
       const auto& record = *stateExecutions[index];
@@ -3382,18 +3382,18 @@ public:
     output << "]";
     uint64_t index = 0;
     for (const auto& [name, section] : stateSections) {
-      const auto partStart = coworkerd::r47::trace ? output.tellp() : std::streampos{};
-      coworkerd::r47::Span partTrace(coworkerd::r47::STATE_SECTION_BASE + index++);
+      const auto partStart = coworkerd::eventLoopTrace::trace ? output.tellp() : std::streampos{};
+      coworkerd::eventLoopTrace::Span partTrace(coworkerd::eventLoopTrace::STATE_SECTION_BASE + index++);
       output << ",\"" << name << "\":" << section();
-      if (coworkerd::r47::trace) partTrace.finish(static_cast<uint64_t>(output.tellp() - partStart));
+      if (coworkerd::eventLoopTrace::trace) partTrace.finish(static_cast<uint64_t>(output.tellp() - partStart));
       co_await timer.afterDelay(1 * kj::MICROSECONDS);
     }
     output << "}";
-    coworkerd::r47::Span flatten(coworkerd::r47::STATE_FLATTEN);
+    coworkerd::eventLoopTrace::Span flatten(coworkerd::eventLoopTrace::STATE_FLATTEN);
     auto result = output.str();
     flatten.finish(result.size());
-    if (started) coworkerd::r47::record(coworkerd::r47::STATE_ASYNC, started,
-        coworkerd::r47::clockNs(CLOCK_MONOTONIC), 0, result.size());
+    if (started) coworkerd::eventLoopTrace::record(coworkerd::eventLoopTrace::STATE_ASYNC, started,
+        coworkerd::eventLoopTrace::clockNs(CLOCK_MONOTONIC), 0, result.size());
     co_return result;
   }
 
@@ -10449,7 +10449,7 @@ int run(Launch launch) {
   const auto joinBackgroundValues = kj::defer([]() { coworkerd::backgroundValues.join(); });
   auto& waitScope = io.waitScope;
   auto& timer = io.provider->getTimer();
-  coworkerd::r47::openTrace();
+  coworkerd::eventLoopTrace::openTrace();
 
   capnp::ByteStreamFactory byteStreamFactory;
   kj::HttpHeaderTable::Builder headerTableBuilder;
@@ -10763,14 +10763,14 @@ int run(Launch launch) {
       -> kj::Promise<std::string> {
     std::string containers;
     {
-      coworkerd::r47::Span trace(coworkerd::r47::STATE_MEMORY);
+      coworkerd::eventLoopTrace::Span trace(coworkerd::eventLoopTrace::STATE_MEMORY);
       containers = "{\"durableLog\":" + durableLog.memoryJson() +
           ",\"membership\":{\"members\":{\"entries\":" + std::to_string(membership->view().members.size()) + "}}" +
           ",\"usage\":" + tenantUsage.memoryJson() + ",\"peerAuth\":" + peerAuth.memoryJson();
     }
     co_await timer.afterDelay(1 * kj::MICROSECONDS);
     {
-      coworkerd::r47::Span trace(coworkerd::r47::STATE_MEMORY);
+      coworkerd::eventLoopTrace::Span trace(coworkerd::eventLoopTrace::STATE_MEMORY);
       containers += ",\"asyncLog\":" + coworkerd::WorkerdOutput::memoryJson() + ",\"processPool\":" + runtime.memoryJson() +
           ",\"serverCore\":" + server.retainedMemoryJson() + '}';
     }
@@ -10900,7 +10900,7 @@ int run(Launch launch) {
       .exclusiveJoin(membership->run())
       .exclusiveJoin(watchShardOwnership(server, runtime, shards, *membership, timer, leaseDroppedShards))
       .exclusiveJoin(durableLog.run())
-      .exclusiveJoin(coworkerd::r47::runTimer(timer))
+      .exclusiveJoin(coworkerd::eventLoopTrace::runTimer(timer))
       .exclusiveJoin(watchDurableEpoch(durableLog, *membership, timer))
       // A draining Server applies no further deployment change: the desired state's poll stops at the announcement.
       .exclusiveJoin(desiredState->run().exclusiveJoin(drain.started())

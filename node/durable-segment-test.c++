@@ -192,7 +192,7 @@ void compare(const Fixture& fixture, const std::map<std::string, Read>& before, 
 }
 
 void runSegmentCase(unsigned seed, SegmentControl control) {
-  auto temp = (std::filesystem::temp_directory_path() / "b57-segment-XXXXXX").string();
+  auto temp = (std::filesystem::temp_directory_path() / "durable-segment-XXXXXX").string();
   KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
   KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
   auto io = kj::setupAsyncIo();
@@ -301,7 +301,7 @@ void runSegmentCase(unsigned seed, SegmentControl control) {
 
 // The cache's own behaviour, on one seed's fixture. Each step names what it would catch.
 void runCacheCase(unsigned seed) {
-  auto temp = (std::filesystem::temp_directory_path() / "b57-cache-XXXXXX").string();
+  auto temp = (std::filesystem::temp_directory_path() / "durable-segment-cache-XXXXXX").string();
   KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
   KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
   auto io = kj::setupAsyncIo();
