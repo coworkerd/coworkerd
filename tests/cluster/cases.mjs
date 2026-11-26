@@ -241,6 +241,15 @@ async function databaseDispatches(cluster, db, owner) {
 }
 
 async function threadedSqlCliParity(cluster) {
+  // An early call can claim a shard while a peer is still appearing in other
+  // nodes' membership views. Wait before relying on the first-owner order.
+  await eventually('all nodes see every durable candidate before the CLI test opens a database', async () => {
+    await Promise.all(cluster.nodes.map(async node => {
+      const { membership } = await cluster.state(node);
+      const active = membership.members.filter(member => member.durableProcesses > 0 && member.state === 'active');
+      assert.deepEqual(active.map(member => member.nodeId).sort(), cluster.nodes, node);
+    }));
+  });
   const ledger = await sqlAtomicity(cluster);
   const tenant = await cluster.tenant('sql-cli');
   const cwd = join(cluster.directory, 'd1-cli');
