@@ -55,9 +55,8 @@ Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matchi
 kernel and product binaries. The case uses the `coworkerd-platform-test` executable from the
 database placement fixture on its threaded owner. It times HTTP and D1 statements and batches,
 including writes with a connected client. It checks the complete reply on a half-closed HTTP
-connection and terminates an active HTTP writer with a TCP reset. The case checks the refusal to
-queued HTTP and D1 reads during the write resets, followed by a fresh SQLite open in the same
-process and a read of the earlier confirmed value.
+connection and terminates an active HTTP writer with a TCP reset. Reads already queued behind
+the interrupted writes must return the earlier confirmed value, with no additional SQLite opens.
 
 ### Threaded SQL default mailbox
 

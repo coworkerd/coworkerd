@@ -1122,25 +1122,16 @@ async function threadedSqlDeadline(cluster) {
 
   const write = [put(2), { sql: insert }];
   const checkQueuedHttp = result => {
-    const failure = json(result, 503, 'HTTP read queued when a write reset the database');
-    assert.equal(failure.code, 'DO_UNAVAILABLE', JSON.stringify(failure));
+    const answer = json(result, 200, 'HTTP read queued behind an interrupted write');
+    assert.deepEqual(answer.results, [{ id: 1 }]);
   };
   const checkQueuedBinding = result => {
-    const failure = json(result, 503, 'D1 read queued when a write reset the database');
-    assert.match(failure.message, /^D1_ERROR: .*DO_UNAVAILABLE/);
-    assert.match(failure.cause, /DO_UNAVAILABLE/);
+    assert.deepEqual(json(result, 200, 'D1 read queued behind an interrupted write'), [{ id: 1 }]);
   };
   const openSamples = async () => (await cluster.state(owner)).durableLog.threadedHomeIo.openSamples;
-  const reopened = async (db, label, run, results) => {
-    const before = await openSamples();
-    await eventually(`${label} reopens ${db.name} after its write was rolled back`, async () => {
-      assert.deepEqual(results(json(await run(), 200, label)), [{ id: 1 }]);
-    }, { timeout: 5000, interval: 50 });
-    assert.equal(await openSamples(), before + 1, `${label} needed a fresh SQLite open`);
-    await eventually(`${label} keeps the same process`, () => activity(0));
-  };
 
   await eventually('SQL homes are idle before the live write deadlines', () => activity(0));
+  const opensBeforeDeadline = await openSamples();
   const timedWrites = Promise.all([
     withTiming('HTTP write deadline', () => sql(databases[0], write), checkHttp),
     withTiming('D1 write deadline', () => binding(2, 'write'), checkBinding),
@@ -1152,10 +1143,10 @@ async function threadedSqlDeadline(cluster) {
   await eventually('an HTTP and a D1 query are queued behind the writes', () => activity(2, 2));
   await timedWrites;
   const [queuedHttp, queuedBinding] = await queued;
-  checkQueuedBinding(queuedBinding);
   checkQueuedHttp(queuedHttp);
-  await reopened(databases[0], 'HTTP after its write deadline', () => sql(databases[0], read, 1500), reply => reply.results);
-  await reopened(databases[2], 'D1 after its write deadline', () => binding(2, 'read'), reply => reply);
+  checkQueuedBinding(queuedBinding);
+  assert.equal(await openSamples(), opensBeforeDeadline, 'the HTTP and D1 queries reused their open databases');
+  await eventually('the deadline test leaves the same process idle', () => activity(0));
 
   // Send the reset directly to the listener. A Docker port proxy can turn it into a FIN.
   const apiserver = await cluster.compose(['ps', '-q', 'apiserver']);
@@ -1172,6 +1163,7 @@ async function threadedSqlDeadline(cluster) {
   void writerClosed.catch(() => {});
   writer.stdin.on('error', () => {});
   try {
+    const opensBeforeDisconnect = await openSamples();
     writer.stdin.write(`${JSON.stringify(sqlWire(databases[0], write))}\n`);
     await eventually('the HTTP write is running before disconnect', () => activity(1));
     const behindDisconnect = sql(databases[0], read, 5000);
@@ -1181,7 +1173,8 @@ async function threadedSqlDeadline(cluster) {
     writer.stdin.end();
     assert.deepEqual(await writerClosed, [0, null], 'the TCP client sent its reset');
     checkQueuedHttp(await behindDisconnect);
-    await reopened(databases[0], 'HTTP after disconnect', () => sql(databases[0], read, 1500), reply => reply.results);
+    assert.equal(await openSamples(), opensBeforeDisconnect, 'the read after TCP reset reused the open database');
+    await eventually('the disconnect test leaves the same process idle', () => activity(0));
     console.log(`HTTP disconnect and recovery: ${(performance.now() - disconnectedAt).toFixed(1)} ms`);
   } finally {
     writer.stdin.end();
