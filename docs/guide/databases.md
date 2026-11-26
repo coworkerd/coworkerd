@@ -13,6 +13,20 @@ takes the shard over rebuilds it from that history. One database holds at most 1
 one of the tenant's 16 namespaces (`durableObjectNamespaces`); what all of a tenant's objects hold together is bounded
 by `durableObjectBytes` (10 GiB by default).
 
+### Threaded database capacity
+
+The threaded database test build keeps each open database on its own home. At the default
+home count, one durable process handled four busy databases at once. Two processes handled
+eight when the database keys were distributed across both. Each process receives a share
+of the node's memory budget, and a smaller resource budget can lower capacity.
+
+When a new database needs room, the process releases its least recently used eligible idle
+database. An active call, queued call, or pending storage confirmation keeps its database
+resident. A later call reopens the released database with its confirmed data.
+An explicit admission refusal returns HTTP `503 OVERLOADED` with `dispatched: false`
+and `retryable: true`.
+[Admission measurements and commands](../database-home-benchmark.md#database-admission-at-the-ceiling)
+
 ## 2. Make one
 
 From a directory with `cowctl.json` initialized for your tenant (see the [quickstart](quickstart.md)):
@@ -362,13 +376,17 @@ cowctl d1 time-travel restore books --timestamp 2026-11-16T04:00:00Z --to books-
 cowctl d1 time-travel restore books --bookmark BOOKMARK --to books-restored --yes
 ```
 
-The command displays the resolved revision and its publication time **before** asking for confirmation or starting
-(`--yes` skips the question). `--timestamp` accepts ISO time with timezone or Unix milliseconds. It selects the highest
-published revision whose generation time is no later than T. Writes after that point are absent. Writes before T
-that have not been published can also be absent: the default segment interval is about 30 seconds. A bookmark names
-one exact immutable revision; a bookmark from another database is rejected. A time before all matching history fails;
-a time after the latest publication selects that latest revision. Clocks can differ at an owner takeover: revision
-order wins. The lookup searches revision numbers with exact GETs, splitting owner epochs before searching their times.
+Without a timestamp, `info` returns the latest published revision. Its bookmark captures the database state
+in that revision's snapshot and sealed log segments. A successful SQL write or import can return before its
+records are published, so `info` can still show an earlier point. The default segment interval is about 30 seconds.
+A bookmark identifies one immutable revision and can only be used with its source database.
+
+The restore command displays the resolved revision and its publication time **before** asking for confirmation or
+starting (`--yes` skips the question). `--timestamp` accepts ISO time with timezone or Unix milliseconds. It selects the
+highest published revision whose generation time is no later than T. A write made before T can be absent if its
+records were still unpublished at T. A time before all matching history fails. A time after the latest publication selects that
+latest revision. If clocks differ at an owner takeover, revision order wins. The lookup searches revision numbers
+with exact GETs, splitting owner epochs before searching their times.
 A lookup is limited to 128 history reads (up to 256 HTTP attempts if each read retries once). Exceeding this returns
 422 `HISTORY_READ_LIMIT`; retry the same request to continue from the cached owner intervals. A bookmark needs at
 most one history read. The control plane retains up to 64 library caches, each with 256 revision records, 128 owner
