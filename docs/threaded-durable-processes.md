@@ -362,9 +362,37 @@ either saves the old actor before close begins or joins the next open, once.
 An eligible threaded platform database closes its tree and releases its exclusive copy about
 10 seconds after its last request finishes. Retaining empty copies exhausted the process
 admission budget in a serial scan of distinct databases. Releasing the copy with the tree
-returns that reservation. The first read after full release took an extra 9.86 ms p50 and
-14.45 ms p99 compared with its immediate warm repeat in the same-epoch D1 profile.
-[Idle-window measurements](database-home-benchmark.md#idle-window-for-exclusive-platform-database-copies)
+returns that reservation. With timed release enabled, the first read after full release
+took an extra 9.46 ms at p50 and 14.38 ms at p99 compared with its immediate warm repeat
+in the same-epoch D1 profile.
+[Idle-window measurements](database-home-benchmark.md#verification-with-patch-0174)
+
+A threaded database can also retire under admission pressure before its idle timer fires.
+The process ranks eligible database trees across its homes by the last completed call.
+The selected home rechecks the mailbox, active calls, tracked background work and WAL
+confirmation before closing the tree. The admission retry follows the normal close and
+copy release. After a routing retirement, the home and one routing tree credit give
+databases 100 ms to retry at the native preface. Existing tenant trees can continue
+serving calls during that interval.
+A cold load that cannot register its initial reservation may retire one database whose
+charge would cover the shortfall. One preparation credit is held for a database while
+the reservation returns and for up to 100 ms afterward. The cold load retries once.
+Above the initial-admission ceiling, a database can only replace one idle database.
+Its first reservation must fit within the returned charge and leave the total within
+the hard process budget. In the memory probe the existing copies charged 1,974,448,702
+bytes against the initial-admission ceiling of 1,973,251,124 bytes. A typical copy
+returned 2,732,370 bytes, and the new copy's first reservation was 2,621,440 bytes.
+If retirement cannot return the reservation within one second, the process clears the
+victim, counts an overload and logs its home and tree. Capacity waiters receive a refusal
+and the process can use the home once its normal close is complete.
+A refused call can retire several databases over the node's five-second routing retry
+window, one per retry after each preceding retirement reaches its own one-second deadline.
+
+The earlier archive completed 1 of 116 queries with `residentObjects: 4` and
+105 of 116 at the default memory budget with extra homes. The revised kernel completed
+116 of 116 in both mixed probes while six tenant definitions competed for the returned
+credits.
+[Admission measurements](database-home-benchmark.md#database-admission-at-the-ceiling)
 
 Use the node's WebSocket registry and transport loop for parked connections. The handoff carries the
 owner/shard epoch, object and attachment identity, ordered frame position, tags, serialized attachments and
