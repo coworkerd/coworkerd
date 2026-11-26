@@ -2350,8 +2350,7 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
           ? facet.loggedFrame : 0;
       facet.checkpointGeneration = generation;facet.checkpointFrames = frames;
       facet.checkpointSalt1 = salt1;facet.checkpointSalt2 = salt2;
-      facet.checkpointSafe = frames <= known &&
-          (facet.loggedNodeEpoch != nodeEpoch || facet.loggedSeq <= appendedSeq);
+      facet.checkpointSafe = frames <= known;
       if (!facet.checkpointSafe) {
         ++positionMismatches;
         log("checkpoint-unlogged-frames", "\"object\":" + quote(objectName) + ",\"facet\":" + std::to_string(facetId) +
@@ -2369,9 +2368,9 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       facet.generation = generation;
       sized(*object);
       const auto bytes = object->bytes;
-      // The files are now at a position the node has confirmed: recorded beside them, so a restart of the daemon or
-      // of a durable process within the same boot reuses them instead of rebuilding from the whole history.
-      writePosition(*object);
+      // A checkpoint can cover submitted frames while their append is still
+      // queued. Keep that position in memory until the log has the frames.
+      if (facet.loggedNodeEpoch != nodeEpoch || facet.loggedSeq <= appendedSeq) writePosition(*object);
       log("checkpoint", "\"object\":" + quote(objectName) + ",\"facet\":" + std::to_string(facetId) + ",\"frames\":" +
               std::to_string(frames) + ",\"databaseBytes\":\"" + std::to_string(databaseBytes) + "\"");
       tasks.add(snapshotIfDue(objectName));
@@ -2644,8 +2643,8 @@ void DurableLog::failLogWrites(const std::string& reason) {
 }
 
 uint64_t DurableLog::recordLimitBytes() const {
-  // The local confirmation queue has no separate byte limit. The local FD uses
-  // UInt32 lengths; the fragment cap and the actual peer RPC reader are tighter.
+  // The local FD uses UInt32 lengths. The fragment cap, append queue and peer
+  // RPC reader are tighter bounds.
   const auto rawLimit = std::min({uint64_t(capnp::ReaderOptions().traversalLimitInWords * sizeof(capnp::word)),
       uint64_t(RECORD_BYTES_LIMIT), settings.config.peerBufferBytes, uint64_t(UINT32_MAX)});
   return rawLimit > TAIL_RPC_HEADROOM_BYTES ? rawLimit - TAIL_RPC_HEADROOM_BYTES : 0;
