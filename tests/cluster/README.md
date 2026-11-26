@@ -65,16 +65,26 @@ the interrupted writes must return the earlier confirmed value, with no addition
 
 ### Long SQL isolation
 
-Run this measurement on a quiet Linux machine or Linux Docker VM, after finishing any builds and
-other load tests. Use the verified kernel pin and the matching `coworkerd-platform-test` executable.
+Run this measurement on a dedicated Linux machine after finishing any builds and other load tests.
+Use the verified kernel pin and the matching `coworkerd-platform-test` executable.
 
 ```sh
 node tests/cluster/long-sql-isolation.mjs "$kernel" "$PWD/long-sql-isolation.jsonl"
 ```
 
+The [manual GitHub Actions workflow](../../.github/workflows/long-sql-isolation-measure.yml) uses a
+dedicated Ubuntu runner for the selected architecture. Set `ref` to the branch you want to measure.
+
+```sh
+gh workflow run long-sql-isolation-measure.yml --ref "$ref" -f architecture=linux-x86_64
+gh workflow run long-sql-isolation-measure.yml --ref "$ref" -f architecture=linux-arm64
+```
+
+Each run uploads the JSONL report, measurement log and runner details.
+
 The driver provisions a fresh single-node Compose cluster and uses `cowctl` to deploy the object
 probe. On the Compose frontend network it offers 40 requests/s per probe in alternating quiet
-and busy windows, three per condition. Each 30-second window starts with the same warm-up.
+and busy windows, three per condition. The same warm-up precedes each 30-second window.
 Two probe paths read seeded rows through HTTP SQL on different databases.
 One belongs to the tenant running the long statement and one belongs to a second tenant. The
 third path calls a Worker Durable Object. Each busy window runs one SQL batch with a single
