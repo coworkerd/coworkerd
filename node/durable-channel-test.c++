@@ -554,11 +554,33 @@ struct DurableLogChannelTest {
       { std::ofstream out(trigger); out << "4000"; }
       log.slowFlushForTest = trigger.string();
       take(44);
-      log.waitForLogWrites().wait(io.waitScope);
+      auto flushed = log.waitForLogWrites();
+      io.provider->getTimer().afterDelay(20 * kj::MILLISECONDS).wait(io.waitScope);
+      KJ_REQUIRE(!flushed.poll(io.waitScope) && log.inFlight.contains(1) && confirmed() == 0,
+          "the main loop's timer runs while the output gate waits for the log worker");
+      flushed.wait(io.waitScope);
       KJ_REQUIRE(!std::filesystem::exists(trigger), "the slow flush did not run");
       KJ_REQUIRE(answers().at(44) == 1 && confirmed() == 0 && lost == 1 && tracker.fenced(1),
           "a lease that ended during the local flush must refuse the confirmation");
       KJ_REQUIRE(log.isolated.size() == 1 && log.inFlight.empty(), "the refused record is excluded like any other");
+    } else if (name == "rotate") {
+      const auto original = log.logPath;
+      const auto trigger = std::filesystem::path(temp) / "slow-flush";
+      { std::ofstream out(trigger); out << "150"; }
+      log.slowFlushForTest = trigger.string();
+      take(51);
+      take(52);
+      auto rotation = log.setNodeEpoch(2);
+      KJ_REQUIRE(!rotation.poll(io.waitScope) && log.nodeEpoch == 1,
+          "the descriptor remains on the old epoch while any append is outstanding");
+      rotation.wait(io.waitScope);
+      KJ_REQUIRE(answers().at(51) == 1 && answers().at(52) == 1 && confirmed() == 0,
+          "the old epoch's pending records could not acknowledge after rotation");
+      KJ_REQUIRE(log.nextSeq == 0 && log.appendedSeq == 0 && log.flushedSeq == 0 && log.nodeEpoch == 2);
+      const auto old = std::filesystem::file_size(original);
+      KJ_REQUIRE(old > 0 && std::filesystem::file_size(log.logPath) == 0,
+          "the old epoch drained and the new append file is empty");
+      KJ_REQUIRE(log.earlierExcluded.at(1).size() == 2 && log.predecessorLogs.at(1).complete);
     } else if (name == "wait") {
       // A heartbeat in flight keeps the answer back; nothing is confirmed until it settles.
       forced = LeaseTracker::Judgment{LeaseTracker::Verdict::WAIT, leaseClockMs() + 30000, "in flight"};

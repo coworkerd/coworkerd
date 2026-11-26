@@ -1160,7 +1160,7 @@ kj::Promise<void> DurableLog::rotateNodeEpoch(uint64_t epoch) {
   }
   if (nodeEpoch) {
     auto& info = predecessorLogs[nodeEpoch];
-    info.complete = !logAppendFailed && bool(logWorker);
+    info.complete = !logAppendFailed && !logPath.empty();
     info.sealedTo = sealedSeq;
     info.maxSeq = nextSeq;
     info.unpublishedShards.clear();
@@ -2299,7 +2299,7 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       if (openId != 0) {
         const bool fenced = (hooks.namespaceActive && !hooks.namespaceActive(object->namespaceId)) ||
             (facetId == 0 && object->definitionDrainDeadline != kj::none);
-        const bool authorized = object->state == ObjectState::LOCAL && !fenced;
+        const bool authorized = object->state == ObjectState::LOCAL && !fenced && !epochChanging;
         std::string opened;
         putU8(opened, TO_OPENED);
         putU64(opened, openId);
@@ -2350,7 +2350,8 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
           ? facet.loggedFrame : 0;
       facet.checkpointGeneration = generation;facet.checkpointFrames = frames;
       facet.checkpointSalt1 = salt1;facet.checkpointSalt2 = salt2;
-      facet.checkpointSafe = frames <= known;
+      facet.checkpointSafe = frames <= known &&
+          (facet.loggedNodeEpoch != nodeEpoch || facet.loggedSeq <= appendedSeq);
       if (!facet.checkpointSafe) {
         ++positionMismatches;
         log("checkpoint-unlogged-frames", "\"object\":" + quote(objectName) + ",\"facet\":" + std::to_string(facetId) +
@@ -2605,7 +2606,7 @@ kj::Promise<void> DurableLog::writeLogBatch(std::vector<LogAppend> batch, bool f
       }
     }
     return result;
-  });
+  }).catch_([](kj::Exception&&) { return Outcome{EIO, 0, false, std::nullopt}; });
   queuedLogBytes -= bytes;
   if (outcome.testDelayMs) log("slow-flush-for-test", "\"ms\":" + std::to_string(*outcome.testDelayMs));
   if (outcome.error) {
@@ -2615,7 +2616,12 @@ kj::Promise<void> DurableLog::writeLogBatch(std::vector<LogAppend> batch, bool f
     failLogWrites(outcome.flushFailed ? "the local log could not be flushed" : "the node's append log could not accept this write");
   } else {
     appendedSeq = through;
-    if (flush) flushedSeq = through;
+    if (flush) {
+      flushedSeq = through;
+      // Requests made while this flush was in flight only cover sequences
+      // the event loop already saw appended. This flush covers them all.
+      logFlushRequested = false;
+    }
     if (!epochChanging && !stopped && !recoveryWriteFailed) {
       checkConfirmations();
       if (!recoveryWriteFailed) sendAppendedRecords(before, through);
@@ -2682,12 +2688,12 @@ void DurableLog::takeRecord(Channel& channel, LogRecord&& record, uint64_t reque
     if (request) answer(channel, request, ACK_UNAVAILABLE);
     return;
   }
-  if (epochChanging) {
-    markRepair(*object, "the node's log epoch changed before this write could be appended");
+  if (ownerFenced(object->namespaceId, object->shard, object->shardEpoch)) {
     if (request) answer(channel, request, ACK_UNAVAILABLE);
     return;
   }
-  if (ownerFenced(object->namespaceId, object->shard, object->shardEpoch)) {
+  if (epochChanging) {
+    markRepair(*object, "the node's log epoch changed before this write could be appended");
     if (request) answer(channel, request, ACK_UNAVAILABLE);
     return;
   }
@@ -4206,8 +4212,11 @@ kj::Promise<void> DurableLog::cleanupClosedEpoch() {
         earlier.contains(epoch) || earlierExcluded.contains(epoch)) continue;
     if (std::any_of(info.unpublishedShards.begin(), info.unpublishedShards.end(), [](const auto& entry) { return entry.second != 0; })) continue;
     const auto original = logDirectory() / (wide(epoch) + ".log");
-    std::error_code code;
-    if (!std::filesystem::is_regular_file(original, code) || code) continue;
+    if (!co_await backgroundValue([original]() {
+      std::error_code code;
+      return std::filesystem::is_regular_file(original, code) && !code;
+    })) continue;
+    if (recoveryWriteFailed) co_return;
     std::optional<eventLoopTrace::Span> cleanup(std::in_place, eventLoopTrace::CLOSED_EPOCH_CLEANUP);  // the loop's part only
     std::vector<RecoveryEvent> carry;
     std::vector<std::string> carried;
@@ -4657,25 +4666,22 @@ kj::Promise<void> DurableLog::dropColdFiles(uint64_t reservedBytes) {
   const auto scanEpoch = nodeEpoch;
   coldFilesSkippedLive = 0;
   if (recoveryWriteFailed || (startupAttempted && !startupReady)) co_return;
+  const auto logBytes = co_await backgroundValue([directory = logDirectory()]() {
+    std::error_code code;
+    uint64_t bytes = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, code)) {
+      if (!entry.is_regular_file(code)) continue;
+      const auto size = entry.file_size(code);
+      if (!code) bytes += size;
+    }
+    return bytes;
+  });
+  if (scanEpoch != nodeEpoch || recoveryWriteFailed) co_return;
   std::error_code code;
-  uint64_t logBytes = 0;
   auto began = monotonicTimeMs();
   size_t items = 0;
   auto sliceFull = [&] { return ++items >= 16 || monotonicTimeMs() - began >= 0.5; };
   auto resetSlice = [&] { items = 0; began = monotonicTimeMs(); };
-  for (const auto& entry : std::filesystem::directory_iterator(logDirectory(), code)) {
-    {
-      eventLoopTrace::Span logFiles(eventLoopTrace::COLD_LOG_FILES);
-      if (entry.is_regular_file(code)) {
-        const auto bytes = entry.file_size(code);
-        if (!code) logBytes += bytes;
-      }
-    }
-    if (sliceFull()) {
-      co_await timer.afterDelay(1 * kj::MICROSECONDS);
-      resetSlice();
-    }
-  }
   auto dirty = std::move(dirtyCacheSizes);
   while (!dirty.empty()) {
     auto entry = dirty.extract(dirty.begin());
@@ -7508,6 +7514,8 @@ std::optional<std::string> DurableLog::prepareOpen(Object& object, const std::st
     object.dispatchPending = false;
     for (const auto& [facetId, facet] : object.facets)
       if (!facet.deleted && !facet.loggedCheckpointCovered) {
+        if (facet.loggedNodeEpoch == nodeEpoch && facet.loggedSeq > appendedSeq)
+          return "the object's WAL frames are still being appended";
         // Even a failed cut can have changed the files before reporting its error.
         dirtyCacheSizes.insert(object.objectName);
         if (auto error = cutBackWal(object, facetId, facet.loggedSalt1, facet.loggedSalt2, facet.loggedPageSize, facet.loggedFrame))
@@ -7530,7 +7538,8 @@ void DurableLog::maybeCloseMarker(Object& object) {
   if (auto state = recoveryStates.find(object.objectName); state != recoveryStates.end() &&
       (state->second.repairPending || state->second.rebuildPending)) return;
   for (const auto& [facetId, facet] : object.facets)
-    if (facet.open || !facet.checkpointSafe) return;
+    if (facet.open || !facet.checkpointSafe ||
+        (facet.loggedNodeEpoch == nodeEpoch && facet.loggedSeq > appendedSeq)) return;
   const bool wasOpen = object.cacheOpen;
   object.cacheOpen = false;
   if (!writePosition(object)) object.cacheOpen = wasOpen;
