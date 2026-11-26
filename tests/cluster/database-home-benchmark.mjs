@@ -107,6 +107,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
     ...(!unpacedAdmission && !mixedAdmission && !busyProcesses && {
       COWORKERD_DO_TEST_MAILBOX_EVENTS: String(throughput ? throughputMailbox.events : 32),
     }),
+    ...(mixedCeiling === 'memory' && { COWORKERD_DO_TEST_MAILBOX_EVENTS: '4' }),
     ...(throughput && { COWORKERD_DO_TEST_MAILBOX_BYTES: String(throughputMailbox.bytes) }),
   }),
 });
@@ -852,9 +853,16 @@ async function runBusyAdmission() {
     const refused = [];
     for (const [slot, names] of groups) {
       const reply = await read(names[settings.homes]);
-      assert.ok(reply.status >= 400, reply.text);
-      assert.match(reply.text, /OVERLOADED|native invocation queue is full/i);
-      refused.push({ slot, status: reply.status, reply: JSON.parse(reply.text) });
+      const overload = json(reply, 503, 'busy database process ' + slot);
+      if (overload.code === 'OVERLOADED') {
+        assert.equal(overload.dispatched, false);
+        assert.equal(overload.retryable, true);
+      } else {
+        // Older checkout daemons returned this envelope for the same refusal.
+        assert.equal(overload.code, 'RESULT_UNCERTAIN');
+        assert.match(overload.reason, /native invocation queue is full/);
+      }
+      refused.push({ slot, status: reply.status, reply: overload });
     }
     await record('busy-admission-result', {
       processes: entries.map(({ processId, pid, generation, residentBytes, lifecycle }) => ({

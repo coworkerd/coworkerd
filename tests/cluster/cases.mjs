@@ -742,8 +742,10 @@ async function threadedDatabaseAdmission(cluster) {
       running: 3, pendingCommits: 3, waiting: 1,
     });
     const refused = await sql(overflow, probe);
-    assert.ok(refused.status >= 400, refused.text);
-    assert.match(refused.text, /OVERLOADED|native invocation queue is full/i);
+    const overload = json(refused, 503, 'all three homes refuse the new database');
+    assert.equal(overload.code, 'OVERLOADED');
+    assert.equal(overload.dispatched, false);
+    assert.equal(overload.retryable, true);
     await sample({ admissionRetirements: 2, running: 3, pendingCommits: 3 });
   } finally {
     await unlink(gate);
