@@ -1,0 +1,53 @@
+name: Long SQL isolation measurement
+
+on:
+  push:
+    branches: [codex/81-long-sql-isolation-runner]
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    env:
+      CC: clang-19
+      CXX: clang++-19
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3
+          npm ci --prefix cli --registry=https://registry.npmjs.org
+      - name: Build the platform test executable and fetch the pinned kernel
+        run: |
+          python3 scripts/fetch-kernel.py --arch linux-arm64
+          bash scripts/build.sh
+          cmake --build build --target coworkerd-platform-test coworkerd-launcher
+      - name: Measure on the idle runner
+        shell: bash
+        run: |
+          mkdir -p build/isolation-evidence
+          lscpu > build/isolation-evidence/host.txt
+          free -m >> build/isolation-evidence/host.txt
+          docker ps >> build/isolation-evidence/host.txt
+          kernel=$(python3 scripts/fetch-kernel.py --arch linux-arm64 --installed)
+          node tests/cluster/long-sql-isolation.mjs "$kernel" build/isolation-evidence/report.jsonl \
+            2>&1 | tee build/isolation-evidence/measurement.log
+      - name: Preserve raw evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: long-sql-isolation-arm64
+          path: build/isolation-evidence/
+          if-no-files-found: ignore
