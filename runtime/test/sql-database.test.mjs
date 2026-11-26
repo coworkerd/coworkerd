@@ -159,3 +159,33 @@ test('a threaded disconnect is passed to the runtime as the original exception',
     await assert.rejects(f.fetch([statement]), actual => actual === error);
   } finally { f.close(); }
 });
+
+test('threaded SQL reports a pre-commit interruption after assembling a successful reply', async () => {
+  const f = fixture({ wallDeadline: true });
+  try {
+    f.db.exec('CREATE TABLE ledger(id); INSERT INTO ledger VALUES (1)');
+    const read = { sql: 'SELECT id FROM ledger ORDER BY id' };
+    const write = { sql: 'INSERT INTO ledger VALUES (2)' };
+    const transactionSync = f.storage.transactionSync;
+    const reason = 'SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded';
+    const deadline = Object.assign(new Error(reason), { code: 'SQL_LIMIT_EXCEEDED' });
+    const disconnected = Object.assign(new Error('SQL client disconnected'), { code: 'SQL_CLIENT_DISCONNECTED' });
+    for (const error of [deadline, disconnected]) {
+      f.storage.transactionSync = fn => transactionSync(() => {
+        const response = fn();
+        assert.equal(response.status, 200);
+        assert.deepEqual(f.db.prepare(read.sql).all().map(row => row.id), [1, 2]);
+        throw error;
+      });
+      if (error === deadline) {
+        const response = await f.fetch(write);
+        assert.equal(response.status, 503);
+        assert.deepEqual(await response.json(), { success: false, error: reason, code: error.code, reason });
+      } else {
+        await assert.rejects(f.fetch(write), actual => actual === error);
+      }
+      f.storage.transactionSync = transactionSync;
+      assert.deepEqual((await f.query(read)).results, [{ id: 1 }]);
+    }
+  } finally { f.close(); }
+});

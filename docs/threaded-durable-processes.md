@@ -388,13 +388,11 @@ execution. A client can shut down its TCP write side and still receive the compl
 A D1 call can continue to its SQL deadline after the Worker’s HTTP caller disconnects. Propagating
 that outer disconnect to the binding call depends on [#66](https://github.com/coworkerd/coworkerd/pull/66).
 
-If SQLite interrupts a write, it rolls back the transaction and the database resets in the current
-process. Queued HTTP SQL receives `503 DO_UNAVAILABLE`, and queued D1 reports `D1_ERROR` with
-that code. A later query opens the database again and sees the last confirmed rows. A deadline or
-disconnect at the commit check after response assembly can also reset the database, including
-after reads. Keeping the database open across these errors is a release prerequisite. SQLite
-functions and file operations without progress callbacks remain release blockers wherever they
-can outlast the deadline. The database placement fixture selects this behavior in the test build.
+An expected SQLite interruption or a failed deadline or disconnect check before commit rolls back
+the current transaction. A queued HTTP or D1 query can read the last confirmed rows on the same open
+database. Storage failures still follow the existing storage error handling. SQLite functions and
+file operations without progress callbacks remain release blockers wherever they can outlast the
+deadline. The database placement fixture selects this behavior in the test build.
 
 ### Decisions taken in review
 

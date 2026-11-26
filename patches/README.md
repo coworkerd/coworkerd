@@ -80,6 +80,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   valid SQL transactions whose frames require more than one record.
   Patch 0174 releases an empty platform database copy when the last root retires. It changes
   the threaded server and tests the home-reservation guard.
+  Patch 0178 lets the platform transaction finish cleanup after SQLite rolls back a write for
+  a request deadline or client disconnect. It keeps SQLite storage failures on the critical
+  error path.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
