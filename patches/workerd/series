@@ -106,4 +106,5 @@
 0174-release-idle-platform-database-copies.patch
 0176-attribute-platform-databases-to-database-worker.patch
 0177-retire-idle-databases-at-admission.patch
+0178-keep-platform-databases-open-after-sql-interruption.patch
 0181-report-durable-copy-reservation-refusal.patch
