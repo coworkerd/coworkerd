@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { eventually } from '../cluster.mjs';
 import { recordPerf, summarizeStacks } from './perf.mjs';
 
+export const profileOperations = ['worker-only', 'object-noop', 'read', 'insert'];
 export const traceInContainer = '/tmp/coworkerd-benchmark-trace.bin';
 
 function weightedStats(durationByCount, total) {
@@ -87,11 +88,10 @@ export function summarizeTrace(bytes, windowNs) {
   return { occupancy: { roots, nested, total, peak, atRootAdmission }, flush };
 }
 
-const operations = ['worker-only', 'object-noop', 'read', 'insert'];
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
 
-export async function runProfile({ cluster, container, owner, binaries, runCell, record, smoke }) {
+export async function runProfile({ cluster, container, owner, binaries, runCell, record, smoke, control }) {
   const proxy = cluster.project + '-proxy';
   const forwarder = join(binaries, 'coworkerd-bench-http-forwarder');
   const observePerf = process.env.COWORKERD_PROFILE_PERF !== '0';
@@ -159,20 +159,31 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
       return result.perSecond;
     }
 
+    if (control) {
+      assert.ok(observePerf && !smoke, 'the traced control requires perf and full windows');
+      for (let round = 1; round <= 3; ++round) {
+        for (const operation of profileOperations) {
+          for (const mode of round % 2 ? ['direct', 'profiled'] : ['profiled', 'direct']) {
+            await measure(operation, 16, mode, round);
+          }
+        }
+      }
+      return;
+    }
     const rounds = smoke ? 1 : 3;
     const offered = smoke ? [2] : [1, 4, 8, 16, 32];
-    const rates = Object.fromEntries(operations.map(operation => [operation,
+    const rates = Object.fromEntries(profileOperations.map(operation => [operation,
       Object.fromEntries(offered.map(clients => [clients, []]))]));
     for (let round = 0; round < rounds; ++round) {
       for (const clients of round % 2 ? [...offered].reverse() : offered) {
-        for (const operation of operations) {
+        for (const operation of profileOperations) {
           rates[operation][clients].push(await measure(operation, clients, 'sweep', round + 1));
         }
       }
     }
 
     const selected = {};
-    for (const operation of operations) {
+    for (const operation of profileOperations) {
       const medians = offered.map(clients => median(rates[operation][clients]));
       const ceiling = Math.max(...medians);
       const clients = offered[medians.findIndex(rate => rate >= 0.95 * ceiling)];
@@ -180,7 +191,7 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
       await record('profile-ceiling', { operation, clients, ceiling, offered, medians });
     }
     for (let round = 0; round < rounds; ++round) {
-      for (const operation of operations) {
+      for (const operation of profileOperations) {
         const modes = observePerf ? ['direct', 'forwarded', 'profiled'] : ['direct', 'forwarded'];
         for (const mode of [...modes.slice(round % modes.length), ...modes.slice(0, round % modes.length)]) {
           await measure(operation, selected[operation], mode, round + 1);

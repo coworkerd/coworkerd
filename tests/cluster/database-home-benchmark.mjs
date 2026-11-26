@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
-import { runProfile, traceInContainer } from './main-thread-profile/profile.mjs';
+import { profileOperations, runProfile, traceInContainer } from './main-thread-profile/profile.mjs';
 
 const [side, checkoutArg, kernelArg, outputArg, mode, ...extra] = process.argv.slice(2);
 const memoryAdmission = mode === '--idle-admission-memory';
@@ -25,6 +25,8 @@ const defaultIdleWindow = mode === '--idle-window-default';
 const patchedIdleWindow = mode === '--idle-window-patched';
 const idleWindow = mode === '--idle-window' || defaultIdleWindow || patchedIdleWindow || idleAdmission;
 const mainThreadProfile = mode === '--main-thread-profile' || mode === '--main-thread-profile-smoke';
+const profileControl = mainThreadProfile ? process.env.COWORKERD_PROFILE_CONTROL : undefined;
+assert.ok(profileControl === undefined || ['plain', 'traced'].includes(profileControl));
 const modes = ['--main-thread-profile', '--main-thread-profile-smoke', '--smoke', '--default-admission', '--cold-follow-up', '--throughput', '--throughput-smoke',
   '--idle-window', '--idle-window-default', '--idle-window-patched', '--idle-window-admission',
   '--idle-admission-unpaced', '--idle-admission-memory', '--idle-admission-mixed',
@@ -112,7 +114,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
     }),
     ...(mixedCeiling === 'memory' && { COWORKERD_DO_TEST_MAILBOX_EVENTS: '4' }),
     ...(throughput && { COWORKERD_DO_TEST_MAILBOX_BYTES: String(throughputMailbox.bytes) }),
-    ...(mainThreadProfile && { COWORKERD_BENCHMARK_TRACE: traceInContainer }),
+    ...(mainThreadProfile && profileControl !== 'plain' && { COWORKERD_BENCHMARK_TRACE: traceInContainer }),
   }),
 });
 const [owner] = cluster.nodes;
@@ -184,6 +186,7 @@ async function provenance() {
     settings: throughput ? { homes: settings.homes, mailbox: throughputMailbox,
       placement: throughputPlacement, inFlightLimit: throughputInFlightLimit, ...throughputSettings } : settings,
     mode: mode ?? 'full', node: process.version,
+    ...(profileControl && { profileControl }),
     ...(throughput && { clientImage,
       runner: process.env.GITHUB_ACTIONS === 'true' ? {
         runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
@@ -569,8 +572,13 @@ async function runNetworkThroughput() {
     }
     return result;
   }
-  if (mainThreadProfile) {
-    await runProfile({ cluster, container, owner, binaries, runCell, record, smoke });
+  if (profileControl === 'plain') {
+    for (const operation of profileOperations) {
+      await runCell({ operation, clients: 16, profileMode: 'plain', round: 1 });
+    }
+  } else if (mainThreadProfile) {
+    await runProfile({ cluster, container, owner, binaries, runCell, record, smoke,
+      control: profileControl === 'traced' });
   } else {
     for (const cell of cells) await runCell(cell);
   }
