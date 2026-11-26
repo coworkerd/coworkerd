@@ -2962,7 +2962,7 @@ private:
     const bool threadedDurable = durable && process->threadedDurableRole();
     auto decision = [this, lifetime = std::weak_ptr<int>(executionLifetime), slotRef = std::weak_ptr<AdmissionSlot>(slot), version, process, invocationId, treeId = std::move(treeId),
                      ingress, peerIngress, deferredCpu, threadedDurable](bool executed) {
-      // Preserve durable accounting on a lost reply. Only the child's explicit admission refusal cancels the charge.
+      // Preserve durable accounting on a lost reply. Only the child's explicit capacity refusal cancels the charge.
       if (threadedDurable) executed = !process->capacityRejected;
       if (deferredCpu) deferredCpu(executed);
       if (lifetime.expired()) return;
@@ -7501,7 +7501,7 @@ private:
         log(line, target, process.get(), status, code, started);
       };
       if (slot->process->threadedDurableRole()) {
-        // Only a native 'R' sets this bit, before the node sends any Cap'n Proto request to the child.
+        // The child can confirm refusal in the raw admission reply or before issuing the event dispatcher.
         if (co_await kj::mv(opened.capacityRejected)) {
           slot->outcome = {};
           slot->decide(false);
