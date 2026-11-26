@@ -361,6 +361,8 @@ def allowed_path(name, path):
                               'src/workerd/api/actor-state.c++',
                               'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h',
                               'src/workerd/util/sqlite-test.c++'} or
+                          name == '0179-size-default-object-mailbox.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0182-bound-platform-sqlite-memory.patch' and path in {
                               'src/workerd/api/actor-state.c++', 'src/workerd/io/actor-sqlite.c++',
                               'src/workerd/threaded/BUILD.bazel', 'src/workerd/threaded/threaded-server.c++',
