@@ -19,14 +19,14 @@ const reservePort = () => new Promise((resolve, reject) => {
   });
 });
 const cases = [
-  ['v33-configuration-default-1', {}, {}, 128],
-  ['v33-configuration-64-1', { memoryLimitMiB: 64 }, {}, 64],
-  ['v33-configuration-0-1', { memoryLimitMiB: 64 }, { COWORKERD_MEMORY_LIMIT_MIB: '0' }, 0],
+  ['child-memory-default-128-mib', {}, {}, 128],
+  ['child-memory-configured-64-mib', { memoryLimitMiB: 64 }, {}, 64],
+  ['child-memory-disabled-by-environment', { memoryLimitMiB: 64 }, { COWORKERD_MEMORY_LIMIT_MIB: '0' }, 0],
 ];
 const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(?:COWORKERD_|WORKERD_)/.test(key)));
 const limitKey = 'COWORKERD_MEMORY_LIMIT_MIB=';
 for (const [label, options, override, expected] of cases) {
-  const stack = await mkdtemp(join(tmpdir(), 'b49-child-memory-'));
+  const stack = await mkdtemp(join(tmpdir(), 'node-child-memory-'));
   let child, closed, exited = false, diagnostic = '';
   try {
     await mkdir(join(stack, 'workers'));
