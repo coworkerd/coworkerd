@@ -64,6 +64,11 @@ request reads one seeded row by primary key. The case starts each burst with idl
 counters and requires all replies to contain the row, with the original threaded process generation
 and no admission overloads.
 
+A Linux ARM64 run with the Worker on the database owner served 121 of 128 D1 requests.
+The other seven hit the node's root admission threshold, which counts both Worker roots
+and active database calls on that node. Running the Worker on a peer gives its roots their
+own default node admission budget. [Maintainer decision](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7183434485)
+
 ### Threaded SQL and CLI parity
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-cli-parity` to run `sql-atomicity` with the
