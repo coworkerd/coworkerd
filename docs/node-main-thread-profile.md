@@ -112,7 +112,7 @@ To replay the measured successful admissions, the threshold would have to be at 
 Use a quiet, standard Ubuntu 24.04 x86-64 Linux instance with Docker and Compose, Node.js 22, Python 3, and `perf` for the running Linux kernel. Use a fresh checkout and finish builds and downloads before timing. The commands below rerun the recorded source and public kernel pin. The profiler uses the Docker host's `sudo -n perf` to attach to the container's daemon main TID. [Build dependencies](../CONTRIBUTING.md#building)
 
 ```sh
-git fetch origin codex/95-main-thread-profile
+git fetch origin refs/pull/116/head
 git worktree add --detach ../coworkerd-profile fccc0ca6e413a0f5c8fc24b8d72c7d1baa00887b
 cd ../coworkerd-profile
 git apply tests/cluster/main-thread-profile/instrumentation.patch
@@ -133,4 +133,31 @@ The report tables can be regenerated from the checked-in recording. Run the stac
 ```sh
 python3 tests/cluster/main-thread-profile/tables.py docs/node-main-thread-profile/measurement.jsonl
 node tests/cluster/main-thread-profile/perf.mjs /path/to/stacks.jsonl
+```
+
+From the checkout containing this report, create a second checkout for the build and shared-object controls. Build both binaries before timing. The three trials start fresh Compose clusters and bracket the traced run with ordinary Release windows.
+
+```sh
+report_checkout=$PWD
+git fetch origin refs/pull/116/head
+git worktree add --detach ../coworkerd-profile-controls 83c3eeb69649c4bd2329259f31bc6dec46be334c
+cd ../coworkerd-profile-controls
+export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4
+bash scripts/build.sh
+mkdir -p build/plain reports
+cp build/coworkerd build/coworkerd-apiserver build/coworkerd-launcher build/plain/
+git apply tests/cluster/main-thread-profile/instrumentation.patch
+bash scripts/build.sh -DCMAKE_CXX_FLAGS_RELEASE='-O3 -DNDEBUG -g1 -fno-omit-frame-pointer'
+cmake --build build --target coworkerd-bench-http-forwarder
+kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64)
+COWORKERD_PROFILE_CONTROL=plain COWORKERD_CLUSTER_BIN_DIR="$PWD/build/plain" \
+  node tests/cluster/database-home-benchmark.mjs object "$PWD" "$kernel" \
+  "$PWD/reports/plain-before.jsonl" --main-thread-profile
+COWORKERD_PROFILE_CONTROL=traced COWORKERD_PROFILE_STACKS="$PWD/reports/stacks.jsonl" \
+  node tests/cluster/database-home-benchmark.mjs object "$PWD" "$kernel" \
+  "$PWD/reports/traced.jsonl" --main-thread-profile
+COWORKERD_PROFILE_CONTROL=plain COWORKERD_CLUSTER_BIN_DIR="$PWD/build/plain" \
+  node tests/cluster/database-home-benchmark.mjs object "$PWD" "$kernel" \
+  "$PWD/reports/plain-after.jsonl" --main-thread-profile
+python3 "$report_checkout/tests/cluster/main-thread-profile/tables.py" --controls reports
 ```

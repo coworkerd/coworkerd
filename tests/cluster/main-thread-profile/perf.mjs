@@ -133,14 +133,18 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
   for await (const line of rows) {
     const { operation, clients, round, samples, stacks } = JSON.parse(line);
     const histogram = emptyHistogram();
+    const residualByDso = {};
     for (const [key, count] of Object.entries(stacks)) {
       const [, ...stack] = JSON.parse(key);
-      if (typeof stack[0] === 'object') stack.shift();
-      const bucket = histogram[classify(stack)];
+      const dso = typeof stack[0] === 'object' ? stack.shift().dso : undefined;
+      const stage = classify(stack);
+      if (dso && residualStages.has(stage)) residualByDso[dso] = (residualByDso[dso] ?? 0) + count.periodNs;
+      const bucket = histogram[stage];
       bucket.samples += count.samples;
       bucket.periodNs += count.periodNs;
     }
     assert.equal(Object.values(histogram).reduce((sum, bucket) => sum + bucket.samples, 0), samples);
-    console.log(JSON.stringify({ operation, clients, round, samples, histogram }));
+    console.log(JSON.stringify({ operation, clients, round, samples, histogram,
+      ...(Object.keys(residualByDso).length > 0 && { residualByDso }) }));
   }
 }

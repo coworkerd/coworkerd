@@ -149,12 +149,86 @@ def tables(records):
     ])
 
 
+def load_windows(path):
+    with path.open() as source:
+        records = [json.loads(line) for line in source]
+    assert records[-1]["metric"] == "complete", path
+    windows = [row for row in records if row["metric"] == "throughput-window"]
+    assert all(row["clients"] == 16 and row["n"] > 0
+               and row["warmup"]["failures"] == row["measurement"]["failures"] == 0 for row in windows)
+    return records[0], windows
+
+
+def controls(directory):
+    before, plain_before = load_windows(directory / "plain-before.jsonl")
+    after, plain_after = load_windows(directory / "plain-after.jsonl")
+    traced, trace_windows = load_windows(directory / "traced.jsonl")
+    assert before["runner"] == after["runner"] == traced["runner"]
+    assert before["archiveSha256"] == after["archiveSha256"] == traced["archiveSha256"]
+    assert before["hashes"]["coworkerd"] == after["hashes"]["coworkerd"] != traced["hashes"]["coworkerd"]
+
+    dso_labels = ["glibc", "Linux kernel and modules", "Node executable",
+                  "libstdc++", "Other userspace objects", "Unknown mapping"]
+
+    def dso_label(name):
+        if name == "[unknown]":
+            return "Unknown mapping"
+        if name.startswith("[") and name != "[vdso]":
+            return "Linux kernel and modules"
+        basename = Path(name).name
+        if basename.startswith("libc.so."):
+            return "glibc"
+        if basename == "coworkerd":
+            return "Node executable"
+        if basename.startswith("libstdc++.so."):
+            return "libstdc++"
+        return "Other userspace objects"
+
+    build_rows = []
+    costs = {}
+    for op, label in OPERATIONS.items():
+        plain = [row for row in plain_before + plain_after if row["operation"] == op]
+        traced_operation = [row for row in trace_windows if row["operation"] == op]
+        direct = [row for row in traced_operation if row["profileMode"] == "direct"]
+        sampled = [row for row in traced_operation if row["profileMode"] == "profiled"]
+        assert len(plain) == 2 and len(direct) == len(sampled) == 3
+        plain_cost = cpu_ms_per_reply(plain)
+        trace_cost = cpu_ms_per_reply(direct)
+        build_rows.append([label, " / ".join(f"{cpu_ms_per_reply([row]):.3f}" for row in plain),
+                           f"{plain_cost:.3f}", f"{trace_cost:.3f}", f"{trace_cost - plain_cost:+.3f}",
+                           f"{median(plain, 'perSecond'):,.0f} / {median(direct, 'perSecond'):,.0f}"])
+        parts = dict.fromkeys(dso_labels, 0.0)
+        for row in sampled:
+            profile = row["perf"]
+            histogram = profile["histogram"]
+            dsos = profile["residualByDso"]
+            total = sum(bucket["periodNs"] for bucket in histogram.values())
+            assert sum(dsos.values()) == sum(histogram[stage]["periodNs"] for stage in
+                    ("allocation", "other", "unresolved"))
+            for dso, period in dsos.items():
+                parts[dso_label(dso)] += cpu_ns(row) * period / total
+        replies = sum(row["n"] for row in sampled)
+        costs[op] = {dso: amount / replies / 1_000_000 for dso, amount in parts.items()}
+
+    table(["Workload", "Plain before / after CPU ms/reply", "Plain pooled CPU ms/reply",
+           "Traced CPU ms/reply", "Traced minus plain ms/reply", "Plain / traced replies/s"], build_rows)
+    table(["Residual DSO (CPU ms/reply)", *OPERATIONS.values()], [
+        [dso, *(f"{costs[op][dso]:.3f}" for op in OPERATIONS)] for dso in dso_labels
+    ] + [["Total residual", *(f"{sum(costs[op].values()):.3f}" for op in OPERATIONS)]])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("jsonl", type=Path)
+    parser.add_argument("jsonl", type=Path, nargs="?")
+    parser.add_argument("--controls", type=Path, help="directory of Release and traced control recordings")
     args = parser.parse_args()
-    with args.jsonl.open() as source:
-        tables([json.loads(line) for line in source])
+    if args.jsonl is None and args.controls is None:
+        parser.error("choose a recording or --controls")
+    if args.jsonl:
+        with args.jsonl.open() as source:
+            tables([json.loads(line) for line in source])
+    if args.controls:
+        controls(args.controls)
 
 
 if __name__ == "__main__":
