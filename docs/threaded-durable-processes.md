@@ -76,12 +76,11 @@ still needs room under the tenant's `maxWorkerCpuMs`, which defaults to 30,000 m
 ### Per-object admission mailbox
 
 The threaded durable child keeps one FIFO of waiting events per root object tree, shared by the
-root and its facets for events admitted through the child. The release binaries use a depth of
-**4 waiting events** (`mailboxDepth`) and **64 KiB of waiting bytes** (`mailboxBytes`) when the
-experimental `durableObjects.threadedStorage` backend is enabled. The normal release configuration
-leaves that backend off. During a synchronous event, up to four more events can wait for that tree,
-provided their combined byte charge fits and the child can reserve them. Admission refuses an event
-when the count is already full or its addition would exceed the byte limit.
+root and its facets for events admitted through the child. When the experimental
+`durableObjects.threadedStorage` backend is enabled, a tree can hold **512 waiting events**
+(`mailboxDepth`) and **2 MiB of declared waiting bytes** (`mailboxBytes`). Waiting events remain
+subject to their original request deadlines. Admission refuses an event when the count is already
+full or its addition would exceed the byte limit.
 
 The child charges a mailbox entry on accepting the routing preface and frees its waiting count and
 bytes when the home begins delivery, or when the queued event is canceled, expires or is refused.
@@ -92,15 +91,45 @@ still hold process resources. The input and output gates govern execution and al
 interleaving across awaits. See [kernel admission](../patches/workerd/0045-threaded-durable-admission.patch)
 and [node routing](../node/main.c++).
 
-Each admitted event reserves a descriptor and 4 KiB of metadata plus its declared bytes from the
-child's shared budget. The per-tree bounds limit how much of that budget one busy tree can hold in
-waiting connections and metadata. The original queue profiles measured those costs before body
-reads and supported the initial four-event and 64 KiB settings. Admission can refuse earlier if
-the child lacks memory or descriptor reservations, a cold tree hits the resident limit or cannot
+The count matches the node's default `processPool.inFlightLimit` of 512. The byte limit budgets
+4 KiB of declared bytes per waiting slot on average. Each admitted event reserves one descriptor
+and a separate 4 KiB of metadata plus its declared bytes from the child's shared budget. A single
+full mailbox therefore charges up to 512 descriptors and 4 MiB of memory for waiting events.
+Delivered events and resident trees also draw on shared reservations. Admission can refuse earlier
+if the child lacks memory or descriptor reservations, a cold tree hits the resident limit or cannot
 reserve a home, or its assigned home is resetting. These conditions can produce the same `R`
 receipt as a full mailbox.
 See the [original queue profiles](https://github.com/coworkerd/coworkerd/pull/43) and the
 [operator guide](guide/durable-objects.md#threaded-object-admission).
+
+The cluster suite uses the compiled mailbox defaults. Its database test runs separate bursts of
+128 public HTTP SQL requests and 128
+Worker requests through a D1 binding from a peer of the database owner. Each request selects the
+same seeded row by primary key in one threaded database. The test uses the database placement
+executable and checks all results and the owner process generation.
+[Cluster test](../tests/cluster/README.md#threaded-sql-default-mailbox).
+
+The node's default root admission threshold of 128 counts both active roots and nested calls on
+that node. A colocated D1 Worker and database share this accounting, so existing binding calls
+can cause the node to refuse new Worker requests during a burst. The cluster case puts the
+Worker roots on a peer and the 128 database calls on one owner. Both nodes use their default
+limits.
+
+In a three-node Docker cluster on Linux ARM64 (10 vCPUs, 7.75 GiB of RAM, Node.js 22.22.2
+driving the load from macOS), a local build of the ordered series through 0179 returned the row
+to all 128 HTTP SQL callers and all 128 D1 callers from a peer. The owner kept its process
+generation without counting any admission overloads. The two bursts took 201 ms and 207 ms
+respectively. The same case with the published 0176 kernel and its 4-event and 64 KiB defaults
+returned the row to 9 of 128 HTTP SQL callers and 5 of 128 D1 callers.
+
+The hosted kernel build also ran both 128-client bursts on Ubuntu 24.04 with the compiled
+0179 defaults. [Hosted build](https://github.com/coworkerd/coworkerd/actions/runs/45765527350) ·
+[Verified kernel archives](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-a572c9630e5c-run-45765527350-1).
+
+| Hosted runner | HTTP SQL reads | D1 reads from a peer |
+| --- | ---: | ---: |
+| Linux x86-64 | 128/128 in 309 ms | 128/128 in 397 ms |
+| Linux ARM64 | 128/128 in 418 ms | 128/128 in 515 ms |
 
 At `f1e41d5`, the hibernation cluster fixture already allowed 32 waiting events with the default
 64 KiB byte bound. The diagnostics for the parallel batch of 16 facet calls recorded a refusal

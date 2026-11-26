@@ -873,6 +873,67 @@ async function threadedDatabaseAdmissionMixed(cluster) {
   }, { interval: 25 });
 }
 
+async function threadedSqlDefaultMailbox(cluster) {
+  const [owner, ingress] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-default-mailbox', { durableObjectNamespaces: 64 });
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 1]]));
+  const [db] = databases.get(owner);
+  const query = { sql: 'SELECT value FROM records WHERE id = ?', params: [1] };
+  const sql = body => cluster.api(`${db.path}/query`, {
+    method: 'POST', token: tenant.token, body, timeout: 35000,
+  });
+  await cluster.deploy(tenant, 'read', `export default { async fetch(request, env) {
+    const row = await env.DB.prepare(${JSON.stringify(query.sql)}).bind(1).first();
+    return Response.json(row);
+  } };`, { wrangler: { d1_databases: [{ binding: 'DB', database_name: db.name }] } });
+  // Exercise the binding across nodes so the Worker roots and database calls
+  // each use their node's default admission budget.
+  const d1 = async () => json(await workerCall(cluster, ingress, tenant, 'read', { timeout: 35000 }), 200, 'D1 read');
+
+  await waitForDurableMembership(cluster);
+  const seed = await sql([
+    { sql: 'CREATE TABLE records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)' },
+    { sql: 'INSERT INTO records VALUES (?, ?)', params: [1, db.name] },
+  ]);
+  assert.deepEqual(seed.map(result => result.success), [true, true]);
+  const row = { value: db.name };
+  const before = await eventually('the D1 Worker serves the row and the threaded owner reports the resident database', async () => {
+    assert.deepEqual(await d1(), row);
+    const process = await durableGeneration(cluster, owner);
+    assert.equal(process.lifecycle.durableServer, 'threaded');
+    assert.equal(process.lifecycle.durableAdmission.residentRoots, 1);
+    return process;
+  });
+
+  const clients = 128;
+  const failures = [];
+  for (const [route, read] of [
+    ['HTTP SQL', async () => {
+      const result = await sql(query);
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual(result.results, [row]);
+    }],
+    ['D1', async () => assert.deepEqual(await d1(), row)],
+  ]) {
+    await eventually(`${route} starts with idle node admission counters`, async () => {
+      const states = await Promise.all(cluster.nodes.map(node => cluster.state(node)));
+      for (const state of states) assert.equal(state.placement.inFlight.total, 0);
+    });
+    const start = performance.now();
+    const replies = await Promise.allSettled(Array.from({ length: clients }, () => read()));
+    const rejected = replies.filter(reply => reply.status === 'rejected');
+    const summary = `${route}: ${clients - rejected.length}/${clients} concurrent single-row reads returned the seeded row`;
+    console.log(`${summary} in ${Math.round(performance.now() - start)} ms`);
+    if (rejected.length) failures.push(`${summary}\n${rejected[0].reason.stack}`);
+  }
+  assert.equal(failures.length, 0, failures.join('\n'));
+
+  const after = await durableGeneration(cluster, owner);
+  assert.equal(after.pid, before.pid);
+  assert.equal(after.generation, before.generation);
+  assert.equal(after.lifecycle.durableAdmission.overloaded, before.lifecycle.durableAdmission.overloaded);
+}
+
 async function threadedSqlMemoryLimit(cluster) {
   const [owner, ingress] = cluster.nodes;
   const tenant = await cluster.tenant('sql-memory-limit', { durableObjectNamespaces: 48 });
@@ -3793,6 +3854,9 @@ export const durableGatedCases = {
   },
   'threaded-sql-deadline': {
     test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+  },
+  'threaded-sql-default-mailbox': {
+    test: threadedSqlDefaultMailbox, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
   },
   'threaded-sql-transaction-limit': {
     test: threadedSqlTransactionLimit, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
