@@ -675,12 +675,13 @@ async function threadedSqlDefaultMailbox(cluster) {
   ]);
   assert.deepEqual(seed.map(result => result.success), [true, true]);
   const row = { value: db.name };
-  await eventually('the D1 Worker serves the seeded row from the threaded owner', async () => {
+  const before = await eventually('the D1 Worker serves the row and the threaded owner reports the resident database', async () => {
     assert.deepEqual(await d1(), row);
+    const process = await durableGeneration(cluster, owner);
+    assert.equal(process.lifecycle.durableServer, 'threaded');
+    assert.equal(process.lifecycle.durableAdmission.residentRoots, 1);
+    return process;
   });
-  const before = await durableGeneration(cluster, owner);
-  assert.equal(before.lifecycle.durableServer, 'threaded');
-  assert.equal(before.lifecycle.durableAdmission.residentRoots, 1);
 
   const clients = 128;
   const failures = [];
