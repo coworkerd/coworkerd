@@ -1,48 +1,22 @@
 import assert from 'node:assert/strict';
-import { constants } from 'node:fs';
-import { access, appendFile, chmod, mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, chmod, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { Agent, request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Cluster, eventually } from '../cluster.mjs';
 
-const [kernel, output, volume, probe, objects] = process.argv.slice(2).map(path => resolve(path));
-assert.ok(kernel && output && volume && probe && objects,
-  'usage: measure.mjs KERNEL REPORT.jsonl LOG_VOLUME TRACE.so OBJECT_VOLUME');
+const [kernel, reports, tier, probe, baselineBin, candidateBin, baselineLog, candidateLog, baselineObjects, candidateObjects] =
+  process.argv.slice(2);
+assert.ok(candidateObjects, 'usage: measure.mjs KERNEL REPORTS TIER TRACE.so BASELINE_BIN CANDIDATE_BIN ' +
+  'BASELINE_LOG CANDIDATE_LOG BASELINE_OBJECTS CANDIDATE_OBJECTS');
+assert.ok(['normal', 'slow'].includes(tier));
 assert.equal(process.platform, 'linux');
-await access(volume, constants.R_OK);
-assert.deepEqual(await readdir(volume), []);
-await writeFile(output, '', { flag: 'wx' });
-const directory = await mkdtemp(join(tmpdir(), 'coworkerd-log-io-'));
-const trace = join(directory, 'trace');
-await mkdir(trace);
-await chmod(trace, 0o777);
-const bind = (source, target, read_only = false) => ({ type: 'bind', source, target, read_only });
-const cluster = new Cluster(directory, kernel, undefined, {
-  singleNode: true, threadedNodes: ['node-1'],
-  configureNode: () => ({
-    memoryBudgetBytes: 16 * 1024 ** 3,
-    quarantineProcesses: 1,
-    placement: { rootLimit: 512, nestedLimit: 1024 },
-    processPool: { count: 1, inFlightLimit: 512, threadedMemoryBytes: 3 * 1024 ** 3 },
-    durableObjects: { processes: 1, threadedStorage: true, peers: 0, segmentBytes: 512 * 1024 ** 2, segmentIntervalMs: 3600000 },
-  }),
-  nodeEnvironment: () => ({
-    COWORKERD_DO_TEST_HOME_COUNT: '16',
-    COWORKERD_DO_TEST_MAILBOX_EVENTS: '64',
-    COWORKERD_DO_TEST_MAILBOX_BYTES: '1048576',
-    COWORKERD_LOG_IO_TRACE: '/tmp/log-io-probe/events.bin',
-    LD_PRELOAD: '/tmp/log-io-trace.so',
-  }),
-  nodeVolumes: () => [
-    bind(objects, '/var/lib/coworkerd/do'),
-    bind(volume, '/var/lib/coworkerd/do/log'),
-    bind(probe, '/tmp/log-io-trace.so', true),
-    bind(trace, '/tmp/log-io-probe'),
-  ],
-});
-const [owner] = cluster.nodes;
-const agent = new Agent({ keepAlive: true, maxSockets: 32 });
+
+const clock = () => Number(process.hrtime.bigint());
+const ms = ns => ns / 1e6;
+const bind = (source, target, read_only = false) => ({ type: 'bind', source: resolve(source), target, read_only });
+const reader = 'log-io-reader';
+const writer = 'log-io-writer';
 const source = `
   import { DurableObject } from 'cloudflare:workers';
   export class Rows extends DurableObject {
@@ -63,23 +37,74 @@ const source = `
     }
   }
   export default {
-    fetch(request, env) { return env.ROWS.getByName('table').fetch(request); },
+    async fetch(request, env) {
+      const { pathname, search } = new URL(request.url);
+      const result = await env.ROWS.getByName('table').fetch('http://rows' + pathname + search, { method: request.method });
+      return Response.json(await result.json(), { status: result.status });
+    },
   };
 `;
-const clock = () => Number(process.hrtime.bigint());
-const ms = ns => ns / 1e6;
-const reader = 'log-io-reader';
-const writer = 'log-io-writer';
-const latency = values => {
-  const sorted = values.sort((a, b) => a - b);
-  return { p50Ms: ms(sorted[Math.floor(sorted.length * 0.5)]),
-    p99Ms: ms(sorted[Math.floor(sorted.length * 0.99)]), maxMs: ms(sorted.at(-1)) };
-};
 
-function call(tenant, operation, query = '') {
+const types = ['', 'daemon', 'poll', 'write', 'writev', 'pwrite', 'fdatasync', 'fsync', 'syncfs'];
+async function listEvents(fixture) {
+  const raw = await readFile(join(fixture.trace, 'events.bin'));
+  const events = [];
+  for (let offset = 0; offset + 240 <= raw.length; offset += 240) {
+    const [kind, start, end, tid, cpuNs, failed] = [0, 8, 16, 24, 32, 40]
+      .map(i => Number(raw.readBigUInt64LE(offset + i)));
+    const data = raw.subarray(offset + 48, offset + 240);
+    const file = data.subarray(0, data.indexOf(0)).toString();
+    assert.ok(types[kind] && !failed, 'traced I/O succeeded');
+    events.push({ call: types[kind], start, end, tid, cpuNs, file });
+  }
+  assert.equal(events[0]?.call, 'daemon', 'daemon trace header');
+  const { tid: main } = events.shift();
+  return { main, events };
+}
+
+const append = event => ['write', 'writev', 'pwrite'].includes(event.call) && event.file.endsWith('.log');
+const flush = event => event.call === 'fdatasync' && event.file.endsWith('.log');
+const within = (event, { begin, end }) => event.end >= begin && event.start <= end;
+const overlaps = (first, second) => first.start < second.end && second.start < first.end;
+
+async function fixture(side, binaries, volume, objects) {
+  assert.deepEqual(await readdir(volume), [], 'fresh log directory');
+  const output = join(reports, side + '-' + tier + '.jsonl');
+  await writeFile(output, '', { flag: 'wx' });
+  const directory = await mkdtemp(join(tmpdir(), 'coworkerd-log-io-'));
+  const trace = await mkdtemp('/dev/shm/coworkerd-log-io-');
+  await chmod(trace, 0o777);
+  const cluster = new Cluster(directory, resolve(kernel), undefined, {
+    singleNode: true, threadedNodes: ['node-1'], binariesDirectory: resolve(binaries),
+    configureNode: () => ({
+      memoryBudgetBytes: 16 * 1024 ** 3,
+      quarantineProcesses: 1,
+      placement: { rootLimit: 512, nestedLimit: 1024 },
+      processPool: { count: 1, inFlightLimit: 512, threadedMemoryBytes: 3 * 1024 ** 3 },
+      durableObjects: { processes: 1, threadedStorage: true, peers: 0, segmentBytes: 512 * 1024 ** 2,
+        segmentIntervalMs: 3600000 },
+    }),
+    nodeEnvironment: () => ({
+      COWORKERD_DO_TEST_HOME_COUNT: '16',
+      COWORKERD_DO_TEST_MAILBOX_EVENTS: '64',
+      COWORKERD_DO_TEST_MAILBOX_BYTES: '1048576',
+      COWORKERD_LOG_IO_TRACE: '/tmp/log-io-probe/events.bin',
+      LD_PRELOAD: '/tmp/log-io-trace.so',
+    }),
+    nodeVolumes: () => [
+      bind(objects, '/var/lib/coworkerd/do'),
+      bind(volume, '/var/lib/coworkerd/do/log'),
+      bind(probe, '/tmp/log-io-trace.so', true),
+      bind(trace, '/tmp/log-io-probe'),
+    ],
+  });
+  return { side, cluster, trace, output, owner: cluster.nodes[0], nextId: 2, windows: [] };
+}
+
+function call(fixture, tenant, operation, agent, query = '') {
   return new Promise((accept, reject) => {
     const start = clock();
-    const http = request(cluster.urls[owner] + '/' + tenant + '/rows/' + operation + query, {
+    const http = request(fixture.cluster.urls[fixture.owner] + '/' + tenant + '/rows/' + operation + query, {
       agent, method: ['seed', 'insert'].includes(operation) ? 'POST' : 'GET',
     }, response => {
       response.setEncoding('utf8');
@@ -88,7 +113,11 @@ function call(tenant, operation, query = '') {
       response.once('error', reject);
       response.on('end', () => {
         if (response.statusCode !== 200) return reject(new Error(tenant + ' ' + operation + ' HTTP ' + response.statusCode + ' ' + data));
-        accept({ start, end: clock(), value: JSON.parse(data) });
+        try {
+          accept({ start, end: clock(), value: JSON.parse(data) });
+        } catch (error) {
+          reject(error);
+        }
       });
     });
     http.once('error', reject);
@@ -97,32 +126,47 @@ function call(tenant, operation, query = '') {
   });
 }
 
-async function listEvents() {
-  const raw = await readFile(join(trace, 'events.bin'));
-  const events = [];
-  for (let offset = 0; offset + 32 <= raw.length; offset += 32) {
-    const [kind, start, end, main] = [0, 8, 16, 24].map(i => Number(raw.readBigUInt64LE(offset + i)));
-    assert.ok([1, 2, 4].includes(kind), 'the real log fdatasync succeeded');
-    events.push({ kind, start, end, main: Boolean(main) });
+async function setup(fixture) {
+  const { cluster, owner } = fixture;
+  await cluster.start();
+  for (const name of [reader, writer]) {
+    const tenant = await cluster.tenant(name, { workers: 1, durableObjectNamespaces: 1 });
+    await cluster.deploy(tenant, 'rows', source, { wrangler: {
+      durable_objects: { bindings: [{ name: 'ROWS', class_name: 'Rows' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['Rows'] }],
+    } });
+    await eventually('route active for ' + name, async () => {
+      assert.equal((await call(fixture, name, 'preflight', false)).value, 1);
+    });
+    assert.equal((await call(fixture, name, 'seed', false)).value, 1);
+    assert.equal((await call(fixture, name, 'read', false)).value, 1);
   }
-  return events;
+  const state = await cluster.state(owner);
+  assert.equal(state.membership.members.filter(member => member.state === 'active').length, 1);
+  assert.equal((await listEvents(fixture)).main, state.server.pid);
 }
 
-async function save(row) {
+function latency(values) {
+  const sorted = values.sort((a, b) => a - b);
+  const percentile = fraction => ms(sorted[Math.floor(sorted.length * fraction)]);
+  return { p50Ms: percentile(0.5), p99Ms: percentile(0.99), maxMs: ms(sorted.at(-1)) };
+}
+
+async function save(fixture, row) {
   const line = JSON.stringify(row);
-  await appendFile(output, line + '\n');
+  await appendFile(fixture.output, line + '\n');
   console.log(line);
 }
 
-let nextId = 2;
-async function exercise(clients, durationMs, withReader) {
+async function exercise(fixture, agent, clients, durationMs, withReader) {
   const begin = clock();
   const end = begin + durationMs * 1e6;
   const batches = await Promise.all(Array.from({ length: clients + Number(withReader) }, async (_, index) => {
     const reading = index === clients;
     const samples = [];
     do {
-      const sample = reading ? await call(reader, 'read') : await call(writer, 'insert', '?id=' + nextId++);
+      const sample = reading ? await call(fixture, reader, 'read', agent) :
+        await call(fixture, writer, 'insert', agent, '?id=' + fixture.nextId++);
       assert.equal(sample.value, 1);
       samples.push(sample);
     } while (clock() < end);
@@ -135,66 +179,99 @@ function inside(samples, begin, end) {
   return samples.filter(sample => sample.start >= begin && sample.end <= end);
 }
 
-async function measure(clients, durationMs, round, withReader = false) {
-  await exercise(clients, 1000, withReader);
-  const { begin, end, writes, reads } = await exercise(clients, durationMs, withReader);
-  await call(reader, 'read'); // Return the main loop to polling after the timed work.
-  const events = await listEvents();
-  const flushes = events.filter(event => event.kind === 2 && event.end >= begin && event.start <= end);
-  const gaps = events.filter(event => event.kind === 1 && event.end >= begin && event.start <= end);
-  const appends = events.filter(event => event.kind === 4 && event.end >= begin && event.start <= end);
+async function measure(fixture, clients, durationMs, round, withReader = false) {
+  const agent = new Agent({ keepAlive: true, maxSockets: clients + Number(withReader) });
+  let window;
+  try {
+    await exercise(fixture, agent, clients, 1000, withReader);
+    window = await exercise(fixture, agent, clients, durationMs, withReader);
+  } finally {
+    agent.destroy();
+  }
+  const { begin, end, writes, reads } = window;
+  fixture.windows.push({ clients, round, withReader, begin, end });
+  await call(fixture, reader, 'read', false); // Return to polling after the timed work.
+  const { main, events } = await listEvents(fixture);
+  const timed = events.filter(event => within(event, window));
+  const appends = timed.filter(append);
+  const flushes = timed.filter(flush);
+  const peak = timed.filter(event => event.call === 'poll').reduce((max, event) =>
+    event.end - event.start > max.end - max.start ? event : max, { start: 0, end: 100000, cpuNs: 0 });
   const measured = inside(writes, begin, end);
   assert.ok(flushes.length && appends.length && measured.length);
   const overlap = inside(reads, begin, end).filter(read =>
-    flushes.some(flush => read.start >= flush.start && read.end <= flush.end));
-  await save({ round, clients, durationMs, withReader, completed: measured.length,
+    flushes.some(sync => read.start >= sync.start && read.end <= sync.end));
+  await save(fixture, { side: fixture.side, round, clients, durationMs, withReader, begin, end, completed: measured.length,
     perSecond: measured.length * 1000 / durationMs, insert: latency(measured.map(({ start, end }) => end - start)),
-    appends: appends.length, appendOnMain: appends.filter(event => event.main).length,
-    flushes: flushes.length, flushOnMain: flushes.filter(event => event.main).length,
+    appends: appends.length, appendOnMain: appends.filter(event => event.tid === main).length,
+    flushes: flushes.length, flushOnMain: flushes.filter(event => event.tid === main).length,
     flush: latency(flushes.map(({ start, end }) => end - start)),
-    longestMainPollGapMs: Math.max(0.1, ...gaps.map(({ start, end }) => ms(end - start))),
+    longFlushes: flushes.filter(event => event.end - event.start > 40e6).length,
+    longestMainPollGapMs: ms(peak.end - peak.start), longestGap: peak,
     reads: inside(reads, begin, end).length, readsEntirelyInsideFlush: overlap.length,
     ...(overlap.length && { example: {
-      read: overlap[0], flush: flushes.find(flush => overlap[0].start >= flush.start && overlap[0].end <= flush.end),
+      read: overlap[0], flush: flushes.find(sync => overlap[0].start >= sync.start && overlap[0].end <= sync.end),
     } }),
   });
 }
 
+async function saveLongFlushes(fixtures) {
+  const files = await Promise.all(fixtures.map(async fixture => {
+    const { main, events } = await listEvents(fixture);
+    return events.filter(event => event.file).map(event =>
+      ({ side: fixture.side, main: event.tid === main, ...event }));
+  }));
+  const all = files.flat();
+  const candidate = fixtures.find(fixture => fixture.side === 'candidate');
+  const rows = [];
+  for (const event of all) {
+    if (event.side !== 'candidate' || !flush(event) || event.end - event.start <= 40e6) continue;
+    const window = candidate.windows.find(window => within(event, window));
+    if (!window) continue;
+    rows.push({ window, flush: event,
+      overlapping: all.filter(other => other !== event && overlaps(other, event)) });
+  }
+  await writeFile(join(reports, tier + '-long-flushes.jsonl'), rows.map(row => JSON.stringify(row) + '\n').join(''), { flag: 'wx' });
+  console.log(tier + ': attributed ' + rows.length + ' candidate flushes above 40 ms');
+}
+
+const fixtures = [];
 try {
-  await cluster.start();
-  for (const name of [reader, writer]) {
-    const tenant = await cluster.tenant(name, { workers: 1, durableObjectNamespaces: 1 });
-    await cluster.deploy(tenant, 'rows', source, { wrangler: {
-      durable_objects: { bindings: [{ name: 'ROWS', class_name: 'Rows' }] },
-      migrations: [{ tag: 'v1', new_sqlite_classes: ['Rows'] }],
-    } });
-    await eventually('route active for ' + name, async () => {
-      const response = await fetch(cluster.urls[owner] + '/' + name + '/rows/preflight');
-      assert.equal(response.status, 200);
-      assert.equal(await response.json(), 1);
-    });
-    assert.equal((await call(name, 'seed')).value, 1);
-    assert.equal((await call(name, 'read')).value, 1);
+  fixtures.push(await fixture('baseline', baselineBin, baselineLog, baselineObjects));
+  fixtures.push(await fixture('candidate', candidateBin, candidateLog, candidateObjects));
+  // Use the opposite starting build on the other volume.
+  if (tier === 'slow') fixtures.reverse();
+  for (const version of fixtures) await setup(version);
+  // One-client windows all precede the heavier insert load. Alternate builds
+  // at every concurrency on this volume.
+  for (const [clients, rounds] of [[1, 5], [16, 3]]) {
+    for (let round = 1; round <= rounds; ++round) {
+      for (const version of fixtures) await measure(version, clients, 5000, round);
+    }
   }
-  const start = await cluster.state(owner);
-  assert.equal(start.membership.members.filter(member => member.state === 'active').length, 1);
-  for (let round = 1; round <= 3; ++round) {
-    for (const clients of round % 2 ? [1, 16] : [16, 1]) await measure(clients, 5000, round);
+  for (const version of fixtures) await measure(version, 1, 7000, 1, true);
+  await saveLongFlushes(fixtures);
+  for (const version of fixtures) {
+    assert.equal((await call(version, writer, 'count', false)).value, version.nextId - 1, 'every successful insert is visible');
+    await save(version, { confirmedInserts: version.nextId - 2, readerTenant: reader, writerTenant: writer });
   }
-  await measure(1, 7000, 1, true);
-  assert.equal((await call(writer, 'count')).value, nextId - 1, 'every successful insert is visible');
-  await save({ confirmedInserts: nextId - 2, readerTenant: reader, writerTenant: writer });
 } catch (error) {
-  if (cluster.started) {
+  for (const { cluster, owner } of fixtures) {
+    if (!cluster.started) continue;
     try {
       console.error(await cluster.compose(['logs', '--no-color', '--tail', '60', owner]));
     } catch (logsError) {
       console.error(logsError.message);
     }
+    await cluster.diagnostics('durable-log-io', error);
   }
-  await cluster.diagnostics('durable-log-io', error);
   throw error;
 } finally {
-  agent.destroy();
-  await cluster.close();
+  await Promise.all(fixtures.map(async ({ cluster, trace }) => {
+    try {
+      await cluster.close();
+    } finally {
+      await rm(trace, { recursive: true, force: true });
+    }
+  }));
 }
