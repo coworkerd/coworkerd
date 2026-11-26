@@ -1862,6 +1862,172 @@ async function threadedPlatformDefinition(cluster) {
   await durableTakeover(cluster, tenants[0]);
 }
 
+async function durableAdmissionRefusal(cluster) {
+  const [objectOwner, databaseOwner] = cluster.nodes;
+  const tenant = await cluster.tenant('durable-refusal', { durableObjectNamespaces: 48 });
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[databaseOwner, 1]]));
+  const [db] = databases.get(databaseOwner);
+  await cluster.deploy(tenant, 'counter', `
+    import { DurableObject } from 'cloudflare:workers';
+    async function call(env, name, op) {
+      const stub = env.COUNTER.getByName(name);
+      if (op !== 'rpc') return stub.fetch('http://object/' + op, op === 'write' ? { method: 'POST', body: '1' } : {});
+      try { return Response.json(await stub.write()); }
+      catch (e) { return Response.json({ code: e.code, message: e.message }, { status: 503 }); }
+    }
+    export class Counter extends DurableObject {
+      attempts = 0;
+      async write() {
+        this.attempts++;
+        const count = 1 + ((await this.ctx.storage.get('count')) ?? 0);
+        await this.ctx.storage.put('count', count);
+        return { count, attempts: this.attempts };
+      }
+      async fetch(request) {
+        const { pathname, searchParams } = new URL(request.url);
+        if (pathname === '/write') {
+          if (await request.text() !== '1') return new Response('missing write body', { status: 400 });
+          return Response.json(await this.write());
+        }
+        if (pathname === '/relay') return call(this.env, searchParams.get('target'), searchParams.get('op'));
+        return Response.json({ count: (await this.ctx.storage.get('count')) ?? 0, attempts: this.attempts });
+      }
+    }
+    export default { async fetch(request, env) {
+      const { searchParams } = new URL(request.url);
+      const op = searchParams.get('op');
+      if (op === 'd1' || op === 'exec') {
+        try {
+          const result = op === 'd1' ? await env.DB.prepare('INSERT INTO ledger VALUES (2)').run()
+            : await env.DB.exec('INSERT INTO ledger VALUES (3)');
+          return Response.json(result);
+        }
+        catch (e) { return Response.json({ message: e.message, cause: e.cause?.message }, { status: 503 }); }
+      }
+      if (searchParams.has('via')) {
+        return env.COUNTER.getByName(searchParams.get('via')).fetch('http://object/relay?' + searchParams);
+      }
+      return call(env, searchParams.get('target'), op);
+    } };
+  `, { wrangler: {
+    durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] },
+    migrations: [{ tag: 'v1', new_sqlite_classes: ['Counter'] }],
+    d1_databases: [{ binding: 'DB', database_name: db.name }],
+  } });
+  const { namespaceId, shards } = await cluster.api(`${tenant.path}/workers/counter/namespaces/Counter`, { token: tenant.token });
+  const names = node => Array.from({ length: 64 }, (_, i) => `counter-${i}`).filter(name => {
+    const id = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update(name).digest();
+    return shardOwnerOrder(cluster, namespaceId, Number(id.readBigUInt64BE() % BigInt(shards)))[0] === node;
+  });
+  const [blocker, target] = names(objectOwner);
+  const [caller] = names(databaseOwner);
+  assert.ok(blocker && target && caller, 'the fixture has objects on both owners');
+  const call = (node, params) => workerCall(cluster, node, tenant, `counter?${new URLSearchParams(params)}`);
+  const read = (node, target) => call(node, { target, op: 'read' });
+  const zero = { count: 0, attempts: 0 };
+  const checkRefusal = result => {
+    assert.equal(result.code, 'OVERLOADED');
+    assert.equal(result.dispatched, false);
+    assert.equal(result.retryable, true);
+  };
+  await eventually('the blocker and relay are resident on separate nodes', async () => {
+    assert.deepEqual(json(await read(objectOwner, blocker), 200, 'blocker'), zero);
+    assert.deepEqual(json(await read(databaseOwner, caller), 200, 'relay'), zero);
+  });
+  const initial = await eventually('the target owner publishes the occupied slot', async () => {
+    const snapshot = await durableGeneration(cluster, objectOwner);
+    assert.equal(snapshot.lifecycle.durableAdmission.residentRoots, 1);
+    assert.equal(snapshot.inFlight, 0);
+    return snapshot;
+  });
+  const calls = [
+    ['Worker fetch', () => call(objectOwner, { target, op: 'write' }), false],
+    ['Worker RPC', () => call(objectOwner, { target, op: 'rpc' }), true],
+    ['object fetch', () => call(databaseOwner, { target, op: 'write', via: caller }), false],
+    ['object RPC', () => call(databaseOwner, { target, op: 'rpc', via: caller }), true],
+  ];
+  for (const [label, write, rpc] of calls) {
+    const reply = json(await write(), 503, `${label} refused before dispatch`);
+    if (rpc) {
+      assert.equal(reply.code, 'OVERLOADED');
+      assert.match(reply.message, /^OVERLOADED: /);
+      checkRefusal(JSON.parse(reply.message.slice('OVERLOADED: '.length)));
+    } else checkRefusal(reply);
+  }
+  await eventually('only the child overload counter changed on the target owner', async () => {
+    const after = await durableGeneration(cluster, objectOwner);
+    assert.equal(after.generation, initial.generation);
+    assert.equal(after.dispatchedCount, initial.dispatchedCount);
+    assert.equal(after.lifecycle.durableAdmission.overloaded, initial.lifecycle.durableAdmission.overloaded + calls.length);
+  });
+  const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
+  await writeFile(advance, '180000');
+  await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
+  await eventually('the blocker retires and releases capacity', async () => {
+    assert.equal((await durableGeneration(cluster, objectOwner)).lifecycle.durableAdmission.residentRoots, 0);
+  });
+  assert.deepEqual(json(await read(objectOwner, target), 200, 'target after refusals'), zero);
+  for (const [index, [label, write]] of calls.entries()) {
+    assert.deepEqual(json(await write(), 200, `${label} retried once`), { count: index + 1, attempts: index + 1 });
+  }
+  assert.deepEqual(json(await read(objectOwner, target), 200, 'target after retries'), { count: 4, attempts: 4 });
+
+  const sql = (sql, timeout = 10000) => request(cluster.urls.apiserver, `${db.path}/query`, {
+    method: 'POST', token: tenant.token, body: { sql }, timeout,
+  });
+  const d1 = (op = 'd1') => call(databaseOwner, { op });
+  const insert = 'INSERT INTO ledger VALUES (1)';
+  const rows = 'SELECT value FROM ledger ORDER BY value';
+  await eventually('the threaded database is ready', async () => {
+    assert.equal(json(await sql('SELECT 1'), 200, 'database ready').success, true);
+  });
+  assert.equal(json(await sql('CREATE TABLE ledger(value INTEGER)'), 200, 'create ledger').success, true);
+  const gate = join(cluster.peerAckGate, 'hold');
+  await writeFile(gate, '');
+  const held = sql('INSERT INTO ledger VALUES (0)');
+  void held.catch(() => {});
+  let queued;
+  try {
+    await eventually('the first SQL write is held by the output gate', async () => {
+      const states = await Promise.all(cluster.nodes.filter(node => node !== databaseOwner).map(node => cluster.state(node)));
+      assert.ok(states.every(state => state.durableLog.peers.heldAcksForTest > 0));
+    });
+    queued = sql(rows);
+    void queued.catch(() => {});
+    const before = await eventually('one read fills the database mailbox', async () => {
+      const snapshot = await durableGeneration(cluster, databaseOwner);
+      assert.equal(snapshot.lifecycle.durableAdmission.running, 1);
+      assert.equal(snapshot.lifecycle.durableAdmission.waiting, 1);
+      return snapshot;
+    });
+    const http = json(await sql(insert), 503, 'public HTTP SQL refused before dispatch');
+    checkRefusal(http);
+    const binding = json(await d1(), 503, 'D1 refused before dispatch');
+    assert.equal(binding.cause, `OVERLOADED: ${http.reason}`);
+    assert.equal(binding.message, `D1_ERROR: ${binding.cause}`);
+    assert.match(binding.cause, /did not execute and can be retried/);
+    const exec = json(await d1('exec'), 503, 'D1 exec refused before dispatch');
+    assert.equal(exec.cause, `Error in line 1: INSERT INTO ledger VALUES (3): ${binding.cause}`);
+    assert.equal(exec.message, `D1_EXEC_ERROR: ${exec.cause}`);
+    await eventually('the full mailbox refused all three SQL writes without dispatch', async () => {
+      const after = await durableGeneration(cluster, databaseOwner);
+      assert.equal(after.generation, before.generation);
+      assert.equal(after.dispatchedCount, before.dispatchedCount);
+      assert.equal(after.lifecycle.durableAdmission.overloaded, before.lifecycle.durableAdmission.overloaded + 3);
+    });
+  } finally {
+    await unlink(gate);
+    await Promise.allSettled([held, queued]);
+  }
+  assert.equal(json(await held, 200, 'held insert after release').success, true);
+  assert.deepEqual(json(await queued, 200, 'queued read after refusals').results, [{ value: 0 }]);
+  assert.equal(json(await sql(insert), 200, 'HTTP SQL retry').success, true);
+  assert.equal(json(await d1(), 200, 'D1 retry').success, true);
+  assert.equal(json(await d1('exec'), 200, 'D1 exec retry').count, 1);
+  assert.deepEqual(json(await sql(rows), 200, 'one row per retried insert').results,
+    [0, 1, 2, 3].map(value => ({ value })));
+}
+
 async function durableSlowHolder(cluster) {
   const tenant = await takeoverWriter(cluster, 'slow-holder-test');
   const [first] = cluster.nodes;
@@ -3304,6 +3470,14 @@ export const durableGatedCases = {
   'durable-threaded-database-accounting': {
     test: threadedDatabaseAccounting, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
     platformFixture: () => [{ worker: 'sql-accounting/object', bindingClass: 'Echo', className: 'PlatformEcho' }],
+  },
+  'durable-threaded-admission-refusal': {
+    test: durableAdmissionRefusal, nodes: ['node-1', 'node-2'], databaseFixtureNodes: ['node-2'],
+    controlDurableLifecycle: true, confirmTimeoutMs: 25000,
+    configureNode: node => node === 'node-1' ? ({
+      durableObjects: { threadedStorage: true, residentObjects: 1, confirmTimeoutMs: 25000 },
+    }) : ({}),
+    nodeEnvironment: node => node === 'node-2' ? { COWORKERD_DO_TEST_MAILBOX_EVENTS: '1' } : {},
   },
   'threaded-sql-deadline': {
     test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],

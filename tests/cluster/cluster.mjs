@@ -203,7 +203,7 @@ export class Cluster {
         volumes: [{ type: 'bind', source: config, target, read_only: true }],
       };
       if (this.budgetLifetime) overrides[node].environment.COWORKERD_LEASE_TTL_MS = String(this.budgetLifetime.leaseMs);
-      if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS = '32';
+      if (this.threadedNodes.has(node)) overrides[node].environment.COWORKERD_DO_TEST_MAILBOX_EVENTS ??= '32';
       if (this.databaseFixtureNodes.has(node)) {
         overrides[node].environment.COWORKERD_TEST_THREADED_DATABASES = '1';
         if (!this.databaseAlarmFixture) {
