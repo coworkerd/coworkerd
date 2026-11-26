@@ -457,6 +457,12 @@ homes available by setting 12 homes and `residentObjects: 4`. It prewarms a tena
 and requests distinct object keys, so a tenant can claim a released tree credit without
 needing a new copy.
 
+With the earlier published archive, the tree probe served 1 of 116 SQL queries and
+the mixed memory probe served 105 of 116 while five tenant definitions obtained copies.
+The revised local Linux ARM64 threaded executable served 116 of 116 in both probes.
+It had 1,893 competing attempts at the tree limit and 5,085 at the memory limit.
+[Recorded revision and test conditions](https://github.com/coworkerd/coworkerd/pull/101#issuecomment-7182027172)
+
 ### Verification with patch 0177
 
 The public ARM64 archive was built from product `c2808ff8a53573cff176c9ee3428e739a3a09b6f`

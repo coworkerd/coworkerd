@@ -23,6 +23,8 @@ of the node's memory budget, and a smaller resource budget can lower capacity.
 When a new database needs room, the process releases its least recently used eligible idle
 database. An active call, queued call, or pending storage confirmation keeps its database
 resident. A later call reopens the released database with its confirmed data.
+An explicit admission refusal returns HTTP `503 OVERLOADED` with `dispatched: false`
+and `retryable: true`.
 [Admission measurements and commands](../database-home-benchmark.md#database-admission-at-the-ceiling)
 
 ## 2. Make one
