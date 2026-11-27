@@ -25,16 +25,17 @@ const serviceWorker = `
 
   export default class LeaseService extends WorkerEntrypoint {
     async fetch(request) {
-      const path = new URL(request.url).pathname;
-      if (!path.startsWith('/drain')) return new Response('service');
+      const url = new URL(request.url);
+      const path = url.pathname.split('/').at(-1);
+      if (!['drain-child', 'drain-markers', 'drain-record'].includes(path)) return new Response('service');
       const ledger = this.env.DRAIN_MARKERS.getByName('response');
       const record = async marker => {
         const response = await ledger.fetch('https://object.test/' + marker, { method: 'PUT' });
         if (response.status !== 204) throw new Error('Could not record ' + marker + ': ' + response.status);
       };
-      if (path === '/drain-markers') return ledger.fetch('https://object.test/');
-      if (path.startsWith('/drain-record/')) {
-        await record(path.slice('/drain-record/'.length));
+      if (path === 'drain-markers') return ledger.fetch('https://object.test/');
+      if (path === 'drain-record') {
+        await record(url.searchParams.get('marker'));
         return new Response(null, { status: 204 });
       }
       await record('child-started');
@@ -139,7 +140,7 @@ const worker = `
       }
       if (path === 'response-drain') {
         const record = async marker => {
-          const response = await env.SERVICE.fetch('https://service.test/drain-record/' + marker);
+          const response = await env.SERVICE.fetch('https://service.test/drain-record?marker=' + marker);
           if (response.status !== 204) throw new Error('Could not record ' + marker + ': ' + response.status);
         };
         ctx.waitUntil((async () => {
