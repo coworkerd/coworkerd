@@ -323,6 +323,10 @@ def allowed_path(name, path):
                               'src/workerd/threaded/isolate-busy-test.c++',
                               'src/workerd/threaded/isolate-busy.h',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0186-start-isolate-busy-time-after-load.patch' and path in {
+                              'src/workerd/threaded/isolate-busy.h',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
                           name == '0130-ordinary-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',

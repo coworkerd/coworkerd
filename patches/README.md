@@ -63,6 +63,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0185 measures wall time under the isolate lock for threaded stateless Workers. The JSG lock
   notifies the existing isolate observer at acquire and release. The threaded lifecycle publishes
   a bounded sliding-window reading for each loaded isolate.
+  Patch 0186 clears the window when stateless initialization completes, before the slot is published
+  to request threads and the lifecycle sampler. It changes the threaded server, its test, and
+  `src/workerd/threaded/isolate-busy.h`.
   Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
   quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and
