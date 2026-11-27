@@ -1211,7 +1211,8 @@ async function threadedSqlProcessMemory(cluster) {
   const room = allOpen.copyMemoryMaximum - allOpen.copyMemoryReservedBytes;
   // SQLite evaluates all four arguments before entering printf. Each blob
   // stays below the per-value limit, and only the small string goes to V8.
-  const blobBytes = (Math.ceil(room / MiB) + 2) * MiB / 4;
+  // Keep six MiB above the sampled headroom so a collection cannot hide the refusal.
+  const blobBytes = (Math.ceil(room / MiB) + 6) * MiB / 4;
   assert.ok(blobBytes >= MiB && blobBytes <= 7 * MiB,
     `expected room for a process-only refusal, got ${room} bytes`);
   const materialize = {
@@ -1219,8 +1220,12 @@ async function threadedSqlProcessMemory(cluster) {
     params: Array(4).fill(blobBytes),
   };
   const first = selected[0];
-  const refused = await query(first, materialize, 422);
-  assert.equal(refused.code, 'SQL_MEMORY_LIMIT_EXCEEDED');
+  const reason = 'the durable process SQLite memory budget is full';
+  const batch = [{ sql: 'INSERT INTO ledger VALUES (9)' }, materialize];
+  const refused = await query(first, batch, 503);
+  assert.deepEqual(refused, {
+    success: false, error: `OVERLOADED: ${reason}`, code: 'OVERLOADED', reason, retryable: true,
+  });
   assert.deepEqual((await query(first, read)).results, [{ value: 0 }]);
   await eventually('the refused query returns temporary heap without closing its database', async () => {
     const afterRefusal = await snapshot();
@@ -1252,9 +1257,11 @@ async function threadedSqlProcessMemory(cluster) {
   });
   const childLogs = await cluster.compose(['logs', '--no-color', owner], { maxBuffer: 8 * 1024 * 1024 });
   assert.doesNotMatch(childLogs, /did not find a valid scope|memoryBytes underflow|SQL transaction refusal cleanup did not finish/);
+  assert.doesNotMatch(childLogs, /SQLite heap (charge remained|change exceeded|changed before)/);
   console.log(`SQLite heap steps with 3 databases: ${allOpen.sqliteHeapReservedBytes} bytes, `
     + `close returned ${allOpen.copyMemoryReservedBytes - idle.copyMemoryReservedBytes} copy bytes, `
-    + `${4 * blobBytes} bytes of SQLite arguments refused before close and accepted after reopen`);
+    + `${4 * blobBytes} bytes of SQLite arguments refused with ${room} bytes of headroom `
+    + 'and accepted after reopen');
 }
 
 async function threadedDatabaseAccounting(cluster) {

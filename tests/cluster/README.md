@@ -221,9 +221,10 @@ the checkout with the tested kernel's patch series when it differs from the prod
 
 `node tests/cluster/run.mjs "$KERNEL_DIR" threaded-sql-process-memory` exercises the test-only
 threaded database mapping with a 112 MiB configured process budget. It checks that three open
-databases reserve 3 MiB of SQLite heap, that a statement exceeding shared headroom returns HTTP 422,
-and that the query succeeds after idle retirement returns the reservations. The same child serves
-the confirmed row after reopen.
+databases reserve 3 MiB of SQLite heap. An atomic batch exceeding shared headroom rolls back and
+returns retryable HTTP 503 `OVERLOADED`. The same child serves the confirmed row and accepts the
+query after idle retirement returns the reservations. The separate `threaded-sql-memory-limit` case
+checks HTTP 422 `SQL_MEMORY_LIMIT_EXCEEDED` at the database cap.
 
 ### Fatal attribution with the test kernel
 

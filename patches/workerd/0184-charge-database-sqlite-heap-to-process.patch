@@ -7,6 +7,35 @@ Reserve the connection's SQLite allocations in 1 MiB steps through the copy's ex
 
 Part of coworkerd/coworkerd#81
 
+diff --git a/src/workerd/api/actor-state.c++ b/src/workerd/api/actor-state.c++
+index dfbca679465bca94f7aa34ceb46939cd5bfd9fd8..ec151b0a36a67d3ed0829ebb4910f7c3f93d720c 100644
+--- a/src/workerd/api/actor-state.c++
++++ b/src/workerd/api/actor-state.c++
+@@ -779,6 +779,7 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
+           const bool recordRefused = limit->wasRefused();
+           const bool spillRefused = limit->wasSpillRefused();
+           const bool memoryRefused = limit->wasMemoryRefused();
++          const bool processMemoryRefused = limit->wasProcessMemoryRefused();
+           // Once commit starts, an unrelated exception can come from work
+           // after the SQLite commit. Trim then only for a recorded refusal
+           // or SQL interruption.
+@@ -799,8 +800,15 @@ jsg::JsRef<jsg::JsValue> DurableObjectStorage::transactionSync(
+                     "jsg.Error: uncommitted WAL and temporary files exceeded a SQLite spill budget"),
+                 "SQL_SPILL_LIMIT_EXCEEDED"));
+           }
+-          if (memoryRefused) {
++          if (memoryRefused || processMemoryRefused) {
+             sqlite.releaseCachedMemory();
++          }
++          if (processMemoryRefused) {
++            kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
++                KJ_EXCEPTION(OVERLOADED, "jsg.Error: the durable process SQLite memory budget is full"),
++                "OVERLOADED"));
++          }
++          if (memoryRefused) {
+             kj::throwRecoverableException(jsg::tagCoworkerdRpcError(
+                 KJ_EXCEPTION(
+                     FAILED, "jsg.Error: the statement exceeds the database SQLite memory limit"),
 diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.c++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
 index 2b2b935a2aed1fa15597b2e832bb27bc6f4d02ef..1035bb028f064145a8273f66632b43169847c8da 100644
 --- a/src/workerd/server/factory/coworkerd-durable-test-storage.c++
@@ -46,10 +75,10 @@ index b03e958d5b8dd371d31e3d775374fef9691404b2..cf9f554ed3a6b79172e1bcba4cce594f
    kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
        DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index d1164d9463d31ce41fce91019133458f2aac7308..0022657f86dc36a6445a68041b40fcc4a0cb7aeb 100644
+index d1164d9463d31ce41fce91019133458f2aac7308..45c32dab4fc2710d66861eed9a6c0abcfa29c987 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -523,6 +523,133 @@ KJ_TEST("queueDurable holds the returned tree and preparation credits until a da
+@@ -523,6 +523,171 @@ KJ_TEST("queueDurable holds the returned tree and preparation credits until a da
    KJ_EXPECT(ordinary.registerPreparation());
  }
  
@@ -73,11 +102,15 @@ index d1164d9463d31ce41fce91019133458f2aac7308..0022657f86dc36a6445a68041b40fcc4
 +  const auto buffers = budget->memoryMaximum - budget->memoryReserved.load();
 +  KJ_REQUIRE(copy.allocateExternal(buffers));
 +  KJ_EXPECT(sqliteMemRealloc(block, MiB + 4096) == nullptr);
-+  KJ_EXPECT(SqliteMemoryScope::wasLimitRefused());
++  KJ_EXPECT(SqliteMemoryScope::getLimitRefusal() == SqliteMemoryScope::LimitRefusal::PROCESS);
 +  KJ_EXPECT(bytes == original);
 +  KJ_EXPECT(budget->sqliteMemoryReserved.load() == MiB);
 +  KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum);
 +  copy.freeExternal(buffers);
++  SqliteMemoryScope::clearLimitRefusal();
++  KJ_EXPECT(sqliteMemRealloc(block, 4 * MiB + 4096) == nullptr);
++  KJ_EXPECT(SqliteMemoryScope::getLimitRefusal() == SqliteMemoryScope::LimitRefusal::DATABASE);
++  KJ_EXPECT(bytes == original);
 +
 +  auto* grown = sqliteMemRealloc(block, MiB + 4096);
 +  KJ_REQUIRE(grown != nullptr);
@@ -148,10 +181,18 @@ index d1164d9463d31ce41fce91019133458f2aac7308..0022657f86dc36a6445a68041b40fcc4
 +    const auto holdingBytes = verify();
 +    KJ_EXPECT(holdingBytes == 3 * MiB);
 +    KJ_EXPECT(budget->memoryReserved.load() == beforeOpen + holdingBytes + buffers);
++    {
++      // Trusted work outside the transaction still acquires and returns the step.
++      auto maintenance = second->run("SELECT randomblob(?)", queryBytes);
++      KJ_REQUIRE(maintenance.getBlob(0).size() == queryBytes);
++      KJ_EXPECT(verify() == holdingBytes + MiB);
++      KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum + MiB);
++    }
++    KJ_EXPECT(verify() == holdingBytes);
 +    secondLimit.begin();
 +    second->run("SAVEPOINT pending");
 +    KJ_EXPECT_THROW_MESSAGE("out of memory", second->run("SELECT randomblob(?)", queryBytes));
-+    KJ_EXPECT(secondLimit.wasMemoryRefused());
++    KJ_EXPECT(secondLimit.wasProcessMemoryRefused() && !secondLimit.wasMemoryRefused());
 +    second->rollbackWalTransaction();
 +    secondLimit.end(*second, /*rolledBack=*/true);
 +    KJ_EXPECT(!second->observedCriticalError());
@@ -159,19 +200,27 @@ index d1164d9463d31ce41fce91019133458f2aac7308..0022657f86dc36a6445a68041b40fcc4
 +    KJ_EXPECT(budget->withinMaximum());
 +  }
 +  KJ_EXPECT(verify() == idleBytes);
++  secondLimit.begin();
 +  {
 +    auto admitted = second->run("SELECT randomblob(?)", queryBytes);
 +    KJ_EXPECT(admitted.getBlob(0).size() == queryBytes);
 +  }
++  secondLimit.end(*second);
 +
 +  // The copy can outlive its connection. Its SQLite bytes must be available
 +  // before the copy returns its own reservation to the process.
 +  first->close();
 +  KJ_EXPECT(firstCopy->sqliteMemoryCharge() == 0);
 +  KJ_EXPECT(verify() == MiB);
++  const auto openHeadroom = budget->memoryMaximum - budget->memoryReserved.load();
++  KJ_REQUIRE(competitor.allocateExternal(openHeadroom));
 +  first = openFirst();
++  KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum + MiB);
++  first->reset();
++  KJ_EXPECT(budget->memoryReserved.load() == budget->memoryMaximum + MiB);
 +  KJ_EXPECT(first->run("SELECT 1").getInt(0) == 1);
 +  KJ_EXPECT(verify() == 2 * MiB);
++  competitor.freeExternal(openHeadroom);
 +  first = nullptr;
 +  second = nullptr;
 +  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
@@ -180,11 +229,29 @@ index d1164d9463d31ce41fce91019133458f2aac7308..0022657f86dc36a6445a68041b40fcc4
 +  KJ_EXPECT(budget->memoryReserved.load() == beforeOpen);
 +}
 +
++KJ_TEST("a copy logs SQLite charge drift and returns its recorded memory once") {
++  constexpr auto MiB = ResourceBudget::MiB;
++  auto budget = std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
++  const auto baseline = budget->memoryReserved.load();
++  {
++    ResourceReservation copy(budget, 64, true);
++    KJ_REQUIRE(copy.registerPreparation());
++    KJ_REQUIRE(copy.resizeSqliteMemory(0, MiB, true));
++    KJ_EXPECT_LOG(ERROR, "SQLite heap change exceeded the copy's recorded charge");
++    KJ_REQUIRE(copy.resizeSqliteMemory(2 * MiB, 0, true));
++    KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
++    KJ_REQUIRE(copy.resizeSqliteMemory(0, MiB, true));
++    KJ_EXPECT_LOG(ERROR, "SQLite heap charge remained when releasing a copy reservation");
++  }
++  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
++  KJ_EXPECT(budget->memoryReserved.load() == baseline);
++}
++
  KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
    int fds[2];
    KJ_SYSCALL(pipe(fds));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index f391261748c3f980c6ea8760d1a0b7b6492ee342..ee598497db95935e5390c4ba7597c9afa49e81f4 100644
+index f391261748c3f980c6ea8760d1a0b7b6492ee342..cee37c292d322dd58849260b7652968baa2c39c5 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -350,7 +350,7 @@ struct ResourceBudget {
@@ -222,17 +289,23 @@ index f391261748c3f980c6ea8760d1a0b7b6492ee342..ee598497db95935e5390c4ba7597c9af
    static constexpr uint64_t MiB = ResourceBudget::MiB;
    // The capacity acquisition records heap and RSS deltas to validate this seed
    // and fixed native overhead separately from each isolate's own heap ceiling.
-@@ -511,7 +513,8 @@ struct ResourceReservation {
+@@ -511,10 +513,13 @@ struct ResourceReservation {
        : budget(std::move(budget)),
          maximumHeap(uint64_t(memoryMiB == 0 ? 128 : memoryMiB) * MiB),
          returned(platformDatabase ? std::make_shared<DatabaseReservationReturn>() : nullptr) {}
 -  ~ResourceReservation() {
 +  ~ResourceReservation() noexcept override {
-+    KJ_ASSERT(sqliteBytes == 0, "SQLite heap outlived its connection");
      if (!registered) return;
++    if (sqliteBytes != 0) {
++      KJ_LOG(ERROR, "SQLite heap charge remained when releasing a copy reservation", sqliteBytes);
++    }
      (void)budget->change(memoryCharge, 0, addressCharge, 0, false, false,
-         returned ? &returned->memoryBeforeRelease : nullptr);
-@@ -522,8 +525,8 @@ struct ResourceReservation {
+-        returned ? &returned->memoryBeforeRelease : nullptr);
++        returned ? &returned->memoryBeforeRelease : nullptr, -int64_t(sqliteBytes));
+     budget->residents.fetch_sub(1);
+     if (returned) returned->releasedMemory.store(memoryCharge);
+   }
+@@ -522,8 +527,8 @@ struct ResourceReservation {
    const uint64_t maximumHeap;
    const std::shared_ptr<DatabaseReservationReturn> returned;
    std::mutex mutex;
@@ -243,7 +316,7 @@ index f391261748c3f980c6ea8760d1a0b7b6492ee342..ee598497db95935e5390c4ba7597c9af
    uint64_t memoryCharge = 0, addressCharge = 0;
    uint32_t preparing = 0;
    bool registered = false;
-@@ -531,10 +534,12 @@ struct ResourceReservation {
+@@ -531,10 +536,12 @@ struct ResourceReservation {
      std::lock_guard lock(mutex);
      return registered ? budget->replacementCeiling(memoryCharge, addressCharge) : std::nullopt;
    }
@@ -259,18 +332,27 @@ index f391261748c3f980c6ea8760d1a0b7b6492ee342..ee598497db95935e5390c4ba7597c9af
      if (fits || observe) {
        memoryCharge = memory;
        addressCharge = address;
-@@ -602,6 +607,21 @@ struct ResourceReservation {
+@@ -602,6 +609,30 @@ struct ResourceReservation {
      ownedExternal -= size;
      (void)resize(false, true);
    }
-+  bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool cleanup) noexcept override {
++  bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool observe) noexcept override {
 +    std::lock_guard lock(mutex);
-+    KJ_ASSERT(registered && oldCharge <= sqliteBytes);
++    if (!registered) {
++      KJ_LOG(ERROR, "SQLite heap changed before its copy reservation was registered");
++      return observe || newCharge <= oldCharge;
++    }
++    if (oldCharge > sqliteBytes) {
++      KJ_LOG(ERROR, "SQLite heap change exceeded the copy's recorded charge", oldCharge, sqliteBytes);
++    }
 +    const auto previous = sqliteBytes;
-+    sqliteBytes = sqliteBytes - oldCharge + newCharge;
-+    // Keep trusted rollback and close able to finish at the process ceiling,
-+    // and report their temporary allocations until SQLite frees them.
-+    if (resize(false, cleanup, int64_t(newCharge) - int64_t(oldCharge)) || cleanup) return true;
++    if (newCharge >= oldCharge) {
++      sqliteBytes += newCharge - oldCharge;
++    } else {
++      sqliteBytes -= kj::min(sqliteBytes, oldCharge - newCharge);
++    }
++    // Observe trusted allocations even at the process ceiling.
++    if (resize(false, observe, int64_t(sqliteBytes) - int64_t(previous)) || observe) return true;
 +    sqliteBytes = previous;
 +    return false;
 +  }
@@ -281,7 +363,7 @@ index f391261748c3f980c6ea8760d1a0b7b6492ee342..ee598497db95935e5390c4ba7597c9af
    bool retainLogs(uint64_t bytes) {
      std::lock_guard lock(mutex);
      logs += bytes;
-@@ -1799,7 +1819,8 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1799,7 +1830,8 @@ struct RequestLimits final: LimitEnforcer {
      return 0 * kj::SECONDS;
    }
    size_t getSqliteMemoryUsage() const override {
@@ -291,7 +373,7 @@ index f391261748c3f980c6ea8760d1a0b7b6492ee342..ee598497db95935e5390c4ba7597c9af
    }
    Slot &slot;
    Measurement &measurement;
-@@ -3757,6 +3778,9 @@ struct ThreadedServer {
+@@ -3757,6 +3789,9 @@ struct ThreadedServer {
          ",\"isolateResets\":" + std::to_string(durableIsolateResets.load()) +
          ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
          ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
@@ -301,7 +383,7 @@ index f391261748c3f980c6ea8760d1a0b7b6492ee342..ee598497db95935e5390c4ba7597c9af
          ",\"overloaded\":" + std::to_string(state.overloads) +
          ",\"expired\":" + std::to_string(state.expired) + "}}";
      if (publish) {
-@@ -7075,8 +7099,14 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7075,8 +7110,14 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
                SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES,
                SqliteDatabase::PLATFORM_SQL_HEAP_LIMIT_BYTES)
          : kj::maxValue;
@@ -319,10 +401,10 @@ index f391261748c3f980c6ea8760d1a0b7b6492ee342..ee598497db95935e5390c4ba7597c9af
        auto shipper = tree->storage().ship(tree->uniqueKey,
            {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),
 diff --git a/src/workerd/util/sqlite-metering.c++ b/src/workerd/util/sqlite-metering.c++
-index 727c2d19d0bab790a52e58b50bcc64321a28708a..f43afb70664db59fa0f18d902914b8f69285008a 100644
+index 727c2d19d0bab790a52e58b50bcc64321a28708a..79e5202a610ca6b1ddf8b5cd6ff80120fabed65d 100644
 --- a/src/workerd/util/sqlite-metering.c++
 +++ b/src/workerd/util/sqlite-metering.c++
-@@ -39,106 +39,72 @@ thread_local SqliteMemoryScope* SqliteMemoryScope::threadLocalScope = nullptr;
+@@ -39,106 +39,73 @@ thread_local SqliteMemoryScope* SqliteMemoryScope::threadLocalScope = nullptr;
  void* sqliteMemMalloc(int size) {
    if (size <= 0) return nullptr;
  
@@ -430,7 +512,8 @@ index 727c2d19d0bab790a52e58b50bcc64321a28708a..f43afb70664db59fa0f18d902914b8f6
 +  const auto reserved = kj::max(oldActual, requested);
 +  if (!scope->resize(oldActual, reserved)) return nullptr;
 +  const bool canRefuse =
-+      scope->maxMemoryBytes != kj::maxValue || (scope->processBudget != nullptr && !scope->cleanup);
++      scope->maxMemoryBytes != kj::maxValue ||
++      (scope->processBudget != nullptr && !scope->observeProcess);
 +  auto* newPtr = canRefuse ? malloc(requested) : realloc(ptr, requested);
 +  if (newPtr == nullptr) {
 +    scope->resize(reserved, oldActual);
@@ -464,7 +547,7 @@ index 727c2d19d0bab790a52e58b50bcc64321a28708a..f43afb70664db59fa0f18d902914b8f6
    }
    return newPtr;
  }
-@@ -177,10 +143,32 @@ static const sqlite3_mem_methods kSqliteMemMethods = {
+@@ -177,23 +144,50 @@ static const sqlite3_mem_methods kSqliteMemMethods = {
  
  }  // namespace
  
@@ -483,7 +566,7 @@ index 727c2d19d0bab790a52e58b50bcc64321a28708a..f43afb70664db59fa0f18d902914b8f6
 +  const auto retained = memoryBytes - previous;
 +  if (replacement > size_t(kj::maxValue) - retained ||
 +      (replacement > previous && retained + replacement > maxMemoryBytes)) {
-+    limitRefused = true;
++    limitRefusal = LimitRefusal::DATABASE;
 +    return false;
 +  }
 +  const auto next = retained + replacement;
@@ -491,8 +574,8 @@ index 727c2d19d0bab790a52e58b50bcc64321a28708a..f43afb70664db59fa0f18d902914b8f6
 +    const auto oldCharge = SqliteProcessMemoryBudget::chargeFor(memoryBytes);
 +    const auto newCharge = SqliteProcessMemoryBudget::chargeFor(next);
 +    if (oldCharge != newCharge &&
-+        !processBudget->resizeSqliteMemory(oldCharge, newCharge, cleanup)) {
-+      limitRefused = true;
++        !processBudget->resizeSqliteMemory(oldCharge, newCharge, observeProcess)) {
++      limitRefusal = LimitRefusal::PROCESS;
 +      return false;
 +    }
 +  }
@@ -501,25 +584,31 @@ index 727c2d19d0bab790a52e58b50bcc64321a28708a..f43afb70664db59fa0f18d902914b8f6
  }
  
  void SqliteMemoryScope::clearLimitRefusal() noexcept {
-@@ -191,9 +179,14 @@ bool SqliteMemoryScope::wasLimitRefused() noexcept {
-   return threadLocalScope != nullptr && threadLocalScope->limitRefused;
+-  if (threadLocalScope != nullptr) threadLocalScope->limitRefused = false;
++  if (threadLocalScope != nullptr) threadLocalScope->limitRefusal = LimitRefusal::NONE;
+ }
+ 
+-bool SqliteMemoryScope::wasLimitRefused() noexcept {
+-  return threadLocalScope != nullptr && threadLocalScope->limitRefused;
++SqliteMemoryScope::LimitRefusal SqliteMemoryScope::getLimitRefusal() noexcept {
++  return threadLocalScope == nullptr ? LimitRefusal::NONE : threadLocalScope->limitRefusal;
  }
  
 -SqliteMemoryScope::SqliteMemoryScope(size_t& memoryBytes, size_t maxMemoryBytes)
 +SqliteMemoryScope::SqliteMemoryScope(size_t& memoryBytes,
 +    size_t maxMemoryBytes,
 +    SqliteProcessMemoryBudget* processBudget,
-+    bool cleanup)
++    bool observeProcess)
      : memoryBytes(memoryBytes),
 -      maxMemoryBytes(maxMemoryBytes) {
 +      maxMemoryBytes(maxMemoryBytes),
 +      processBudget(processBudget),
-+      cleanup(cleanup) {
++      observeProcess(observeProcess) {
    if (threadLocalScope == nullptr) {
      threadLocalScope = this;
    }
 diff --git a/src/workerd/util/sqlite-metering.h b/src/workerd/util/sqlite-metering.h
-index 225a55559600052098f407390cb03b853315147c..9493f881755256dd28b2261841dc966fa9b56221 100644
+index 225a55559600052098f407390cb03b853315147c..c692e7c32c1f96f90cb21b0b2cc5737db82b14f7 100644
 --- a/src/workerd/util/sqlite-metering.h
 +++ b/src/workerd/util/sqlite-metering.h
 @@ -10,6 +10,19 @@
@@ -535,8 +624,8 @@ index 225a55559600052098f407390cb03b853315147c..9493f881755256dd28b2261841dc966f
 +  }
 +
 +  virtual ~SqliteProcessMemoryBudget() noexcept = default;
-+  // Only called when the rounded charge changes. Decreases cannot be refused.
-+  virtual bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool cleanup) noexcept = 0;
++  // Called at a rounded charge boundary. Decreases and observed changes cannot be refused.
++  virtual bool resizeSqliteMemory(size_t oldCharge, size_t newCharge, bool observe) noexcept = 0;
 +};
 +
  // This module implements per-database SQLite memory metering.
@@ -550,23 +639,34 @@ index 225a55559600052098f407390cb03b853315147c..9493f881755256dd28b2261841dc966f
 +  explicit SqliteMemoryScope(size_t& memoryBytes,
 +      size_t maxMemoryBytes,
 +      SqliteProcessMemoryBudget* processBudget = nullptr,
-+      bool cleanup = false);
++      bool observeProcess = false);
  
    ~SqliteMemoryScope() noexcept(false);
    KJ_DISALLOW_COPY_AND_MOVE(SqliteMemoryScope);
-@@ -50,7 +66,9 @@ class SqliteMemoryScope {
+@@ -43,14 +59,18 @@ class SqliteMemoryScope {
+   // The wrapper clears this at the start of a SQLite call. SQLITE_NOMEM can
+   // also come from SQLite's own limits or a system allocation failure.
+   static void clearLimitRefusal() noexcept;
+-  static bool wasLimitRefused() noexcept;
++  enum class LimitRefusal { NONE, DATABASE, PROCESS };
++  static LimitRefusal getLimitRefusal() noexcept;
++  static bool wasLimitRefused() noexcept { return getLimitRefusal() != LimitRefusal::NONE; }
+ 
+  private:
+   // These are accessed by the allocator functions via threadLocalScope.
    size_t& memoryBytes;
    const size_t maxMemoryBytes;
-   bool limitRefused = false;
+-  bool limitRefused = false;
 -  bool permitsGrowth(size_t bytes) noexcept;
++  LimitRefusal limitRefusal = LimitRefusal::NONE;
 +  SqliteProcessMemoryBudget* const processBudget;
-+  const bool cleanup;
++  const bool observeProcess;
 +  bool resize(size_t previous, size_t replacement) noexcept;
  
    // Thread-local pointer to the active scope. Set to this on construction (if not already set),
    // cleared on destruction (if we set it).
 diff --git a/src/workerd/util/sqlite.c++ b/src/workerd/util/sqlite.c++
-index 99de48236684d499496dfa21e8fbb4cef7997d85..b6fd2866f51dc6c712c67de6bd17f86031d5d53d 100644
+index 99de48236684d499496dfa21e8fbb4cef7997d85..1b701cce83e50808bc5694e6880780f7f549647e 100644
 --- a/src/workerd/util/sqlite.c++
 +++ b/src/workerd/util/sqlite.c++
 @@ -816,11 +816,13 @@ SqliteDatabase::SqliteDatabase(const Vfs& vfs,
@@ -584,7 +684,19 @@ index 99de48236684d499496dfa21e8fbb4cef7997d85..b6fd2866f51dc6c712c67de6bd17f860
        sqliteMaxMemoryBytes(sqliteMaxMemoryBytes),
        sqliteMaxMemoryPerProcessBytes(sqliteMaxMemoryPerProcessBytes),
        actorAccountLimits(actorAccountLimits) {
-@@ -884,9 +886,9 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
+@@ -837,7 +839,10 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
+   // expected that sqlite3_close_v2 sets up a database in need of close, or sets nullptr.
+   // sqlite3_close_v2 is safe to call on nullptr, so we should simply call this always, thus
+   // cleaning up a partial db even when SQLITE_CALL_NODB throws.
+-  KJ_ON_SCOPE_FAILURE(sqlite3_close_v2(db));
++  KJ_ON_SCOPE_FAILURE({
++    sqlite3_close_v2(db);
++    releaseProcessMemoryAfterClose();
++  });
+ 
+   KJ_IF_SOME(mode, maybeMode) {
+     int flags = SQLITE_OPEN_READWRITE;
+@@ -884,9 +889,9 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
  SqliteDatabase::~SqliteDatabase() noexcept(false) {
    sqlite3* db = &KJ_UNWRAP_OR(maybeDb, return);
  
@@ -597,38 +709,84 @@ index 99de48236684d499496dfa21e8fbb4cef7997d85..b6fd2866f51dc6c712c67de6bd17f860
      close();
      KJ_IF_SOME(closed, afterCloseCallback) closed();
      return;
-@@ -919,7 +921,7 @@ SqliteDatabase::operator sqlite3*() {
+@@ -919,7 +924,19 @@ SqliteDatabase::operator sqlite3*() {
  }
  
  SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
 -  return SqliteMemoryScope(sqliteMemoryBytes, sqliteMaxMemoryBytes);
-+  return SqliteMemoryScope(sqliteMemoryBytes, sqliteMaxMemoryBytes, processMemoryBudget.get());
++  // Opening, recovery and maintenance have no platform transaction to settle a refusal.
++  auto* limit = getWalTransactionLimit();
++  const bool observeProcess = limit == nullptr || !limit->isActive();
++  return SqliteMemoryScope(
++      sqliteMemoryBytes, sqliteMaxMemoryBytes, processMemoryBudget.get(), observeProcess);
++}
++
++void SqliteDatabase::releaseProcessMemoryAfterClose() noexcept {
++  if (processMemoryBudget == nullptr || sqliteMemoryBytes == 0) return;
++  KJ_LOG(ERROR, "SQLite heap charge remained after closing the database", sqliteMemoryBytes);
++  processMemoryBudget->resizeSqliteMemory(
++      SqliteProcessMemoryBudget::chargeFor(sqliteMemoryBytes), 0, /*observe=*/true);
++  sqliteMemoryBytes = 0;
  }
  
  bool SqliteDatabase::observedCriticalError() {
-@@ -949,7 +951,8 @@ void SqliteDatabase::rollbackWalTransaction() {
+@@ -949,7 +966,8 @@ void SqliteDatabase::rollbackWalTransaction() {
    // A failed statement may have left little headroom. Account for cleanup
    // allocations while allowing the trusted rollback to finish. The platform
    // transaction calls this after leaving the failed SQLite call's memory scope.
 -  SqliteMemoryScope memoryScope(sqliteMemoryBytes, kj::maxValue);
 +  SqliteMemoryScope memoryScope(sqliteMemoryBytes, kj::maxValue, processMemoryBudget.get(),
-+      /*cleanup=*/true);
++      /*observeProcess=*/true);
    if (!sqlite3_get_autocommit(*this)) {
      run("ROLLBACK TRANSACTION");
    } else {
-@@ -1536,7 +1539,9 @@ void SqliteDatabase::close() noexcept {
+@@ -1128,7 +1146,7 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
+       if (code == SQLITE_FULL && limit->isRefusingWrites()) return;
+       if (code == SQLITE_NOMEM && SqliteMemoryScope::wasLimitRefused()) {
+         // The active platform transaction owns rollback and error translation.
+-        limit->noteMemoryRefusal();
++        limit->noteMemoryRefusal(SqliteMemoryScope::getLimitRefusal());
+         return;
+       }
+     }
+@@ -1513,6 +1531,7 @@ void SqliteDatabase::reset() {
+         sqlite3_errstr(err));
+ 
+     maybeDb = kj::none;
++    releaseProcessMemoryAfterClose();
+     vfs.directory.remove(path);
+   }
+ 
+@@ -1536,7 +1555,9 @@ void SqliteDatabase::close() noexcept {
    KJ_ASSERT(currentStatement == kj::none, "close() called while a query is executing");
    KJ_ASSERT(currentRegulator == kj::none, "close() called while a query is compiling");
  
 -  auto memoryScope = enterMemoryScope();
 +  SqliteMemoryScope memoryScope(sqliteMemoryBytes,
 +      processMemoryBudget == nullptr ? sqliteMaxMemoryBytes : size_t(kj::maxValue),
-+      processMemoryBudget.get(), /*cleanup=*/true);
++      processMemoryBudget.get(), /*observeProcess=*/true);
  
    KJ_IF_SOME(db, maybeDb) {
      for (auto& listener: resetListeners) {
+@@ -1560,6 +1581,7 @@ void SqliteDatabase::close() noexcept {
+   inTransaction = false;
+   savepoints.clear();
+   rollbackCallbacks.clear();
++  releaseProcessMemoryAfterClose();
+   closed = true;
+ }
+ 
+@@ -2327,7 +2349,7 @@ void SqliteDatabase::Query::checkColumnMemoryLimit(sqlite3_stmt* statement) {
+   if (auto* limit = db.getWalTransactionLimit(); limit != nullptr && limit->isActive()) {
+     // A column accessor can allocate, for example when it expands a zero BLOB.
+     // Finalize this execution now rather than returning a bogus empty value.
+-    limit->noteMemoryRefusal();
++    limit->noteMemoryRefusal(SqliteMemoryScope::getLimitRefusal());
+     sqlite3_reset(statement);
+     kj::throwRecoverableException(
+         KJ_EXCEPTION(FAILED, "SQLite failed", sqlite3_errstr(SQLITE_NOMEM)));
 diff --git a/src/workerd/util/sqlite.h b/src/workerd/util/sqlite.h
-index e348784b4b4b2053632b0dce4026fd630fe02bca..d724ed911ebbf2ec2ddc551fb7c465015e7ff517 100644
+index e348784b4b4b2053632b0dce4026fd630fe02bca..6fa1b5007bfe81dde001be983957445949b181d3 100644
 --- a/src/workerd/util/sqlite.h
 +++ b/src/workerd/util/sqlite.h
 @@ -155,7 +155,8 @@ class SqliteDatabase {
@@ -649,3 +807,45 @@ index e348784b4b4b2053632b0dce4026fd630fe02bca..d724ed911ebbf2ec2ddc551fb7c46501
  
    // The maximum amount of memory in bytes that can be used by this database for use by
    // sqlite3_mem_methods (from WorkerLimits::sqliteMaxMemoryMb). This is set to kj::maxValue to
+@@ -531,6 +533,7 @@ class SqliteDatabase {
+   bool inTransaction = false;
+ 
+   void init(kj::Maybe<kj::WriteMode> maybeMode);
++  void releaseProcessMemoryAfterClose() noexcept;
+   WalHook walHook = nullptr;
+   void* walHookContext = nullptr;
+ 
+@@ -1008,6 +1011,9 @@ class SqliteDatabase::WalTransactionLimit {
+   bool wasMemoryRefused() const {
+     return active && refusal == Refusal::MEMORY_LIMIT;
+   }
++  bool wasProcessMemoryRefused() const {
++    return active && refusal == Refusal::PROCESS_MEMORY_LIMIT;
++  }
+   bool wasSpillRefused() const {
+     return active && refusal == Refusal::SPILL_LIMIT;
+   }
+@@ -1015,8 +1021,10 @@ class SqliteDatabase::WalTransactionLimit {
+     return spill != kj::none;
+   }
+   bool resizeSpill(uint64_t before, uint64_t after) noexcept;
+-  void noteMemoryRefusal() {
+-    noteRefusal(Refusal::MEMORY_LIMIT);
++  void noteMemoryRefusal(SqliteMemoryScope::LimitRefusal cause) {
++    noteRefusal(cause == SqliteMemoryScope::LimitRefusal::PROCESS
++            ? Refusal::PROCESS_MEMORY_LIMIT
++            : Refusal::MEMORY_LIMIT);
+   }
+   void noteInterruption() {
+     noteRefusal(Refusal::INTERRUPTED);
+@@ -1044,7 +1052,9 @@ class SqliteDatabase::WalTransactionLimit {
+   kj::Maybe<int64_t> originalSize;
+   bool active = false;
+   bool committed = false;
+-  enum class Refusal { NONE, WAL_LIMIT, SPILL_LIMIT, MEMORY_LIMIT, INTERRUPTED, STATEMENT_ROLLBACK };
++  enum class Refusal {
++    NONE, WAL_LIMIT, SPILL_LIMIT, MEMORY_LIMIT, PROCESS_MEMORY_LIMIT, INTERRUPTED, STATEMENT_ROLLBACK
++  };
+   Refusal refusal = Refusal::NONE;
+ 
+   void releaseWalSpill() noexcept;

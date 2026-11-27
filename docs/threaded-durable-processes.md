@@ -325,11 +325,12 @@ when their tenant, package and limits match. The product definition enables the 
 SQLite methods used by the SQL class. Tenant Workers keep their existing compatibility flags.
 
 Each open platform database reserves process memory for its SQLite heap in 1 MiB steps.
-The byte counter on the SQLite connection still enforces the per-database limit. Growth into a
-new step needs room in the same process budget that holds the copy's V8 heap and external
-allocations. A SQL transaction that cannot get the next step rolls back and returns
-`SQL_MEMORY_LIMIT_EXCEEDED`. SQLite frees whole steps as its live heap shrinks and returns the
-last step on close.
+The byte counter on the SQLite connection enforces the per-database limit. Inside a SQL transaction,
+growth into a new step needs room in the same process budget that holds the copy's V8 heap and external
+allocations. A SQL transaction that cannot get the next step rolls back and returns HTTP 503
+`OVERLOADED`. An atomic query can be retried. Exceeding the database's own heap limit returns
+HTTP 422 `SQL_MEMORY_LIMIT_EXCEEDED`. Opening, recovery and maintenance account for their heap
+as well. SQLite returns whole steps as its live heap shrinks and releases the remaining step on close.
 
 The threaded mapping is enabled by the cluster test executable. Production activation
 depends on the database deadline, cancellation, WAL, temporary-file and SQLite memory

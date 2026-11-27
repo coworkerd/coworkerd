@@ -377,6 +377,7 @@ def allowed_path(name, path):
                               'src/workerd/util/sqlite-test.c++', 'src/workerd/util/sqlite.c++',
                               'src/workerd/util/sqlite.h'} or
                           name == '0184-charge-database-sqlite-heap-to-process.patch' and path in {
+                              'src/workerd/api/actor-state.c++',
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++',
                               'src/workerd/util/sqlite-metering.c++',
