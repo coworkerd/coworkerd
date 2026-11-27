@@ -3429,17 +3429,7 @@ public:
   void enqueueAutomatic(size_t slot, const std::string& reason) {
     if (!queuedOrActive(slot)) enqueue(slot, reason);
   }
-  bool reportsUnconfirmedClose(ProcessGeneration& process) {
-    auto snapshot = process.lifecycle.read(&process.lastCloseCheckPublication);
-    if (snapshot.empty()) return false;
-    if (const auto* fixture = std::getenv("COWORKERD_DO_TEST_LIFECYCLE_DIR")) {
-      // The cluster fixture supplies the status for one generation and keeps the normal WAL and exit paths.
-      std::error_code error;
-      if (std::filesystem::exists(std::filesystem::path(fixture) /
-          ("unconfirmed-close-" + process.id + "-" + std::to_string(process.generation)), error)) {
-        snapshot = R"({"durableAdmission":{"unconfirmedCloseIdentities":1}})";
-      }
-    }
+  static bool reportsUnconfirmedClose(std::string_view snapshot) {
     try {
       capnp::MallocMessageBuilder arena;
       auto value = arena.initRoot<capnp::JsonValue>();
@@ -3450,18 +3440,49 @@ public:
       return false;
     }
   }
-  bool observeUnconfirmedClose(const std::shared_ptr<ProcessGeneration>& process) {
-    if (!process || !process->durable || !process->threaded || process->durableTestStorage || process->pid == 0) return false;
-    if (!process->storageCloseUnconfirmed) process->storageCloseUnconfirmed = reportsUnconfirmedClose(*process);
-    return process->storageCloseUnconfirmed;
+  kj::Promise<void> watchUnconfirmedCloses() {
+    const auto* fixture = std::getenv("COWORKERD_DO_TEST_LIFECYCLE_DIR");
+    while (!shuttingDown && !durableClosed) {
+      std::vector<std::shared_ptr<ProcessGeneration>> generations;
+      std::vector<std::pair<std::string, std::filesystem::path>> reports;
+      auto collect = [&](const std::shared_ptr<ProcessGeneration>& process) {
+        if (!process || !process->durable || !process->threaded || process->durableTestStorage || process->pid == 0 ||
+            process->storageCloseUnconfirmed) return;
+        auto snapshot = process->lifecycle.read(&process->lastCloseCheckPublication);
+        if (snapshot.empty()) return;
+        std::filesystem::path marker;
+        if (fixture) marker = std::filesystem::path(fixture) /
+            ("unconfirmed-close-" + process->id + "-" + std::to_string(process->generation));
+        reports.emplace_back(std::move(snapshot), std::move(marker));
+        generations.push_back(process);
+      };
+      // An existing rotation already replaces its old generation. Observe close failures during its drain too.
+      if (rotation) collect(rotation->old);
+      for (const auto& slot : slots) if (slot.current && slot.current->state == "ready") collect(slot.current);
+      if (!reports.empty()) {
+        auto observed = co_await backgroundValue([reports = std::move(reports)] {
+          std::vector<size_t> unconfirmed;
+          for (size_t i = 0; i < reports.size(); ++i) {
+            const auto& [snapshot, marker] = reports[i];
+            std::error_code error;
+            // Change only the report in the cluster fixture. WAL and process exit still run normally.
+            const bool forTest = !marker.empty() && std::filesystem::exists(marker, error);
+            if (reportsUnconfirmedClose(forTest ? R"({"durableAdmission":{"unconfirmedCloseIdentities":1}})"
+                                                : std::string_view(snapshot))) unconfirmed.push_back(i);
+          }
+          return unconfirmed;
+        });
+        // Commit the result to the generation that supplied it even if its slot has since changed hands.
+        for (auto index : observed) generations[index]->storageCloseUnconfirmed = true;
+      }
+      co_await provider.getTimer().afterDelay(100 * kj::MILLISECONDS);
+    }
   }
-  void checkUnconfirmedCloses() {
+  void triggerUnconfirmedCloseRotations() {
     if (durableClosed) return;
-    // An existing rotation already replaces its old generation. Keep its refusal current if close fails during drain.
-    if (rotation) observeUnconfirmedClose(rotation->old);
     for (size_t i = 0; i < slots.size(); ++i) {
       const auto& p = slots[i].current;
-      if (p && p->state == "ready" && observeUnconfirmedClose(p) && !queuedOrActive(i)) {
+      if (p && p->state == "ready" && p->storageCloseUnconfirmed && !queuedOrActive(i)) {
         enqueue(i, "unconfirmed-close", p->generation);
       }
     }
@@ -3531,7 +3552,7 @@ public:
     // Exited generations no rotation still refers to are released.
     for (auto& s : slots) std::erase_if(s.retiring, [&](const auto& p) { return p->pid == 0 && !(rotation && rotation->old == p); });
     if (!shuttingDown) {
-      checkUnconfirmedCloses();
+      triggerUnconfirmedCloseRotations();
       triggers(mono());
     }
     const auto now = mono();
@@ -3969,6 +3990,7 @@ ProcessPool::ProcessPool(ProcessPoolConfig config, std::string executable, std::
         std::move(bindingAddress), std::move(sourceAddress), provider, eventPort, headers, suspects)) {}
 ProcessPool::~ProcessPool() noexcept(false) = default;
 kj::Promise<void> ProcessPool::run() {
+  if (impl->config.threadedDurableStorage) impl->tasks.add(impl->watchUnconfirmedCloses());
   while (true) {
     impl->refresh();
     const auto heatNow = mono();

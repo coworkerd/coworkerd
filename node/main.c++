@@ -1766,8 +1766,7 @@ public:
     auto value = closeUnconfirmed
         ? refusal("DO_UNAVAILABLE", DURABLE_CLOSE_UNCONFIRMED_REASON)
         : refusal("OVERLOADED", DURABLE_CAPACITY_REASON);
-    value.notExecuted = true;
-    value.retryable = !closeUnconfirmed;
+    value.notExecuted = value.retryable = true;
     return value;
   }
 
@@ -1775,7 +1774,7 @@ public:
     if (!runtime.durableCloseRecoveryPending(objectKey)) return std::nullopt;
     auto value = refusal("DO_UNAVAILABLE", "the durable process of this object (" +
         runtime.durableProcessFor(objectKey) + ") is being replaced after an unconfirmed storage close");
-    value.notExecuted = true;
+    value.notExecuted = value.retryable = true;
     return value;
   }
 

@@ -222,14 +222,17 @@ compiled defaults.
 
 If SQLite cannot confirm that a connection closed, the threaded child fences that storage identity
 for the rest of its process generation. It reports the count in `lifecycle.durableAdmission.unconfirmedCloseIdentities`.
-The node queues a rotation for that generation and stops admitting new calls to it when rotation starts.
-Calls refused for the unconfirmed close or while that generation is draining receive `503 DO_UNAVAILABLE`
-with `dispatched: false` and `retryable: false`. Calls already admitted can finish and confirm their writes.
+The node queues a rotation for that generation. When rotation starts, it stops admitting new calls to
+every object served by that process, across all tenants. Calls refused for the unconfirmed close or
+while that generation is draining receive `503 DO_UNAVAILABLE` with `dispatched: false` and
+`retryable: true`. Calls already admitted can finish and confirm their writes. New calls can succeed
+once the successor is ready.
 The node starts a successor only after reaping the old process. The next open uses the normal storage
 recovery path, including WAL repair when needed, to recover confirmed data.
 
-The child publishes lifecycle status about once a second. Rotation can wait behind another rotation on
-the node. `rotation.drainTimeoutMs` (30,000 ms by default) bounds draining. If a connection never sends
+The child publishes lifecycle status about once a second, and the node checks for new publications
+every 100 ms. Rotation can wait behind another rotation on the node.
+`rotation.drainTimeoutMs` (30,000 ms by default) bounds draining. If a connection never sends
 `CLOSED`, the node waits for that timeout, then kills and reaps the old child. After a successful drain,
 `rotation.termGraceMs` (5,000 ms by default) gives the child time to exit after `SIGTERM` before `SIGKILL`.
 Reaping, successor startup, and any storage rebuild add to the time before the object answers.
@@ -242,7 +245,7 @@ The [cluster fixture](../../tests/cluster/README.md#threaded-unconfirmed-close-r
 from injecting a lifecycle report to reading the confirmed value. It uses a three-node cluster and releases
 two held peer acknowledgements during drain. Its controlled report permits a normal storage close and
 measures graceful rotation with `drainTimeoutMs` set to 3,000 ms and `termGraceMs` set to 1,000 ms.
-One Linux ARM64 Docker run took about 0.6 s from the report to readback, including the fixture's
+One Linux ARM64 Docker run took 0.87 s from the report to readback, including the fixture's
 acknowledgement hold and 25 ms polling interval.
 
 ## 7. When ownership changes

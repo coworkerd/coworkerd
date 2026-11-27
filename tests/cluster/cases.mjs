@@ -3219,7 +3219,7 @@ async function durableUnconfirmedClose(cluster) {
     const refusal = json(await request(cluster.urls[owner], target), 503, 'read during close recovery');
     assert.equal(refusal.code, 'DO_UNAVAILABLE');
     assert.equal(refusal.dispatched, false);
-    assert.equal(refusal.retryable, false);
+    assert.equal(refusal.retryable, true);
   }), false, 'the old generation waits for write confirmation before it exits');
 
   const recovered = await eventually('the reported generation exits and its successor reads the confirmed write', async () => {
