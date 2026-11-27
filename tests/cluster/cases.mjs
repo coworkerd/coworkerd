@@ -2510,6 +2510,16 @@ async function durableAdmissionRefusal(cluster) {
           if (await request.text() !== '1') return new Response('missing write body', { status: 400 });
           return Response.json(await this.write());
         }
+        if (pathname === '/hold') {
+          await new Promise(resolve => { this.releaseHold = resolve; });
+          return Response.json({ released: true });
+        }
+        if (pathname === '/held') return Response.json({ held: Boolean(this.releaseHold) });
+        if (pathname === '/release') {
+          this.releaseHold();
+          this.releaseHold = undefined;
+          return Response.json({ released: true });
+        }
         if (pathname === '/relay') return call(this.env, searchParams.get('target'), searchParams.get('op'));
         return Response.json({ count: (await this.ctx.storage.get('count')) ?? 0, attempts: this.attempts });
       }
@@ -2550,10 +2560,17 @@ async function durableAdmissionRefusal(cluster) {
     assert.deepEqual(json(await read(objectOwner, blocker), 200, 'blocker'), zero);
     assert.deepEqual(json(await read(databaseOwner, caller), 200, 'relay'), zero);
   });
-  const initial = await eventually('the target owner publishes the occupied slot', async () => {
+  const hold = call(objectOwner, { target: blocker, op: 'hold' });
+  void hold.catch(() => {});
+  await eventually('the blocker is waiting for release', async () => {
+    const reply = await call(objectOwner, { target: blocker, op: 'held' });
+    assert.deepEqual(json(reply, 200, 'blocker holding its slot'), { held: true });
+  });
+  const initial = await eventually('the target owner publishes the held invocation', async () => {
     const snapshot = await durableGeneration(cluster, objectOwner);
     assert.equal(snapshot.lifecycle.durableAdmission.residentRoots, 1);
-    assert.equal(snapshot.inFlight, 0);
+    assert.equal(snapshot.inFlight, 1);
+    assert.equal(snapshot.lifecycle.durableAdmission.running, 1);
     return snapshot;
   });
   const calls = [
@@ -2562,27 +2579,38 @@ async function durableAdmissionRefusal(cluster) {
     ['object fetch', () => call(databaseOwner, { target, op: 'write', via: caller }), false],
     ['object RPC', () => call(databaseOwner, { target, op: 'rpc', via: caller }), true],
   ];
-  for (const [label, write, rpc] of calls) {
-    const reply = json(await write(), 503, `${label} refused before dispatch`);
-    if (rpc) {
-      assert.equal(reply.code, 'OVERLOADED');
-      assert.match(reply.message, /^OVERLOADED: /);
-      assertDurableCapacityRefusal(JSON.parse(reply.message.slice('OVERLOADED: '.length)));
-    } else assertDurableCapacityRefusal(reply);
+  try {
+    for (const [label, write, rpc] of calls) {
+      const reply = json(await write(), 503, `${label} refused before dispatch`);
+      if (rpc) {
+        assert.equal(reply.code, 'OVERLOADED');
+        assert.match(reply.message, /^OVERLOADED: /);
+        assertDurableCapacityRefusal(JSON.parse(reply.message.slice('OVERLOADED: '.length)));
+      } else assertDurableCapacityRefusal(reply);
+    }
+    await eventually('only the child overload counter changed on the target owner', async () => {
+      const after = await durableGeneration(cluster, objectOwner);
+      assert.equal(after.generation, initial.generation);
+      assert.equal(after.dispatchedCount, initial.dispatchedCount);
+      assert.equal(after.lifecycle.durableAdmission.overloaded, initial.lifecycle.durableAdmission.overloaded + calls.length);
+    });
+  } finally {
+    const release = await call(objectOwner, { target: blocker, op: 'release' });
+    assert.deepEqual(json(release, 200, 'release blocker'), { released: true });
+    assert.deepEqual(json(await hold, 200, 'held invocation completed'), { released: true });
   }
-  await eventually('only the child overload counter changed on the target owner', async () => {
+  await eventually('the held invocation has finished', async () => {
+    const current = await durableGeneration(cluster, objectOwner);
+    assert.equal(current.inFlight, 0);
+    assert.equal(current.lifecycle.durableAdmission.running, 0);
+    assert.equal(current.lifecycle.durableAdmission.residentRoots, 1);
+  });
+  await eventually('the refused object is admitted after the blocker finishes', async () => {
+    assert.deepEqual(json(await read(objectOwner, target), 200, 'target after refusals'), zero);
     const after = await durableGeneration(cluster, objectOwner);
-    assert.equal(after.generation, initial.generation);
-    assert.equal(after.dispatchedCount, initial.dispatchedCount);
-    assert.equal(after.lifecycle.durableAdmission.overloaded, initial.lifecycle.durableAdmission.overloaded + calls.length);
+    assert.equal(after.lifecycle.durableAdmission.admissionRetirements,
+      initial.lifecycle.durableAdmission.admissionRetirements + 1);
   });
-  const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
-  await writeFile(advance, '180000');
-  await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
-  await eventually('the blocker retires and releases capacity', async () => {
-    assert.equal((await durableGeneration(cluster, objectOwner)).lifecycle.durableAdmission.residentRoots, 0);
-  });
-  assert.deepEqual(json(await read(objectOwner, target), 200, 'target after refusals'), zero);
   for (const [index, [label, write]] of calls.entries()) {
     assert.deepEqual(json(await write(), 200, `${label} retried once`), { count: index + 1, attempts: index + 1 });
   }
@@ -2594,6 +2622,7 @@ async function durableAdmissionRefusal(cluster) {
     assert.equal(current.inFlight, 0);
     return current.lifecycle.durableAdmission;
   });
+  const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
   await writeFile(advance, '360000');
   await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
   await eventually('the written object releases its resident root', async () => {

@@ -662,9 +662,11 @@ of a 90,672-byte WAL took 0.250 ms.
   shard's epochs (`do/<namespace>/shards/<shard>/alarms/<object>/0`) names each object's next alarm so that the shard's
   next owner knows which objects to wake; every firing then asks the object's own database, which decides -- a stale hint does not authorize a handler whose database no longer has a due alarm. Delivery can be delayed or repeated across failures; handlers should tolerate retries. The hint carries no correctness: a stale one costs
   one wake, a missing one a delay until the object is next opened.
-- **Resident objects.** A durable process targets `durableObjects.residentObjects` (4096) resident object trees (`0` removes the limit), evicting idle trees in least-recently-used order, facets before their root. Active trees are protected, so the count can temporarily exceed the target; an object with hibernatable WebSockets keeps them
-  connected while it is evicted and is woken by the next message. The state endpoint reports the resident count per
-  process, the limit, the evictions, the wakes and how long they took.
+- **Resident objects.** `durableObjects.residentObjects` defaults to 4,096 trees per durable process; `0` removes
+  the process count limit. A threaded process at its count limit can admit a new ordinary object by retiring the
+  least recently used eligible idle tree. It refuses before execution when no tree can make room. The upstream
+  backend retires idle trees after crossing the target. Both protect active work, close facets before their root,
+  and hibernate eligible WebSockets so that the next message wakes the object.
 
 On glibc the daemon fixes the mmap/trim thresholds at 128 KiB with no top padding and trims free pages at most once a minute after one minute without own or peer log appends. `memory.daemon.containers` reports retained entries and available payload byte counts: unsealed records are pruned after seal/manifest publication, peer buffers after owner trim/drop, histories at their fixed caps, and usage/auth state at flush/expiry; request-log links without a live invocation lease expire after ten quiet minutes and counter windows after sixty seconds even when idle, while epoch exclusions and known-object/tenant metadata follow their documented lifecycle rather than a fixed entry cap.
 

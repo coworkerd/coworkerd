@@ -54,9 +54,9 @@ Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different b
 
 ### Threaded admission refusal
 
-`durable-threaded-admission-refusal` uses a single resident object slot on one owner and a one-event database
+`durable-threaded-admission-refusal` holds the single resident object slot busy on one owner and uses a one-event database
 mailbox on another. It checks Worker and object calls through fetch and RPC, plus public HTTP SQL and the D1
-binding. The child records the refusals without dispatching the writes. After capacity returns, each caller
+binding. The child records the refusals without dispatching the writes. Closing the held invocation lets admission retire the idle tree. Once capacity returns, each caller
 retries once and the stored counter or row confirms one write per retry.
 
 `durable-threaded-copy-reservation-refusal` consumes a one-shot marker at the cold-copy reservation step
