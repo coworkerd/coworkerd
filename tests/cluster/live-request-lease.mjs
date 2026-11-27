@@ -437,9 +437,13 @@ export async function disconnectedRequestLease(cluster) {
       await eventually(`${mode} drained with workerd's cancellation semantics`, async () => {
         assert.deepEqual(await markers(), withinDrain);
       }, { timeout: 31_000, interval: 250 });
+      const backgroundMs = performance.now() - resetAt;
+      assert.ok(backgroundMs < 30_000, `${mode} recorded background work before the reset drain ended`);
       const untilAfterDrain = registeredAt + 42_000 - performance.now();
       if (untilAfterDrain > 0) await delay(untilAfterDrain, undefined, { signal: cluster.signal });
       assert.deepEqual(await markers(), withinDrain, `${mode} ended all work after its one drain`);
+      console.log(`HTTP reset ${mode} recorded waitUntil work by ${backgroundMs.toFixed(1)} ms. ` +
+        `The beyond-cutoff write was absent at ${(performance.now() - resetAt).toFixed(1)} ms.`);
     } finally {
       await cluster.command('docker', ['stop', '-t', '1', client], { cleanup: true });
     }
