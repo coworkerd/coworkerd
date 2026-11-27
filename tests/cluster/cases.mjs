@@ -3547,6 +3547,87 @@ async function threadedClassMigration(cluster) {
   });
 }
 
+async function threadedSocketFrameBudget(cluster) {
+  const { WebSocket: Client } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
+  const tenant = await cluster.tenant('socket-frame-budget');
+  const [node] = cluster.nodes;
+  const path = `/${tenant.name}/socket`;
+  const origin = cluster.urls[node];
+  await cluster.deploy(tenant, 'socket', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Echo extends DurableObject {
+      fetch(request) {
+        const action = new URL(request.url).pathname.split('/').at(-1);
+        if (action === 'release') this.released = true;
+        if (action === 'terminal') return Response.json(this.terminal ?? null);
+        if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return new Response('ready');
+        const [client, socket] = Object.values(new WebSocketPair());
+        this.ctx.acceptWebSocket(socket);
+        return new Response(null, { status: 101, webSocket: client });
+      }
+      async webSocketMessage(socket, message) {
+        if (message === 'hold') {
+          while (!this.released) await scheduler.wait(20);
+        }
+        socket.send(message);
+      }
+      webSocketClose(socket, code, reason, wasClean) {
+        this.terminal = { code, reason, wasClean };
+      }
+    }
+    export default {
+      fetch(request, env) {
+        return env.ECHO.getByName(new URL(request.url).searchParams.get('id') ?? 'first').fetch(request);
+      }
+    };
+  `, { wrangler: { migrations: [{ tag: 'v1', new_sqlite_classes: ['Echo'] }],
+    durable_objects: { bindings: [{ name: 'ECHO', class_name: 'Echo' }] } } });
+  const call = (suffix = '') => request(origin, path + suffix);
+  await eventually('the two test objects answer on the same node', async () => {
+    assertStatus(await call(), 200);
+    assertStatus(await call('?id=second'), 200);
+  });
+  const url = new URL(path, origin);
+  url.protocol = 'ws:';
+  const first = new Client(url);
+  const second = new Client(new URL('?id=second', url));
+  const next = (socket, event) => once(socket, event, { signal: AbortSignal.timeout(7000) });
+  const budget = async () => (await cluster.state(node)).webSockets.homeFrames;
+  const reason = 'Durable Object socket frame capacity';
+  try {
+    await Promise.all([next(first, 'open'), next(second, 'open')]);
+    const echo = next(first, 'message');
+    void echo.catch(() => {});
+    first.send('hold');
+    await eventually('one delivery reserves the full eight-byte budget', async () => {
+      assert.deepEqual(await budget(), { limitBytes: 8, reservedBytes: 8, refused: 0 });
+    });
+    const close = next(second, 'close');
+    second.send(Buffer.from([1]));
+    const [code, closeReason] = await close;
+    assert.equal(code, 1013);
+    assert.equal(closeReason.toString(), reason);
+    await eventually('the second home gets the terminal event while the first delivery holds the budget', async () => {
+      assert.deepEqual(await budget(), { limitBytes: 8, reservedBytes: 8, refused: 1 });
+      assert.deepEqual(json(await call('/terminal?id=second'), 200, 'capacity close'),
+        { code: 1013, reason, wasClean: false });
+    });
+    assertStatus(await call('/release'), 200);
+    assert.equal((await echo)[0].toString(), 'hold');
+    await eventually('completion returns the reservation', async () => {
+      assert.deepEqual(await budget(), { limitBytes: 8, reservedBytes: 0, refused: 1 });
+    });
+    const binary = next(first, 'message');
+    first.send(Buffer.from([0, 128, 255]));
+    const [bytes, isBinary] = await binary;
+    assert.equal(isBinary, true);
+    assert.deepEqual(bytes, Buffer.from([0, 128, 255]));
+  } finally {
+    first.terminate();
+    second.terminate();
+  }
+}
+
 async function threadedSocketHibernation(cluster) {
   const { WebSocket: PingSocket } = createRequire(new URL('../../cli/package.json', import.meta.url))('ws');
   const tenant = await cluster.tenant('threaded-hibernation');
@@ -3905,6 +3986,10 @@ async function threadedSocketHibernation(cluster) {
     assert.deepEqual(wake.attachment, { field: 42, role: 'root' });
     assert.ok(wake.automatic > firstEvent.automatic);
     assert.deepEqual(JSON.parse(await send(second, Buffer.from([0, 128, 255]))).message, [0, 128, 255]);
+    const controlText = 'NUL\0 tab\t newline\n quote" backslash\\ 雪';
+    assert.equal(JSON.parse(await send(second, controlText)).message, controlText);
+    assert.equal(JSON.parse(await send(second, '')).message, '');
+    assert.deepEqual(JSON.parse(await send(second, Buffer.alloc(0))).message, []);
 
     const thirdRetirement = await retired(secondRetirement);
     assert.deepEqual(json(await lookup('/facet/status'), 200, 'facet HTTP wake'),
@@ -3916,10 +4001,10 @@ async function threadedSocketHibernation(cluster) {
     const clean = new PingSocket(socketUrl);
     await next(clean, 'open');
     const cleanClose = next(clean, 'close');
-    clean.close(1000, 'finished');
+    clean.close(1000, 'finished 雪');
     assert.equal((await cleanClose)[0], 1000);
     await eventually('the actor receives the clean close code and its reason', async () => {
-      assert.deepEqual(await readTerminal(), { code: 1000, reason: 'finished', wasClean: true });
+      assert.deepEqual(await readTerminal(), { code: 1000, reason: 'finished 雪', wasClean: true });
     }, { timeout: 7000 });
     const interrupted = new PingSocket(socketUrl);
     await next(interrupted, 'open');
@@ -4341,6 +4426,10 @@ export const durableGatedCases = {
   'durable-threaded-hibernation': {
     test: threadedSocketHibernation, nodes: ['node-1', 'node-2', 'node-3'],
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
+  },
+  'durable-threaded-socket-frame-budget': {
+    test: threadedSocketFrameBudget, nodes: ['node-1'], singleNode: true, holdPeerAcks: false,
+    configureNode: () => ({ durableObjects: { threadedStorage: true, peers: 0, socketFrameBytesPerNode: 8 } }),
   },
   'durable-threaded-retirement': {
     test: threadedSocketRetirement, nodes: ['node-1', 'node-2', 'node-3'], controlDurableLifecycle: true,

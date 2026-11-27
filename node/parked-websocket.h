@@ -9,6 +9,46 @@
 
 namespace coworkerd {
 
+// Shared by all home deliveries on the node's event loop. Charge the received
+// payload and room for its copy in HTTP-over-Cap'n Proto.
+class DurableSocketFrameBudget {
+public:
+  class Reservation {
+  public:
+    Reservation(Reservation&& other) noexcept
+        : budget(std::exchange(other.budget, nullptr)), bytes(other.bytes) {}
+    ~Reservation() { if (budget) budget->used -= bytes; }
+
+  private:
+    friend class DurableSocketFrameBudget;
+    Reservation(DurableSocketFrameBudget& budget, uint64_t bytes): budget(&budget), bytes(bytes) {}
+
+    DurableSocketFrameBudget* budget;
+    uint64_t bytes;
+  };
+
+  explicit DurableSocketFrameBudget(uint64_t limit): limit(limit) {}
+
+  std::optional<Reservation> tryReserve(uint64_t payloadBytes) {
+    if (payloadBytes > (limit - used) / 2) {
+      ++refused;
+      return std::nullopt;
+    }
+    const auto bytes = payloadBytes * 2;
+    used += bytes;
+    return Reservation(*this, bytes);
+  }
+
+  uint64_t limitBytes() const { return limit; }
+  uint64_t usedBytes() const { return used; }
+  uint64_t refusals() const { return refused; }
+
+private:
+  const uint64_t limit;
+  uint64_t used = 0;
+  uint64_t refused = 0;
+};
+
 // Each relay owns this state on the node's event loop. The transport continues
 // to belong to the relay while the attached home and its open are replaced.
 class ParkedWebSocket {

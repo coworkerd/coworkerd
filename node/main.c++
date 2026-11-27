@@ -418,10 +418,17 @@ struct DurableTarget {
   uint32_t alarmRetryCount = 0;
   uint32_t alarmFacetId = 1;
   bool clearAlarm = false;
-  std::string socketId;
-  uint64_t socketFrame = 0;
-  uint32_t socketFacet = 0;
-  size_t socketBytes = 0;
+  struct SocketEvent {
+    std::string id;
+    uint64_t frame;
+    uint32_t facet;
+    std::optional<uint64_t> autoResponseTime;
+    const char* kind = nullptr;
+    size_t bytes = 0;
+    uint16_t closeCode = 0;
+    bool wasClean = false;
+  };
+  std::optional<SocketEvent> socket;
   std::optional<coworkerd::PlatformClassRef> platformClass;
   std::optional<double> sqlDeadline;
   bool isDatabase() const { return !database.empty(); }
@@ -625,9 +632,10 @@ public:
     std::string direction, cause;
     uint64_t toWorker = 0, toClient = 0;
   };
-  explicit WebSocketRegistry(uint32_t ingressLimit): ingressLimit(ingressLimit) {}
+  WebSocketRegistry(uint32_t ingressLimit, uint64_t frameLimit): ingressLimit(ingressLimit), frames(frameLimit) {}
   uint32_t limit() const { return ingressLimit; }
   uint32_t inUse() const { return ingressInUse; }
+  coworkerd::DurableSocketFrameBudget& frameBudget() { return frames; }
   // Reserve before dispatch so that upgrades in progress and open connections both count.
   bool reserve(const std::string& tenant) {
     if (ingressInUse >= ingressLimit) {
@@ -681,10 +689,10 @@ public:
     return found == byObject.end() ? empty : found->second;
   }
   bool validateSocketDefinition(const DurableTarget& target, std::string_view definition) {
-    bool valid = target.socketId.empty();
+    bool valid = !target.socket;
     for (auto* relay : managedObject(target.namespaceId, target.objectId)) {
       if (relay->matchesDurableDefinition(target, definition)) {
-        if (relay->managedId() == target.socketId) valid = true;
+        if (target.socket && relay->managedId() == target.socket->id) valid = true;
       } else {
         relay->goAway("definition-changed");
       }
@@ -752,7 +760,10 @@ public:
         [](const auto& entry) { return entry.second->parked(); });
     return out + ",\"places\":" + counts({places.begin(), places.end()}) + ",\"refused\":" + counts(refusedByTenant) +
         ",\"toldToGoAway\":" + counts(goneAway) + ",\"parked\":" + std::to_string(parked) +
-        ",\"socketWakes\":" + std::to_string(socketWakes) + "}";
+        ",\"socketWakes\":" + std::to_string(socketWakes) +
+        ",\"homeFrames\":{\"limitBytes\":" + std::to_string(frames.limitBytes()) +
+        ",\"reservedBytes\":" + std::to_string(frames.usedBytes()) +
+        ",\"refused\":" + std::to_string(frames.refusals()) + "}}";
   }
 
 private:
@@ -767,6 +778,7 @@ private:
   }
   struct Totals { std::map<std::string, uint64_t> codes, causes; uint64_t toWorker = 0, toClient = 0; };
   const uint32_t ingressLimit;
+  coworkerd::DurableSocketFrameBudget frames;
   uint32_t ingressInUse = 0;
   std::set<Relay*> relays;
   std::map<std::string, Relay*, std::less<>> managed;
@@ -3727,7 +3739,8 @@ private:
                 << "\",\"invocationId\":\"" << jsonEscape(invocationId) << "\",\"generation\":\"" << process.generation
                 << "\",\"dataEpoch\":\"" << durable->dataEpoch << "\",\"shardEpoch\":\"" << durable->shardEpoch
                 << "\",\"openId\":\"1\",\"uniqueKey\":\"" << storage.uniqueKey << "\",\"storageId\":\"" << storage.storageId
-                << "\",\"queuedBytes\":\"" << encoded.size() + durable->socketBytes << "\",\"expiresMonotonicNs\":\""
+                << "\",\"queuedBytes\":\"" << encoded.size() + (durable->socket ? durable->socket->bytes : 0)
+                << "\",\"expiresMonotonicNs\":\""
                 << uint64_t(expiresAtMonotonicMs * 1000000) << "\"}}";
           encoded.pop_back();
           if (durableLog && durable->isDatabase() && durable->platformClass) {
@@ -3745,10 +3758,19 @@ private:
           }
           if (!webSocketRegistry.managedObject(durable->namespaceId, durable->objectId).empty())
             encoded += ",\"hasNodeSockets\":true";
-          if (!durable->socketId.empty()) {
-            encoded += ",\"durableSocket\":{\"id\":\"" + jsonEscape(durable->socketId) +
-                "\",\"frame\":\"" + std::to_string(durable->socketFrame) +
-                "\",\"facet\":\"" + std::to_string(durable->socketFacet) + "\"}";
+          if (const auto& socket = durable->socket) {
+            encoded += ",\"durableSocket\":{\"id\":\"" + jsonEscape(socket->id) +
+                "\",\"frame\":\"" + std::to_string(socket->frame) +
+                "\",\"facet\":\"" + std::to_string(socket->facet) +
+                "\",\"kind\":\"" + socket->kind + "\",\"bytes\":\"" + std::to_string(socket->bytes) + "\"";
+            if (socket->autoResponseTime) {
+              encoded += ",\"autoResponseUnixMs\":\"" + std::to_string(*socket->autoResponseTime) + "\"";
+            }
+            if (std::string_view(socket->kind) == "close") {
+              encoded += ",\"code\":\"" + std::to_string(socket->closeCode) +
+                  "\",\"wasClean\":" + (socket->wasClean ? "true" : "false");
+            }
+            encoded += '}';
           }
           encoded += route.str();
         }
@@ -3859,7 +3881,7 @@ private:
   std::map<std::string, uint64_t> nextArrivalOrder;
   LeaseConfig leaseConfig;
   ServerConfig serverConfig;
-  WebSocketRegistry webSocketRegistry{serverConfig.webSocketsPerNode};
+  WebSocketRegistry webSocketRegistry{serverConfig.webSocketsPerNode, serverConfig.durableSocketFrameBytesPerNode};
   DurableSocketDispatch durableSocketDispatch;
   // What the forked log writers hide on this node, and which calls with secrets it starts
   // (node/secret-dictionary.h). Mutable: encodeDescriptor() records what each descriptor carries.
@@ -4388,7 +4410,8 @@ public:
   bool parked() const override { return managed && managed->parked(managedOwner); }
   const ManagedSocket::Snapshot* adoptable(const coworkerd::DurableLog::ObjectIdentity& object,
       const ManagedSocket::Home& home) const {
-    return managed && !closing && belongsTo(object) ? managed->adoptable(managedOwner, home) : nullptr;
+    return managed && (!closing || deliveringCapacityClose) && belongsTo(object)
+        ? managed->adoptable(managedOwner, home) : nullptr;
   }
   void adopt(ManagedSocket::Home home, std::string process) {
     if (!this->parked()) return;
@@ -4522,20 +4545,35 @@ private:
       const auto action = managed->receive(managedOwner, text);
       if (action.action == Action::REFUSE) co_return;
       if (action.action == Action::ANSWER) {
+        message = kj::String();
         co_await outerWriter.send(kj::str(kj::arrayPtr(action.answer.data(), action.answer.size())));
         managed->answered(managedOwner, action.position, wallTimeMsForTest());
         ++toClient;
         continue;
       }
       KJ_REQUIRE(action.action != Action::BACKPRESSURE, "socket already has a frame in progress");
+      size_t payloadBytes = text ? text->size() : 0;
+      KJ_IF_SOME(binary, message.tryGet<kj::Array<kj::byte>>()) { payloadBytes = binary.size(); }
+      auto credit = registry.frameBudget().tryReserve(payloadBytes);
+      // Drop the data before any more awaits. The close uses the same delivery
+      // path so a live or parked home can dispose of its socket and run its handler.
+      if (!credit) {
+        constexpr auto reason = "Durable Object socket frame capacity";
+        message = kj::WebSocket::Close{1013, kj::str(reason)};
+        deliveringCapacityClose = true;
+        nodeClose(1013, reason, "frame-capacity");
+      }
+      KJ_DEFER(deliveringCapacityClose = false);
       if (action.action == Action::WAKE) registry.recordSocketWake();
       const bool closingFrame = message.is<kj::WebSocket::Close>();
       const auto closeCode = closingFrame ? message.get<kj::WebSocket::Close>().code : 0;
       const auto closeReason = closingFrame ? std::string(message.get<kj::WebSocket::Close>().reason.cStr()) : std::string();
       if (!closingFrame) ++toWorker;
       const auto result = co_await dispatchManaged({durableObject, identity.invocationId, action.position,
-          kj::mv(message), managed->autoResponseTime(), disconnected, transportError, managedFacet});
+          kj::mv(message), managed->autoResponseTime(), disconnected || deliveringCapacityClose, transportError, managedFacet});
+      credit.reset();
       managed->complete(managedOwner, action.position);
+      if (deliveringCapacityClose) co_return;
       if (!result.delivered) {
         if (!closing && result.terminalCode == "DO_CODE_UPDATED") goAway("definition-changed");
         else if (!closing && socketLimitCode(result.terminalCode)) actorReset(result.terminalCode);
@@ -4730,6 +4768,7 @@ private:
   kj::Promise<void> grace = nullptr;
   bool started = false, runEnded = false, closing = false, outerClosed = false, innerClosed = false, outerBroken = false,
       innerBroken = false, innerFailed = false;
+  bool deliveringCapacityClose = false;
   double startedAt = 0;
   uint64_t toWorker = 0, toClient = 0;
   // Who closed first (client, worker, node), with what; why the node ended it (drain, rotation, limit, peer-lost, ...);
@@ -7477,7 +7516,7 @@ private:
         co_return refused(server.refusal("DO_ALARM_STALE", "the alarm lost its dispatch authority", 409));
       }
     }
-    if (!target.socketId.empty() && shards.heldShardEpoch(target.namespaceId, target.shard) != target.shardEpoch)
+    if (target.socket && shards.heldShardEpoch(target.namespaceId, target.shard) != target.shardEpoch)
       co_return refused(server.refusal("DO_SHARD_EPOCH_MISMATCH", "the socket shard changed before dispatch", 409));
     if (target.alarmAtUnixMs) durableLog.alarmCapacityAvailable(server.durableProcessFor(target.key()));
     if (target.platformClass && target.sqlDeadline && monotonicTimeMs() >= *target.sqlDeadline)
@@ -7568,16 +7607,18 @@ private:
 // One request the node makes of an object itself, through the ordinary dispatch: the shard's owner runs it, which
 // may be another node. There is no caller's call tree, so it opens one of its own, as an object's call does.
 kj::Promise<CollectedResponse> collectObjectResponse(BindingDispatch::Dispatched dispatched,
-    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, kj::StringPtr path, std::string body) {
+    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, kj::StringPtr path,
+    kj::ArrayPtr<const kj::byte> body, kj::StringPtr contentType) {
   auto ready = kj::mv(dispatched.ready).eagerlyEvaluate([](kj::Exception&&) {});
   auto getHttp = dispatched.dispatcher.getHttpServiceRequest().send();
   auto service = factory.capnpToKj(getHttp.getHttp());
-  auto held = kj::heap<std::string>(std::move(body));
   kj::HttpHeaders headers(headerTable);
   headers.set(kj::HttpHeaderId::HOST, "coworkerd-node");
-  headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
-  auto pipe = kj::newOneWayPipe(held->size());
-  auto upload = pipe.out->write(kj::arrayPtr(held->data(), held->size()).asBytes())
+  headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, contentType);
+  auto pipe = kj::newOneWayPipe(body.size());
+  // With a write pending, KJ pumps the borrowed range directly into the RPC
+  // ByteStream. It does not first copy the range into a pump buffer.
+  auto upload = pipe.out->write(body)
                     .then([out = kj::mv(pipe.out)]() mutable { out = nullptr; }).eagerlyEvaluate(nullptr);
   CollectedResponse collected;
   // A refused dispatch answers without reading the body. Once the response is complete, cancel any remaining upload.
@@ -7589,6 +7630,12 @@ kj::Promise<CollectedResponse> collectObjectResponse(BindingDispatch::Dispatched
         CollectedResponse::OVERFLOW_REASON + "\"}";
   }
   co_return kj::mv(collected);
+}
+
+kj::Promise<CollectedResponse> collectObjectResponse(BindingDispatch::Dispatched dispatched,
+    capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, kj::StringPtr path, std::string body) {
+  co_return co_await collectObjectResponse(kj::mv(dispatched), factory, headerTable, path,
+      kj::arrayPtr(body.data(), body.size()).asBytes(), "application/json");
 }
 
 kj::Promise<CollectedResponse> askObject(DurableDispatch& durable, capnp::HttpOverCapnpFactory& factory,
@@ -7742,34 +7789,31 @@ kj::Promise<DurableSocketResult> deliverDurableSocket(DurableDispatch& durable, 
   request.target.tenant = owner->tenant;
   request.target.dataEpoch = event.object.dataEpoch;
   request.target.shardEpoch = event.object.shardEpoch;
-  request.target.socketId = event.socketId;
-  request.target.socketFrame = event.frame;
-  request.target.socketFacet = event.facet;
-
-  using coworkerd::json::quote;
-  std::ostringstream body;
-  body << "{\"connection\":" << quote(event.socketId) << ",\"position\":" << quote(std::to_string(event.frame));
+  auto& socket = request.target.socket.emplace(std::move(event.socketId), event.frame, event.facet,
+      event.autoResponseTime);
+  kj::ArrayPtr<const kj::byte> body;
   KJ_SWITCH_ONEOF(event.message) {
     KJ_CASE_ONEOF(text, kj::String) {
-      request.target.socketBytes = text.size();
-      body << ",\"text\":" << quote(std::string(text.begin(), text.size()));
+      socket.kind = "text";
+      body = text.asBytes();
     }
     KJ_CASE_ONEOF(binary, kj::Array<kj::byte>) {
-      request.target.socketBytes = binary.size();
-      const std::string bytes(reinterpret_cast<const char*>(binary.begin()), binary.size());
-      body << ",\"binary\":" << quote(coworkerd::json::base64(bytes));
+      socket.kind = "binary";
+      body = binary.asPtr();
     }
     KJ_CASE_ONEOF(close, kj::WebSocket::Close) {
-      body << ",\"code\":" << close.code << ",\"reason\":" << quote(close.reason.cStr())
-           << ",\"wasClean\":" << (event.disconnected ? "false" : "true");
+      socket.kind = event.transportError ? "error" : "close";
+      if (!event.transportError) {
+        socket.closeCode = close.code;
+        socket.wasClean = !event.disconnected;
+        body = close.reason.asBytes();
+      }
     }
   }
-  if (event.autoResponseTime)
-    body << ",\"autoResponseUnixMs\":" << quote(std::to_string(*event.autoResponseTime));
-  if (event.transportError) body << ",\"error\":true";
-  body << '}';
+  socket.bytes = body.size();
   auto opened = co_await durable.dispatchLocalEvent(std::move(request), event.object.shard);
-  auto result = co_await collectObjectResponse(kj::mv(opened), factory, headers, DURABLE_SOCKET_PATH, body.str());
+  auto result = co_await collectObjectResponse(kj::mv(opened), factory, headers, DURABLE_SOCKET_PATH,
+      body, "application/octet-stream");
   if (result.status == 204) co_return DurableSocketResult{true, {}};
   try {
     capnp::MallocMessageBuilder message;
@@ -10420,7 +10464,8 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"probation\":" << b(c.suspectProbation)
       << "},\"drainTimeoutMs\":" << c.drainTimeoutMs << ",\"loadCheck\":" << b(c.loadCheck)
       << ",\"ingress\":{\"webSocketsPerNode\":" << c.webSocketsPerNode << "}"
-      << ",\"durableObjects\":{\"processes\":" << c.processPool.durableProcesses << "}"
+      << ",\"durableObjects\":{\"processes\":" << c.processPool.durableProcesses
+      << ",\"socketFrameBytesPerNode\":" << c.durableSocketFrameBytesPerNode << "}"
       << ",\"lease\":{\"mode\":" << q(lease.naive() ? "naive" : "correct") << ",\"ttlMs\":" << lease.ttlMs
       << ",\"defaultSubrequests\":" << lease.defaultSubrequests
       << "},\"logs\":{\"tenantBufferBytes\":" << c.logs.tenantBufferBytes << ",\"totalBufferBytes\":" << c.logs.totalBufferBytes

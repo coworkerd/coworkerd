@@ -299,6 +299,7 @@ struct ServerConfig {
   uint32_t webSocketsPerNode = 0;
   // durableObjects: how the node replicates and stores its objects' data (processes is in processPool).
   DurableLogConfig durableLog;
+  uint64_t durableSocketFrameBytesPerNode = 128ull << 20;
   // The configuration file of `serve`. The four paths and addresses are serve only (the
   // positional form takes them as arguments); the shortcuts below them fill the nested fields.
   std::string stackDirectory, workerdPath, runtimePath, listenAddress;

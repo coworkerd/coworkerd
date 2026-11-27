@@ -61,6 +61,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and
   WebSocket hooks carry a native upgrade through local facet fetches. The legacy hibernation manager
   and the threaded host validate the upgrade against the tree that staged it.
+  Patch 0109 reads raw WebSocket bodies in `src/workerd/threaded/threaded-server.c++`. The existing
+  invocation descriptor supplies the event type, expected length and control metadata.
   Patches 0150 and 0151 recognize the platform Durable Object definition on the threaded host. The host checks the
   tenant and local definition pin before the home uses the existing package compiler and actor path.
   Both patches use `threaded-server.c++` and `threaded-server-test.c++` in `src/workerd/threaded/`.

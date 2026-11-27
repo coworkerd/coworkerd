@@ -123,6 +123,33 @@ struct DurableLogChannelTest {
     KJ_REQUIRE(reading.wait(io.waitScope) == 1 && byte == sent, "the existing stream survives a tail failure");
   }
 
+  static void webSocketFrameBudget() {
+    auto io = kj::setupAsyncIo();
+    DurableSocketFrameBudget budget(16);
+    auto submit = [&](uint64_t bytes, kj::Promise<void> delivery) -> kj::Promise<void> {
+      auto reservation = budget.tryReserve(bytes);
+      KJ_REQUIRE(reservation.has_value(), "delivery must fit");
+      co_await delivery;
+    };
+    auto gate = kj::newPromiseAndFulfiller<void>();
+    auto delivered = submit(3, kj::mv(gate.promise));
+    auto cancelled = submit(5, kj::NEVER_DONE);
+    KJ_REQUIRE(budget.usedBytes() == 16 && budget.limitBytes() == 16);
+    KJ_REQUIRE(!budget.tryReserve(1).has_value());
+    KJ_REQUIRE(budget.tryReserve(0).has_value() && budget.usedBytes() == 16);
+    gate.fulfiller->fulfill();
+    delivered.wait(io.waitScope);
+    KJ_REQUIRE(budget.usedBytes() == 10);
+    auto replacement = budget.tryReserve(3);
+    KJ_REQUIRE(replacement.has_value() && budget.usedBytes() == 16);
+    cancelled = nullptr;
+    KJ_REQUIRE(budget.usedBytes() == 6);
+    replacement.reset();
+    KJ_REQUIRE(!budget.tryReserve(UINT64_MAX).has_value() && budget.refusals() == 2);
+    KJ_REQUIRE(budget.usedBytes() == 0 && budget.tryReserve(8).has_value());
+    KJ_REQUIRE(budget.usedBytes() == 0);
+  }
+
   static void parkedWebSocket() {
     using Socket = ParkedWebSocket;
     using Action = Socket::Frame::Action;
@@ -2647,6 +2674,7 @@ int main(int argc, char* argv[]) {
   else if (mode == "upstream-channel-eof") coworkerd::DurableLogChannelTest::upstreamChannelEof();
   else if (mode == "threaded-channel") coworkerd::DurableLogChannelTest::threadedChannel();
   else if (mode == "parked-websocket") coworkerd::DurableLogChannelTest::parkedWebSocket();
+  else if (mode == "websocket-frame-budget") coworkerd::DurableLogChannelTest::webSocketFrameBudget();
   else if (mode == "threaded-alarms") coworkerd::DurableLogChannelTest::threadedAlarms();
   else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
   else if (mode == "recovery-admission") coworkerd::DurableLogChannelTest::recoveryAdmission();
