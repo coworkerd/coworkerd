@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
 
 async function checkIngressPlacement(cluster, enabled) {
@@ -35,7 +36,7 @@ async function checkIngressPlacement(cluster, enabled) {
 export const ingressPlacementDefault = cluster => checkIngressPlacement(cluster, false);
 export const ingressPlacementEnabled = cluster => checkIngressPlacement(cluster, true);
 
-async function saturationWorker(cluster) {
+async function saturationWorker(cluster, source) {
   const tenant = await cluster.tenant('ingress-saturation');
   const [home, ingress] = cluster.nodes;
   const names = Array.from({ length: 32 }, (_, i) => `where-${i}`);
@@ -49,11 +50,11 @@ async function saturationWorker(cluster) {
   assert.notEqual(index, -1, `one of the fixture names has home ${home}`);
   const name = names[index];
   const workerId = `${tenant.name}/${name}`;
-  await cluster.deploy(tenant, name, `export default { async fetch(request) {
+  await cluster.deploy(tenant, name, source ?? `export default { async fetch(request) {
     if (new URL(request.url).searchParams.has('hold')) await new Promise(resolve => setTimeout(resolve, 8000));
     return Response.json({ nodeId: request.cf.nodeId });
   } };`);
-  const call = (hold = false) => request(cluster.urls[ingress], `/${workerId}${hold ? '?hold' : ''}`, { timeout: 15000 });
+  const call = (query = '') => request(cluster.urls[ingress], `/${workerId}${query}`, { timeout: 15000 });
   return { workerId, call };
 }
 
@@ -123,7 +124,7 @@ export async function ingressPlacementAllBusy(cluster) {
   const held = [];
   try {
     for (const node of [home, ingress, peer]) {
-      const response = call(true);
+      const response = call('?hold');
       // Keep a rejection observed while checking the slot through state.
       response.catch(() => {});
       held.push([node, response]);
@@ -140,5 +141,50 @@ export async function ingressPlacementAllBusy(cluster) {
     await Promise.all(held.map(async ([node, response]) => {
       assert.equal(json(await response, 200, `held call on ${node}`).nodeId, node);
     }));
+  }
+}
+
+export async function ingressPlacementLiveSaturation(cluster) {
+  const [home] = cluster.nodes;
+  const { workerId, call } = await saturationWorker(cluster, `export default { async fetch(request) {
+    let checksum = 1234;
+    if (new URL(request.url).searchParams.has('busy')) {
+      const until = Date.now() + 8500;
+      do {
+        for (let i = 0; i < 200_000_000; ++i)
+          checksum = (Math.imul(checksum ^ i, 1664525) + 1013904223) | 0;
+        await scheduler.wait(1);
+      } while (Date.now() < until);
+    }
+    return Response.json({ nodeId: request.cf.nodeId, checksum });
+  } };`);
+  assert.equal(json(await call(), 200, 'warm call').nodeId, home);
+  const read = async () => {
+    const state = await cluster.state(home);
+    const process = state.processes.entries.find(entry => entry.processClass === 'ordinary');
+    const isolate = process?.lifecycle?.residentWorkers.find(row => row.workerId === workerId && row.versionId === 'v1');
+    assert.ok(isolate?.isolateBusy, 'the kernel must publish the busy reading');
+    return { permille: isolate.isolateBusy.permille, instance: isolate.instance,
+      softRefusals: state.placement.rejections.WORKER_SATURATED ?? 0 };
+  };
+  const warm = await eventually('the warm isolate has a busy-time reading', read);
+  const busyCall = call('?busy');
+  busyCall.catch(() => {});
+  try {
+    const busy = await eventually('the serving isolate crosses the threshold', async () => {
+      const reading = await read();
+      assert.equal(reading.instance, warm.instance);
+      assert.ok(reading.permille >= 900, `sample was ${reading.permille} permille`);
+      return reading;
+    }, { timeout: 6500, interval: 100 });
+
+    // Let the node's once-per-second reader observe the kernel publication.
+    await delay(1250);
+    const { nodeId: peer } = json(await call(), 200, 'probe while the home isolate is busy');
+    assert.ok(cluster.nodes.includes(peer) && peer !== home);
+    assert.equal((await read()).softRefusals, busy.softRefusals + 1);
+    console.log(`Live isolate on ${home} reached ${busy.permille} permille. Probe ran on ${peer}`);
+  } finally {
+    assert.equal(json(await busyCall, 200, 'busy call').nodeId, home);
   }
 }

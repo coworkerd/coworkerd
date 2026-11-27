@@ -6,6 +6,7 @@
 #include "trial-verdict.h"
 #include "placement-contract.h"
 #include "node-cpu.h"
+#include "isolate-saturation.h"
 #include "reasons.h"
 #include "event-loop-trace.h"
 #include "background-value.h"
@@ -1861,8 +1862,11 @@ public:
     return value;
   }
 
-  kj::Promise<void> samplePlacementLoad() {
+  void sampleNodeCpu() {
     if (!placementCpuFullForTest) nodeCpu.sample(monotonicTimeMs());
+  }
+
+  kj::Promise<void> sampleWorkerSaturation() {
     if (!placementWorkerBusyForTest) co_await runtime.sampleWorkerSaturation();
   }
 
@@ -5945,7 +5949,7 @@ public:
     bool allPaused = true, allTenantLimited = true;
     bool allNotExecuted = true;
     std::optional<InvocationRejection> tenantRefusal;
-    std::optional<InvocationRejection> firstPaused;
+    size_t finalRefusals = 0;
     const auto firstPassSize = std::min<size_t>(ordered.size(), hops);
     std::vector<std::string> saturated;
     for (size_t i = 0; i < firstPassSize + saturated.size(); ++i) {
@@ -5958,9 +5962,6 @@ public:
       const auto startedAt = wallTimeMsForTest();
       if (id == config.serverId) result = co_await attemptHere(ordered.size() == 1, preferIdle);
       else result = co_await tryOpen(id, invocationFor(hops, preferIdle));
-      allNotExecuted = allNotExecuted && result.failure && result.failure->notExecuted;
-      allPaused = allPaused && result.failure && pausedRefusal(*result.failure);
-      if (result.failure && pausedRefusal(*result.failure) && !firstPaused) firstPaused = result.failure;
       server.observeAttempt(id, allocation.ingressRoot, result.failure);
       if (id == config.serverId && result.failure && result.retryable)
       {
@@ -5987,9 +5988,7 @@ public:
       pathMark(allocation.timing, "attempt-logs");
       if (result.failure && result.failure->code == "LOAD_FAILED")
         server.loadFailed(*version, *result.failure, id, allocation.ingressRoot ? "ingress" : "binding",
-            result.retryable && attempted < ordered.size() && hops > 0);
-      if (result.failure) packagesUnavailable = packagesUnavailable && result.failure->code == "LOAD_FAILED" &&
-          result.failure->category == PACKAGE_UNAVAILABLE;
+            result.retryable && i + 1 < firstPassSize + saturated.size());
       if (!result.failure) {
         avoidance.erase(id);
         if (forwarded) *forwarded = id != config.serverId;
@@ -6009,24 +6008,34 @@ public:
       if (id == home) homeFailed = true;
       if (attempted > 1) failures += ',';
       failures += "{\"nodeId\":\"" + id + "\",\"failure\":" + result.failure->json() + "}";
-      if (tenantLimitRefusal(*result.failure)) {
-        // This candidate can still accept other tenants. Do not touch shared node avoidance.
-        tenantRefusal = *result.failure;
-      } else if (coworkerd::placementSaturationRefusal(result.failure->code)) {
-        allTenantLimited = false;
-        if (preferIdle && rerouteAfter(*result.failure)) saturated.push_back(id);
+      const auto& refusal = *result.failure;
+      if (preferIdle && coworkerd::placementSaturationRefusal(refusal.code) && rerouteAfter(refusal)) {
+        // Keep the probe in attempt diagnostics. The retry determines the candidate's final refusal.
+        saturated.push_back(id);
       } else {
-        allTenantLimited = false;
-        auto& avoid = avoidance[id];
-        const auto delay = coworkerd::advancePlacementAvoidance(avoid.failures, result.failure->avoidMs,
-            result.connectionFailure, config.connectBackoffMs, config.avoidMaxMs);
-        avoid.until = monotonicTimeMs() + delay;
+        ++finalRefusals;
+        allNotExecuted = allNotExecuted && refusal.notExecuted;
+        allPaused = allPaused && pausedRefusal(refusal);
+        packagesUnavailable = packagesUnavailable && refusal.code == "LOAD_FAILED" &&
+            refusal.category == PACKAGE_UNAVAILABLE;
+        if (tenantLimitRefusal(refusal)) {
+          // This candidate can still accept other tenants. Do not touch shared node avoidance.
+          tenantRefusal = refusal;
+        } else {
+          allTenantLimited = false;
+          if (!coworkerd::placementSaturationRefusal(refusal.code)) {
+            auto& avoid = avoidance[id];
+            const auto delay = coworkerd::advancePlacementAvoidance(avoid.failures, refusal.avoidMs,
+                result.connectionFailure, config.connectBackoffMs, config.avoidMaxMs);
+            avoid.until = monotonicTimeMs() + delay;
+          }
+        }
       }
       if (i + 1 < firstPassSize + saturated.size()) server.reroute(result.failure->code);
     }
     // Every candidate explicitly refused before execution because its eligible processes were paused.
     // Only now may one candidate wait. The first pass, including immediate reroutes, stays unchanged.
-    if (allPaused && firstPaused && attempted == ordered.size() && server.pausedAdmissionWaitMs() &&
+    if (allPaused && finalRefusals > 0 && finalRefusals == ordered.size() && server.pausedAdmissionWaitMs() &&
         std::find(ordered.begin(), ordered.end(), config.serverId) != ordered.end()) {
       const auto target = config.serverId;
       auto result = co_await attemptHere(true, false);
@@ -6050,11 +6059,11 @@ public:
     auto refusal = server.refusal("PLACEMENT_EXHAUSTED", coworkerd::placementExhaustionReason(hops), 503, allocation.ingressRoot);
     // Preserve explicit pre-execution proof through placement aggregation. A failed
     // connection alone is insufficient evidence that another node did not execute.
-    if (attempted > 0 && allNotExecuted) refusal.notExecuted = refusal.retryable = true;
-    if (attempted > 0 && packagesUnavailable) {
+    if (finalRefusals > 0 && allNotExecuted) refusal.notExecuted = refusal.retryable = true;
+    if (finalRefusals > 0 && packagesUnavailable) {
       // No candidate could load the code package: the load failure is the answer.
       refusal = server.refusal("LOAD_FAILED", "the code package could not be fetched or verified on any candidate (" +
-          std::to_string(attempted) + (attempted == 1 ? " attempt)" : " attempts)"), 503, allocation.ingressRoot);
+          std::to_string(finalRefusals) + (finalRefusals == 1 ? " attempt)" : " attempts)"), 503, allocation.ingressRoot);
       refusal.category = PACKAGE_UNAVAILABLE;
     }
     server.observeLocalRefusal(refusal, allocation.ingressRoot ? "localIngress" : "localBinding");
@@ -10123,9 +10132,16 @@ kj::Promise<void> watchDurableEpoch(coworkerd::DurableLog& durableLog, coworkerd
   }
 }
 
-kj::Promise<void> samplePlacementLoad(ServerCore& server, kj::Timer& timer) {
+kj::Promise<void> sampleNodeCpu(ServerCore& server, kj::Timer& timer) {
   while (true) {
-    co_await server.samplePlacementLoad();
+    server.sampleNodeCpu();
+    co_await timer.afterDelay(1 * kj::SECONDS);
+  }
+}
+
+kj::Promise<void> sampleWorkerSaturation(ServerCore& server, kj::Timer& timer) {
+  while (true) {
+    co_await server.sampleWorkerSaturation();
     co_await timer.afterDelay(1 * kj::SECONDS);
   }
 }
@@ -11048,7 +11064,8 @@ int run(Launch launch) {
       .exclusiveJoin(suspects.run())
       .exclusiveJoin(tenantUsage.run())
       .exclusiveJoin(runLeaseReaper(server, timer))
-      .exclusiveJoin(samplePlacementLoad(server, timer))
+      .exclusiveJoin(sampleNodeCpu(server, timer))
+      .exclusiveJoin(sampleWorkerSaturation(server, timer))
       .exclusiveJoin(runLogClock(timer))
       .exclusiveJoin(membership->run())
       .exclusiveJoin(watchShardOwnership(server, runtime, shards, *membership, timer, leaseDroppedShards))

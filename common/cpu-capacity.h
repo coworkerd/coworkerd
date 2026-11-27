@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <iosfwd>
 #include <limits>
 
 namespace coworkerd {
@@ -25,6 +26,7 @@ uint32_t cpusWithinQuota(uint32_t affinity, std::filesystem::path directory,
     const std::filesystem::path& root);
 uint32_t availableProcessCpus();
 double availableProcessCpuCapacity();
+std::filesystem::path cpuCgroupFromMembership(std::istream& membership, const std::filesystem::path& root);
 std::filesystem::path processCpuCgroup();
 
 }  // namespace coworkerd

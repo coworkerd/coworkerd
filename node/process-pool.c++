@@ -1,6 +1,6 @@
 #include "process-culprit.h"
 #include "process-pool.h"
-#include "node-cpu.h"
+#include "isolate-saturation.h"
 #include "rpc-clock.h"
 #include "event-loop.h"
 #include "memory-events.h"
@@ -1127,7 +1127,7 @@ struct ProcessGeneration {
   bool oomSignalled = false;
   // Lifecycle snapshot shared memory.
   LifecycleView lifecycle;
-  std::map<std::string, double, std::less<>> saturatedPlans;  // plan revision to sampled monotonic time.
+  SaturatedPlans saturatedPlans;
   // Tenant request contexts. workerd writes a `completed` row when a request's context
   // ends -- after its waitUntil work, whether or not it ran JavaScript, limits or not -- so
   // a dispatched invocation stays open until that row is read.
@@ -4133,9 +4133,7 @@ std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
 bool ProcessPool::workerSaturated(const std::string& worker, std::string_view planRevision, double nowMs) const {
   if (planRevision.empty()) return false;
   const auto process = ordinaryProcess(worker, quarantined(worker));
-  if (!process) return false;
-  const auto sample = process->saturatedPlans.find(planRevision);
-  return sample != process->saturatedPlans.end() && sample->second <= nowMs && nowMs - sample->second <= 2500;
+  return process && hasSaturatedPlan(process->saturatedPlans, planRevision, nowMs);
 }
 std::optional<std::pair<std::string, uint64_t>> ProcessPool::threadedGenerationHint(const std::string& worker) const {
   const auto quarantine = quarantined(worker);
@@ -4290,47 +4288,9 @@ kj::Promise<void> ProcessPool::sampleWorkerSaturation() {
   if (snapshots.empty()) co_return;
   // Parse the existing publication on the background worker and leave a bounded lookup on admission.
   auto pending = backgroundValue([snapshots = std::move(snapshots)] {
-    std::vector<std::map<std::string, double, std::less<>>> result;
-    for (const auto& snapshot : snapshots) {
-      auto& saturated = result.emplace_back();
-      // Use the newest instance of one isolate label. Multiple labels for one plan
-      // revision can refer to different resolved bindings, so that plan is ambiguous.
-      struct Reading {
-        std::string label;
-        double instance, throughMs;
-        bool busy, ambiguous = false;
-      };
-      std::map<std::string, Reading> readings;
-      try {
-        capnp::MallocMessageBuilder message;
-        auto value = message.initRoot<capnp::JsonValue>();
-        capnp::JsonCodec().decodeRaw(kj::arrayPtr(snapshot.data(), snapshot.size()), value);
-        const auto residents = json::field(value, "residentWorkers");
-        if (!residents.isArray()) continue;
-        for (auto row : residents.getArray()) {
-          const auto plan = json::field(row, "planRevision");
-          const auto instance = json::field(row, "instance");
-          const auto label = json::field(row, "isolate");
-          if (!plan.isString() || !instance.isNumber() || !label.isString()) continue;
-          const auto busy = json::field(row, "isolateBusy");
-          const auto through = busy.isObject() ? json::field(busy, "throughMonotonicMs") : capnp::JsonValue::Reader();
-          const auto permille = busy.isObject() ? json::field(busy, "permille") : capnp::JsonValue::Reader();
-          const bool aboveThreshold = through.isNumber() && permille.isNumber() &&
-              permille.getNumber() >= WORKER_BUSY_PERMILLE && permille.getNumber() <= 1000;
-          Reading reading{label.getString().cStr(), instance.getNumber(),
-              aboveThreshold ? through.getNumber() : 0, aboveThreshold};
-          auto [previous, inserted] = readings.try_emplace(plan.getString().cStr(), std::move(reading));
-          if (!inserted && !previous->second.ambiguous) {
-            if (reading.label != previous->second.label) previous->second.ambiguous = true;
-            else if (reading.instance > previous->second.instance) previous->second = std::move(reading);
-          }
-        }
-      } catch (const kj::Exception&) {
-        continue;
-      }
-      for (const auto& [plan, reading] : readings)
-        if (reading.busy && !reading.ambiguous) saturated.emplace(plan, reading.throughMs);
-    }
+    std::vector<SaturatedPlans> result;
+    result.reserve(snapshots.size());
+    for (const auto& snapshot : snapshots) result.push_back(parseIsolateSaturation(snapshot));
     return result;
   });
   auto sampled = co_await kj::mv(pending);

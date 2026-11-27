@@ -77,6 +77,10 @@ ordinary request skips busy nodes and executes once on the idle candidate, that 
 open stops placement, and that explicit soft refusals can be revisited. The all-busy case
 fills the three root slots with sleeping requests to verify the hard concurrency limit.
 
+With a kernel that publishes isolate busy time, run `ingress-placement-live-saturation` to
+test the production reader without overrides. It warms an isolate on the Worker home,
+runs one CPU-bound request there, and checks that a subsequent probe executes on a peer.
+
 ### Threaded SQL deadline and disconnect
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matching Linux

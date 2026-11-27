@@ -6,11 +6,13 @@
 
 namespace coworkerd {
 
-inline constexpr uint32_t WORKER_BUSY_PERMILLE = 900;
 inline constexpr uint32_t NODE_CPU_FULL_PERMILLE = 950;
 
 class NodeCpuUse {
 public:
+  NodeCpuUse(): NodeCpuUse(cpuStat(), availableProcessCpuCapacity()) {}
+  NodeCpuUse(std::filesystem::path stat, double capacity): stat(std::move(stat)), capacity(capacity) {}
+
   void sample(double nowMs) {
     if (stat.empty()) return;
     std::ifstream input(stat);
@@ -43,8 +45,8 @@ private:
     auto group = processCpuCgroup();
     return group.empty() ? group : group / "cpu.stat";
   }
-  const std::filesystem::path stat = cpuStat();
-  const double capacity = availableProcessCpuCapacity();
+  const std::filesystem::path stat;
+  const double capacity;
   struct Sample { double atMs; uint64_t usageUsec; };
   std::deque<Sample> samples;
 };

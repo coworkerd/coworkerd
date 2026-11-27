@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { cases, durableGatedCases, fatalAttribution, webSocketCases } from './cases.mjs';
 import { Cluster } from './cluster.mjs';
-import { ingressPlacementDefault, ingressPlacementEnabled, ingressPlacementSaturation, ingressPlacementAllBusy } from './ingress-placement.mjs';
+import { ingressPlacementDefault, ingressPlacementEnabled, ingressPlacementSaturation, ingressPlacementAllBusy,
+  ingressPlacementLiveSaturation } from './ingress-placement.mjs';
 
 async function runSuite(selected, kernel, signal, options) {
   const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-cluster-')), kernel, signal, options);
@@ -40,6 +41,7 @@ async function main(args) {
     'ingress-placement': { test: ingressPlacementEnabled },
     'ingress-placement-saturation': { test: ingressPlacementSaturation, isolatePermilleOnThird: 899 },
     'ingress-placement-all-busy': { test: ingressPlacementAllBusy, isolatePermilleOnThird: 900 },
+    'ingress-placement-live-saturation': { test: ingressPlacementLiveSaturation, manual: true },
   };
   const all = { ...regularCases, ...placementCases, ...webSocketCases, ...durableGatedCases,
     'fatal-attribution': fatalAttribution };
@@ -63,7 +65,7 @@ async function main(args) {
   }
   const regular = fatalTest ? [['fatal-attribution', fatalAttribution]]
     : Object.entries(regularCases).filter(([name]) => !args[1] || args[1] === name);
-  const placement = Object.entries(placementCases).filter(([name]) => !args[1] || args[1] === name);
+  const placement = Object.entries(placementCases).filter(([name, { manual }]) => args[1] ? args[1] === name : !manual);
   const webSockets = Object.entries(webSocketCases).filter(([name]) => !args[1] || args[1] === name);
   const gated = Object.entries(durableGatedCases).filter(([name]) => !args[1] || args[1] === name);
   let failed = 0;
@@ -96,11 +98,10 @@ async function main(args) {
           ...(isolatePermilleOnThird && { initialPlacementHops: 3, peerTimeoutMs: 1200 }),
           placement: { homeProbability: 1, ...(isolatePermilleOnThird && { rootLimit: 1 }) },
         }),
-        nodeEnvironment: node => ({
-          COWORKERD_WORKER_BUSY_PERMILLE_FOR_TEST: isolatePermilleOnThird
-            ? { 'node-1': 900, 'node-2': 899, 'node-3': isolatePermilleOnThird }[node] : 0,
-          COWORKERD_NODE_CPU_PERMILLE_FOR_TEST: isolatePermilleOnThird && node === 'node-2' ? 950 : 949,
-        }),
+        nodeEnvironment: isolatePermilleOnThird ? node => ({
+          COWORKERD_WORKER_BUSY_PERMILLE_FOR_TEST: { 'node-1': 900, 'node-2': 899, 'node-3': isolatePermilleOnThird }[node],
+          COWORKERD_NODE_CPU_PERMILLE_FOR_TEST: node === 'node-2' ? 950 : 949,
+        }) : undefined,
       });
     }
     console.log(`${regular.length + webSockets.length + gated.length + placement.length} executed, ${failed} failed`);

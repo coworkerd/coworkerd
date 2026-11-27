@@ -56,15 +56,18 @@ uint32_t cpusWithinQuota(uint32_t affinity, std::filesystem::path directory,
 static constexpr auto CGROUP_ROOT = "/sys/fs/cgroup";
 #endif
 
+std::filesystem::path cpuCgroupFromMembership(std::istream& membership, const std::filesystem::path& root) {
+  for (std::string line; std::getline(membership, line);) if (line.starts_with("0::/")) {
+    const auto relative = std::filesystem::path(line.substr(3)).relative_path();
+    return relative.empty() ? root : (root / relative).lexically_normal();
+  }
+  return {};
+}
+
 std::filesystem::path processCpuCgroup() {
 #ifdef __linux__
-  const std::filesystem::path root = CGROUP_ROOT;
   std::ifstream membership("/proc/self/cgroup");
-  for (std::string line; std::getline(membership, line);) if (line.starts_with("0::/")) {
-    auto directory = root / line.substr(4);
-    if (std::filesystem::exists(directory / "cpu.max")) return directory;
-  }
-  return root;
+  return cpuCgroupFromMembership(membership, CGROUP_ROOT);
 #else
   return {};
 #endif

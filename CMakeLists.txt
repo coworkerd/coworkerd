@@ -109,6 +109,7 @@ configure_file(node/platform-source.h.in "${GENERATED_DIR}/platform-source.h" @O
 add_library(coworkerd-node OBJECT
   node/main.c++
   node/process-pool.c++
+  node/isolate-saturation.c++
   node/secret-dictionary.c++
   node/async-log.c++
   node/memory-watermark.c++
@@ -243,7 +244,7 @@ set_tests_properties(node-log-stream node-log-many-values PROPERTIES TIMEOUT 30)
 set_tests_properties(node-log-generations node-secret-rotations node-secret-limits node-secret-share
   node-secret-pinned-rotation node-secret-rotation-cooldown node-log-stale PROPERTIES TIMEOUT 60)
 add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
-  node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
+  node/node-contract-test.c++ node/bundle-cache.c++ node/isolate-saturation.c++ apiserver/manifests.c++)
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
 add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
@@ -283,7 +284,7 @@ foreach(case fenced full cut-short limit corrupt fenced-reconnect full-reconnect
     reacquired unreachable)
   add_test(NAME durable-refused-owner-${case} COMMAND coworkerd-durable-channel-test refused-owner ${case})
 endforeach()
-foreach(case native-config tenant-execution deadlines event-loop shutdown-signals once-per-turn memory-events durable-not-sent tenant-line-truncation trial-verdicts leases tree-lease budget identity admission placement package module-types cache
+foreach(case native-config tenant-execution deadlines event-loop shutdown-signals once-per-turn memory-events durable-not-sent tenant-line-truncation trial-verdicts leases tree-lease budget identity admission placement cpu-saturation isolate-saturation package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()

@@ -197,10 +197,14 @@ With `ingressPlacement` off (it is on by default), and for a Worker with a stati
 the first pass lets a node refuse a root before dispatch with `WORKER_SATURATED` or
 `NODE_CPU_SATURATED`. The Worker threshold is 900 permille of isolate lock hold time over the
 threaded kernel's last 3 s. The node uses a recent sample for the requested plan revision in the
-process generation that would serve it. A missing, stale or ambiguous sample supplies no saturation signal.
-The CPU threshold is 950 permille of the node's available CPU. On Linux this uses cgroup v2
-`cpu.stat` usage over approximately 3 s, bounded by CPU affinity and visible CPU quotas. A node
-without that reading can still use the isolate signal.
+process generation that would serve it. A missing, stale or ambiguous sample supplies no saturation
+signal. A catalog change clears the node's plan lookup. The Worker's saturation reading becomes
+eligible again after the node prepares that plan on the next dispatch.
+
+The CPU threshold is 950 permille of the node's available CPU. On Linux the node reads about 3 s of
+usage from its own cgroup v2 `cpu.stat`, which covers the daemon, its runtime processes and any
+other work in that cgroup and its descendants. The denominator uses the node's CPU affinity and
+every visible ancestor quota. A node without that reading can still use the isolate signal.
 
 Each soft refusal explicitly reports that the call has not been dispatched and can be retried.
 If the first pass finds no candidate that can serve, the ingress revisits each candidate that sent
