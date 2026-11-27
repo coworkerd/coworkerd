@@ -94,8 +94,9 @@ resolving to their original files.
 ## CI and local unit tests
 
 The `CI` workflow runs on every pull request and on pushes to `main`, on GitHub-hosted Ubuntu 24.04 x86_64
-and macOS 26 arm64 runners. Its checks are **`Build and unit tests (linux-x86_64)`** and
-**`Build and unit tests (macos-arm64)`** (`build-and-unit-tests` in [.github/workflows/ci.yml](.github/workflows/ci.yml)).
+and macOS 26 arm64 runners. The required **`Build and unit tests (linux-x86_64)`** check waits for
+the Linux build, unit tests and all four [cluster integration shards](tests/cluster/README.md).
+**`Build and unit tests (macos-arm64)`** reports the macOS job independently.
 Both runners build the daemons with `scripts/build.sh` and run the `check` target. The Ubuntu runner also builds the
 Linux launcher. Build dependencies come from Ubuntu or the macOS runner image, with the pinned Cap'n Proto source
 from public GitHub and CLI dependencies from the public npm registry (`cli/package-lock.json`). CTest fails on an
@@ -207,7 +208,7 @@ covers the configuration, the sandbox (sections 3 and 4: the default compose fil
 prepared as section 4 describes runs it with `docker-compose.sandbox.yml`) and operations.
 
 The [cluster integration suite](tests/cluster/README.md) starts its own three-node cluster and object store. Use its
-runner to check a change on Linux, with all cases or a single case. Linux pull-request CI runs the same command.
+runner to check all cases, one case or a shard on Linux.
 
 ## Sending a change
 

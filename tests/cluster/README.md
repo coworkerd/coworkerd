@@ -37,8 +37,18 @@ node tests/cluster/run.mjs --help
 ```
 
 The runner reports every case, its elapsed time, and the total with cluster setup and teardown. A failed case,
-setup or teardown exits nonzero. Linux pull-request CI uses the same entry point. Each case that holds
-peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses upstream durable processes.
+setup or teardown exits nonzero. Linux pull-request CI runs four shards on separate Ubuntu runners,
+using the same daemons and verified kernel from the Linux build. Each shard runs its assigned projects
+sequentially. Cases that share a Compose project stay in their original order on the same shard.
+The required Linux check passes when the Linux build, unit tests and all four shards pass.
+
+```sh
+node tests/cluster/run.mjs --list
+node tests/cluster/run.mjs --list --shard 1/4
+node tests/cluster/run.mjs "$kernel" --shard 1/4
+```
+
+Each case that holds peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses upstream durable processes.
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 

@@ -12,79 +12,62 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  WRANGLER_SEND_METRICS: 'false'
+
 jobs:
-  build-and-unit-tests:
-    name: Build and unit tests (${{ matrix.platform }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
-            cc: clang-19
-            cxx: clang++-19
-          - platform: macos-arm64
-            runner: macos-26
-            cc: /usr/bin/clang
-            cxx: /usr/bin/clang++
+  linux-build-and-unit-tests:
+    name: Linux build and unit tests
+    runs-on: ubuntu-24.04
     timeout-minutes: 55
     env:
-      CC: ${{ matrix.cc }}
-      CXX: ${{ matrix.cxx }}
+      CC: clang-19
+      CXX: clang++-19
       CMAKE_BUILD_PARALLEL_LEVEL: 4
-      WRANGLER_SEND_METRICS: 'false'
     steps:
-      - name: Check out source
+      - &checkout
+        name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Node.js
+      - &setup-node
+        name: Install Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           package-manager-cache: false
       - name: Install Ubuntu build dependencies
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3
-      - name: Select OpenSSL on macOS
-        if: runner.os == 'macOS'
-        run: |
-          openssl_root="$(brew --prefix openssl@3)"
-          printf 'OPENSSL_ROOT_DIR=%s\n' "$openssl_root" >> "$GITHUB_ENV"
-      - name: Install CLI dependencies
+      - &install-cli
+        name: Install CLI dependencies
         run: npm ci --prefix cli --registry=https://registry.npmjs.org
       - name: Test kernel archive verification
-        if: runner.os == 'Linux'
         run: python3 scripts/test-kernel-artifacts.py
       - name: Read the Linux kernel pin
-        if: runner.os == 'Linux'
         id: kernel-pin
         run: |
           digest=$(python3 scripts/fetch-kernel.py --arch linux-x86_64 --sha256)
           printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
       - name: Cache the Linux kernel archive
-        if: runner.os == 'Linux'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .cache/kernel/${{ steps.kernel-pin.outputs.sha256 }}
           key: kernel-linux-x86_64-${{ steps.kernel-pin.outputs.sha256 }}
       - name: Fetch and verify the Linux kernel
-        if: runner.os == 'Linux'
-        id: kernel
         run: |
           kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64)
-          printf 'workerd=%s/workerd\n' "$kernel" >> "$GITHUB_OUTPUT"
-      - name: Build daemons
-        env:
-          TEST_WORKERD: ${{ steps.kernel.outputs.workerd }}
-        run: bash scripts/build.sh -DCOWORKERD_TEST_WORKERD="$TEST_WORKERD" -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
-      - name: Run unit and component tests
+          printf 'TEST_WORKERD=%s/workerd\n' "$kernel" >> "$GITHUB_ENV"
+      - &build-daemons
+        name: Build daemons
+        run: bash scripts/build.sh -DCOWORKERD_TEST_WORKERD="${TEST_WORKERD:-}" -DCOWORKERD_TEST_JUNIT="$PWD/build/test-results.xml"
+      - &check-unit-tests
+        name: Run unit and component tests
         run: cmake --build build --target check
-      - name: Report executed tests
+      - &report-unit-tests
+        name: Report executed tests
         if: success() || (failure() && hashFiles('build/test-results.xml') != '')
         run: |
           python3 - <<'PY'
@@ -126,11 +109,67 @@ jobs:
           if not cases or failed or skipped or missing:
               raise SystemExit('Expected a nonempty test suite including all required tests, with no failures or skips')
           PY
+      - name: Pack cluster test inputs
+        run: |
+          tar -cf "$RUNNER_TEMP/cluster-inputs.tar" \
+            -C "$PWD/build" coworkerd coworkerd-apiserver coworkerd-launcher coworkerd-platform-test \
+            -C "$(dirname "$TEST_WORKERD")" workerd coworkerd-threaded allowlist
+      - name: Upload cluster test inputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-inputs
+          path: ${{ runner.temp }}/cluster-inputs.tar
+          compression-level: 1
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  macos-build-and-unit-tests:
+    name: Build and unit tests (macos-arm64)
+    runs-on: macos-26
+    timeout-minutes: 55
+    env:
+      CC: /usr/bin/clang
+      CXX: /usr/bin/clang++
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+    steps:
+      - *checkout
+      - *setup-node
+      - name: Select OpenSSL on macOS
+        run: |
+          openssl_root="$(brew --prefix openssl@3)"
+          printf 'OPENSSL_ROOT_DIR=%s\n' "$openssl_root" >> "$GITHUB_ENV"
+      - *install-cli
+      - *build-daemons
+      - *check-unit-tests
+      - *report-unit-tests
+
+  cluster:
+    name: Cluster integration tests (shard ${{ matrix.shard }})
+    needs: linux-build-and-unit-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - *checkout
+      - *setup-node
+      - *install-cli
+      - name: Download cluster test inputs
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cluster-inputs
+          path: ${{ runner.temp }}
+      - name: Unpack cluster test inputs
+        run: |
+          mkdir -p build
+          tar -xf "$RUNNER_TEMP/cluster-inputs.tar" -C build
       - name: Run cluster integration tests
-        if: runner.os == 'Linux'
-        timeout-minutes: 35
+        timeout-minutes: 20
         env:
-          TEST_WORKERD: ${{ steps.kernel.outputs.workerd }}
+          SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
         run: |
           uname -sm
           nproc
@@ -139,4 +178,20 @@ jobs:
           du -sh build
           docker version --format 'Docker Engine {{.Server.Version}}'
           docker compose version
-          node tests/cluster/run.mjs "$(dirname "$TEST_WORKERD")"
+          node tests/cluster/run.mjs "$PWD/build" --shard "$SHARD"
+
+  linux-required:
+    # This name is the required status check in the main ruleset.
+    name: Build and unit tests (linux-x86_64)
+    needs: [linux-build-and-unit-tests, cluster]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require a successful Linux build and every cluster shard
+        env:
+          UNIT_RESULT: ${{ needs.linux-build-and-unit-tests.result }}
+          CLUSTER_RESULT: ${{ needs.cluster.result }}
+        run: |
+          printf 'Linux build and unit tests: %s\nCluster integration tests: %s\n' "$UNIT_RESULT" "$CLUSTER_RESULT"
+          test "$UNIT_RESULT" = success && test "$CLUSTER_RESULT" = success
