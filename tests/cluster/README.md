@@ -54,6 +54,23 @@ after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` eac
 did not start and that one retry applies it once. A Durable Object exception after writing and a SQL
 constraint failure retain their ordinary error results.
 
+### Stateless Worker ingress placement
+
+```sh
+node tests/cluster/run.mjs "$kernel" ingress-placement-default
+node tests/cluster/run.mjs "$kernel" ingress-placement
+```
+
+Each case sends one ordinary HTTP request through each node to the same stateless Worker. The Worker
+returns its execution node as `{ nodeId: request.cf.nodeId }` in the response body. The runner prints
+the execution node for each ingress. The default fixture serves each call on the receiving node.
+
+To enable placement on all nodes for a new fixture, pass
+`configureNode: () => ({ ingressPlacement: true })` to `Cluster`. The enabled smoke case also sets
+`placement: { homeProbability: 1 }` so that all three requests go to the current Worker home,
+including two requests forwarded to a peer. Later cases can choose their own placement settings
+and use the same response field to see where each request ran.
+
 ### Threaded SQL deadline and disconnect
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matching Linux
