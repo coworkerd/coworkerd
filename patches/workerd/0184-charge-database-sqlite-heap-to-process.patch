@@ -75,7 +75,7 @@ index b03e958d5b8dd371d31e3d775374fef9691404b2..cf9f554ed3a6b79172e1bcba4cce594f
    kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
        DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index d1164d9463d31ce41fce91019133458f2aac7308..45c32dab4fc2710d66861eed9a6c0abcfa29c987 100644
+index d1164d9463d31ce41fce91019133458f2aac7308..4c793547cf799e161aabb914ec5d74ddb1a5b3c4 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -523,6 +523,171 @@ KJ_TEST("queueDurable holds the returned tree and preparation credits until a da
@@ -234,6 +234,7 @@ index d1164d9463d31ce41fce91019133458f2aac7308..45c32dab4fc2710d66861eed9a6c0abc
 +  auto budget = std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
 +  const auto baseline = budget->memoryReserved.load();
 +  {
++    KJ_EXPECT_LOG(ERROR, "SQLite heap charge remained when releasing a copy reservation");
 +    ResourceReservation copy(budget, 64, true);
 +    KJ_REQUIRE(copy.registerPreparation());
 +    KJ_REQUIRE(copy.resizeSqliteMemory(0, MiB, true));
@@ -241,7 +242,6 @@ index d1164d9463d31ce41fce91019133458f2aac7308..45c32dab4fc2710d66861eed9a6c0abc
 +    KJ_REQUIRE(copy.resizeSqliteMemory(2 * MiB, 0, true));
 +    KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
 +    KJ_REQUIRE(copy.resizeSqliteMemory(0, MiB, true));
-+    KJ_EXPECT_LOG(ERROR, "SQLite heap charge remained when releasing a copy reservation");
 +  }
 +  KJ_EXPECT(budget->sqliteMemoryReserved.load() == 0);
 +  KJ_EXPECT(budget->memoryReserved.load() == baseline);
