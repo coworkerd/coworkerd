@@ -9090,7 +9090,6 @@ private:
 struct IngressWebSocket {
   WebSocketRegistry& registry;
   std::string tenant, workerId, versionId, treeId, executingNodeId;
-  std::shared_ptr<coworkerd::RequestLease> requestLease;
   bool forwarded = false;
   double receivedAtMonotonicMs = monotonicTimeMs();
   const bool reserved;
@@ -9111,9 +9110,10 @@ public:
       kj::String url,
       kj::HttpHeaders headers,
       kj::AsyncInputStream& requestBody,
-      kj::HttpService::Response& response, SharedPathTiming timing = {}, std::string target = {},
-      std::unique_ptr<IngressWebSocket> webSocket = {}) {
-    auto exchange = kj::heap<Exchange>(server, response, method, timing, std::move(target), std::move(webSocket));
+      kj::HttpService::Response& response, std::shared_ptr<coworkerd::RequestLease> requestLease,
+      SharedPathTiming timing, std::string target, std::unique_ptr<IngressWebSocket> webSocket) {
+    auto exchange = kj::heap<Exchange>(server, response, method, timing, std::move(target),
+        std::move(requestLease), std::move(webSocket));
     auto& ref = *exchange;
     auto getHttp = opened.dispatcher.getHttpServiceRequest().send();
     auto workerService = factory.capnpToKj(getHttp.getHttp());
@@ -9142,9 +9142,10 @@ private:
   class Exchange final: public kj::HttpService::Response {
   public:
     Exchange(ServerCore& server, kj::HttpService::Response& client, kj::HttpMethod method, SharedPathTiming timing,
-        std::string target, std::unique_ptr<IngressWebSocket> webSocket)
+        std::string target, std::shared_ptr<coworkerd::RequestLease> requestLease,
+        std::unique_ptr<IngressWebSocket> webSocket)
         : server(server), client(client), method(method), timing(std::move(timing)), target(std::move(target)),
-          webSocket(std::move(webSocket)) {
+          requestLease(std::move(requestLease)), webSocket(std::move(webSocket)) {
       auto paf = kj::newPromiseAndFulfiller<void>();
       done = kj::mv(paf.promise);
       doneFulfiller = kj::mv(paf.fulfiller);
@@ -9183,7 +9184,7 @@ private:
       pathMark(timing, "response-headers");
       started = true;
       auto socket = client.acceptWebSocket(headers);
-      webSocket->requestLease->beginDrain();
+      requestLease->beginDrain();
       WebSocketRelay::Identity identity;
       identity.nodeId = server.placementConfig().serverId;
       identity.workerId = webSocket->workerId; identity.versionId = webSocket->versionId; identity.treeId = webSocket->treeId;
@@ -9236,6 +9237,7 @@ private:
       completed = true;
       completedAtUnixMs = wallTimeMsForTest();
       clientBody = nullptr;  // the response is whole; the client may reuse its connection
+      requestLease->beginDrain();
       if (doneFulfiller->isWaiting()) doneFulfiller->fulfill();
     }
     void settled(kj::Maybe<kj::Exception> failure) {
@@ -9258,11 +9260,9 @@ private:
         if (doneFulfiller->isWaiting()) doneFulfiller->reject(KJ_EXCEPTION(FAILED, "the backend returned without a response"));
         return;
       }
-      // A body of unknown length ends with the backend; one shorter than its length is left to the
-      // client connection's writer, which closes the connection.
-      clientBody = nullptr;
-      completed = true;
-      if (doneFulfiller->isWaiting()) doneFulfiller->fulfill();
+      // The backend finished an unknown-length body. Closing the writer sends EOF.
+      // A body shorter than its declared length makes the client connection close.
+      complete();
     }
 
     ServerCore& server;
@@ -9270,6 +9270,7 @@ private:
     kj::HttpMethod method;
     SharedPathTiming timing;
     std::string target;
+    std::shared_ptr<coworkerd::RequestLease> requestLease;
     kj::Promise<void> done = nullptr;
     kj::Own<kj::PromiseFulfiller<void>> doneFulfiller;
     kj::Own<kj::AsyncOutputStream> clientBody;
@@ -9932,7 +9933,6 @@ private:
       webSocket->versionId = selected.version->versionId;
     }
     auto requestLease = std::make_shared<coworkerd::RequestLease>(server.clock());
-    if (webSocket) webSocket->requestLease = requestLease;
     auto drainRequest = kj::defer([&requestLease]() { requestLease->beginDrain(); });
     if (server.placementConfig().ingressPlacement && !server.placementConfig().hasPlacement(selected.version->workerId)) {
       auto allocation = server.allocateRoot(selected.pins, deadline);
@@ -9947,7 +9947,8 @@ private:
       if (proxy) server.proxyIngress(true);
       auto proxySlot = kj::defer([&] { if (proxy) server.proxyIngress(false); });
       co_return co_await forwarder.forward({std::move(dispatcher), kj::READY_NOW}, method,
-          kj::str("http://", host.c_str(), url), headers.clone(), requestBody, response, timing, selected.version->key(),
+          kj::str("http://", host.c_str(), url), headers.clone(), requestBody, response, requestLease,
+          timing, selected.version->key(),
           std::move(webSocket));
     }
     auto admitted = co_await server.admit(selected.version->workerId, selected.version->definitionHash, true, deadline);
@@ -10007,7 +10008,7 @@ private:
         std::move(forwardedUrl),
         std::move(forwardedHeaders),
         requestBody,
-        response, timing, std::move(targetKey), std::move(webSocket));
+        response, requestLease, timing, std::move(targetKey), std::move(webSocket));
     } catch (const ProcessUnavailable& error) {
       processFailure = server.processRefusal(error, true);
     }

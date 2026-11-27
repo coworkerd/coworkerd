@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sat, 28 Nov 2026 01:39:48 +0800
+Subject: [PATCH] Finish leased HTTP response bodies before draining background
+ work
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index e74da820a5ec00c0b0534b691d7ff18d864f9dfb..6d517562d05f98a80e97b721cbc1c4bc1d539de4 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -7773,7 +7773,13 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
+     }
+     kj::throwRecoverableException(kj::mv(error));
+   }
+-  co_await settleBackground(state.io.provider->getTimer(), state.tasks);
++  // Return the HTTP result at body completion, so a chunked writer can send
++  // EOF and ingress can start the shared drain. The incoming request retains
++  // its budget capability while background work runs. The connection keeps
++  // pumping the call thread and its teardown still has a bounded backstop.
++  if (invocation->measurement.requestLeaseEnded == kj::none) {
++    co_await settleBackground(state.io.provider->getTimer(), state.tasks);
++  }
+ }
+ 
+ void acceptLoop(ThreadedServer &server, int listener, int parent) {
