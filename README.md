@@ -81,7 +81,8 @@ the error codes in [docs/guide/errors.md](docs/guide/errors.md).
 ## Building from source
 
 - **The daemons**: `scripts/build.sh` builds `coworkerd` and `coworkerd-apiserver` for the host with CMake and Ninja
-  (it fetches Cap'n Proto and applies [patches/kj-http-abort.diff](patches/kj-http-abort.diff)); OpenSSL is required.
+  and requires OpenSSL. CMake fetches Cap'n Proto and applies
+  [kj-http-abort.diff](patches/kj-http-abort.diff) and [capnp-http-upload.diff](patches/capnp-http-upload.diff).
 - **The Linux kernel binaries**: `python3 scripts/fetch-kernel.py` fetches and verifies the patched `workerd`
   and `coworkerd-threaded` for the checkout. To build them from source, see
   [CONTRIBUTING.md](CONTRIBUTING.md#building-the-kernel-from-source).

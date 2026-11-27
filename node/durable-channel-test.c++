@@ -158,61 +158,92 @@ struct DurableLogChannelTest {
   static void webSocketUploadBudget() {
     auto io = kj::setupAsyncIo();
     DurableSocketFrameBudget budget(8);
+    enum class Scenario { COMPLETE, CANCEL_REQUEST, REPLY_WITHOUT_READING };
     class Home final: public kj::HttpService {
     public:
       Home(kj::PromiseFulfiller<void>& entered, kj::Promise<void> allowRead,
-          kj::Promise<void> allowResponse, const kj::HttpHeaderTable& headers)
-          : entered(entered), allowRead(kj::mv(allowRead)), allowResponse(kj::mv(allowResponse)), headers(headers) {}
+          kj::Promise<void> allowResponse, const kj::HttpHeaderTable& headers, Scenario scenario)
+          : entered(entered), allowRead(kj::mv(allowRead)), allowResponse(kj::mv(allowResponse)),
+            headers(headers), scenario(scenario) {}
       kj::Promise<void> request(kj::HttpMethod, kj::StringPtr, const kj::HttpHeaders&,
           kj::AsyncInputStream& body, Response& response) override {
         entered.fulfill();
-        co_await allowRead;
-        char message[4];
-        co_await body.read(kj::arrayPtr(message, sizeof(message)).asBytes());
-        KJ_REQUIRE(std::string_view(message, sizeof(message)) == "hold");
-        co_await allowResponse;
+        if (scenario != Scenario::REPLY_WITHOUT_READING) {
+          co_await allowRead;
+          char message[4];
+          co_await body.read(kj::arrayPtr(message, sizeof(message)).asBytes());
+          KJ_REQUIRE(std::string_view(message, sizeof(message)) == "hold");
+          co_await allowResponse;
+        }
         response.send(204, "No Content", kj::HttpHeaders(headers), uint64_t{0});
       }
     private:
       kj::PromiseFulfiller<void>& entered;
       kj::Promise<void> allowRead, allowResponse;
       const kj::HttpHeaderTable& headers;
+      Scenario scenario;
+    };
+    class Reply final: public kj::HttpService::Response {
+    public:
+      kj::Own<kj::AsyncOutputStream> send(uint statusCode, kj::StringPtr, const kj::HttpHeaders&,
+          kj::Maybe<uint64_t>) override {
+        status = statusCode;
+        return kj::heap<kj::NullStream>();
+      }
+      kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders&) override {
+        KJ_FAIL_REQUIRE("unexpected WebSocket upgrade");
+      }
+      uint status = 0;
     };
     kj::HttpHeaderTable::Builder builder;
     capnp::HttpOverCapnpFactory::HeaderIdBundle ids(builder);
     auto headers = builder.build();
     capnp::ByteStreamFactory streams;
     capnp::HttpOverCapnpFactory factory(streams, kj::mv(ids), capnp::HttpOverCapnpFactory::LEVEL_2);
-    for (bool cancel : {false, true}) {
+    for (auto scenario : {Scenario::COMPLETE, Scenario::CANCEL_REQUEST, Scenario::REPLY_WITHOUT_READING}) {
       auto entered = kj::newPromiseAndFulfiller<void>();
       auto allowRead = kj::newPromiseAndFulfiller<void>();
       auto allowResponse = kj::newPromiseAndFulfiller<void>();
       auto home = factory.kjToCapnp(kj::heap<Home>(*entered.fulfiller, kj::mv(allowRead.promise),
-          kj::mv(allowResponse.promise), *headers));
+          kj::mv(allowResponse.promise), *headers, scenario));
       auto credit = budget.tryReserve(4);
       KJ_REQUIRE(credit.has_value());
       auto message = kj::heap<kj::String>(kj::str("hold"));
       auto bytes = message->asBytes();
       auto service = factory.capnpToKj(kj::mv(home), message.attach(std::move(*credit)));
-      auto client = kj::newHttpClient(*service);
-      auto request = client->request(kj::HttpMethod::POST, "http://coworkerd-node/socket",
-          kj::HttpHeaders(*headers), bytes.size());
-      auto upload = request.body->write(bytes).eagerlyEvaluate(nullptr);
+      auto pipe = kj::newOneWayPipe(bytes.size());
+      auto upload = pipe.out->write(bytes)
+          .then([out = kj::mv(pipe.out)]() mutable { out = nullptr; }).eagerlyEvaluate(nullptr);
+      kj::HttpHeaders requestHeaders(*headers);
+      Reply reply;
+      auto request = service->request(kj::HttpMethod::POST, "http://coworkerd-node/socket",
+          requestHeaders, *pipe.in, reply);
       entered.promise.wait(io.waitScope);
-      KJ_REQUIRE(budget.usedBytes() == 8, "the home has not read the request body");
-      if (cancel) {
-        upload = nullptr;
-        request.body = nullptr;
-        request.response = nullptr;
-        io.waitScope.poll();
-        KJ_REQUIRE(budget.usedBytes() == 0, "cancellation returns the upload reservation");
-      } else {
-        allowRead.fulfiller->fulfill();
-        KJ_REQUIRE(!request.response.poll(io.waitScope) && budget.usedBytes() == 0,
-            "the upload has settled and the home still holds the reply");
-        upload.wait(io.waitScope);
-        allowResponse.fulfiller->fulfill();
-        KJ_REQUIRE(request.response.wait(io.waitScope).statusCode == 204);
+      if (scenario != Scenario::REPLY_WITHOUT_READING) {
+        KJ_REQUIRE(budget.usedBytes() == 8, "the home has not read the request body");
+      }
+      switch (scenario) {
+        case Scenario::COMPLETE:
+          allowRead.fulfiller->fulfill();
+          KJ_REQUIRE(!request.poll(io.waitScope) && budget.usedBytes() == 0,
+              "the upload has settled and the home still holds the reply");
+          upload.wait(io.waitScope);
+          allowResponse.fulfiller->fulfill();
+          request.wait(io.waitScope);
+          KJ_REQUIRE(reply.status == 204);
+          break;
+        case Scenario::CANCEL_REQUEST:
+          request = nullptr;
+          KJ_REQUIRE(budget.usedBytes() == 0 && !upload.poll(io.waitScope),
+              "canceling the request returns its credit while the pipe write is still waiting");
+          upload = nullptr;
+          break;
+        case Scenario::REPLY_WITHOUT_READING:
+          request.wait(io.waitScope);
+          KJ_REQUIRE(reply.status == 204 && budget.usedBytes() == 0 && !upload.poll(io.waitScope),
+              "a reply without a read returns credit while the pipe write is still waiting");
+          upload = nullptr;
+          break;
       }
     }
   }
