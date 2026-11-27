@@ -112,6 +112,20 @@ On the experimental threaded host, an eligible tree retires after about ten seco
 
 When a threaded tree retires, the node parks the upgraded hibernatable WebSockets accepted by its root and facets. The home transfers them before canceling expired work or closing ordinary sockets. While parking is in progress, changes to hibernatable sockets such as `send()`, `close()`, `serializeAttachment()` and `ctx.setWebSocketAutoResponse()` throw `InvalidStateError`. The node answers WebSocket pings and matching auto-responses while the tree sleeps. An application message or a close requiring a handler opens the tree on its current shard owner and reaches the root or facet that accepted the socket. Each actor gets its sockets, tags, serialized attachments and automatic response configuration before its constructor runs.
 
+For deliveries to threaded homes, the shard owner's node shares a 128 MiB budget across tenants, configured by
+`durableObjects.socketFrameBytesPerNode`. A text or binary message reserves twice its payload size in bytes
+from receipt by the managed relay until the home acknowledges the internal upload, covering the received
+message and room for its copy in the internal byte stream. A canceled upload returns the reservation too.
+If the reservation would exceed the budget, the node discards the message
+and closes the socket with `1013` and reason `Durable Object socket frame capacity`. The node attempts to
+deliver a close event to the object during the close grace period. A close reason longer than 123 bytes
+instead gets a protocol-error close with `1002`. The object's close handler can call `ws.close()` for
+either node-initiated close while the transport is still settling. Empty messages, close and error events,
+and automatic replies do not draw from the budget. The budget covers the handoff to the home. Network and
+relay buffering before the managed relay receives the message, protocol overhead, and memory in workerd
+are outside this accounting. Node state reports the limit, current reservations and cumulative refusals
+under `webSockets.homeFrames`.
+
 Parking and adoption calls each have a five-second response bound. After a lost reply the home gives the node another five seconds to confirm the transfer. A pending write can defer parking for five seconds from the first refusal it causes. If the write still blocks parking, the node closes that connection.
 
 On a threaded Durable Object, return the peer of a `ctx.acceptWebSocket()` socket in an HTTP 101 response. A parent can forward the response from its facet. Calling `accept()` on the peer throws `NotSupportedError`, including when the parent receives it from a facet fetch. If the request ends before the parent forwards the response, the unupgraded socket closes and leaves the facet's socket list.

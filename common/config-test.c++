@@ -91,8 +91,10 @@ void tenantBorrowConfiguration(Fixture& fixture) {
 }
 
 void webSocketConfiguration(Fixture& fixture) {
-  KJ_REQUIRE(fixture.load("{}").webSocketsPerNode == 0);
+  const auto defaults = fixture.load("{}");
+  KJ_REQUIRE(defaults.webSocketsPerNode == 0 && defaults.durableSocketFrameBytesPerNode == (128ull << 20));
   KJ_REQUIRE(fixture.load(R"({"ingress":{"webSocketsPerNode":2}})").webSocketsPerNode == 2);
+  KJ_REQUIRE(fixture.load(R"({"durableObjects":{"socketFrameBytesPerNode":8}})").durableSocketFrameBytesPerNode == 8);
   for (const auto* oldLimit : {"0", "1000"}) {
     std::string refusal;
     try { fixture.load(std::string("{\"ingress\":{\"webSocketsPerTenant\":") + oldLimit + "}}"); }

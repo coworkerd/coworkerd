@@ -484,6 +484,8 @@ struct ServerConfig {
     sqlDatabaseSpillBytes @26 :UInt64 = 1073741824;
     # Total of those charges in one persistent durable process. 0 uses four times the database limit.
     sqlProcessSpillBytes @27 :UInt64 = 0;
+    # Shared across all threaded hibernatable WebSocket data deliveries to homes on this node.
+    socketFrameBytesPerNode @28 :UInt64 = 134217728;
   }
 
   struct IngressConfig {
