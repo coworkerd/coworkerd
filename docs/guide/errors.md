@@ -70,6 +70,16 @@ A caller's retry is a new binding call and uses its own subrequest and, for D1, 
 | 507 | `SQL_SPILL_LIMIT_EXCEEDED` | A threaded database exceeded its own or its durable process's budget for uncommitted WAL and live SQLite temporary files | Rolled back. The same database connection can serve the next request | Reduce the work in one transaction or query |
 | 422 | `QUOTA_EXCEEDED` | A write while the tenant's Durable Objects already hold more than its `durableObjectBytes` quota (10 GiB by default). What the tenant holds is what the nodes publish of their own objects every `durableObjects.usagePublishMs` (an hour), so enforcement lags; failed publication or reads can delay it beyond an hour. Only growing transactions are refused | Not durable; immediate repair and recovery before the next request, as above | Delete data, or ask the administrator to raise the quota (`cowctl tenant update T --quota durableObjectBytes=N`); transactions that do not grow their database are permitted |
 
+### SQLite errors inside a threaded Durable Object
+
+`ctx.storage.sql` throws these JavaScript errors inside the object. The fields describe the SQL
+operation. Catch the error in the object to choose what the handler returns.
+
+| `error.code` | Meaning | Outcome |
+| --- | --- | --- |
+| `SQL_MEMORY_LIMIT_EXCEEDED` | The connection reached its 32 MiB SQLite heap limit | The active storage transaction rolled back. The same connection can run later statements. Reduce the memory needed by the statement. |
+| `OVERLOADED` | The durable process could not reserve more SQLite heap | The active storage transaction rolled back and the same connection remains available. The SQL error has `dispatched: false` and `retryable: true`. Retry the transaction when process headroom returns. |
+
 **Oversized WAL records (0.5.5).** A record larger than `durableLog.settings.recordLimitBytes` is refused with
 `STORAGE_UNAVAILABLE` before it enters the node log or any peer. The default limit is 67,104,768 encoded bytes;
 WAL page headers and record metadata are included, so this is not the SQL value size. The node logs
