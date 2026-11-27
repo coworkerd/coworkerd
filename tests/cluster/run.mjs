@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { cases, durableGatedCases, fatalAttribution, webSocketCases } from './cases.mjs';
 import { Cluster } from './cluster.mjs';
-import { ingressPlacementDefault, ingressPlacementEnabled } from './ingress-placement.mjs';
+import { ingressPlacementDefault, ingressPlacementEnabled, ingressPlacementSaturation, ingressPlacementAllBusy,
+  ingressPlacementLiveSaturation } from './ingress-placement.mjs';
 import { isolateBusy } from './isolate-busy.mjs';
 
 async function runSuite(selected, kernel, signal, options) {
@@ -37,7 +38,13 @@ async function runSuite(selected, kernel, signal, options) {
 
 async function main(args) {
   const regularCases = { 'ingress-placement-default': ingressPlacementDefault, ...cases };
-  const placementCases = { 'ingress-placement': ingressPlacementEnabled, 'isolate-busy': isolateBusy };
+  const placementCases = {
+    'ingress-placement': { test: ingressPlacementEnabled },
+    'isolate-busy': { test: isolateBusy },
+    'ingress-placement-saturation': { test: ingressPlacementSaturation, isolatePermilleOnThird: 899 },
+    'ingress-placement-all-busy': { test: ingressPlacementAllBusy, isolatePermilleOnThird: 900 },
+    'ingress-placement-live-saturation': { test: ingressPlacementLiveSaturation },
+  };
   const all = { ...regularCases, ...placementCases, ...webSocketCases, ...durableGatedCases,
     'fatal-attribution': fatalAttribution };
   const help = `Usage: node tests/cluster/run.mjs <kernel-directory> [${Object.keys(all).join('|')}]`;
@@ -86,9 +93,17 @@ async function main(args) {
         previousKernel: previousKernel ? resolve(previousKernel) : undefined,
       });
     }
-    if (placement.length) {
-      failed += await runSuite(placement, kernel, controller.signal, {
-        configureNode: () => ({ ingressPlacement: true, placement: { homeProbability: 1 } }),
+    for (const [name, { test, isolatePermilleOnThird }] of placement) {
+      failed += await runSuite([[name, test]], kernel, controller.signal, {
+        configureNode: () => ({
+          ingressPlacement: true,
+          ...(isolatePermilleOnThird && { initialPlacementHops: 3, peerTimeoutMs: 1200 }),
+          placement: { homeProbability: 1, ...(isolatePermilleOnThird && { rootLimit: 1 }) },
+        }),
+        nodeEnvironment: isolatePermilleOnThird ? node => ({
+          COWORKERD_WORKER_BUSY_PERMILLE_FOR_TEST: { 'node-1': 900, 'node-2': 899, 'node-3': isolatePermilleOnThird }[node],
+          COWORKERD_NODE_CPU_PERMILLE_FOR_TEST: node === 'node-2' ? 950 : 949,
+        }) : undefined,
       });
     }
     console.log(`${regular.length + webSockets.length + gated.length + placement.length} executed, ${failed} failed`);

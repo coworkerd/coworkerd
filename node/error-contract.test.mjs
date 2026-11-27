@@ -5,6 +5,7 @@ import test from 'node:test';
 const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
 const node = read('./main.c++');
 const runtime = read('../runtime/runtime.js');
+const placement = read('./placement-contract.h');
 const guide = read('../docs/guide/errors.md');
 
 function section(source, start, end) {
@@ -64,6 +65,13 @@ function workerResponses() {
   const [, quarantine, unavailable, processStatus] = evidence(generic,
     /\brefusal\(error\.quarantine \? "([A-Z_]+)" : "([A-Z_]+)",[\s\S]*?, (\d{3}), root\);/);
   for (const code of [quarantine, unavailable]) add(processStatus, code);
+
+  const [, isolateBusy, cpuFull, saturationStatus] = evidence(generic,
+    /refusal\(workerBusy \? coworkerd::(\w+) : coworkerd::(\w+),\s*workerBusy \? "[^"]+" : "[^"]+", (\d{3}), root\)/);
+  for (const symbol of [isolateBusy, cpuFull]) {
+    const [, code] = evidence(placement, new RegExp(`const char\\* ${symbol} = "([A-Z_]+)"`));
+    add(saturationStatus, code);
+  }
 
   const [, missing, brokenRoute, brokenWorker] = evidence(generic,
     /std::string code = missing \? "([A-Z_]+)" : selected\.kind == Kind::ROUTE_INVALID \? "([A-Z_]+)" : "([A-Z_]+)"/);

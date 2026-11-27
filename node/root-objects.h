@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <tuple>
 
 namespace coworkerd {
@@ -53,6 +54,7 @@ struct PlainPlanCache {
   std::map<Key, std::string> plans;
 };
 
+std::string_view plainPlanFingerprint(std::string_view plan);
 std::string plainEnvironmentRevision(const DeploymentState& catalog, const VersionDefinition& version);
 
 RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionDefinition& version,
