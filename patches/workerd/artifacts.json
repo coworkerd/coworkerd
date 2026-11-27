@@ -1,10 +1,10 @@
 {
   "upstream": "v1.20261114.1",
   "upstreamCommit": "3d3093c8f01b9b53f4d36d20a8e4ea0a39787992",
-  "patchSeriesSha256": "ce00bd62d2d6b02963c8e51bd80a071ef6a68b8aee96b412ee82c5d1c0e67a04",
-  "releaseTag": "kernel-v1.20261114.1-ce00bd62d2d6-run-45983799782-1",
+  "patchSeriesSha256": "ae87f02cf4a316584e739104304fe1bbb105c69b750477137bb2d4a86cf86741",
+  "releaseTag": "kernel-v1.20261114.1-ae87f02cf4a3-run-46014564615-1",
   "archives": {
-    "linux-x86_64": "a38ea46b0554036af9514a5d925131c4fda4101ba8168a28e2d201ffee1ee2a1",
-    "linux-arm64": "9092f174c8af28d1c6e4a7a821401be054cc00c5d2e556db3b09737572946112"
+    "linux-x86_64": "b99867803ecd0a6687949faf4ef96a7850a820fde9a53f6d2fd24ee9241269c8",
+    "linux-arm64": "49b307bff64f710bcfea369b30ef835863c528c59e6368d947610da358571e7d"
   }
 }

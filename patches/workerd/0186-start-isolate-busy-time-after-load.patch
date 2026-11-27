@@ -115,10 +115,10 @@ index 2d0a094081c3ec544e1c62a186b5bd3ce7a8adad..974470feb6085ee0f537f33022c5fd49
    JsonDoc input(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
        "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 94edf00375b8b5ff1eec655e65199b07aeb880a1..1a091f14d5cbce28e242d59d9417c9744d3614c4 100644
+index 64357521a0629f9245743c228a7db44d1b3496cb..9656855c948c66daf2ea8a93aa05e484324a8723 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -2713,6 +2713,7 @@ struct ThreadedServer {
+@@ -2714,6 +2714,7 @@ struct ThreadedServer {
    };
    const std::unique_ptr<Engine> engine;
    jsg::V8System& v8;
@@ -126,7 +126,7 @@ index 94edf00375b8b5ff1eec655e65199b07aeb880a1..1a091f14d5cbce28e242d59d9417c974
    const std::string sourceAddress, identity;
    const std::unique_ptr<server::DurableStorage> durableStorage;
    kj::Own<server::ThreadedWalLog> durableLog;
-@@ -2809,9 +2810,11 @@ struct ThreadedServer {
+@@ -2810,9 +2811,11 @@ struct ThreadedServer {
        int parent,
        kj::Own<const kj::Directory> durableDirectory = {},
        kj::Own<server::ThreadedWalLog> durableLog = {},
@@ -139,7 +139,7 @@ index 94edf00375b8b5ff1eec655e65199b07aeb880a1..1a091f14d5cbce28e242d59d9417c974
          sourceAddress(std::move(sourceAddress)),
          identity(std::move(identity)),
          durableStorage(durableDirectory
-@@ -4545,8 +4548,7 @@ struct ThreadedServer {
+@@ -4549,8 +4552,7 @@ struct ThreadedServer {
              else {
                slot = std::make_shared<Slot>();
                slot->reservation = std::move(reservation);
@@ -149,7 +149,7 @@ index 94edf00375b8b5ff1eec655e65199b07aeb880a1..1a091f14d5cbce28e242d59d9417c974
                slot->instance = ++nextInstance;
                slot->workerId = str(descriptor, "workerId");
                slot->versionId = str(descriptor, "versionId");
-@@ -4613,6 +4615,9 @@ struct ThreadedServer {
+@@ -4617,6 +4619,9 @@ struct ThreadedServer {
            trace("source-end");
            fetched = true;
            slot->worker = compile(*slot, descriptor, source);

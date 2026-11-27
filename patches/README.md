@@ -60,6 +60,13 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0122 cancels home tasks, destroys resident roots, and cancels facet drains queued by those roots.
   The actor index and WAL Home stay live through actor cleanup, shipper deregistration, and SQLite close.
   It changes only the threaded server and its tests.
+  Patch 0123 reserves a durable storage identity before its WAL scan. A replacement tree waits for
+  the previous root and facets to confirm SQLite close. The SQLite wrapper reports final close even
+  when reset already closed the handle and failed to reopen it. When close remains unconfirmed,
+  further preparations for that identity return `DO_UNAVAILABLE` for this generation.
+  The private threaded start reply lets the node report a retryable refusal before event dispatch.
+  `durableAdmission.unconfirmedCloseIdentities` counts the affected identities, and the node's
+  existing generation-exit check protects the next child.
   Patch 0185 measures wall time under the isolate lock for threaded stateless Workers. The JSG lock
   notifies the existing isolate observer at acquire and release. The threaded lifecycle publishes
   a bounded sliding-window reading for each loaded isolate.
@@ -168,6 +175,37 @@ pins in `patches/workerd/artifacts.json`. Follow the [publishing steps](../CONTR
 `check` is the source side of checking a sync: the complete checkout tree differs
 from the tag in `UPSTREAM` by exactly the series, and each patch stays within its permitted paths. All four
 operations validate the series before mutating a checkout or exporting files.
+
+## Verifying a kernel pull request
+
+Follow [Sending a kernel change](../CONTRIBUTING.md#sending-a-kernel-change) to choose the fork base from
+`workerd/UPSTREAM` and open the two linked PRs. Run this manual check from the root of the product PR checkout
+using Git and Python 3. Set `fork_sha` to the full commit SHA on `coworkerd/workerd` that should contain the entire
+series. Use the fork PR head for a proposed series or its merge commit for a landed series.
+
+```sh
+(
+  set -e
+  fork_sha=FULL_FORK_COMMIT_SHA
+  tag=$(sed -n 's/^tag=//p' patches/workerd/UPSTREAM)
+  checkout=$(mktemp -d)
+  git init -q "$checkout"
+  git -C "$checkout" fetch --depth=1 https://github.com/cloudflare/workerd.git "refs/tags/${tag}:refs/tags/${tag}"
+  git -C "$checkout" fetch --depth=1 https://github.com/coworkerd/workerd.git "$fork_sha"
+  git -C "$checkout" switch --detach "$fork_sha"
+  python3 scripts/workerd-patches.py check --checkout "$checkout"
+)
+```
+
+`check` verifies the `UPSTREAM` tag and commit, replays the files in `series` order in a temporary index, and
+compares the resulting full Git tree with the clean fork checkout. A successful run reports `passed: true`
+and identical `expectedTree` and `actualTree` IDs. Record the fork SHA and tree ID on the product PR so reviewers
+can repeat the check against the same revisions.
+
+For a merged example, run the check from product commit `840acf4ebf57b1c8a685b3138331370b8645c5fc`
+with fork commit `8fcc166a0865aa9df0092ee2d717059b2f7ad1fa`. The expected tree is
+`1b629d3906724d898bb6262c26997e01cb25da7a`. [Product PR #117](https://github.com/coworkerd/coworkerd/pull/117)
+and [fork PR #29](https://github.com/coworkerd/workerd/pull/29) link to each other.
 
 ## Rust server port (v1.20261114.1)
 
