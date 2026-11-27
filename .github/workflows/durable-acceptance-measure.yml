@@ -8,7 +8,7 @@ on:
         type: choice
         required: true
         default: all
-        options: [all, wake, cpu, idle, takeover]
+        options: [all, wake, cpu, idle, capacity, takeover]
 
 permissions:
   contents: read
@@ -65,6 +65,14 @@ jobs:
           test -z "$(docker ps -q)"
           node tests/cluster/durable-idle-measure.mjs "$KERNEL_DIR" build/durable-acceptance/idle.jsonl \
             2>&1 | tee build/durable-acceptance/idle.log
+        shell: bash
+      - name: Record capacity and reset component results
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && (inputs.scope == 'all' || inputs.scope == 'capacity') }}
+        run: |
+          test -z "$(docker ps -q)"
+          ctest --test-dir build --no-tests=error --verbose \
+            -R '^node-threaded-durable-(home-reservation|queues|fd-limit|memory-reservation|process-memory|process-heap|http-memory|reset-progress)$' \
+            2>&1 | tee build/durable-acceptance/capacity.log
         shell: bash
       - name: Run early-answer control and release takeover
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' && (inputs.scope == 'all' || inputs.scope == 'takeover') }}
