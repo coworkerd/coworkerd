@@ -16,6 +16,8 @@ const kernel = resolve(kernelArg);
 const report = resolve(reportArg);
 const cohortSize = 5000;
 const batchSize = 250;
+const offerPeriodMs = Number(process.env.COWORKERD_ACCEPTANCE_IDLE_PERIOD_MS ?? 50);
+assert.ok(Number.isFinite(offerPeriodMs) && offerPeriodMs >= 0);
 const controller = new AbortController();
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => controller.abort(new Error(`Interrupted by ${signal}`)));
@@ -62,7 +64,7 @@ async function measure() {
   await record('provenance', { commit: await run('git', ['rev-parse', 'HEAD']),
     kernelRelease: pins.releaseTag, archiveSha256: pins.archives[manifest.architecture],
     architecture: manifest.architecture, binaryHash, os: await run('uname', ['-a']),
-    cpu: await run('lscpu', []), node: process.version, cohorts: 2, cohortSize, batchSize, concurrency: 1,
+    cpu: await run('lscpu', []), node: process.version, cohorts: 2, cohortSize, batchSize, concurrency: 1, offerPeriodMs,
     placements: 'One durable child, one shard, no peers' });
   await cluster.start();
   const tenant = await cluster.tenant('acceptance-idle');
@@ -142,6 +144,7 @@ async function measure() {
     const accepted = new Map();
     for (const phase of ['seed', 'reopen']) {
       const samples = [];
+      let nextOffer = performance.now();
       for (let from = 0; from < cohortSize; from += batchSize) {
         controller.signal.throwIfAborted();
         await onSameChild();
@@ -149,7 +152,10 @@ async function measure() {
         for (let offset = from; offset < Math.min(from + batchSize, cohortSize); ++offset) {
           const index = (cohort - 1) * cohortSize + offset + 1;
           const value = 'cohort-' + cohort + '-object-' + index;
+          const wait = nextOffer - performance.now();
+          if (wait > 0) await delay(Math.ceil(wait));
           const start = performance.now();
+          nextOffer = start + offerPeriodMs;
           try {
             const result = await call(index, phase === 'seed' ? value : undefined);
             const ms = performance.now() - start;

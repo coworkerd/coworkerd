@@ -2,6 +2,13 @@ name: Durable acceptance measurement
 
 on:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Measurements to run
+        type: choice
+        required: true
+        default: all
+        options: [all, wake, cpu, idle]
 
 permissions:
   contents: read
@@ -37,22 +44,23 @@ jobs:
           bash scripts/build.sh -DCOWORKERD_TEST_WORKERD="$kernel/workerd"
           cmake --build build --target coworkerd-launcher
           printf 'KERNEL_DIR=%s\n' "$kernel" >> "$GITHUB_ENV"
-      - name: Measure upstream and threaded in sequence
-        run: |
           mkdir -p build/durable-acceptance
           clang-19 --version > build/durable-acceptance/compiler.txt
+      - name: Measure upstream and threaded in sequence
+        if: inputs.scope == 'all' || inputs.scope == 'wake'
+        run: |
           node tests/cluster/durable-wake-measure.mjs "$KERNEL_DIR" build/durable-acceptance/wake.jsonl \
             2>&1 | tee build/durable-acceptance/wake.log
         shell: bash
       - name: Measure CPU isolation
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && (inputs.scope == 'all' || inputs.scope == 'cpu') }}
         run: |
           test -z "$(docker ps -q)"
           node tests/cluster/durable-cpu-isolation-measure.mjs "$KERNEL_DIR" build/durable-acceptance/cpu.jsonl \
             2>&1 | tee build/durable-acceptance/cpu.log
         shell: bash
       - name: Measure idle resources and recoverability
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && (inputs.scope == 'all' || inputs.scope == 'idle') }}
         run: |
           test -z "$(docker ps -q)"
           node tests/cluster/durable-idle-measure.mjs "$KERNEL_DIR" build/durable-acceptance/idle.jsonl \
