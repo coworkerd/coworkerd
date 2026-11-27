@@ -1,0 +1,89 @@
+name: Durable acceptance measurement
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Measurements to run
+        type: choice
+        required: true
+        default: all
+        options: [all, wake, cpu, idle, capacity, takeover]
+
+permissions:
+  contents: read
+
+jobs:
+  wake:
+    name: Durable acceptance gates on Linux x86-64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      CC: clang-19
+      CXX: clang++-19
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3
+          npm ci --prefix cli --registry=https://registry.npmjs.org
+      - name: Build the release daemons and verify the published kernel
+        id: prepare
+        run: |
+          kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64)
+          bash scripts/build.sh -DCOWORKERD_TEST_WORKERD="$kernel/workerd"
+          cmake --build build --target coworkerd-launcher
+          printf 'KERNEL_DIR=%s\n' "$kernel" >> "$GITHUB_ENV"
+          mkdir -p build/durable-acceptance
+          clang-19 --version > build/durable-acceptance/compiler.txt
+      - name: Measure upstream and threaded in sequence
+        if: inputs.scope == 'all' || inputs.scope == 'wake'
+        run: |
+          node tests/cluster/durable-wake-measure.mjs "$KERNEL_DIR" build/durable-acceptance/wake.jsonl \
+            2>&1 | tee build/durable-acceptance/wake.log
+        shell: bash
+      - name: Measure CPU isolation
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && (inputs.scope == 'all' || inputs.scope == 'cpu') }}
+        run: |
+          test -z "$(docker ps -q)"
+          node tests/cluster/durable-cpu-isolation-measure.mjs "$KERNEL_DIR" build/durable-acceptance/cpu.jsonl \
+            2>&1 | tee build/durable-acceptance/cpu.log
+        shell: bash
+      - name: Measure idle resources and recoverability
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && (inputs.scope == 'all' || inputs.scope == 'idle') }}
+        run: |
+          test -z "$(docker ps -q)"
+          node tests/cluster/durable-idle-measure.mjs "$KERNEL_DIR" build/durable-acceptance/idle.jsonl \
+            2>&1 | tee build/durable-acceptance/idle.log
+        shell: bash
+      - name: Record capacity and reset component results
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && (inputs.scope == 'all' || inputs.scope == 'capacity') }}
+        run: |
+          test -z "$(docker ps -q)"
+          ctest --test-dir build --no-tests=error --verbose \
+            -R '^node-threaded-durable-(home-reservation|queues|fd-limit|memory-reservation|process-memory|process-heap|http-memory|reset-progress)$' \
+            2>&1 | tee build/durable-acceptance/capacity.log
+        shell: bash
+      - name: Run early-answer control and release takeover
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && (inputs.scope == 'all' || inputs.scope == 'takeover') }}
+        run: bash tests/cluster/durable-takeover-control.sh "$KERNEL_DIR" build/durable-acceptance/takeover
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: durable-acceptance-linux-x86_64
+          path: |
+            build/durable-acceptance/
+            build/cluster-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 90
