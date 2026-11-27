@@ -441,7 +441,7 @@ struct DurableSocketEvent {
   uint64_t frame;
   kj::WebSocket::Message message;
   std::optional<uint64_t> autoResponseTime;
-  bool disconnected = false;
+  bool wasClean = true;
   bool transportError = false;
   uint32_t facet = 0;
 };
@@ -4570,7 +4570,8 @@ private:
       const auto closeReason = closingFrame ? std::string(message.get<kj::WebSocket::Close>().reason.cStr()) : std::string();
       if (!closingFrame) ++toWorker;
       const auto result = co_await dispatchManaged({durableObject, identity.invocationId, action.position,
-          kj::mv(message), managed->autoResponseTime(), disconnected || deliveringCapacityClose, transportError, managedFacet});
+          kj::mv(message), managed->autoResponseTime(), !disconnected && !deliveringCapacityClose,
+          transportError, managedFacet});
       credit.reset();
       managed->complete(managedOwner, action.position);
       if (deliveringCapacityClose) co_return;
@@ -7805,7 +7806,7 @@ kj::Promise<DurableSocketResult> deliverDurableSocket(DurableDispatch& durable, 
       socket.kind = event.transportError ? "error" : "close";
       if (!event.transportError) {
         socket.closeCode = close.code;
-        socket.wasClean = !event.disconnected;
+        socket.wasClean = event.wasClean;
         body = close.reason.asBytes();
       }
     }

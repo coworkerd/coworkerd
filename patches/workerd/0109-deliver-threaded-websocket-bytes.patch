@@ -6,7 +6,7 @@ Subject: [PATCH] Read threaded Durable Object WebSocket frames as bytes
 Use typed metadata from the node invocation descriptor and read the fixed-length body directly into the hibernation event buffer. Preserve the existing Worker event types and output gate.
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index cee37c292d322dd58849260b7652968baa2c39c5..bd7d4368d0d0734abc76dc7307096987773c38a8 100644
+index cee37c292d322dd58849260b7652968baa2c39c5..03c685ee1f06db8ff06615f23750e29c9785d84a 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -4833,11 +4833,52 @@ class DurableAlarmHttp final: public kj::HttpService {
@@ -73,8 +73,8 @@ index cee37c292d322dd58849260b7652968baa2c39c5..bd7d4368d0d0734abc76dc7307096987
 -    auto json = co_await body.readAllText(6u * (32u << 20) + 4096u);
 -    JsonDoc document(json);
 -    auto value = document.get();
-     auto& manager = kj::downcast<LegacyHibernationManagerImpl>(
-         KJ_REQUIRE_NONNULL(event.actor->getHibernationManager()));
+-    auto& manager = kj::downcast<LegacyHibernationManagerImpl>(
+-        KJ_REQUIRE_NONNULL(event.actor->getHibernationManager()));
      kj::Maybe<api::HibernatableSocketParams> params;
 -    auto string = field(value, "text");
 -    auto binary = field(value, "binary");
@@ -111,6 +111,8 @@ index cee37c292d322dd58849260b7652968baa2c39c5..bd7d4368d0d0734abc76dc7307096987
 +        params.emplace(event.closeCode, kj::mv(text), event.wasClean, kj::String());
 +      }
      }
++    auto& manager = kj::downcast<LegacyHibernationManagerImpl>(
++        KJ_REQUIRE_NONNULL(event.actor->getHibernationManager()));
      co_await manager.dispatchNodeSocket(*entry, kj::mv(event.socketId), event.position,
 -        lastAutoResponse, kj::mv(KJ_ASSERT_NONNULL(params)));
 +        event.lastAutoResponse, kj::mv(KJ_ASSERT_NONNULL(params)));
