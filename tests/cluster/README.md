@@ -71,6 +71,10 @@ To enable placement on all nodes for a new fixture, pass
 including two requests forwarded to a peer. Later cases can choose their own placement settings
 and use the same response field to see where each request ran.
 
+The `isolate-busy` case uses the placement-enabled fixture and reads the serving node's management
+state. An outstanding request waiting on a timer leaves a full idle window on its isolate. A second
+ordinary request adds hold time to the same isolate's reading.
+
 ### Threaded SQL deadline and disconnect
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matching Linux

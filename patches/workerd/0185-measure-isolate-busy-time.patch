@@ -1,0 +1,344 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Fri, 27 Nov 2026 17:54:00 +0800
+Subject: [PATCH] Measure stateless Worker isolate lock hold time
+
+Track bounded wall-time windows on the outer JSG lock and publish each loaded stateless isolate's reading in the existing lifecycle snapshot.
+
+diff --git a/src/workerd/jsg/jsg.c++ b/src/workerd/jsg/jsg.c++
+index aaddc0431204ebf7a8944628b7ad4ef8ce302f9f..658445f2c05723ed2cbda2c1416b2e810104036e 100644
+--- a/src/workerd/jsg/jsg.c++
++++ b/src/workerd/jsg/jsg.c++
+@@ -208,9 +208,11 @@ Lock::Lock(v8::Isolate* v8Isolate)
+ #endif
+   }
+   v8Isolate->SetData(SET_DATA_LOCK, this);
++  if (previousData == nullptr) IsolateBase::from(v8Isolate).getObserver().onLockAcquired();
+ }
+ Lock::~Lock() noexcept(false) {
+   v8Isolate->SetData(SET_DATA_LOCK, previousData);
++  if (previousData == nullptr) IsolateBase::from(v8Isolate).getObserver().onLockReleasing();
+ }
+ 
+ #ifdef WORKERD_ASAN
+diff --git a/src/workerd/jsg/observer.h b/src/workerd/jsg/observer.h
+index b13e0ff4511578c0b7bd6ddd73c91927edc5be10..60ab17ba9f46b0a750c1868a863c3ba453a94e1a 100644
+--- a/src/workerd/jsg/observer.h
++++ b/src/workerd/jsg/observer.h
+@@ -188,6 +188,10 @@ struct IsolateObserver: public CompilationObserver,
+                         public ResolveObserver {
+   virtual ~IsolateObserver() noexcept(false) {}
+ 
++  // These callbacks bracket an outer JSG lock, on the thread holding the V8 locker.
++  virtual void onLockAcquired() noexcept {}
++  virtual void onLockReleasing() noexcept {}
++
+   // Called when eval(), new Function(), or similar dynamic code generation
+   // is performed. Note that the source here may not be a string: V8 also reports
+   // each object argument to new Function() before converting it to a string.
+diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
+index 1174e5a0fdea79713a88256b94006969f77212e0..b2d1c524acd9ca2f1aaddbde51c2ebda230add16 100644
+--- a/src/workerd/threaded/BUILD.bazel
++++ b/src/workerd/threaded/BUILD.bazel
+@@ -5,6 +5,7 @@ load("//:build/wd_cc_library.bzl", "wd_cc_library")
+ 
+ THREADED_DEPS = [
+     ":fatal-attribution",
++    ":isolate-busy",
+     ":protocol_capnp",
+     "//src/workerd/api:memory-cache",
+     "//src/workerd/io",
+@@ -33,6 +34,18 @@ THREADED_DEPS = [
+     "@ssl",
+ ]
+ 
++wd_cc_library(
++    name = "isolate-busy",
++    hdrs = ["isolate-busy.h"],
++    deps = ["@capnp-cpp//src/kj"],
++)
++
++kj_test(
++    size = "small",
++    src = "isolate-busy-test.c++",
++    deps = [":isolate-busy"],
++)
++
+ wd_cc_library(
+     name = "fatal-attribution",
+     hdrs = ["fatal-attribution.h"],
+diff --git a/src/workerd/threaded/isolate-busy-test.c++ b/src/workerd/threaded/isolate-busy-test.c++
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f387db8dacfc8a3a21d5c253a6d4ba88f14144f
+--- /dev/null
++++ b/src/workerd/threaded/isolate-busy-test.c++
+@@ -0,0 +1,85 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#include "isolate-busy.h"
++
++#include <kj/test.h>
++
++namespace workerd::threaded {
++namespace {
++
++class TestClock final: public kj::MonotonicClock {
++ public:
++  kj::TimePoint now() const override {
++    return kj::origin<kj::TimePoint>() + time;
++  }
++
++  kj::Duration time = 0 * kj::NANOSECONDS;
++};
++
++KJ_TEST("isolate busy time includes a live hold and rolls off bucket by bucket") {
++  TestClock clock;
++  IsolateBusyWindow window(clock);
++  IsolateBusyWindow other(clock);
++
++  clock.time = 50 * kj::MILLISECONDS;
++  window.acquired();
++  clock.time = 150 * kj::MILLISECONDS;
++  KJ_EXPECT(window.sample().throughNs == 100000000);
++  KJ_EXPECT(window.sample().busyNs == 50000000);
++  window.releasing();
++  clock.time = 200 * kj::MILLISECONDS;
++  KJ_EXPECT(window.sample().busyNs == 100000000);
++  KJ_EXPECT(other.sample().busyNs == 0);
++
++  // The second hold leaves an idle gap even though it ends in the same window.
++  clock.time = 225 * kj::MILLISECONDS;
++  window.acquired();
++  clock.time = 250 * kj::MILLISECONDS;
++  window.releasing();
++  clock.time = 3099 * kj::MILLISECONDS;
++  KJ_EXPECT(window.sample().throughNs == 3000000000);
++  KJ_EXPECT(window.sample().busyNs == 125000000);
++  clock.time = 3100 * kj::MILLISECONDS;
++  KJ_EXPECT(window.sample().busyNs == 75000000);
++  clock.time = 3200 * kj::MILLISECONDS;
++  KJ_EXPECT(window.sample().busyNs == 25000000);
++  clock.time = 3300 * kj::MILLISECONDS;
++  KJ_EXPECT(window.sample().busyNs == 0);
++
++  window.acquired();
++  clock.time = 6400 * kj::MILLISECONDS;
++  KJ_EXPECT(window.sample().permille() == 1000);
++  window.releasing();
++  KJ_EXPECT(window.sample().permille() == 1000);
++  clock.time = 9400 * kj::MILLISECONDS;
++  KJ_EXPECT(window.sample().permille() == 0);
++}
++
++KJ_TEST("the published permille crosses an inclusive fractional threshold at the exact boundary") {
++  TestClock clock;
++  const auto readingAfter = [&](kj::Duration held) {
++    IsolateBusyWindow window(clock);
++    clock.time = 0 * kj::MILLISECONDS;
++    window.acquired();
++    clock.time = held;
++    window.releasing();
++    clock.time = 3 * kj::SECONDS;
++    return window.sample().permille();
++  };
++
++  constexpr uint64_t threshold = 900;
++  constexpr auto boundary = 2700 * kj::MILLISECONDS;
++  const auto below = readingAfter(boundary - 1 * kj::NANOSECONDS);
++  const auto at = readingAfter(boundary);
++  const auto above = readingAfter(boundary + 1 * kj::NANOSECONDS);
++  KJ_EXPECT(below == 899);
++  KJ_EXPECT(below < threshold);
++  KJ_EXPECT(at == threshold);
++  KJ_EXPECT(at >= threshold);
++  KJ_EXPECT(above >= threshold);
++}
++
++}  // namespace
++}  // namespace workerd::threaded
+diff --git a/src/workerd/threaded/isolate-busy.h b/src/workerd/threaded/isolate-busy.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f2e874e1ad0c2798a69f6e2be256d902975a3ac
+--- /dev/null
++++ b/src/workerd/threaded/isolate-busy.h
+@@ -0,0 +1,91 @@
++// Copyright (c) 2026 Cloudflare, Inc.
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#pragma once
++
++#include <kj/debug.h>
++#include <kj/mutex.h>
++#include <kj/time.h>
++
++namespace workerd::threaded {
++
++// A sliding window of wall time under the isolate lock. Each sample ends at the latest
++// completed bucket boundary. The extra bucket retains work since that boundary.
++class IsolateBusyWindow final {
++ public:
++  static constexpr uint64_t BUCKET_NS = 100 * 1000000;
++  static constexpr uint64_t WINDOW_BUCKETS = 30;
++  static constexpr uint64_t WINDOW_NS = BUCKET_NS * WINDOW_BUCKETS;
++
++  struct Sample {
++    uint64_t throughNs;
++    uint64_t busyNs;
++
++    uint64_t permille() const {
++      return busyNs * 1000 / WINDOW_NS;
++    }
++  };
++
++  explicit IsolateBusyWindow(const kj::MonotonicClock& clock): clock(clock) {}
++
++  // Serialize each clock read with the state it describes. The snapshot thread never
++  // takes the V8 locker. Only the outer V8 lock owner calls acquired() and releasing().
++  void acquired() {
++    auto locked = state.lockExclusive();
++    locked->heldSince = nowNs();
++  }
++
++  void releasing() {
++    auto locked = state.lockExclusive();
++    const auto end = nowNs();
++    const auto oldest = firstBucket(end / BUCKET_NS) * BUCKET_NS;
++    auto start = kj::max(KJ_ASSERT_NONNULL(locked->heldSince), oldest);
++    while (start < end) {
++      const auto index = start / BUCKET_NS;
++      const auto through = kj::min(end, (index + 1) * BUCKET_NS);
++      auto& bucket = locked->buckets[index % (WINDOW_BUCKETS + 1)];
++      if (bucket.index != index) bucket = {index, 0};
++      bucket.busyNs += through - start;
++      start = through;
++    }
++    locked->heldSince = kj::none;
++  }
++
++  Sample sample() const {
++    auto locked = state.lockShared();
++    const auto end = nowNs() / BUCKET_NS;
++    const auto start = firstBucket(end);
++    Sample sample{end * BUCKET_NS, 0};
++    for (const auto& bucket: locked->buckets) {
++      if (bucket.index >= start && bucket.index < end) sample.busyNs += bucket.busyNs;
++    }
++    KJ_IF_SOME(heldSince, locked->heldSince) {
++      const auto heldFrom = kj::max(heldSince, start * BUCKET_NS);
++      if (heldFrom < sample.throughNs) sample.busyNs += sample.throughNs - heldFrom;
++    }
++    return sample;
++  }
++
++ private:
++  static uint64_t firstBucket(uint64_t end) {
++    return end - kj::min(end, WINDOW_BUCKETS);
++  }
++
++  uint64_t nowNs() const {
++    return (clock.now() - kj::origin<kj::TimePoint>()) / kj::NANOSECONDS;
++  }
++
++  struct Bucket {
++    uint64_t index;
++    uint64_t busyNs;
++  };
++  struct State {
++    Bucket buckets[WINDOW_BUCKETS + 1]{};
++    kj::Maybe<uint64_t> heldSince;
++  };
++  const kj::MonotonicClock& clock;
++  kj::MutexGuarded<State> state;
++};
++
++}  // namespace workerd::threaded
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 20f5e0299499088e0c7fcdfaa89a9e7ed3ce62d7..d2bfcecefc6fa6c260d771e93d731febff703e83 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -3,6 +3,7 @@
+ //     https://opensource.org/licenses/Apache-2.0
+ 
+ #include "fatal-attribution.h"
++#include "isolate-busy.h"
+ #include "protocol.h"
+ 
+ #include <workerd/api/actor-state.h>
+@@ -1508,6 +1509,20 @@ struct Reporter final: Worker::ValidationErrorReporter {
+   void addWorkflowClass(kj::StringPtr, kj::Array<kj::String>) override {}
+ };
+ 
++class BusyIsolateObserver final: public JsgIsolateObserver {
++ public:
++  explicit BusyIsolateObserver(const kj::MonotonicClock &clock): window(clock) {}
++
++  void onLockAcquired() noexcept override {
++    window.acquired();
++  }
++  void onLockReleasing() noexcept override {
++    window.releasing();
++  }
++
++  threaded::IsolateBusyWindow window;
++};
++
+ struct Slot {
+   capnp::MallocMessageBuilder configArena, flagsArena;
+   api::MemoryCacheProvider cache;
+@@ -1515,6 +1530,7 @@ struct Slot {
+   std::atomic<bool> complete{false};
+   std::atomic<bool> retryableLoad{false};
+   std::shared_ptr<ResourceReservation> reservation;
++  kj::Maybe<kj::Own<BusyIsolateObserver>> busy;
+   std::string workerId, versionId, planRevision, isolateLabel;
+   uint64_t instance = 0;
+   std::atomic<uint64_t> lastUseNs{nowNs()};
+@@ -2947,7 +2963,18 @@ struct ThreadedServer {
+           ",\"active\":" + std::to_string(contexts) +
+           ",\"loading\":" + (complete ? "false" : "true") +
+           ",\"backgroundActive\":" + (contexts && js == 0 ? "true" : "false") +
+-          ",\"nativeMemory\":" + slot->reservation->metrics() + "}";
++          ",\"nativeMemory\":" + slot->reservation->metrics();
++      if (complete) {
++        KJ_IF_SOME(busy, slot->busy) {
++          const auto sample = busy->window.sample();
++          json += ",\"isolateBusy\":{\"windowMs\":" +
++              std::to_string(threaded::IsolateBusyWindow::WINDOW_NS / 1000000) +
++              ",\"throughMonotonicMs\":" + std::to_string(sample.throughNs / 1000000) +
++              ",\"busyNs\":" + std::to_string(sample.busyNs) +
++              ",\"permille\":" + std::to_string(sample.permille()) + "}";
++        }
++      }
++      json += "}";
+     }
+     json += "],\"createdIsolates\":" + std::to_string(compilations.load()) +
+         ",\"resourceBudget\":{\"memoryBytes\":" + std::to_string(resources->memoryReserved.load()) +
+@@ -4198,9 +4225,15 @@ struct ThreadedServer {
+     isolateCreationAttempts.fetch_add(1);
+     const api::pyodide::PythonConfig python{
+       .packageDiskCacheRoot = kj::none, .createSnapshot = false, .createBaselineSnapshot = false};
++    kj::Own<JsgIsolateObserver> jsgObserver;
++    KJ_IF_SOME(busy, slot.busy) {
++      jsgObserver = kj::atomicAddRef(*busy);
++    } else {
++      jsgObserver = kj::atomicRefcounted<JsgIsolateObserver>();
++    }
+     auto api = kj::heap<server::WorkerdApi>(v8, flags.asReader(),
+         capnp::List<server::config::Extension>::Reader(), limits->getCreateParams(), group,
+-        kj::atomicRefcounted<JsgIsolateObserver>(), slot.cache, python);
++        kj::mv(jsgObserver), slot.cache, python);
+     auto name = kj::str(text(descriptor, "workerId"), "@", text(descriptor, "versionId"));
+     // Declared before the isolate so that a load that fails tears its Worker down in this scope.
+     kj::Maybe<FatalInvocation> fatal;
+@@ -4512,6 +4545,8 @@ struct ThreadedServer {
+             else {
+               slot = std::make_shared<Slot>();
+               slot->reservation = std::move(reservation);
++              slot->busy =
++                  kj::atomicRefcounted<BusyIsolateObserver>(kj::systemPreciseMonotonicClock());
+               slot->instance = ++nextInstance;
+               slot->workerId = str(descriptor, "workerId");
+               slot->versionId = str(descriptor, "versionId");

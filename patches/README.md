@@ -59,6 +59,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0122 cancels home tasks, destroys resident roots, and cancels facet drains queued by those roots.
   The actor index and WAL Home stay live through actor cleanup, shipper deregistration, and SQLite close.
   It changes only the threaded server and its tests.
+  Patch 0185 measures wall time under the isolate lock for threaded stateless Workers. The JSG lock
+  notifies the existing isolate observer at acquire and release. The threaded lifecycle publishes
+  a bounded sliding-window reading for each loaded isolate.
   Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
   quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and
