@@ -229,6 +229,8 @@ struct DurableLogConfig {
   bool diskBytesDefault = true;
   uint64_t peerBufferBytes = 256u << 20;
   uint64_t objectBytes = 10ull << 30;
+  uint64_t sqlDatabaseSpillBytes = 1ull << 30;
+  uint64_t sqlProcessSpillBytes = 0; // Derive from sqlDatabaseSpillBytes.
   uint64_t checkpointBytes = 4u << 20;
   uint32_t idleCheckpointMs = 10000;
   uint32_t uploadRetryMs = 500, uploadRetryMaxMs = 30000;
@@ -302,6 +304,7 @@ struct ServerConfig {
   } ingressKeepalive;
   // durableObjects: how the node replicates and stores its objects' data (processes is in processPool).
   DurableLogConfig durableLog;
+  uint64_t durableSocketFrameBytesPerNode = 128ull << 20;
   // The configuration file of `serve`. The four paths and addresses are serve only (the
   // positional form takes them as arguments); the shortcuts below them fill the nested fields.
   std::string stackDirectory, workerdPath, runtimePath, listenAddress;

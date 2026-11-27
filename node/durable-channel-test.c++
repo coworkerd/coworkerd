@@ -6,6 +6,7 @@
 #include "json.h"
 #include "object-state.h"
 
+#include <capnp/compat/http-over-capnp.h>
 #include <kj/async-io.h>
 #include <kj/timer.h>
 #include <sys/socket.h>
@@ -45,6 +46,28 @@ struct DurableLogChannelTest {
     advance(kj::SECONDS);
     for (int i = 0; i != 4; ++i) metadata.acquire().wait(io.waitScope) = nullptr;
     KJ_REQUIRE(!metadata.acquire().poll(io.waitScope), "an idle bucket refills to four tokens");
+
+    RecoveryGate sharedMetadata(clock, 1, 16, 1);
+    auto held = sharedMetadata.acquire().wait(io.waitScope);
+    auto canceled = sharedMetadata.acquireCoordination();
+    auto bulkFirst = sharedMetadata.acquire();
+    auto bulkSecond = sharedMetadata.acquire();
+    auto discovery = sharedMetadata.acquireCoordination();
+    auto heartbeat = sharedMetadata.acquireCoordination();
+    canceled = nullptr;
+    held = nullptr;
+    KJ_REQUIRE(!discovery.poll(io.waitScope), "coordination waits for the same token bucket");
+    advance(62500 * kj::MICROSECONDS);
+    KJ_REQUIRE(discovery.poll(io.waitScope) && !bulkFirst.poll(io.waitScope));
+    discovery = nullptr;
+    advance(62500 * kj::MICROSECONDS);
+    KJ_REQUIRE(bulkFirst.poll(io.waitScope) && !bulkSecond.poll(io.waitScope) && !heartbeat.poll(io.waitScope));
+    bulkFirst = nullptr;
+    advance(62500 * kj::MICROSECONDS);
+    KJ_REQUIRE(heartbeat.poll(io.waitScope) && !bulkSecond.poll(io.waitScope));
+    heartbeat = nullptr;
+    advance(62500 * kj::MICROSECONDS);
+    KJ_REQUIRE(bulkSecond.poll(io.waitScope) && sharedMetadata.started() == 5 && sharedMetadata.peakActive() == 1);
 
     RecoveryGate connections(clock, 4);
     std::vector<kj::Own<RecoveryGate::Permit>> connecting;
@@ -99,6 +122,130 @@ struct DurableLogChannelTest {
     tail.reset();
     pipe.ends[1]->write(kj::arrayPtr(&sent, 1).asBytes()).wait(io.waitScope);
     KJ_REQUIRE(reading.wait(io.waitScope) == 1 && byte == sent, "the existing stream survives a tail failure");
+  }
+
+  static void webSocketFrameBudget() {
+    auto io = kj::setupAsyncIo();
+    DurableSocketFrameBudget budget(16);
+    auto submit = [&](uint64_t bytes, kj::Promise<void> delivery) -> kj::Promise<void> {
+      auto reservation = budget.tryReserve(bytes);
+      KJ_REQUIRE(reservation.has_value(), "delivery must fit");
+      co_await delivery;
+    };
+    auto gate = kj::newPromiseAndFulfiller<void>();
+    auto delivered = submit(3, kj::mv(gate.promise));
+    auto cancelled = submit(5, kj::NEVER_DONE);
+    KJ_REQUIRE(budget.usedBytes() == 16 && budget.limitBytes() == 16);
+    KJ_REQUIRE(!budget.tryReserve(1).has_value());
+    KJ_REQUIRE(budget.tryReserve(0).has_value() && budget.usedBytes() == 16);
+    gate.fulfiller->fulfill();
+    delivered.wait(io.waitScope);
+    KJ_REQUIRE(budget.usedBytes() == 10);
+    auto replacement = budget.tryReserve(3);
+    KJ_REQUIRE(replacement.has_value() && budget.usedBytes() == 16);
+    cancelled = nullptr;
+    KJ_REQUIRE(budget.usedBytes() == 6);
+    replacement.reset();
+    KJ_REQUIRE(!budget.tryReserve(UINT64_MAX).has_value() && budget.refusals() == 2);
+    KJ_REQUIRE(budget.usedBytes() == 0 && budget.tryReserve(8).has_value());
+    KJ_REQUIRE(budget.usedBytes() == 0);
+
+    KJ_REQUIRE(!durableSocketRefusal(123, true).has_value());
+    KJ_REQUIRE(durableSocketRefusal(124, true)->code == 1002);
+    KJ_REQUIRE(durableSocketRefusal(0, false)->code == 1013);
+  }
+
+  static void webSocketUploadBudget() {
+    auto io = kj::setupAsyncIo();
+    DurableSocketFrameBudget budget(8);
+    enum class Scenario { COMPLETE, CANCEL_REQUEST, REPLY_WITHOUT_READING };
+    class Home final: public kj::HttpService {
+    public:
+      Home(kj::PromiseFulfiller<void>& entered, kj::Promise<void> allowRead,
+          kj::Promise<void> allowResponse, const kj::HttpHeaderTable& headers, Scenario scenario)
+          : entered(entered), allowRead(kj::mv(allowRead)), allowResponse(kj::mv(allowResponse)),
+            headers(headers), scenario(scenario) {}
+      kj::Promise<void> request(kj::HttpMethod, kj::StringPtr, const kj::HttpHeaders&,
+          kj::AsyncInputStream& body, Response& response) override {
+        entered.fulfill();
+        if (scenario != Scenario::REPLY_WITHOUT_READING) {
+          co_await allowRead;
+          char message[4];
+          co_await body.read(kj::arrayPtr(message, sizeof(message)).asBytes());
+          KJ_REQUIRE(std::string_view(message, sizeof(message)) == "hold");
+          co_await allowResponse;
+        }
+        response.send(204, "No Content", kj::HttpHeaders(headers), uint64_t{0});
+      }
+    private:
+      kj::PromiseFulfiller<void>& entered;
+      kj::Promise<void> allowRead, allowResponse;
+      const kj::HttpHeaderTable& headers;
+      Scenario scenario;
+    };
+    class Reply final: public kj::HttpService::Response {
+    public:
+      kj::Own<kj::AsyncOutputStream> send(uint statusCode, kj::StringPtr, const kj::HttpHeaders&,
+          kj::Maybe<uint64_t>) override {
+        status = statusCode;
+        return kj::heap<kj::NullStream>();
+      }
+      kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders&) override {
+        KJ_FAIL_REQUIRE("unexpected WebSocket upgrade");
+      }
+      uint status = 0;
+    };
+    kj::HttpHeaderTable::Builder builder;
+    capnp::HttpOverCapnpFactory::HeaderIdBundle ids(builder);
+    auto headers = builder.build();
+    capnp::ByteStreamFactory streams;
+    capnp::HttpOverCapnpFactory factory(streams, kj::mv(ids), capnp::HttpOverCapnpFactory::LEVEL_2);
+    for (auto scenario : {Scenario::COMPLETE, Scenario::CANCEL_REQUEST, Scenario::REPLY_WITHOUT_READING}) {
+      auto entered = kj::newPromiseAndFulfiller<void>();
+      auto allowRead = kj::newPromiseAndFulfiller<void>();
+      auto allowResponse = kj::newPromiseAndFulfiller<void>();
+      auto home = factory.kjToCapnp(kj::heap<Home>(*entered.fulfiller, kj::mv(allowRead.promise),
+          kj::mv(allowResponse.promise), *headers, scenario));
+      auto credit = budget.tryReserve(4);
+      KJ_REQUIRE(credit.has_value());
+      auto message = kj::heap<kj::String>(kj::str("hold"));
+      auto bytes = message->asBytes();
+      auto service = factory.capnpToKj(kj::mv(home), message.attach(std::move(*credit)));
+      auto pipe = kj::newOneWayPipe(bytes.size());
+      auto upload = pipe.out->write(bytes)
+          .then([out = kj::mv(pipe.out)]() mutable { out = nullptr; }).eagerlyEvaluate(nullptr);
+      kj::HttpHeaders requestHeaders(*headers);
+      Reply reply;
+      auto request = service->request(kj::HttpMethod::POST, "http://coworkerd-node/socket",
+          requestHeaders, *pipe.in, reply);
+      entered.promise.wait(io.waitScope);
+      if (scenario != Scenario::REPLY_WITHOUT_READING) {
+        KJ_REQUIRE(budget.usedBytes() == 8, "the home has not read the request body");
+      }
+      switch (scenario) {
+        case Scenario::COMPLETE:
+          allowRead.fulfiller->fulfill();
+          KJ_REQUIRE(!request.poll(io.waitScope) && budget.usedBytes() == 0,
+              "the upload has settled and the home still holds the reply");
+          upload.wait(io.waitScope);
+          allowResponse.fulfiller->fulfill();
+          request.wait(io.waitScope);
+          KJ_REQUIRE(reply.status == 204);
+          break;
+        case Scenario::CANCEL_REQUEST:
+          request = nullptr;
+          KJ_REQUIRE(budget.usedBytes() == 0 && !upload.poll(io.waitScope),
+              "canceling the request returns its credit while the pipe write is still waiting");
+          upload = nullptr;
+          break;
+        case Scenario::REPLY_WITHOUT_READING:
+          request.wait(io.waitScope);
+          KJ_REQUIRE(reply.status == 204 && budget.usedBytes() == 0 && !upload.poll(io.waitScope),
+              "a reply without a read returns credit while the pipe write is still waiting");
+          upload = nullptr;
+          break;
+      }
+    }
   }
 
   static void parkedWebSocket() {
@@ -447,8 +594,8 @@ struct DurableLogChannelTest {
     DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), clock, *io.lowLevelProvider,
         membership, {});
     log.settings.config.peers = 0;
-    log.setNodeEpoch(1);
-    KJ_REQUIRE(log.logFd >= 0, "the test log could not be opened");
+    log.setNodeEpoch(1).wait(io.waitScope);
+    KJ_REQUIRE(!log.logAppendFailed, "the test log could not be opened");
     // The real tracker, on the real lease clock, with a TTL the scenario sets (wide margins: a busy machine must not
     // make the setup itself outlive a lease that should still hold).
     const double ttl = name == "expired" || name == "stale-timer" ? 300 : name == "slow-flush" ? 2000 : 60000;
@@ -459,8 +606,13 @@ struct DurableLogChannelTest {
     std::optional<LeaseTracker::Judgment> forced;
     uint32_t lost = 0;
     double judgedAt = 0;
+    bool throwAfterAppend = name == "completion-error";
     log.setLeaseHooks([&](uint64_t epoch, double now) {
           judgedAt = now;
+          if (throwAfterAppend && log.appendedSeq == 1) {
+            throwAfterAppend = false;
+            KJ_FAIL_REQUIRE("fixture failed the first post-append lease check");
+          }
           return forced ? *forced : tracker.judge(epoch, now);
         }, [&](std::string) { ++lost; });
     const int peer = log.openChannel("d0");
@@ -486,6 +638,7 @@ struct DurableLogChannelTest {
     // Every TO_ACK the log wrote to the durable process so far: request -> status.
     std::map<uint64_t, uint8_t> acks;
     auto answers = [&]() {
+      log.waitForLogWrites().wait(io.waitScope);
       io.waitScope.poll();
       char buffer[4096];
       std::string bytes;
@@ -531,10 +684,40 @@ struct DurableLogChannelTest {
       { std::ofstream out(trigger); out << "4000"; }
       log.slowFlushForTest = trigger.string();
       take(44);
+      auto flushed = log.waitForLogWrites();
+      io.provider->getTimer().afterDelay(20 * kj::MILLISECONDS).wait(io.waitScope);
+      KJ_REQUIRE(!flushed.poll(io.waitScope) && log.inFlight.contains(1) && confirmed() == 0,
+          "the main loop's timer runs while the output gate waits for the log worker");
+      flushed.wait(io.waitScope);
       KJ_REQUIRE(!std::filesystem::exists(trigger), "the slow flush did not run");
       KJ_REQUIRE(answers().at(44) == 1 && confirmed() == 0 && lost == 1 && tracker.fenced(1),
           "a lease that ended during the local flush must refuse the confirmation");
       KJ_REQUIRE(log.isolated.size() == 1 && log.inFlight.empty(), "the refused record is excluded like any other");
+    } else if (name == "completion-error") {
+      take(61);
+      KJ_REQUIRE(!answers().contains(61) && !log.logWriting && !throwAfterAppend,
+          "an error after I/O must release the batch slot");
+      take(62);
+      KJ_REQUIRE(answers().at(61) == 0 && answers().at(62) == 0 && confirmed() == 2,
+          "a later batch progresses and confirms both writes");
+    } else if (name == "rotate") {
+      const auto original = log.logPath;
+      const auto trigger = std::filesystem::path(temp) / "slow-flush";
+      { std::ofstream out(trigger); out << "150"; }
+      log.slowFlushForTest = trigger.string();
+      take(51);
+      take(52);
+      auto rotation = log.setNodeEpoch(2);
+      KJ_REQUIRE(!rotation.poll(io.waitScope) && log.nodeEpoch == 1,
+          "the descriptor remains on the old epoch while any append is outstanding");
+      rotation.wait(io.waitScope);
+      KJ_REQUIRE(answers().at(51) == 1 && answers().at(52) == 1 && confirmed() == 0,
+          "the old epoch's pending records could not acknowledge after rotation");
+      KJ_REQUIRE(log.nextSeq == 0 && log.appendedSeq == 0 && log.flushedSeq == 0 && log.nodeEpoch == 2);
+      const auto old = std::filesystem::file_size(original);
+      KJ_REQUIRE(old > 0 && std::filesystem::file_size(log.logPath) == 0,
+          "the old epoch drained and the new append file is empty");
+      KJ_REQUIRE(log.earlierExcluded.at(1).size() == 2 && log.predecessorLogs.at(1).complete);
     } else if (name == "wait") {
       // A heartbeat in flight keeps the answer back; nothing is confirmed until it settles.
       forced = LeaseTracker::Judgment{LeaseTracker::Verdict::WAIT, leaseClockMs() + 30000, "in flight"};
@@ -920,8 +1103,8 @@ struct DurableLogChannelTest {
     DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), clock, *io.lowLevelProvider,
         membership, std::move(hooks));
     log.settings.config.peers = 1;
-    log.setNodeEpoch(1);
-    KJ_REQUIRE(log.logFd >= 0);
+    log.setNodeEpoch(1).wait(io.waitScope);
+    KJ_REQUIRE(!log.logAppendFailed);
     const int process = log.openChannel("d0");
     KJ_REQUIRE(process >= 0);
     auto& channel = log.channels.at("d0");
@@ -959,9 +1142,11 @@ struct DurableLogChannelTest {
       if (i == 1 && chunk) record.frameBytes = std::string(5u << 20, 'f');  // two pieces
       log.takeRecord(channel, std::move(record), 101 + i);
     }
+    log.waitForLogWrites().wait(io.waitScope);
     io.waitScope.poll();
     std::map<uint64_t, uint8_t> acks;
     auto answers = [&]() {
+      log.waitForLogWrites().wait(io.waitScope);
       io.waitScope.poll();
       char buffer[4096];
       std::string bytes;
@@ -990,8 +1175,10 @@ struct DurableLogChannelTest {
       record.storageId = log.objects.at(hosts[i]).storageId;
       record.dataEpoch = 1;
       log.takeRecord(channel, std::move(record), request);
+      log.waitForLogWrites().wait(io.waitScope);
     };
     if (name == "unreachable") {
+      log.waitForLogWrites().wait(io.waitScope);
       clock.advanceTo(KJ_ASSERT_NONNULL(clock.nextEvent()));
       answers();
       KJ_REQUIRE(opened == 1 && calls.empty() && acks.empty() && log.confirmations == 0 &&
@@ -1204,7 +1391,7 @@ struct DurableLogChannelTest {
         record.objectName = object;
         log.rememberParsedRecord(record);
       };
-      log.setNodeEpoch(1);
+      log.setNodeEpoch(1).wait(io.waitScope);
       insert(1, "object-a");
       insert(2, "object-b");
       insert(3, "object-a");
@@ -1217,7 +1404,7 @@ struct DurableLogChannelTest {
       log.forgetParsedRecord(2);
       check();
       KJ_REQUIRE(!log.unsealedByObject.contains("object-b"));
-      log.setNodeEpoch(2);
+      log.setNodeEpoch(2).wait(io.waitScope);
       check();
       KJ_REQUIRE(log.parsed.empty() && log.unsealedByObject.empty());
       return;
@@ -1305,7 +1492,7 @@ struct DurableLogChannelTest {
     hooks.closeObjects = [&](std::string) -> kj::Promise<void> { ++closeCalls; co_return; };
     DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), timer,
         *io.lowLevelProvider, membership, std::move(hooks));
-    log.setNodeEpoch(1);
+    log.setNodeEpoch(1).wait(io.waitScope);
     const int old = log.openChannel("d0-1"), active = log.openChannel("d0-2");
     KJ_REQUIRE(old >= 0 && active >= 0);
     KJ_DEFER({ ::close(old); ::close(active); });
@@ -1354,7 +1541,7 @@ struct DurableLogChannelTest {
     MembershipView membership;
     DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), clock,
         *io.lowLevelProvider, membership, {});
-    log.setNodeEpoch(1);
+    log.setNodeEpoch(1).wait(io.waitScope);
     const int peer = log.openChannel("d0-7", 7);
     KJ_REQUIRE(peer >= 0);
     auto child = io.lowLevelProvider->wrapSocketFd(peer, kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
@@ -2095,7 +2282,8 @@ struct DurableLogChannelTest {
       until("first epoch read", [&] { return store.heldReads.contains(newEpoch); });
       check(1, 0);
       heldEpoch.fulfiller->fulfill();
-      KJ_REQUIRE(firstAccess.wait(io.waitScope).ready && log.recoveryMetadata.started() == 2);
+      KJ_REQUIRE(firstAccess.wait(io.waitScope).ready && log.recoveryMetadata.started() == 2 &&
+          log.waitingRecoveryPublication.started() == 0);
       check(0, 0);
     }
 
@@ -2136,6 +2324,15 @@ struct DurableLogChannelTest {
     cancel('4');
     check(0, 0);
     KJ_REQUIRE(log.rebuildMetadataBytes == 0 && log.backgroundRebuildMetadataBytes == 0);
+
+    // A returning owner can release a waiting recovery with a complete proof.
+    // Its publication takes the same permit as a bounded cut.
+    const auto publications = log.waitingRecoveryPublication.started();
+    auto returning = log.openObject(id('b'), false).eagerlyEvaluate(nullptr);
+    until("waiting for the returning owner", [&] { return ownerCalls == 3 && log.rebuildRuns.at(name('b'))->parkedAtMs != 0; });
+    owner.fulfiller->fulfill();
+    KJ_REQUIRE(returning.wait(io.waitScope).ready && log.waitingRecoveryPublication.started() == publications + 1);
+    check(0, 0);
 
     // Hold/cancel a real preparation after filling the background share with
     // queued jobs. A request can still enter the foreground queue.
@@ -2189,6 +2386,35 @@ struct DurableLogChannelTest {
     log.rebuildCancelers.at(foreignName)->cancel("fixture cancellation");
     heldDiscovery.fulfiller->fulfill();
     KJ_REQUIRE(!foreignAccess.wait(io.waitScope).ready);
+    busyTwo = nullptr;
+
+    // Exercise a real acquisition and reuse only the authority it read from
+    // the store for that shard and ownership epoch.
+    membership.epoch = "9";
+    membership.conditionalPutAtomic = "true";
+    DurableShards shards({"new"}, config, io.provider->getNetwork(), timer, membership, [] { return false; });
+    const std::string reusedNs(64, 'd');
+    const auto predecessorKey = shardEpochKey(reusedNs, 0, 1);
+    const auto predecessor = shardEpochJson(
+        {reusedNs, "old", "first", "old-instance", "nonce", "", 0, 1, 7, 1, 1});
+    store.objects[predecessorKey] = predecessor;
+    store.objects[shardReleasedKey(reusedNs, 0, 1)] = "";
+    store.sendStoreTimes = true;
+    const auto acquired = shards.accept(reusedNs, 0, 0, "peer").wait(io.waitScope);
+    KJ_REQUIRE(acquired.kind == ShardRoute::Kind::LOCAL && acquired.epoch == 2);
+    KJ_REQUIRE(!shards.heldPredecessor(reusedNs, 0, 2, 2) && !shards.heldPredecessor(reusedNs, 0, 3, 1) &&
+        !shards.heldPredecessor(reusedNs, 1, 2, 1));
+    log.setPredecessorEpochHook([&](const std::string& ns, uint32_t shard, uint64_t held, uint64_t source) {
+      return shards.heldPredecessor(ns, shard, held, source);
+    });
+    const DurableLog::ObjectIdentity reused{reusedNs, std::string(64, '1'), "", 2, 2, 0};
+    store.unreadable.insert(predecessorKey);
+    const auto started = log.recoveryMetadata.started();
+    const auto response = log.readSourceEpoch(reused, 1, false).wait(io.waitScope);
+    KJ_REQUIRE(response->bytes == predecessor && response->lastModifiedUnixMs > 0 &&
+        log.recoveryMetadata.started() == started && log.reusedPredecessorEpochs == 1);
+    shards.dropAll("fixture");
+    KJ_REQUIRE(!shards.heldPredecessor(reusedNs, 0, 2, 1));
   }
 
   static LogRecord recoveryPage(const std::string& name, const std::string& page) {
@@ -2310,6 +2536,7 @@ struct DurableLogChannelTest {
     timer.timeoutAfter(5 * kj::SECONDS, kj::mv(bothBorrowed.promise)).wait(io.waitScope);
     KJ_REQUIRE(!failed && log.tailPages.active() == 1, "both objects borrow the same connection before its failure");
     KJ_REQUIRE(a.wait(io.waitScope).ready && b.wait(io.waitScope).ready);
+    KJ_REQUIRE(log.waitingRecoveryPublication.started() == 2, "each cut takes a publication permit");
     KJ_REQUIRE(failed && replacements == 1 && healthyPages == 1, "the queued object gets its own final page");
     const auto* image = log.objectOf(durableHostName(ns, healthy, 2));
     std::ifstream file(log.databasePath(*image, 0), std::ios::binary);
@@ -2545,6 +2772,8 @@ int main(int argc, char* argv[]) {
   else if (mode == "upstream-channel-eof") coworkerd::DurableLogChannelTest::upstreamChannelEof();
   else if (mode == "threaded-channel") coworkerd::DurableLogChannelTest::threadedChannel();
   else if (mode == "parked-websocket") coworkerd::DurableLogChannelTest::parkedWebSocket();
+  else if (mode == "websocket-frame-budget") coworkerd::DurableLogChannelTest::webSocketFrameBudget();
+  else if (mode == "websocket-upload-budget") coworkerd::DurableLogChannelTest::webSocketUploadBudget();
   else if (mode == "threaded-alarms") coworkerd::DurableLogChannelTest::threadedAlarms();
   else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
   else if (mode == "recovery-admission") coworkerd::DurableLogChannelTest::recoveryAdmission();

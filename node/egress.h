@@ -32,16 +32,21 @@ namespace coworkerd {
 struct EgressSource {
   std::string processId;
   uint64_t generation = 0;
+  bool durable = false;
 };
+
+enum class EgressDebit { charged, exhausted, expired };
 
 class EgressService final: public kj::HttpService {
 public:
   // `clusterEndpoints`: the cluster's own HOST[:PORT]s this node knows (members, the object store, its own
-  // listeners), asked at every refresh. `source`: the process holding an egress token, if any. `metered`: each part of
+  // listeners), asked at every refresh. `source`: the process holding an egress token, if any.
+  // `charge`: the caller's lease debit, checked before DNS or upstream I/O. `metered`: each part of
   // either body as it passes, for the tenant's usage (TenantUsage::egress).
   EgressService(const EgressConfig& config, std::string serverId, kj::Network& network, kj::Timer& timer,
       const kj::HttpHeaderTable& headerTable, std::function<std::vector<std::string>()> clusterEndpoints,
       std::function<std::optional<EgressSource>(const std::string&)> source,
+      std::function<EgressDebit(const std::string& invocationId, bool fromDurableProcess)> charge,
       std::function<void(const std::string& tenant, uint64_t bytes)> metered = {});
   ~EgressService() noexcept(false);
 

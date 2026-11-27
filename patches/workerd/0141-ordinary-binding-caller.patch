@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 11:26:58 +0800
+Subject: [PATCH] Use an empty object identity for ordinary D1 and object calls
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 7b0c5b5aeeb1d1c2addfafb7f80ffc200452d05f..69a54c498db6924c7a7fd4604f8f0031d9ce9bb2 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -5148,10 +5148,12 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+       return encode(root.asReader());
+     };
+     auto target = field(input(), "durableObject");
++    const auto callerNamespace = target.isObject() ? text(target, "namespaceId") : kj::str("");
++    const auto callerObject = target.isObject() ? text(target, "objectId") : kj::str("");
+     auto object = kj::str("{\"namespaceId\":", quoted(route.space),
+         ",\"className\":", quoted(route.className), ",\"objectId\":", quoted(objectId),
+-        ",\"callerNamespaceId\":", quoted(text(target, "namespaceId")),
+-        ",\"callerObjectId\":", quoted(text(target, "objectId")),
++        ",\"callerNamespaceId\":", quoted(callerNamespace),
++        ",\"callerObjectId\":", quoted(callerObject),
+         ",\"database\":", quoted(route.database),
+         "}");
+     return envelope(input(), "", false, kj::mv(object));

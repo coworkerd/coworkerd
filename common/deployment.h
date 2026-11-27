@@ -82,6 +82,7 @@ struct VersionDefinition {
   std::vector<DurableObjectBindingDefinition> durableObjects;
   std::vector<std::string> declaredClasses, deletedClasses;
   std::vector<DurableObjectRename> renamedClasses;
+  std::optional<uint32_t> subrequestLimit;
   // Input location only; excluded from immutable identity and authority state.
   std::filesystem::path packagePath;
   std::string key() const { return workerId + "@" + versionId; }
@@ -193,6 +194,11 @@ struct DurableObjectNamespace {
   std::string id, status = "active";
   uint32_t shards = 1024;
   bool operator==(const DurableObjectNamespace&) const = default;
+};
+
+struct PlatformClassRef {
+  std::string definition, name;
+  bool operator==(const PlatformClassRef&) const = default;
 };
 std::string namespacesStateJson(const std::map<std::string, DurableObjectNamespace>& namespaces);
 std::map<std::string, DurableObjectNamespace> decodeNamespacesState(const std::string& bytes,
@@ -340,6 +346,7 @@ public:
   struct NamespaceOwner {
     std::string tenant, workerId, className, database, status;
     uint32_t shards = 1024;
+    std::optional<PlatformClassRef> platformClass;
     bool isDatabase() const { return !database.empty(); }
     bool active() const { return status == "active"; }
   };

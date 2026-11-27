@@ -12,6 +12,8 @@
 #include "tenant-execution.h"
 #include "process-heat.h"
 #include "cpu-capacity.h"
+#include "node-cpu.h"
+#include "isolate-saturation.h"
 #include "placement-contract-test.h"
 #include "json.h"
 #include "process-culprit.h"
@@ -137,6 +139,64 @@ void liveRequestLease() {
 void write(const std::filesystem::path& path, const std::string& bytes) {
   std::ofstream file(path, std::ios::binary);
   KJ_REQUIRE(bool(file << bytes), path.c_str());
+}
+
+void nodeCpuUse() {
+  TempDir directory;
+  const auto root = std::filesystem::path(directory.path);
+  const auto group = root / "system.slice/worker.service";
+  std::filesystem::create_directories(group);
+  write(root / "cpu.max", "50000 100000\n");
+  std::istringstream membership("9:cpu:/legacy\n0::/system.slice/worker.service\n");
+  const auto ownGroup = cpuCgroupFromMembership(membership, root);
+  KJ_REQUIRE(ownGroup == group);  // The service has a cpu.stat and inherits its parent quota.
+  KJ_REQUIRE(cpusWithinQuota(8, ownGroup, root) == 1);
+  std::istringstream legacyOnly("9:cpu:/legacy\n");
+  KJ_REQUIRE(cpuCgroupFromMembership(legacyOnly, root).empty());
+
+  const auto stat = ownGroup / "cpu.stat";
+  NodeCpuUse cpu(stat, 0.5);
+  auto sample = [&](double nowMs, uint64_t usec) {
+    write(stat, "user_usec 10\nusage_usec " + std::to_string(usec) + "\nsystem_usec 0\n");
+    cpu.sample(nowMs);
+  };
+  sample(0, 0);
+  sample(1000, 500000);
+  KJ_REQUIRE(!cpu.full(1000), "two seconds of history are required");
+  sample(2000, 949999);
+  KJ_REQUIRE(!cpu.full(2000), "one microsecond below the threshold");
+  sample(3000, 1425000);
+  KJ_REQUIRE(cpu.full(3000), "950 permille of half a CPU");
+  KJ_REQUIRE(!cpu.full(5001), "stale samples do not refuse");
+  sample(4000, 1425000);
+  KJ_REQUIRE(!cpu.full(4000), "idle clears saturation as the window moves");
+  sample(5000, 100000);
+  KJ_REQUIRE(!cpu.full(5000), "a counter reset discards the old window");
+  write(stat, "user_usec 10\n");
+  cpu.sample(6000);
+  KJ_REQUIRE(!cpu.full(6000), "missing usage clears the reading");
+}
+
+void isolateSaturation() {
+  const auto readings = parseIsolateSaturation(R"JSON({"residentWorkers":[
+    {"planRevision":"agree", "instance":2, "isolate":"worker-a", "isolateBusy":{"throughMonotonicMs":5000,"permille":900}},
+    {"planRevision":"agree", "instance":1, "isolate":"worker-a", "isolateBusy":{"throughMonotonicMs":4800,"permille":1000}},
+    {"planRevision":"below", "instance":1, "isolate":"worker-b", "isolateBusy":{"throughMonotonicMs":5000,"permille":899}},
+    {"planRevision":"loading", "instance":1, "isolate":"worker-c", "isolateBusy":{"throughMonotonicMs":5000,"permille":1000}},
+    {"planRevision":"loading", "instance":2, "isolate":"worker-c"},
+    {"planRevision":"multiple", "instance":1, "isolate":"worker-d", "isolateBusy":{"throughMonotonicMs":5000,"permille":1000}},
+    {"planRevision":"multiple", "instance":2, "isolate":"worker-e", "isolateBusy":{"throughMonotonicMs":5000,"permille":1000}},
+    {"planRevision":"missing", "instance":1, "isolate":"worker-f"},
+    {"planRevision":"invalid", "instance":1, "isolate":"worker-g", "isolateBusy":{"throughMonotonicMs":5000,"permille":1001}}
+  ]})JSON");
+  KJ_REQUIRE(readings.size() == 1 && readings.at("agree") == 5000,
+      "only the latest valid, unambiguous sample at the inclusive threshold should survive");
+  KJ_REQUIRE(hasSaturatedPlan(readings, "agree", 7500));
+  KJ_REQUIRE(!hasSaturatedPlan(readings, "agree", 7501), "stale window end");
+  KJ_REQUIRE(!hasSaturatedPlan(readings, "agree", 4999), "future window end");
+  KJ_REQUIRE(!hasSaturatedPlan(readings, "absent", 5000));
+  KJ_REQUIRE(parseIsolateSaturation("{").empty());
+  KJ_REQUIRE(parseIsolateSaturation(R"({"residentWorkers":[]})").empty());
 }
 
 void nativeConfig() {
@@ -328,7 +388,7 @@ void eventLoopProgress() {
       "ready I/O must be checked during a continuation burst, every so many turns", port.polls, port.largestBatch);
   // The interval itself: 32 to 128 turns, not the old 1 (a poll every other turn).
   KJ_REQUIRE(NODE_BUSY_POLL_INTERVAL >= 32 && NODE_BUSY_POLL_INTERVAL <= 128, NODE_BUSY_POLL_INTERVAL);
-  KJ_REQUIRE(port.largestBatch >= 8, "a poll every few turns is the waste v138 removed", port.largestBatch);
+  KJ_REQUIRE(port.largestBatch >= 8, "ready I/O polls must leave room for a batch of continuations", port.largestBatch);
 }
 
 // A line its server already cut (the threaded server forwards at most 4,096 bytes of a message, and its size) is
@@ -504,11 +564,32 @@ void treeLease() {
 }
 
 void budget() {
-  auto child = childBudget(8, 3, false);
-  KJ_REQUIRE(child.grant == 3 && child.charged == 4 && child.remaining == 4);
-  KJ_REQUIRE(childBudget(1, 3, false).remaining == 0);
-  auto naive = childBudget(8, 3, true);
-  KJ_REQUIRE(naive.grant == 8 && naive.charged == 0 && naive.remaining == 8);
+  InvocationBudget root(DEFAULT_SUBREQUEST_LIMIT, DEFAULT_D1_QUERY_LIMIT);
+  for (unsigned call = 0; call < 100; ++call) {
+    KJ_REQUIRE(root.debit(false) == BudgetDebit::charged);
+  }
+  InvocationBudget child(2, DEFAULT_D1_QUERY_LIMIT);
+  KJ_REQUIRE(child.debit(false) == BudgetDebit::charged);
+  KJ_REQUIRE(child.debit(false) == BudgetDebit::charged);
+  KJ_REQUIRE(child.debit(false) == BudgetDebit::subrequestsExhausted);
+  KJ_REQUIRE(child.remaining == 0 && child.d1Remaining == 1'000);
+  KJ_REQUIRE(root.remaining == 9'900 && root.d1Remaining == 1'000);
+
+  InvocationBudget wide(MAX_SUBREQUEST_LIMIT, DEFAULT_D1_QUERY_LIMIT);
+  KJ_REQUIRE(wide.subrequestLimit == 10'000'000);
+  KJ_REQUIRE(wide.debit(false) == BudgetDebit::charged && wide.remaining == 9'999'999);
+
+  InvocationBudget database(3, 1);
+  KJ_REQUIRE(database.debit(true) == BudgetDebit::charged);
+  KJ_REQUIRE(database.remaining == 2 && database.d1Remaining == 0);
+  KJ_REQUIRE(database.debit(true) == BudgetDebit::d1Exhausted && database.remaining == 2);
+  KJ_REQUIRE(child.debit(true) == BudgetDebit::subrequestsExhausted && child.d1Remaining == 1'000);
+
+  InvocationBudget socket(2, 50);
+  KJ_REQUIRE(socket.debit(true) == BudgetDebit::charged);
+  KJ_REQUIRE(socket.debit(false) == BudgetDebit::charged);
+  socket.refill();
+  KJ_REQUIRE(socket.remaining == 2 && socket.d1Remaining == 50);
 }
 void identity() {
   KJ_REQUIRE(invocationName("n1", "epoch-9", "-tree-", 12) == "n1.epoch-9-tree-12");
@@ -914,6 +995,8 @@ int main(int argc, char* argv[]) {
   else if (name == "identity") identity();
   else if (name == "admission") admission();
   else if (name == "placement") placementContracts();
+  else if (name == "cpu-saturation") nodeCpuUse();
+  else if (name == "isolate-saturation") isolateSaturation();
   else if (name == "cpu-culprit-current-behavior") cpuCulpritCurrentBehavior();
   else if (name == "memory-culprit") memoryCulprit();
   else if (name == "package") package();

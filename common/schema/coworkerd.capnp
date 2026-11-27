@@ -62,9 +62,14 @@ interface JsRpcSession @0xbbfec607777f1620 {
   # No methods: the session lasts as long as the capability is held.
 }
 
+interface InvocationBudgetLifetime {
+  # Opaque to workerd. Dropping this capability releases the live invocation budget.
+}
+
 interface WorkerdBootstrap @0x878048cda334ade3 {
-  startEvent @0 (cfBlobJson :Text, fromPersistentStub :Bool)
-      -> (dispatcher :EventDispatcher);
+  startEvent @0 (cfBlobJson :Text, fromPersistentStub :Bool, fromHandoff :Bool,
+                 forwardedBy :Text, causedBy :List(Text), budgetLifetime :Capability, budgetTicket :UInt64)
+      -> (dispatcher :EventDispatcher, budgetAccepted :Bool);
 }
 
 # Native ordinary-process loopback props. The wire type and method are private
@@ -144,11 +149,10 @@ interface ThreadedSocketControl @0xdc432f018090bcc4 {
 }
 
 interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {
-  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer)
-      -> (dispatcher :EventDispatcher);
+  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer, budgetLifetime :Capability,
+                       budgetTicket :UInt64, lease :NativeLeaseControl)
+      -> (dispatcher :EventDispatcher, budgetAccepted :Bool);
   socketControl @1 () -> (control :ThreadedSocketControl);
-  startLeasedEvent @2 (cfBlobJson :Text, coworkerdProps :AnyPointer, lease :NativeLeaseControl)
-      -> (dispatcher :EventDispatcher);
 }
 
 interface NativeLeaseControl @0xbbb54ed58665162a $Cxx.allowCancellation {
@@ -260,6 +264,7 @@ struct RemoteInvocation {
   contentHash @2 :Text;
   treeId @3 :Text;
   parentInvocationId @4 :Text;
+  # Reserved for the former sender-assigned allowance. Executing nodes now resolve their own limit.
   subrequestGrant @5 :UInt16;
   remainingMs @6 :Float64;
   depth @7 :UInt16;
@@ -276,7 +281,10 @@ struct RemoteInvocation {
   entrypoint @18 :Text;
   # Opaque native loopback props, including its capability table. Nodes only copy it.
   coworkerdProps @19 :AnyPointer;
-  callerLease @20 :CallerLease;
+  # Set by dynamic ingress placement on its first pass. A peer may decline before execution
+  # on soft saturation. The ingress can then retry without this preference.
+  preferIdle @20 :Bool;
+  callerLease @21 :CallerLease;
 }
 
 # A request to a Durable Object from the node where its caller runs to the node that owns the object's shard. The owner
@@ -300,6 +308,7 @@ struct ObjectInvocation {
   originServerId @8 :Text;
   treeId @9 :Text;
   parentInvocationId @10 :Text;
+  # Reserved for the former sender-assigned allowance.
   subrequestGrant @11 :UInt16;
   depth @12 :UInt16;
   remainingMs @13 :Float64;
@@ -315,7 +324,12 @@ struct ObjectInvocation {
   alarmRetryCount @21 :UInt32;
   # Internal alarm routing; only the root object schedules alarms, always at facet 0.
   alarmFacetId @22 :UInt32 = 1;
-  callerLease @23 :CallerLease;
+  # For platform namespaces the owner resolves this class reference against its own build.
+  platformDefinition @23 :Text;
+  platformClass @24 :Text;
+  # SQL wall time left at the sender. Older nodes omit the field.
+  sqlRemainingMs @25 :Float64 = -1;
+  callerLease @26 :CallerLease;
 }
 
 struct ServerConfig {
@@ -485,6 +499,12 @@ struct ServerConfig {
     threadedStorage @24 :Bool = false;
     # When a new definition first waits for a busy tree, bound the remaining drain time.
     versionDrainTimeoutMs @25 :UInt32 = 30000;
+    # Threaded platform database: current transaction's WAL plus live SQLite temporary files.
+    sqlDatabaseSpillBytes @26 :UInt64 = 1073741824;
+    # Total of those charges in one persistent durable process. 0 uses four times the database limit.
+    sqlProcessSpillBytes @27 :UInt64 = 0;
+    # Shared across all threaded hibernatable WebSocket data deliveries to homes on this node.
+    socketFrameBytesPerNode @28 :UInt64 = 134217728;
   }
 
   struct IngressConfig {
@@ -958,6 +978,11 @@ struct DeploymentDefinition {
   # The version's Durable Object Bindings and classes (v2 only).
   durableObjects @12 :List(DurableObjectBinding);
   classes @13 :DurableObjectClasses;
+  limits @14 :VersionLimits;
+}
+
+struct VersionLimits {
+  subrequests @0 :UInt32;
 }
 
 # The value of a secret's deployment key secrets/<workerId>/<name>: the secret string and when it
@@ -1034,6 +1059,7 @@ struct Manifest {
     secrets @11 :List(Text);
     durableObjects @12 :List(DurableObjectBinding);
     classes @13 :DurableObjectClasses;
+    limits @14 :VersionLimits;
   }
 
   struct Binding {
@@ -1144,8 +1170,8 @@ struct InvocationDescriptor {
 }
 
 struct InvocationLease {
-  remainingSubrequests @0 :UInt16;
-  grant @1 :UInt16;
+  remainingSubrequests @0 :UInt32;
+  subrequestLimit @1 :UInt32;
   expiresAtMonotonicMs @2 :Float64;
 }
 

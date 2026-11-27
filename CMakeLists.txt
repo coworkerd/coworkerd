@@ -18,10 +18,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(capnproto)
 
-# KJ's HTTP entity writers must honor AsyncOutputStream::abortWrite(). Without
-# this, destroying a chunked writer after an upstream read failure sends EOF.
+# Patch KJ's HTTP disconnect handling and the Cap'n Proto HTTP adapter's
+# ownership of borrowed request data through upload acknowledgment.
 find_package(Git REQUIRED)
-foreach(patch IN ITEMS kj-http-abort.diff kj-peer-half-close.diff)
+foreach(patch IN ITEMS kj-http-abort.diff capnp-http-upload.diff kj-peer-half-close.diff)
   set(patch_file "${CMAKE_CURRENT_SOURCE_DIR}/patches/${patch}")
   execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${patch_file}"
     WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" RESULT_VARIABLE patch_check
@@ -101,9 +101,15 @@ target_compile_features(common PUBLIC cxx_std_23)
 target_include_directories(common PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/common" "${GENERATED_DIR}")
 target_link_libraries(common PUBLIC capnp-http-over OpenSSL::Crypto)
 
-add_executable(coworkerd
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "runtime/platform.js" "runtime/sql-database.js")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/runtime/platform.js" COWORKERD_PLATFORM_SOURCE)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/runtime/sql-database.js" COWORKERD_SQL_DATABASE_SOURCE)
+configure_file(node/platform-source.h.in "${GENERATED_DIR}/platform-source.h" @ONLY)
+
+add_library(coworkerd-node OBJECT
   node/main.c++
   node/process-pool.c++
+  node/isolate-saturation.c++
   node/secret-dictionary.c++
   node/async-log.c++
   node/memory-watermark.c++
@@ -117,6 +123,7 @@ add_executable(coworkerd
   node/recovery-history.c++
   node/database-seed.c++
   node/root-objects.c++
+  node/platform-definition.c++
   node/bundle-cache.c++
   node/desired-state.c++
   node/desired-state-store.c++
@@ -128,8 +135,20 @@ add_executable(coworkerd
   node/blob-store.c++
   node/v8-sandbox.c++
 )
-target_include_directories(coworkerd PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
-target_link_libraries(coworkerd PRIVATE common kj-tls-local)
+target_include_directories(coworkerd-node PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
+target_link_libraries(coworkerd-node PUBLIC common kj-tls-local)
+
+add_executable(coworkerd node/platform-fixture.c++)
+target_link_libraries(coworkerd PRIVATE coworkerd-node)
+
+add_executable(coworkerd-platform-test EXCLUDE_FROM_ALL node/platform-fixture.c++)
+target_compile_definitions(coworkerd-platform-test PRIVATE COWORKERD_PLATFORM_FIXTURE)
+target_link_libraries(coworkerd-platform-test PRIVATE coworkerd-node)
+
+add_executable(coworkerd-platform-definition-test EXCLUDE_FROM_ALL
+  node/platform-definition-test.c++ node/platform-definition.c++ node/platform-fixture.c++)
+target_link_libraries(coworkerd-platform-definition-test PRIVATE common)
+add_test(NAME node-platform-definition COMMAND coworkerd-platform-definition-test)
 
 add_executable(coworkerd-apiserver
   apiserver/main.c++
@@ -225,13 +244,15 @@ set_tests_properties(node-log-stream node-log-many-values PROPERTIES TIMEOUT 30)
 set_tests_properties(node-log-generations node-secret-rotations node-secret-limits node-secret-share
   node-secret-pinned-rotation node-secret-rotation-cooldown node-log-stale PROPERTIES TIMEOUT 60)
 add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
-  node/node-contract-test.c++ node/bundle-cache.c++ apiserver/manifests.c++)
+  node/node-contract-test.c++ node/bundle-cache.c++ node/isolate-saturation.c++ apiserver/manifests.c++)
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
 add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
 add_test(NAME durable-upstream-channel-eof COMMAND coworkerd-durable-channel-test upstream-channel-eof)
 add_test(NAME durable-threaded-channel COMMAND coworkerd-durable-channel-test threaded-channel)
 add_test(NAME durable-parked-websocket COMMAND coworkerd-durable-channel-test parked-websocket)
+add_test(NAME durable-websocket-frame-budget COMMAND coworkerd-durable-channel-test websocket-frame-budget)
+add_test(NAME durable-websocket-upload-budget COMMAND coworkerd-durable-channel-test websocket-upload-budget)
 add_test(NAME durable-threaded-alarms COMMAND coworkerd-durable-channel-test threaded-alarms)
 add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
 add_test(NAME durable-tail-equivalence COMMAND coworkerd-durable-channel-test tail)
@@ -249,7 +270,7 @@ add_test(NAME durable-restored-tail-negative-controls COMMAND coworkerd-durable-
 # Freed memory is overwritten, so that a load touching its destroyed cache fails this test instead of passing by luck.
 set_tests_properties(durable-segment-cache PROPERTIES ENVIRONMENT "MALLOC_PERTURB_=165")
 add_test(NAME durable-lease-tracker COMMAND coworkerd-durable-channel-test lease-tracker)
-foreach(case held expired stale-timer slow-flush wait wait-expired old-epoch not-held)
+foreach(case held expired stale-timer slow-flush rotate completion-error wait wait-expired old-epoch not-held)
   add_test(NAME durable-lease-${case} COMMAND coworkerd-durable-channel-test lease-confirm ${case})
 endforeach()
 foreach(case raise unverified old-ask coalesce outage)
@@ -263,7 +284,7 @@ foreach(case fenced full cut-short limit corrupt fenced-reconnect full-reconnect
     reacquired unreachable)
   add_test(NAME durable-refused-owner-${case} COMMAND coworkerd-durable-channel-test refused-owner ${case})
 endforeach()
-foreach(case native-config tenant-execution deadlines event-loop shutdown-signals once-per-turn memory-events durable-not-sent tenant-line-truncation trial-verdicts leases tree-lease budget identity admission placement package module-types cache
+foreach(case native-config tenant-execution deadlines event-loop shutdown-signals once-per-turn memory-events durable-not-sent tenant-line-truncation trial-verdicts leases tree-lease budget identity admission placement cpu-saturation isolate-saturation package module-types cache
     cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()
@@ -300,7 +321,7 @@ endif()
 add_custom_target(check
   COMMAND "${CMAKE_CTEST_COMMAND}" --output-on-failure --no-tests=error -C $<CONFIG> ${COWORKERD_TEST_REPORT_ARGS}
   DEPENDS coworkerd-durable-channel-test coworkerd-node-contract-test coworkerd-process-culprit-test coworkerd-log-cleaning-test coworkerd-config-test
-    coworkerd-object-store-test coworkerd-v8-sandbox-test
+    coworkerd-object-store-test coworkerd-v8-sandbox-test coworkerd-platform-definition-test coworkerd-platform-test
   USES_TERMINAL)
 
 # The CLI tests use the Wrangler and Miniflare versions pinned in cli/package-lock.json.

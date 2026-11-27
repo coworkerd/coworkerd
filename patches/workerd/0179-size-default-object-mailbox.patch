@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Thu, 26 Nov 2026 12:20:09 +0800
+Subject: [PATCH] Size the default object mailbox for ordinary request bursts
+
+Use the node process in-flight default as the waiting-event ceiling and allow an average of 4 KiB in declared bytes per slot. Keep charging the shared memory and descriptor budgets for each admitted event.
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index f676810d53511142b686177f7362e90f848fc913..cca899fe5587696686ccf4b5bb8f2b1b9ecebf00 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2780,6 +2780,10 @@ struct ThreadedServer {
+           boundedDurableSetting("COWORKERD_DO_TEST_FD_HEADROOM", 256, 65536) + uint64_t(limit) * 5;
+       KJ_REQUIRE(
+           files.rlim_cur > fdHeadroom, "durable test descriptors leave no admission headroom");
++      // Match the node's default process in-flight limit and allow 4 KiB of
++      // declared bytes per waiting event on average.
++      constexpr uint32_t defaultMailboxDepth = 512;
++      constexpr uint64_t defaultMailboxBytes = uint64_t(defaultMailboxDepth) * 4096;
+       durableAdmission.emplace(
+           server::DurableAdmission::Limits{
+             .capacity = {.threads = limit,
+@@ -2788,9 +2792,9 @@ struct ThreadedServer {
+             .tree = {.descriptors = 4, .memory = 16 * 1024},
+             .event = {.descriptors = 1, .memory = 4096},
+             .residentTarget = uint32_t(configuredCount("COWORKERD_DO_RESIDENT_OBJECTS", 4096)),
+-            .mailboxDepth =
+-                uint32_t(boundedDurableSetting("COWORKERD_DO_TEST_MAILBOX_EVENTS", 4, 65536)),
+-            .mailboxBytes = configuredCount("COWORKERD_DO_TEST_MAILBOX_BYTES", 64 * 1024),
++            .mailboxDepth = uint32_t(boundedDurableSetting(
++                "COWORKERD_DO_TEST_MAILBOX_EVENTS", defaultMailboxDepth, 65536)),
++            .mailboxBytes = configuredCount("COWORKERD_DO_TEST_MAILBOX_BYTES", defaultMailboxBytes),
+           },
+           durableNumber(std::string_view(this->identity).substr(colon + 1)));
+     }

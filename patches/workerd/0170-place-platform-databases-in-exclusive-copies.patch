@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 22:47:36 +0800
+Subject: [PATCH] Place platform databases in exclusive isolate copies
+
+
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 7451f2ee2c20206d35cb59ff1954bd39467f97fe..d706e00f8c866295dbd39e4363610f498065df6c 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -65,6 +65,25 @@ KJ_TEST("platform durable plans pin the class and copy to the tenant") {
+   KJ_EXPECT(!platformDurablePlan(input.get(), alpha.get(), selection.get(), route));
+ }
+ 
++KJ_TEST("platform databases require a copy pinned to the specific object") {
++  JsonDoc input(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
++      "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
++      "durableObject":{"database":"first"}})"));
++  JsonDoc plan(kj::str(R"({"kind":"platformDurable","definitionName":"coworkerd:platform","tenant":"alpha"})"));
++  JsonDoc selection(kj::str(R"({"className":"SqlDatabase"})"));
++  DurableRoute route{};
++  route.key = {"namespace-one", "object-one"};
++  route.open.className = "SqlDatabase";
++  route.open.definition = platformCopyKey(input.get(), plan.get());
++  KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
++  route.open.definition = platformCopyKey(input.get(), plan.get(), &route.key);
++  KJ_EXPECT(platformDurablePlan(input.get(), plan.get(), selection.get(), route));
++  route.key.namespaceId = "namespace-two";
++  KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
++  route.key = {"namespace-one", "object-two"};
++  KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
++}
++
+ KJ_TEST("fatal record identifies only the invocation on the current V8 thread") {
+   int fds[2];
+   KJ_SYSCALL(pipe(fds));
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index b9f6cab54ffdd9e8528b666bc96e685ce3c871e7..593c2a0fdecf25d0d14d24b09a6f57417cb15ab2 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1984,7 +1984,7 @@ kj::String invocationIdentity(Slot &slot, Json::Reader descriptor) {
+ }
+ 
+ CompatibilityFlags::Builder compileTenantFlags(
+-    Slot &slot, Json::Reader descriptor, Reporter &reporter) {
++    Slot &slot, Json::Reader descriptor, Reporter &reporter, bool productPlatform = false) {
+   // Compatibility flags are tenant validation, before package decoding.
+   slot.loadStage = threaded::LoadStage::EVALUATION;
+   auto flags = slot.flagsArena.initRoot<CompatibilityFlags>();
+@@ -2001,8 +2001,11 @@ CompatibilityFlags::Builder compileTenantFlags(
+       list.set(i++, item.getString());
+     }
+   }
++  // The product SQL class uses the same experimental SQL methods as the upstream runtime.
++  const kj::StringPtr permittedPlatformFlags[] = {"experimental"};
+   compileCompatibilityFlags(text(descriptor, "compatibilityDate"), list.asReader(), flags, reporter,
+-      false, CompatibilityDateValidation::CODE_VERSION, {});
++      false, CompatibilityDateValidation::CODE_VERSION,
++      productPlatform ? kj::arrayPtr(permittedPlatformFlags, 1) : kj::ArrayPtr<const kj::StringPtr>());
+   reporter.requireValid();
+   if (flags.getPreciseTimers()) unsupported("precise_timers is disabled for tenants");
+   return flags;
+@@ -2104,7 +2107,15 @@ std::string digest(kj::ArrayPtr<const kj::byte> value) {
+   return kj::encodeHex(result).cStr();
+ }
+ 
+-std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan) {
++bool productPlatformPlan(Json::Reader plan) {
++  auto kind = field(plan, "kind");
++  auto name = field(plan, "definitionName");
++  return kind.isString() && kind.getString() == "platformDurable" &&
++      name.isString() && name.getString() == "coworkerd:platform";
++}
++
++std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
++    const server::DurableAdmission::Key *object = nullptr) {
+   auto namedLimit = [&](kj::StringPtr name) -> uint32_t {
+     auto value = field(descriptor, name);
+     if (value.isNull()) return 0;
+@@ -2116,15 +2127,22 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan) {
+       text(descriptor, "versionId"), "\n", text(descriptor, "definitionHash"), "\n",
+       text(descriptor, "contentHash"), "\n", namedLimit("cpuLimitMs"), "\n",
+       namedLimit("memoryLimitMiB"));
++  if (object != nullptr) {
++    auto exclusive = kj::str(identity, "\n", object->namespaceId.c_str(), "\n", object->objectId.c_str());
++    return "platform-object-v1:" + digest(exclusive.asBytes());
++  }
+   return "platform-v1:" + digest(identity.asBytes());
+ }
+ 
+ bool platformDurablePlan(Json::Reader input, Json::Reader plan, Json::Reader selection,
+     const DurableRoute &route) {
+   const auto tenant = text(plan, "tenant");
++  const auto database = field(field(input, "durableObject"), "database");
++  const bool isDatabase = database.isString() && database.getString().size() > 0;
++  if (isDatabase != (productPlatformPlan(plan) && route.open.className == "SqlDatabase")) return false;
+   if (tenant.size() == 0 || text(input, "workerId") != kj::str(tenant, "/:platform") ||
+       text(input, "format") != "v2" || text(selection, "className") != route.open.className.c_str() ||
+-      platformCopyKey(input, plan) != route.open.definition) return false;
++      platformCopyKey(input, plan, isDatabase ? &route.key : nullptr) != route.open.definition) return false;
+   auto empty = [](Json::Reader value) {
+     return value.isNull() || (value.isArray() && value.getArray().size() == 0);
+   };
+@@ -3632,7 +3650,9 @@ struct ThreadedServer {
+   kj::Own<Worker> compile(Slot &slot, Json::Reader descriptor, kj::StringPtr source) {
+     slot.loadStage = threaded::LoadStage::PACKAGE;
+     Reporter reporter;
+-    auto flags = compileTenantFlags(slot, descriptor, reporter);
++    // A durable package reaches this compiler after DurableBootstrap has checked the trusted root plan.
++    const bool productPlatform = slot.resetDurableRoot && productPlatformPlan(field(descriptor, "rootPlan"));
++    auto flags = compileTenantFlags(slot, descriptor, reporter, productPlatform);
+     auto config = slot.configArena.initRoot<server::config::Worker>();
+     auto main = text(descriptor, "mainModule");
+     if (field(descriptor, "format").isString() && text(descriptor, "format") == "v2") {

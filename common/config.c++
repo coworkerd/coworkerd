@@ -50,6 +50,11 @@ void DurableLogConfig::validate() const {
   KJ_REQUIRE(peerBufferBytes >= (1u << 20), "durableObjects.peerBufferBytes is at least 1048576");
   KJ_REQUIRE(objectBytes >= (1u << 20), "durableObjects.objectBytes is at least 1048576");
   KJ_REQUIRE(checkpointBytes >= (1u << 16), "durableObjects.checkpointBytes is at least 65536");
+  KJ_REQUIRE(sqlDatabaseSpillBytes >= (1ull << 16) && sqlDatabaseSpillBytes <= (1ull << 40),
+      "durableObjects.sqlDatabaseSpillBytes is between 64 KiB and 1 TiB");
+  KJ_REQUIRE(sqlProcessSpillBytes == 0 ||
+      (sqlProcessSpillBytes >= (1ull << 16) && sqlProcessSpillBytes <= (4ull << 40)),
+      "durableObjects.sqlProcessSpillBytes is zero or between 64 KiB and 4 TiB");
   KJ_REQUIRE(recoverParallelism > 0 && recoverParallelism <= 16,
       "durableObjects.recoverParallelism is between 1 and 16");
   KJ_REQUIRE(rebuildConcurrency > 0 && rebuildConcurrency <= 64,
@@ -251,6 +256,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.quarantineProcesses = root.getQuarantineProcesses();
   auto durable = root.getDurableObjects();
   result.processPool.durableProcesses = durable.getProcesses();
+  result.durableSocketFrameBytesPerNode = durable.getSocketFrameBytesPerNode();
   result.durableLog.peers = durable.getPeers();
   result.durableLog.confirmTimeoutMs = durable.getConfirmTimeoutMs();
   result.durableLog.versionDrainTimeoutMs = durable.getVersionDrainTimeoutMs();
@@ -265,6 +271,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.durableLog.peerBufferBytes = durable.getPeerBufferBytes();
   result.durableLog.objectBytes = durable.getObjectBytes();
   result.durableLog.checkpointBytes = durable.getCheckpointBytes();
+  result.durableLog.sqlDatabaseSpillBytes = durable.getSqlDatabaseSpillBytes();
+  result.durableLog.sqlProcessSpillBytes = durable.getSqlProcessSpillBytes();
   result.durableLog.idleCheckpointMs = durable.getIdleCheckpointMs();
   result.durableLog.uploadRetryMs = durable.getUploadRetryMs();
   result.durableLog.uploadRetryMaxMs = durable.getUploadRetryMaxMs();

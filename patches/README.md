@@ -8,6 +8,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 | `workerd/series` | The order of the patches |
 | `workerd/0001-native-binding.patch` ... | One patch per file; the header of each states its purpose |
 | `kj-http-abort.diff` | A change to Cap'n Proto's KJ that `CMakeLists.txt` applies when it builds the daemons: KJ's HTTP entity writers honor `abortWrite()`, so a response that fails midway ends with an error instead of looking complete |
+| `capnp-http-upload.diff` | The node's HTTP-over-Cap'n Proto adapter can own a borrowed body through upload acknowledgment and release it while the HTTP reply is pending |
 | `kj-peer-half-close.diff` | Exposes a peer's write-side shutdown without consuming any input so ingress can cancel a pending WebSocket upgrade |
 
 ## How the series is maintained
@@ -57,11 +58,59 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0107 blocks socket mutation during the saved-state handoff, resolves interrupted adoption,
   and requires an HTTP upgrade for threaded hibernatable pairs. Forced session cancellation is scoped
   to a code-update reset.
+  Patch 0122 cancels home tasks, destroys resident roots, and cancels facet drains queued by those roots.
+  The actor index and WAL Home stay live through actor cleanup, shipper deregistration, and SQLite close.
+  It changes only the threaded server and its tests.
+  Patch 0185 measures wall time under the isolate lock for threaded stateless Workers. The JSG lock
+  notifies the existing isolate observer at acquire and release. The threaded lifecycle publishes
+  a bounded sliding-window reading for each loaded isolate.
   Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
   quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and
   WebSocket hooks carry a native upgrade through local facet fetches. The legacy hibernation manager
   and the threaded host validate the upgrade against the tree that staged it.
+  Patch 0109 reads raw WebSocket bodies in `src/workerd/threaded/threaded-server.c++`. The existing
+  invocation descriptor supplies the event type, expected length and control metadata.
+  Patches 0150 and 0151 recognize the platform Durable Object definition on the threaded host. The host checks the
+  tenant and local definition pin before the home uses the existing package compiler and actor path.
+  Both patches use `threaded-server.c++` and `threaded-server-test.c++` in `src/workerd/threaded/`.
+  Patch 0170 validates an object-specific copy key for platform databases and permits the
+  built-in package's SQL compatibility flag. It uses the same two files.
+  Patch 0171 passes a per-request wall deadline and session disconnect check from the threaded
+  database home into the existing SQLite execution scope. It extends the SQL API's experimental
+  hooks for checking the same deadline from the platform class before returning results.
+  Patch 0172 starts the threaded WAL confirmation clock after the synchronous SQL turn and lets
+  the platform database's output-gate watchdog cover both windows. The `io/worker.{h,c++}` hook sets
+  that watchdog when the database home is created. The home finishes delivering a database reply
+  before it starts the next queued SQL event.
+  Patch 0173 bounds the platform database's WAL frame writes using the capacity supplied by the node.
+  The SQLite VFS checks the frame span, and the SQL transaction returns a limit refusal after rollback.
+  The storage actor still owns confirmation of successful commits.
+  Patch 0175 keeps WAL cleanup out of exception unwinding and tests a group of individually
+  valid SQL transactions whose frames require more than one record.
+  Patch 0174 releases an empty platform database copy when the last root retires. It changes
+  the threaded server and tests the home-reservation guard.
+  Patch 0176 reserves `<tenant>/__databases` for the product SQL class's execution and metering
+  while the platform definition still supplies its code and isolate copy key.
+  Patch 0177 reclaims the least recently used eligible database when opening another
+  needs a home or a process reservation. The home closes the actor and releases its copy
+  before admission retries.
+  Patch 0178 settles platform SQL interruptions and removes any WAL tail spilled by the aborted
+  transaction. It keeps SQLite storage failures on the critical error path.
+  Patch 0179 sizes the default object mailbox for ordinary request bursts in
+  `src/workerd/threaded/threaded-server.c++`.
+  Patch 0181 marks a refused cold-copy reservation on the private threaded durable bootstrap. The node
+  uses that detail before it receives an event dispatcher to confirm that the operation never ran.
+  Patch 0182 uses SQLite's per-connection allocator meter for threaded platform databases.
+  A local heap refusal rolls back the current transaction and preserves the open connection.
+  Patch 0183 bounds uncommitted WAL and live SQLite temporary files across each threaded
+  platform database and its durable process. The SQLite VFS charges write extents and the
+  platform transaction settles spill refusals on the open connection.
+  Patch 0180 recognizes recorded database reservation returns at expiry, protects the returned
+  preparation credit after routing retirement, and counts lent heap headroom in the replacement band.
+  Patch 0184 adds each platform database's SQLite heap to its copy's process memory reservation
+  in 1 MiB steps. The hooks use the existing allocator scope in `src/workerd/util/` and the copy
+  accounting in `src/workerd/threaded/`.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
@@ -69,6 +118,16 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 - **A contract with the daemons.** The patches and the node change together (the CPU limit's parameters, the culprit
   reports and the descriptors workerd inherits are a contract between them), and a release's `VERSION` names the
   upstream tag and the series it was built from.
+
+`0140-invocation-budget-identity` carries the active event's trusted identity to the node's egress service and
+the legacy Durable Object binding shims. The threaded server also includes the calling object's identity on a
+Durable Object call so the node can count object hops. Its Rust paths are `server/root_loader.rs` and `server/bridge.rs`.
+`0142-hold-invocation-budget-through-drain` keeps the node's budget alive while the kernel holds the incoming
+request, including its existing background drain. An alarm carries its event identity, and the current incoming
+request inherits background work when the request that started it has drained.
+`0143-release-durable-budgets-over-parent-socket` keeps the budget attachment on the incoming request's observer
+reference. The legacy root loader forwards that token from the platform wrapper to the selected root. Threaded
+Durable Object processes return finished budget tickets on their existing parent-liveness socket.
 
 ## Working on the series
 
@@ -107,6 +166,37 @@ pins in `patches/workerd/artifacts.json`. Follow the [publishing steps](../CONTR
 `check` is the source side of checking a sync: the complete checkout tree differs
 from the tag in `UPSTREAM` by exactly the series, and each patch stays within its permitted paths. All four
 operations validate the series before mutating a checkout or exporting files.
+
+## Verifying a kernel pull request
+
+Follow [Sending a kernel change](../CONTRIBUTING.md#sending-a-kernel-change) to choose the fork base from
+`workerd/UPSTREAM` and open the two linked PRs. Run this manual check from the root of the product PR checkout
+using Git and Python 3. Set `fork_sha` to the full commit SHA on `coworkerd/workerd` that should contain the entire
+series. Use the fork PR head for a proposed series or its merge commit for a landed series.
+
+```sh
+(
+  set -e
+  fork_sha=FULL_FORK_COMMIT_SHA
+  tag=$(sed -n 's/^tag=//p' patches/workerd/UPSTREAM)
+  checkout=$(mktemp -d)
+  git init -q "$checkout"
+  git -C "$checkout" fetch --depth=1 https://github.com/cloudflare/workerd.git "refs/tags/${tag}:refs/tags/${tag}"
+  git -C "$checkout" fetch --depth=1 https://github.com/coworkerd/workerd.git "$fork_sha"
+  git -C "$checkout" switch --detach "$fork_sha"
+  python3 scripts/workerd-patches.py check --checkout "$checkout"
+)
+```
+
+`check` verifies the `UPSTREAM` tag and commit, replays the files in `series` order in a temporary index, and
+compares the resulting full Git tree with the clean fork checkout. A successful run reports `passed: true`
+and identical `expectedTree` and `actualTree` IDs. Record the fork SHA and tree ID on the product PR so reviewers
+can repeat the check against the same revisions.
+
+For a merged example, run the check from product commit `840acf4ebf57b1c8a685b3138331370b8645c5fc`
+with fork commit `8fcc166a0865aa9df0092ee2d717059b2f7ad1fa`. The expected tree is
+`1b629d3906724d898bb6262c26997e01cb25da7a`. [Product PR #117](https://github.com/coworkerd/coworkerd/pull/117)
+and [fork PR #29](https://github.com/coworkerd/workerd/pull/29) link to each other.
 
 ## Rust server port (v1.20261114.1)
 

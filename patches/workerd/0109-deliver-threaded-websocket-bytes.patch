@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Fri, 27 Nov 2026 13:52:36 +0800
+Subject: [PATCH] Read threaded Durable Object WebSocket frames as bytes
+
+Use typed metadata from the node invocation descriptor and read the fixed-length body directly into the hibernation event buffer. Preserve the existing Worker event types and output gate.
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 20f5e0299499088e0c7fcdfaa89a9e7ed3ce62d7..477cef832e7392b3c9c2135cf6a8230266e6314d 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -4839,11 +4839,52 @@ class DurableAlarmHttp final: public kj::HttpService {
+ };
+ 
+ struct DurableSocketEvent {
++  enum class Kind { TEXT, BINARY, CLOSE, ERROR };
+   kj::Own<Worker::Actor> actor;
+   kj::String socketId;
+   uint64_t position;
++  Kind kind;
++  size_t bytes;
++  uint16_t closeCode = 0;
++  bool wasClean = false;
++  kj::Maybe<kj::Date> lastAutoResponse;
+ };
+ 
++DurableSocketEvent readDurableSocketEvent(Json::Reader descriptor, kj::Own<Worker::Actor> actor) {
++  using Kind = DurableSocketEvent::Kind;
++  auto name = text(descriptor, "kind");
++  Kind kind;
++  size_t limit = 32u << 20;
++  if (name == "text") {
++    kind = Kind::TEXT;
++  } else if (name == "binary") {
++    kind = Kind::BINARY;
++  } else if (name == "close") {
++    kind = Kind::CLOSE;
++    limit = 123;  // A close control frame allows 125 bytes, including its two-byte status.
++  } else {
++    KJ_REQUIRE(name == "error", "invalid durable socket event kind");
++    kind = Kind::ERROR;
++    limit = 0;
++  }
++  const auto bytes = durableNumber(descriptor, "bytes");
++  KJ_REQUIRE(bytes <= limit, "invalid durable socket event size");
++  DurableSocketEvent event{kj::mv(actor), text(descriptor, "id"),
++    durableNumber(descriptor, "frame"), kind, static_cast<size_t>(bytes)};
++  if (kind == Kind::CLOSE) {
++    const auto code = durableNumber(descriptor, "code");
++    KJ_REQUIRE(code <= UINT16_MAX, "invalid durable socket close code");
++    event.closeCode = static_cast<uint16_t>(code);
++    event.wasClean = flag(descriptor, "wasClean");
++  }
++  if (field(descriptor, "autoResponseUnixMs").isString()) {
++    const auto milliseconds = durableNumber(descriptor, "autoResponseUnixMs");
++    KJ_REQUIRE(milliseconds <= INT64_MAX / 1000000);
++    event.lastAutoResponse = kj::UNIX_EPOCH + milliseconds * kj::MILLISECONDS;
++  }
++  return event;
++}
++
+ class DurableSocketHttp final: public kj::HttpService {
+  public:
+   DurableSocketHttp(kj::Own<WorkerInterface> worker, DurableSocketEvent event,
+@@ -4855,39 +4896,29 @@ class DurableSocketHttp final: public kj::HttpService {
+     KJ_REQUIRE(method == kj::HttpMethod::POST &&
+         url == "http://coworkerd-node/__coworkerd/durable-socket", "invalid socket event");
+     KJ_REQUIRE(worker.get() != nullptr, "one call per socket event");
++    KJ_REQUIRE(body.tryGetLength() == event.bytes, "invalid durable socket body length");
+     auto entry = kj::mv(worker);
+-    // The trusted node limits the raw frame to 32 MiB. Text containing control
+-    // characters can expand up to six times when serialized as JSON.
+-    auto json = co_await body.readAllText(6u * (32u << 20) + 4096u);
+-    JsonDoc document(json);
+-    auto value = document.get();
+-    auto& manager = kj::downcast<LegacyHibernationManagerImpl>(
+-        KJ_REQUIRE_NONNULL(event.actor->getHibernationManager()));
+     kj::Maybe<api::HibernatableSocketParams> params;
+-    auto string = field(value, "text");
+-    auto binary = field(value, "binary");
+-    if (string.isString()) {
+-      params.emplace(kj::str(string.getString()), kj::String());
+-    } else if (binary.isString()) {
+-      auto bytes = decode64(binary.getString());
+-      params.emplace(kj::heapArray<kj::byte>(kj::arrayPtr(bytes.data(), bytes.size()).asBytes()),
+-          kj::String());
+-    } else if (flag(value, "error")) {
++    using Kind = DurableSocketEvent::Kind;
++    if (event.kind == Kind::BINARY) {
++      auto bytes = kj::heapArray<kj::byte>(event.bytes);
++      if (bytes.size() > 0) co_await body.read(bytes.asPtr());
++      params.emplace(kj::mv(bytes), kj::String());
++    } else if (event.kind == Kind::ERROR) {
+       params.emplace(KJ_EXCEPTION(FAILED, "WebSocket transport error"), kj::String());
+     } else {
+-      auto code = field(value, "code");
+-      KJ_REQUIRE(code.isNumber() && code.getNumber() >= 0 && code.getNumber() <= 65535);
+-      params.emplace(static_cast<uint16_t>(code.getNumber()), text(value, "reason"),
+-          flag(value, "wasClean"), kj::String());
+-    }
+-    kj::Maybe<kj::Date> lastAutoResponse;
+-    if (field(value, "autoResponseUnixMs").isString()) {
+-      const auto milliseconds = durableNumber(value, "autoResponseUnixMs");
+-      KJ_REQUIRE(milliseconds <= INT64_MAX / 1000000);
+-      lastAutoResponse = kj::UNIX_EPOCH + milliseconds * kj::MILLISECONDS;
++      auto text = kj::heapString(event.bytes);
++      if (text.size() > 0) co_await body.read(text.asBytes());
++      if (event.kind == Kind::TEXT) {
++        params.emplace(kj::mv(text), kj::String());
++      } else {
++        params.emplace(event.closeCode, kj::mv(text), event.wasClean, kj::String());
++      }
+     }
++    auto& manager = kj::downcast<LegacyHibernationManagerImpl>(
++        KJ_REQUIRE_NONNULL(event.actor->getHibernationManager()));
+     co_await manager.dispatchNodeSocket(*entry, kj::mv(event.socketId), event.position,
+-        lastAutoResponse, kj::mv(KJ_ASSERT_NONNULL(params)));
++        event.lastAutoResponse, kj::mv(KJ_ASSERT_NONNULL(params)));
+     co_await event.actor->getOutputGate().wait(nullptr);
+     response.send(204, "No Content", kj::HttpHeaders(headers), uint64_t{0});
+   }
+@@ -7417,8 +7448,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+       entry = kj::mv(opened.first);
+       socketActor = kj::mv(opened.second);
+     }
+-    socketEvent = DurableSocketEvent{
+-      kj::mv(socketActor), text(socketDescriptor, "id"), durableNumber(socketDescriptor, "frame")};
++    socketEvent = readDurableSocketEvent(socketDescriptor, kj::mv(socketActor));
+   }
+   if (entry.get() == nullptr) {
+     checkSqlDeadline();

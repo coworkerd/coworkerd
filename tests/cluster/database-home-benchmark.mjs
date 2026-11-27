@@ -1,35 +1,83 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { appendFile, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, rename, writeFile } from 'node:fs/promises';
 import { arch, cpus, freemem, loadavg, platform, release, tmpdir, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
+import { profileOperations, runProfile, traceInContainer } from './main-thread-profile/profile.mjs';
 
 const [side, checkoutArg, kernelArg, outputArg, mode, ...extra] = process.argv.slice(2);
-const modes = ['--smoke', '--default-admission', '--cold-follow-up'];
+const memoryAdmission = mode === '--idle-admission-memory';
+const unpacedAdmission = mode === '--idle-admission-unpaced' || memoryAdmission;
+const mixedCeiling = {
+  '--idle-admission-mixed': 'homes',
+  '--idle-admission-mixed-memory': 'memory',
+  '--idle-admission-mixed-resident': 'residentObjects',
+}[mode];
+const mixedAdmission = mixedCeiling !== undefined;
+const residentObjects = mixedCeiling === 'residentObjects' ? 4 : undefined;
+const busyProcesses = { '--idle-admission-busy-one': 1, '--idle-admission-busy-two': 2 }[mode];
+const idleAdmission = mode === '--idle-window-admission' || unpacedAdmission || mixedAdmission || Boolean(busyProcesses);
+const defaultHomes = mode === '--idle-admission-unpaced' || mixedCeiling === 'homes' || Boolean(busyProcesses);
+const defaultIdleWindow = mode === '--idle-window-default';
+const patchedIdleWindow = mode === '--idle-window-patched';
+const idleWindow = mode === '--idle-window' || defaultIdleWindow || patchedIdleWindow || idleAdmission;
+const mainThreadProfile = mode === '--main-thread-profile' || mode === '--main-thread-profile-smoke';
+const profileControl = mainThreadProfile ? process.env.COWORKERD_PROFILE_CONTROL : undefined;
+assert.ok(profileControl === undefined || ['plain', 'traced'].includes(profileControl));
+const modes = ['--main-thread-profile', '--main-thread-profile-smoke', '--smoke', '--default-admission', '--cold-follow-up', '--throughput', '--throughput-smoke',
+  '--idle-window', '--idle-window-default', '--idle-window-patched', '--idle-window-admission',
+  '--idle-admission-unpaced', '--idle-admission-memory', '--idle-admission-mixed',
+  '--idle-admission-mixed-memory', '--idle-admission-mixed-resident',
+  '--idle-admission-busy-one', '--idle-admission-busy-two'];
 if (!['object', 'native'].includes(side) || !checkoutArg || !kernelArg || !outputArg ||
-    (mode !== undefined && !modes.includes(mode)) || extra.length) {
-  console.error('Usage: node tests/cluster/database-home-benchmark.mjs <object|native> <product-checkout> <pinned-kernel-directory> <new-report.jsonl> [--smoke|--default-admission|--cold-follow-up]');
+    (mode !== undefined && !modes.includes(mode)) || ((idleWindow || mainThreadProfile) && side !== 'object') || extra.length) {
+  console.error('Usage: node tests/cluster/database-home-benchmark.mjs <object|native> <product-checkout> <kernel-directory> <new-report.jsonl> [' + modes.join('|') + ']');
   process.exit(2);
 }
-const smoke = mode === '--smoke';
+const throughput = mainThreadProfile || mode === '--throughput' || mode === '--throughput-smoke';
+const smoke = mode === '--smoke' || mode === '--throughput-smoke' || mode === '--main-thread-profile-smoke';
+const clientImage = 'node:22-trixie@sha256:f92a4668ece057eff6b83ed531b5f6277892b5c8fa8c1df4ea4ef470bf92b91e';
+const throughputSettings = { warmMs: smoke ? 200 : 1500,
+  measureMs: smoke ? 500 : mainThreadProfile ? 6000 : 10000 };
+const throughputMailbox = { events: 64, bytes: 1024 * 1024 };
+const throughputPlacement = { rootLimit: 512, nestedLimit: 1024 };
+const throughputInFlightLimit = 512;
 const defaultAdmission = mode === '--default-admission';
 const coldFollowUp = mode === '--cold-follow-up';
+const native = side === 'native';
+const threadedSqlThroughput = process.env.COWORKERD_BENCHMARK_THREADED_SQL === '1';
+assert.ok(!threadedSqlThroughput || (!native && throughput && !mainThreadProfile),
+  'the threaded SQL benchmark requires object throughput mode');
+const useD1Binding = native || idleWindow || threadedSqlThroughput;
 const checkout = resolve(checkoutArg);
+const kernelCheckout = threadedSqlThroughput && process.env.COWORKERD_BENCHMARK_KERNEL_CHECKOUT
+  ? resolve(process.env.COWORKERD_BENCHMARK_KERNEL_CHECKOUT) : checkout;
 const kernel = resolve(kernelArg);
 const output = resolve(outputArg);
 const binaries = resolve(process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(checkout, 'build'));
+// The test-only database mapping is part of the product checkout being measured.
+const BenchmarkCluster = idleWindow
+  ? (await import(pathToFileURL(join(checkout, 'tests/cluster/cluster.mjs')).href)).Cluster
+  : Cluster;
 const settings = {
-  homes: smoke ? 16 : 520,
-  density: smoke ? [0, 3, 8] : [0, 100, 500],
+  homes: mixedCeiling === 'memory' ? 768
+    : residentObjects ? 12 : memoryAdmission ? 192
+    : defaultHomes ? 4 : idleWindow && !idleAdmission ? 80 : smoke || throughput ? 16 : 520,
+  density: idleWindow ? [0, 1, 32, 64] : smoke ? [0, 3, 8] : [0, 100, 500],
   coldSamples: smoke ? 6 : 200,
   warmSamples: smoke ? 20 : 1000,
   pacedColdDelayMs: 100,
   throughputMs: smoke ? 500 : 10000,
-  densityClients: smoke ? 4 : 24,
+  densityClients: idleWindow ? 8 : smoke ? 4 : 24,
 };
-const native = side === 'native';
+const reopenRounds = defaultIdleWindow ? 1 : 4;
+// Shorten the copy's post-retirement grace period for the benchmark.
+const profileCopyIdleMs = mode === '--idle-window' ? 12000 : 300000;
+const admissionDatabases = 1000;
+const admissionSpacingMs = unpacedAdmission ? 0 : 50;
 const controller = new AbortController();
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => controller.abort(new Error('Interrupted by ' + signal)));
@@ -38,28 +86,53 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 await writeFile(output, '', { flag: 'wx' });
 const directory = await mkdtemp(join(tmpdir(), 'coworkerd-database-home-'));
 process.env.COWORKERD_CLUSTER_BIN_DIR = binaries;
-const cluster = new Cluster(directory, kernel, controller.signal, {
+const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   singleNode: true,
   productRoot: checkout,
+  controlDurableLifecycle: mixedCeiling === 'memory',
+  threadedNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
+  ...((idleWindow || threadedSqlThroughput) && {
+    databaseFixtureNodes: ['node-1'],
+    // The imported Cluster from a historical checkout uses the singular option.
+    databaseFixtureNode: 'node-1',
+  }),
   configureNode: () => ({
     quarantineProcesses: 1,
+    // A completed HTTP reply can precede retirement of its invocation.
+    ...(throughput && { placement: throughputPlacement }),
+    ...(mode === '--idle-window' && { idleEvictMs: profileCopyIdleMs, placement: { idleMs: 1000 } }),
     // The admission share derived from a small VM can refuse fewer than 500 copies.
     // Raise the planning budget while keeping an explicit, equal process cap.
-    ...(!defaultAdmission && { memoryBudgetBytes: 16 * 1024 ** 3 }),
-    processPool: { count: 1, inFlightLimit: 128,
-      ...(!defaultAdmission && { threadedMemoryBytes: 3 * 1024 ** 3 }) },
-    durableObjects: { processes: 1, threadedStorage: true, peers: 0 },
+    ...(!defaultAdmission && !idleWindow && { memoryBudgetBytes: 16 * 1024 ** 3 }),
+    processPool: { count: 1, ...(!unpacedAdmission && !mixedAdmission && !busyProcesses && {
+      inFlightLimit: throughput ? throughputInFlightLimit : 128,
+    }),
+      ...(memoryAdmission && { threadedMemoryBytes: 448 * 1024 ** 2 }),
+      ...(!defaultAdmission && !idleWindow && { threadedMemoryBytes: 3 * 1024 ** 3 }) },
+    durableObjects: { processes: busyProcesses ?? 1, threadedStorage: true, peers: 0, residentObjects },
   }),
   nodeEnvironment: () => ({
-    COWORKERD_DO_TEST_HOME_COUNT: String(settings.homes),
-    // The normal cluster fixture also uses 32 so eight clients can queue at the same home.
-    COWORKERD_DO_TEST_MAILBOX_EVENTS: '32',
+    ...(!defaultHomes && { COWORKERD_DO_TEST_HOME_COUNT: String(settings.homes) }),
+    // Keep both mailbox limits above the offered concurrency and its routing bytes.
+    ...(!unpacedAdmission && !mixedAdmission && !busyProcesses && {
+      COWORKERD_DO_TEST_MAILBOX_EVENTS: String(throughput ? throughputMailbox.events : 32),
+    }),
+    ...(mixedCeiling === 'memory' && { COWORKERD_DO_TEST_MAILBOX_EVENTS: '4' }),
+    ...(throughput && { COWORKERD_DO_TEST_MAILBOX_BYTES: String(throughputMailbox.bytes) }),
+    ...(mainThreadProfile && profileControl !== 'plain' && { COWORKERD_BENCHMARK_TRACE: traceInContainer }),
   }),
 });
 const [owner] = cluster.nodes;
+if (idleWindow) {
+  assert.ok(cluster.databaseFixtureNodes?.has(owner) ?? (cluster.databaseFixtureNode === owner),
+    'supply a database placement checkout');
+}
 const tenantName = 'database-benchmark';
 const workload = 'traffic';
-const databases = Array.from({ length: defaultAdmission ? settings.homes + 1 : settings.density.at(-1) },
+const databaseCount = mixedCeiling === 'memory' ? settings.homes + 120
+  : memoryAdmission ? 125 : mixedAdmission ? 120 : busyProcesses ? 64 : idleAdmission ? admissionDatabases
+  : throughput ? 8 : defaultAdmission ? settings.homes + 1 : settings.density.at(-1);
+const databases = Array.from({ length: databaseCount },
   (_, index) => 'db-' + String(index).padStart(4, '0'));
 let nextId = 1;
 let child;
@@ -75,16 +148,26 @@ async function record(metric, data) {
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const jsonFile = async path => JSON.parse(await readFile(path, 'utf8'));
 const productFiles = ['docker/Dockerfile', 'docker/docker-compose.yml', 'docker/entrypoint.sh',
-  'docker/storage-entrypoint.sh', 'runtime/runtime.js'];
+  'docker/storage-entrypoint.sh', 'runtime/runtime.js', ...(idleWindow ? ['runtime/sql-database.js'] : [])];
 
 async function provenance() {
   const commit = await cluster.command('git', ['rev-parse', 'HEAD'], { cwd: checkout });
-  const pins = await jsonFile(join(checkout, 'patches/workerd/artifacts.json'));
+  const pins = await jsonFile(join(kernelCheckout, 'patches/workerd/artifacts.json'));
   const metadata = await jsonFile(join(kernel, 'kernel.json'));
-  assert.equal(metadata.patchSeriesSha256, pins.patchSeriesSha256);
-  assert.equal(metadata.upstream, pins.upstream);
-  const archiveSha256 = pins.archives[metadata.architecture];
-  assert.ok(archiveSha256, 'checkout has a pinned release for ' + metadata.architecture);
+  const pinned = metadata.patchSeriesSha256 === pins.patchSeriesSha256 && metadata.upstream === pins.upstream;
+  if (idleWindow || threadedSqlThroughput) {
+    // A kernel may be profiled before its release pin lands. Match the actual patch bytes.
+    const series = await cluster.command('python3', ['-B', '-c',
+      'import json, sys; sys.path.insert(0, "scripts"); from kernel_artifacts import series_identity; print(json.dumps(series_identity()))'],
+    { cwd: kernelCheckout });
+    const [identity, names] = JSON.parse(series);
+    for (const [key, value] of Object.entries(identity)) assert.equal(metadata[key], value, key);
+    assert.deepEqual(metadata.patchSeries, names);
+  } else {
+    assert.ok(pinned, 'the kernel matches the checkout pin');
+  }
+  const archiveSha256 = pinned ? pins.archives[metadata.architecture] : null;
+  if (pinned) assert.ok(archiveSha256, 'checkout has a pinned release for ' + metadata.architecture);
   const hashes = {};
   for (const file of ['workerd', 'coworkerd-threaded', 'allowlist/coworkerd-syscalls-startup.txt',
     'allowlist/coworkerd-syscalls-steady.txt']) {
@@ -95,13 +178,29 @@ async function provenance() {
   for (const file of productFiles) {
     productHashes[file] = sha256(await readFile(join(checkout, file)));
   }
-  for (const file of ['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher']) {
+  const executables = ['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher'];
+  if (idleWindow || threadedSqlThroughput) executables.push('coworkerd-platform-test');
+  for (const file of executables) {
     hashes[file] = sha256(await readFile(join(binaries, file)));
   }
   await record('provenance', {
-    commit, archive: pins.releaseTag, architecture: metadata.architecture, archiveSha256, hashes, productHashes,
-    kernelBuildCommit: metadata.coworkerdCommit, kernelRun: metadata.githubActions?.url,
-    settings, mode: mode ?? 'full', node: process.version,
+    commit, archive: pinned ? pins.releaseTag : null, architecture: metadata.architecture, archiveSha256,
+    hashes, productHashes, kernelBuildCommit: metadata.coworkerdCommit, kernelRun: metadata.githubActions?.url,
+    ...((idleWindow || threadedSqlThroughput) && {
+      kernelPatchSeries: metadata.patchSeriesSha256, workerdTree: metadata.workerdTree,
+    }),
+    ...(idleWindow && { reopenRounds, profileCopyIdleMs }),
+    ...(threadedSqlThroughput && { databaseMapping: 'threaded-platform' }),
+    settings: throughput ? { homes: settings.homes, mailbox: throughputMailbox,
+      placement: throughputPlacement, inFlightLimit: throughputInFlightLimit, ...throughputSettings } : settings,
+    mode: mode ?? 'full', node: process.version,
+    ...(profileControl && { profileControl }),
+    ...(throughput && { clientImage,
+      runner: process.env.GITHUB_ACTIONS === 'true' ? {
+        runId: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT,
+        image: process.env.ImageOS, imageVersion: process.env.ImageVersion,
+        instance: process.env.RUNNER_NAME,
+      } : null }),
     clientHost: { platform: platform(), arch: arch(), release: release(), model: cpus()[0].model,
       cpus: cpus().length, memoryBytes: totalmem() },
     docker: await cluster.command('docker', ['info', '--format',
@@ -112,26 +211,32 @@ async function provenance() {
 
 async function workerSource() {
   const runtime = await readFile(join(checkout, 'runtime/runtime.js'), 'utf8');
-  const start = runtime.indexOf('export class SqlDatabase extends DurableObject');
-  const end = runtime.indexOf('export class BoundWorker', start);
+  const shared = await readFile(join(checkout, 'runtime/sql-database.js'), 'utf8').catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  const source = shared ?? runtime;
+  const start = source.indexOf('export class SqlDatabase extends DurableObject');
+  const end = shared ? source.length : source.indexOf('export class BoundWorker', start);
   assert.ok(start >= 0 && end > start, 'locate the pinned SqlDatabase class');
-  const alarmHeader = runtime.match(/^const DO_ALARM_HEADER = .*;$/m)?.[0];
+  const alarmHeader = source.match(/^(?:export )?(const DO_ALARM_HEADER = .*;)$/m)?.[1];
   assert.ok(alarmHeader);
   // The platform class can use the internal prepare API. A deployed class has the public exec API.
-  const database = runtime.slice(start, end)
+  const database = source.slice(start, end)
     .replace('const counters = sqlite.prepare(', 'const counters = () => sqlite.exec(')
     .replace('sqlite.prepare(sql)(...bindings)', 'sqlite.exec(sql, ...bindings)')
     .replace('this.ctx.storage.sql.abortExecutionLimit()', 'this.ctx.storage.sql.abortExecutionLimit?.()');
   assert.ok(!database.includes('sqlite.prepare('), 'adapt all platform-only prepare calls');
   const fixture = await readFile(new URL('./database-home-worker.js', import.meta.url), 'utf8');
   return 'import { DurableObject } from "cloudflare:workers";\n' + alarmHeader + '\n' +
-    'const native = ' + native + ';\n' + database + fixture;
+    'const useD1Binding = ' + useD1Binding + ';\n' + database + fixture;
 }
 
 async function setup() {
-  const targets = [workload, ...databases];
-  const tenant = await cluster.tenant(tenantName, { workers: targets.length, durableObjectNamespaces: targets.length });
-  if (native) {
+  const targets = idleWindow ? databases : [workload, ...databases];
+  const tenant = await cluster.tenant(tenantName, { workers: targets.length,
+    durableObjectNamespaces: targets.length + Number(throughput) });
+  if (useD1Binding) {
     for (const name of targets) {
       await cluster.api(tenant.path + '/databases/' + name, { method: 'POST', token: tenant.token });
     }
@@ -150,12 +255,17 @@ async function setup() {
     await mkdir(path, { recursive: true, mode: 0o755 });
     await writeFile(join(path, 'index.js'), source);
     await writeFile(join(path, 'package.json'), codePackage);
-    const durableObjects = native
+    const durableObjects = useD1Binding
       ? [{ binding: 'DB', className: '__coworkerdSqlDatabase', database: name }]
       : [{ binding: 'DB', className: 'BenchmarkDatabase' }];
+    const classes = useD1Binding ? [] : ['BenchmarkDatabase'];
+    if (throughput && name === workload) {
+      durableObjects.push({ binding: 'NOOP', className: 'BenchmarkNoop' });
+      classes.push('BenchmarkNoop');
+    }
     workers.push({ workerId: name, activeVersion: 'v1', versions: [{ versionId: 'v1', format: 'v2',
       compatibilityDate: '2026-10-01', mainModule: 'index.js', contentHash, durableObjects,
-      ...(!native && { classes: { declared: ['BenchmarkDatabase'] } }) }] });
+      ...(classes.length > 0 && { classes: { declared: classes } }) }] });
     routes.push({ host: '*', pathPrefix: '/' + tenantName + '/' + name, workerId: name });
   }
   await writeFile(join(packageDir, 'manifest.json'),
@@ -216,25 +326,37 @@ async function parallel(items, clients, run) {
   }));
 }
 
-async function durable() {
+async function durableProcesses() {
   const state = await cluster.state(owner);
-  const entries = state.processes.entries.filter(entry => entry.processClass === 'durable');
-  assert.equal(entries.length, 1);
-  const entry = entries[0];
-  assert.equal(entry.sandbox.durableServer, 'threaded');
-  assert.ok(entry.pid > 0 && entry.lifecycle?.durableAdmission);
-  return { entry, log: state.durableLog, processPool: state.processes.configuration };
+  const entries = state.processes.entries.filter(entry => entry.processClass === 'durable' && entry.state === 'ready');
+  assert.equal(entries.length, busyProcesses ?? 1);
+  for (const entry of entries) {
+    assert.equal(entry.sandbox.durableServer, 'threaded');
+    assert.ok(entry.pid > 0 && entry.lifecycle?.durableAdmission);
+  }
+  return { entries, log: state.durableLog, processPool: state.processes.configuration };
+}
+
+async function durable() {
+  const { entries: [entry], log, processPool } = await durableProcesses();
+  return { entry, log, processPool };
 }
 
 async function identify(kernelHash) {
-  const { entry, processPool } = await eventually('threaded durable child is ready', async () => {
-    const snapshot = await durable();
-    assert.equal(snapshot.entry.binarySha256, kernelHash);
-    assert.equal(snapshot.entry.lifecycle.durableAdmission.workerThreads, settings.homes);
+  const { entries, processPool } = await eventually('threaded durable children are ready', async () => {
+    const snapshot = await durableProcesses();
+    for (const entry of snapshot.entries) {
+      assert.equal(entry.binarySha256, kernelHash);
+      assert.equal(entry.lifecycle.durableAdmission.workerThreads, settings.homes);
+    }
     return snapshot;
   }, { timeout: 30000 });
-  child = { processId: entry.processId, generation: entry.generation, pid: entry.pid };
-  await record('child', { ...child, processPool });
+  if (idleWindow) assert.equal(processPool.idleEvictMs, profileCopyIdleMs);
+  for (const entry of entries) {
+    const identity = { processId: entry.processId, generation: entry.generation, pid: entry.pid };
+    child ??= identity;
+    await record('child', { ...identity, processPool });
+  }
 }
 
 async function validateConfirmation() {
@@ -384,6 +506,100 @@ async function runThroughput() {
   await record('confirmation', { acknowledgedRows: nextId, confirm: log.confirm });
 }
 
+function throughputProcesses(state) {
+  const snapshot = role => {
+    const entries = state.processes.entries.filter(entry => entry.processClass === role);
+    assert.equal(entries.length, 1, 'one ' + role + ' process on the node');
+    const { pid, processId, generation } = entries[0];
+    assert.ok(pid > 0);
+    return { pid, processId, generation };
+  };
+  assert.ok(state.server.pid > 0);
+  return { node: { pid: state.server.pid }, worker: snapshot('ordinary'), durable: snapshot('durable') };
+}
+
+async function runNetworkThroughput() {
+  const container = await cluster.compose(['ps', '-q', owner]);
+  assert.match(container, /^[0-9a-f]{12,64}$/);
+  const base = 'http://' + owner + ':8930/' + tenantName;
+  const source = fileURLToPath(new URL('./database-throughput-client.mjs', import.meta.url));
+  await cluster.command('docker', ['pull', clientImage], { timeout: 240000 });
+  const nodeCpuMax = await execOwner('if test -r /sys/fs/cgroup/cpu.max; then cat /sys/fs/cgroup/cpu.max; fi');
+  await seed(mainThreadProfile ? [workload] : [workload, ...databases]);
+  const rows = new Map([workload, ...databases].map(name => [name, 1]));
+  const cells = [];
+  if (threadedSqlThroughput) {
+    await eventually('the SQL databases use separate threaded platform copies', async () => {
+      const { entry } = await durable();
+      assert.equal(entry.lifecycle.durableAdmission.residentRoots, databases.length + 1);
+      assert.equal(entry.lifecycle.durableAdmission.homes, databases.length + 1);
+    });
+  }
+  const operations = threadedSqlThroughput ? ['read', 'insert'] : ['worker-only', 'object-noop', 'read', 'insert'];
+  for (const operation of operations) {
+    for (const clients of [1, 8, 32]) cells.push({ operation, clients, targets: [workload] });
+    if (operation === 'read' || operation === 'insert') {
+      for (const clients of [8, 32]) cells.push({ operation, clients, targets: databases });
+    }
+  }
+
+  const processes = throughputProcesses(await cluster.state(owner));
+  assert.deepEqual(processes.durable, child);
+  const pids = Object.fromEntries(Object.entries(processes).map(([role, entry]) => [role, entry.pid]));
+  await record('throughput-processes', { processes, nodeCpuMax: nodeCpuMax || null });
+  async function runCell({ operation, clients, targets = [workload], site = owner,
+    extraPids = {}, profileMode, round, observe }) {
+    const ids = targets.map(name => rows.get(name));
+    const args = JSON.stringify({ operation, clients, targets, ids, ...throughputSettings,
+      pids: { ...pids, ...extraPids }, ...(mainThreadProfile && { host: owner + ':8930', clockWindow: true }) });
+    const writes = operation === 'insert';
+    const before = await cluster.state(owner);
+    assert.deepEqual(throughputProcesses(before), processes);
+    const drive = async () => JSON.parse(await cluster.command('docker', [
+      'run', '--rm', '--network', cluster.project + '_frontend', '--pid', 'container:' + container,
+      '--mount', 'type=bind,src=' + source + ',dst=/client.mjs,readonly',
+      clientImage, 'node', '/client.mjs', site === owner ? base : 'http://' + site + ':8930/' + tenantName, args,
+    ], { timeout: throughputSettings.measureMs + throughputSettings.warmMs + 45000 }));
+    const result = observe ? await observe(drive) : await drive();
+    const after = await cluster.state(owner);
+    await record('throughput-window', { operation, ...result,
+      ...(profileMode && { profileMode, round }),
+      ...(writes && { confirm: { before: before.durableLog.confirm, after: after.durableLog.confirm } }) });
+    assert.deepEqual(throughputProcesses(after), processes, 'same server and children throughout the window');
+    assert.equal(result.measurement.failures, 0, 'all timed requests succeeded');
+    if (writes || mainThreadProfile) assert.equal(result.warmup.failures, 0, 'all warm-up requests succeeded');
+    assert.ok(result.n > 0);
+    if (writes) {
+      let acknowledged = 0;
+      for (const [index, name] of targets.entries()) {
+        const inserted = result.warmup.completed[index] + result.measurement.completed[index];
+        acknowledged += inserted;
+        rows.set(name, rows.get(name) + inserted);
+        assert.deepEqual((await query(name, 'count')).body, [{ value: rows.get(name) }],
+          'every acknowledged row is present in ' + name);
+      }
+      assert.equal(after.durableLog.peers.want, 0);
+      assert.equal(after.durableLog.confirm.failures, 0);
+      assert.equal(after.durableLog.confirm.unconfirmed, 0);
+      const confirmations = after.durableLog.confirm.confirmations - before.durableLog.confirm.confirmations;
+      assert.ok(confirmations >= acknowledged, 'local WAL confirmed every acknowledged insert');
+      await record('throughput-confirmation', { clients, targets, acknowledged, confirmations,
+        ...(profileMode && { profileMode, round }) });
+    }
+    return result;
+  }
+  if (profileControl === 'plain') {
+    for (const operation of profileOperations) {
+      await runCell({ operation, clients: 16, profileMode: 'plain', round: 1 });
+    }
+  } else if (mainThreadProfile) {
+    await runProfile({ cluster, container, owner, binaries, runCell, record, smoke,
+      control: profileControl === 'traced' });
+  } else {
+    for (const cell of cells) await runCell(cell);
+  }
+}
+
 async function memorySample() {
   const output = await execOwner("awk '/^(Rss|Pss):/ {print $2}' \"/proc/$1/smaps_rollup\"", child.pid);
   const [rssKiB, pssKiB] = output.split('\n').map(Number);
@@ -391,15 +607,19 @@ async function memorySample() {
   return { rssKiB, pssKiB };
 }
 
-async function assertResident(n) {
+async function assertResident(n, homes = n) {
   const { entry } = await durable();
   assert.equal(entry.pid, child.pid);
   assert.equal(entry.generation, child.generation);
   assert.equal(entry.inFlight, 0, 'durable child is idle');
   const state = entry.lifecycle.durableAdmission;
   assert.equal(state.residentRoots, n, 'live roots at memory sample');
-  assert.equal(state[native ? 'databaseHomes' : 'homes'], n, 'one home per populated database');
+  assert.equal(state[native ? 'databaseHomes' : 'homes'], homes, 'expected number of occupied homes');
   assert.equal(state.homeSessions, 0);
+  if (idleWindow) {
+    assert.equal(state.resettingHomes, 0);
+    assert.equal(state.pressureRetirements, 0);
+  }
   return state;
 }
 
@@ -424,29 +644,54 @@ async function rotateChild(kernelHash) {
   await identify(kernelHash);
 }
 
+async function memoryWindow(n, homes = n) {
+  const residencyBefore = await assertResident(n, homes);
+  const samples = [];
+  for (let index = 0; index < 5; index++) {
+    samples.push(await memorySample());
+    if (index < 4) await delay(150, undefined, { signal: controller.signal });
+  }
+  const residencyAfter = await assertResident(n, homes);
+  const median = key => samples.map(sample => sample[key]).sort((a, b) => a - b)[2];
+  return { n, samples, rssKiB: median('rssKiB'), pssKiB: median('pssKiB'),
+    residencyBefore, residencyAfter };
+}
+
 async function runDensity(kernelHash) {
   console.log('Seeding small tables before rotating the density child');
+  const confirmationsBeforeSeed = idleWindow ? (await durable()).log.confirm.confirmations : 0;
   await seed(databases);
+  if (idleWindow) {
+    const { log: afterSeed } = await durable();
+    assert.equal(afterSeed.peers.want, 0);
+    assert.equal(afterSeed.confirm.failures, 0);
+    assert.equal(afterSeed.confirm.unconfirmed, 0);
+    const confirmations = afterSeed.confirm.confirmations - confirmationsBeforeSeed;
+    assert.ok(confirmations >= databases.length, 'local WAL confirmed the seed writes');
+    await record('idle-window-seed', { rows: databases.length, confirmations });
+  }
   await rotateChild(kernelHash);
   const results = [];
+  let lastReadCompleted;
+  let previousCount = 0;
   for (const n of settings.density) {
     const before = await hostSample();
     const start = performance.now();
-    await parallel(databases.slice(0, n), settings.densityClients, name => query(name, 'read'));
-    const openMs = performance.now() - start;
-    await delay(600);
-    const residencyBefore = await assertResident(n);
-    const samples = [];
-    for (let index = 0; index < 5; index++) {
-      samples.push(await memorySample());
-      if (index < 4) await delay(150);
-    }
-    const residencyAfter = await assertResident(n);
-    const median = key => samples.map(sample => sample[key]).sort((a, b) => a - b)[2];
-    const result = { n, openMs, samples, rssKiB: median('rssKiB'), pssKiB: median('pssKiB'),
-      residencyBefore, residencyAfter };
+    await parallel(databases.slice(idleWindow ? previousCount : 0, n), settings.densityClients,
+      name => query(name, 'read'));
+    lastReadCompleted = performance.now();
+    previousCount = n;
+    await delay(600, undefined, { signal: controller.signal });
+    const result = { ...await memoryWindow(n), openMs: lastReadCompleted - start };
     results.push(result);
     await record('memory', { ...result, before, after: await hostSample() });
+  }
+  if (idleWindow) {
+    const zero = results[0];
+    const high = results.at(-1);
+    await record('idle-window-memory-slope', { counts: results.map(result => result.n),
+      rssKiB: (high.rssKiB - zero.rssKiB) / high.n, pssKiB: (high.pssKiB - zero.pssKiB) / high.n });
+    return lastReadCompleted;
   }
   const [zero, middle, high] = results;
   const slope = key => ({
@@ -455,6 +700,350 @@ async function runDensity(kernelHash) {
     zeroTo500: (high[key] - zero[key]) / high.n,
   });
   await record('memory-slope', { counts: results.map(result => result.n), rssKiB: slope('rssKiB'), pssKiB: slope('pssKiB') });
+}
+
+async function waitForIdleRelease(lastReadCompleted, retiredWaves) {
+  if (defaultIdleWindow) await delay(305000, undefined, { signal: controller.signal });
+  let lastNonzeroMs;
+  const allClosedMs = await eventually('all database roots and homes retire', async () => {
+    controller.signal.throwIfAborted();
+    const { entry } = await durable();
+    assert.equal(entry.pid, child.pid);
+    assert.equal(entry.generation, child.generation);
+    const afterLastReadMs = performance.now() - lastReadCompleted;
+    const { residentRoots, homes, homeSessions, resettingHomes, idleRetirements, pressureRetirements } =
+      entry.lifecycle.durableAdmission;
+    assert.equal(resettingHomes, 0);
+    assert.equal(pressureRetirements, 0);
+    if (residentRoots !== 0 || homes !== 0) lastNonzeroMs = afterLastReadMs;
+    assert.equal(residentRoots + homes + homeSessions + entry.inFlight, 0);
+    assert.equal(idleRetirements, retiredWaves * databases.length, 'every tree retired through the idle path');
+    return afterLastReadMs;
+  }, { timeout: patchedIdleWindow ? 15000 : 30000, interval: 200 });
+  assert.ok(lastNonzeroMs > 0, 'observed residents before idle release');
+  await record('idle-window-retirement', { retiredWaves, lastNonzeroMs, allClosedMs });
+}
+
+async function measureReopen(round, homes, samples) {
+  // Keep each calling Worker warm while leaving the database's tree closed.
+  await parallel(databases, settings.densityClients, name => query(name, 'ping'));
+  await assertResident(0, homes);
+  const before = await hostSample();
+  const { log: start } = await durable();
+  for (const name of databases) {
+    const first = await query(name, 'read');
+    const next = await query(name, 'read');
+    samples.reopened.push(first.elapsed);
+    samples.warm.push(next.elapsed);
+    samples.deltas.push(first.elapsed - next.elapsed);
+  }
+  const lastReadCompleted = performance.now();
+  await eventually('all reopened databases are served on distinct homes', () => assertResident(databases.length));
+  const { log: end } = await durable();
+  const rebuilds = end.objects.rebuilds - start.objects.rebuilds;
+  const homeOpens = end.threadedHomeIo.openSamples - start.threadedHomeIo.openSamples;
+  assert.equal(rebuilds, 0, 'same storage epoch with no rebuild');
+  assert.equal(homeOpens, databases.length, 'one SQLite open per pair');
+  await record('idle-window-round', { round, retainedCopies: homes, pairs: databases.length, homeOpens,
+    rebuilds, before, after: await hostSample() });
+  return lastReadCompleted;
+}
+
+async function runIdleReopen(lastReadCompleted) {
+  const retainedCopy = { reopened: [], warm: [], deltas: [] };
+  const releasedCopy = { reopened: [], warm: [], deltas: [] };
+  const wavesPerRound = patchedIdleWindow ? 1 : 2;
+  for (let round = 1; round <= reopenRounds; round++) {
+    if (!patchedIdleWindow) {
+      await eventually('all trees retire with their copies still loaded', () => assertResident(0, databases.length));
+      if (round === 1) {
+        await record('idle-window-empty-copy-memory', { afterLastReadMs: performance.now() - lastReadCompleted,
+          ...await memoryWindow(0, databases.length) });
+      }
+      lastReadCompleted = await measureReopen(round, databases.length, retainedCopy);
+    }
+    await waitForIdleRelease(lastReadCompleted, wavesPerRound * round);
+    if (round === 1) await record('idle-window-released-memory', await memoryWindow(0));
+    lastReadCompleted = await measureReopen(round, 0, releasedCopy);
+  }
+  if (!defaultIdleWindow) {
+    await waitForIdleRelease(lastReadCompleted, wavesPerRound * reopenRounds + 1);
+    await record('idle-window-released-memory', await memoryWindow(0));
+  }
+  const conditions = patchedIdleWindow ? [['released', releasedCopy]]
+    : [['retained', retainedCopy], ['released', releasedCopy]];
+  for (const [copy, { reopened, warm, deltas }] of conditions) {
+    await record('idle-window-reopen', { copy, ...times(reopened) });
+    await record('idle-window-warm', { copy, ...times(warm) });
+    await record('idle-window-paired-delta', { copy, ...times(deltas) });
+  }
+}
+
+async function provisionAdmissionDatabases() {
+  const tenant = await cluster.tenant(tenantName, { durableObjectNamespaces: databases.length });
+  let revision = 0;
+  const catalog = [];
+  for (const name of databases) {
+    const created = await cluster.api(tenant.path + '/databases/' + name, { method: 'POST', token: tenant.token });
+    revision = Math.max(created.revision, revision);
+    catalog.push(created.database);
+  }
+  assert.ok(revision > 0, 'database creation returns a catalog revision');
+  await eventually('owner applies the database catalog', async () => {
+    const state = await cluster.state(owner);
+    assert.ok(Number(state.storage.appliedTenantsRevision) >= revision);
+  });
+  return { tenant, revision, catalog };
+}
+
+async function runIdleAdmission() {
+  const { tenant, revision } = await provisionAdmissionDatabases();
+  await record('idle-admission-setup', { databases: databases.length, revision, admissionSpacingMs,
+    guest: await hostSample() });
+
+  const start = performance.now();
+  let succeeded = 0;
+  let peakRssBytes = 0;
+  let peakHomes = 0;
+  const { processPool } = await durable();
+  const memoryBudgetBytes = processPool.threadedMemoryBytes;
+  const failures = [];
+  for (const [index, name] of databases.entries()) {
+    const tried = index + 1;
+    const started = performance.now();
+    assert.ok(started - start < profileCopyIdleMs, 'serial scan finishes inside the copy window');
+    const reply = await request(cluster.urls.apiserver, tenant.path + '/databases/' + name + '/query', {
+      method: 'POST', body: { sql: 'SELECT 1 AS value' }, token: tenant.token,
+    });
+    if (reply.status === 200) {
+      assert.deepEqual(JSON.parse(reply.text).results, [{ value: 1 }]);
+      ++succeeded;
+    } else {
+      failures.push({ tried, status: reply.status, body: reply.text });
+    }
+    if (tried % 25 === 0 || (failures.length === 1 && failures[0].tried === tried)) {
+      const { entry } = await durable();
+      assert.equal(entry.pid, child.pid);
+      assert.equal(entry.generation, child.generation);
+      peakRssBytes = Math.max(peakRssBytes, entry.residentBytes);
+      peakHomes = Math.max(peakHomes, entry.lifecycle.durableAdmission.homes);
+      await record('idle-admission-sample', { tried, succeeded, elapsedMs: performance.now() - start,
+        rssBytes: entry.residentBytes, memoryBudgetBytes,
+        firstFailure: failures[0], residency: entry.lifecycle.durableAdmission });
+    }
+    // Let children retire earlier trees before the scan reaches the simultaneous-open ceiling.
+    const pause = admissionSpacingMs - (performance.now() - started);
+    if (pause > 0 && tried < databases.length) await delay(pause, undefined, { signal: controller.signal });
+  }
+  const elapsedMs = performance.now() - start;
+  assert.ok(elapsedMs < profileCopyIdleMs, 'serial scan finishes inside the copy window');
+  const { entry } = await durable();
+  const admissionRetirements = entry.lifecycle.durableAdmission.admissionRetirements;
+  await record('idle-admission-result', { tried: databases.length, succeeded, elapsedMs, peakRssBytes,
+    memoryBudgetBytes, peakHomes, admissionRetirements, failures, guest: await hostSample() });
+  assert.equal(failures.length, 0, 'every idle-admission query succeeded');
+  assert.ok(peakRssBytes < memoryBudgetBytes, 'sampled RSS remains below the child memory budget');
+  if (unpacedAdmission) assert.ok(admissionRetirements > 0, 'the scan exercised admission-time retirement');
+  // Every database in the probe could fit into an unused home. The lower process
+  // reservation, rather than the number of homes, must have triggered retirement.
+  if (memoryAdmission) assert.ok(databases.length < settings.homes && peakHomes < settings.homes);
+}
+
+async function runBusyAdmission() {
+  const { tenant, catalog } = await provisionAdmissionDatabases();
+  const { entries: initial } = await durableProcesses();
+  const slots = initial.map(entry => entry.processId);
+  const groups = new Map(slots.map(slot => [slot, []]));
+  for (const { name, namespaceId } of catalog) {
+    // Match the platform's canonical database ID and durable slot rendezvous.
+    const objectId = sha256(Buffer.concat([Buffer.from(namespaceId, 'hex'), Buffer.from('namedatabase')]));
+    const scores = slots.map(slot => [slot, sha256(`${namespaceId}/${objectId}\0${slot}`).slice(0, 16)]);
+    scores.sort(([a, x], [b, y]) => y.localeCompare(x) || a.localeCompare(b));
+    groups.get(scores[0][0]).push(name);
+  }
+  for (const group of groups.values()) assert.ok(group.length > settings.homes);
+  const queryUrl = name => tenant.path + '/databases/' + name + '/query';
+  const read = name => request(cluster.urls.apiserver, queryUrl(name), {
+    method: 'POST', token: tenant.token, body: { sql: 'SELECT 1 AS value' },
+  });
+  const active = [...groups.values()].flatMap(group => group.slice(0, settings.homes));
+  for (const name of active) {
+    assert.deepEqual(json(await read(name), 200, name).results, [{ value: 1 }]);
+  }
+  const abort = new AbortController();
+  const activeSql = { sql: 'WITH RECURSIVE r(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM r WHERE n < 1000000000) SELECT sum(n) FROM r' };
+  const queries = active.map(name => fetch(cluster.urls.apiserver + queryUrl(name), {
+    method: 'POST',
+    headers: { authorization: `Bearer ${tenant.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(activeSql), signal: AbortSignal.any([abort.signal, controller.signal]),
+  }).then(async reply => ({ status: reply.status, text: await reply.text() })).catch(error => ({ error })));
+  try {
+    const { entries, processPool } = await eventually('the default homes in every durable process are busy', async () => {
+      const snapshot = await durableProcesses();
+      for (const entry of snapshot.entries) {
+        const before = initial.find(candidate => candidate.processId === entry.processId);
+        assert.equal(entry.pid, before.pid);
+        assert.equal(entry.generation, before.generation);
+        assert.equal(entry.lifecycle.durableAdmission.running, settings.homes);
+        assert.equal(entry.lifecycle.durableAdmission.admissionRetirements, 0);
+      }
+      return snapshot;
+    }, { timeout: 10000, interval: 25 });
+    const refused = [];
+    for (const [slot, names] of groups) {
+      const reply = await read(names[settings.homes]);
+      const overload = json(reply, 503, 'busy database process ' + slot);
+      if (overload.code === 'OVERLOADED') {
+        assert.equal(overload.dispatched, false);
+        assert.equal(overload.retryable, true);
+      } else {
+        // Older checkout daemons returned this envelope for the same refusal.
+        assert.equal(overload.code, 'RESULT_UNCERTAIN');
+        assert.match(overload.reason, /native invocation queue is full/);
+      }
+      refused.push({ slot, status: reply.status, reply: overload });
+    }
+    await record('busy-admission-result', {
+      processes: entries.map(({ processId, pid, generation, residentBytes, lifecycle }) => ({
+        processId, pid, generation, residentBytes, ...lifecycle.durableAdmission,
+      })),
+      totalBusy: active.length, refused, memoryBudgetBytes: processPool.threadedMemoryBytes,
+    });
+  } finally {
+    abort.abort();
+    await Promise.all(queries);
+  }
+}
+
+async function runMixedAdmission() {
+  const { tenant } = await provisionAdmissionDatabases();
+  const workers = Array.from({ length: 6 }, (_, index) => `object-${index}`);
+  const objects = await cluster.tenant('database-admission-objects', {
+    workers: workers.length, durableObjectNamespaces: workers.length,
+  });
+  for (const name of workers) {
+    // Separate definitions compete for new homes instead of sharing a warm copy.
+    await cluster.deploy(objects, name, `export class Service {
+      async fetch() {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        return new Response(${JSON.stringify(name)});
+      }
+    }
+    export default { async fetch(request, env) {
+      const id = new URL(request.url).searchParams.get('object') ?? 'one';
+      return env.SERVICE.getByName(id).fetch(request);
+    } };`,
+    { wrangler: {
+      durable_objects: { bindings: [{ name: 'SERVICE', class_name: 'Service' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['Service'] }],
+    } });
+  }
+  const sql = name => request(cluster.urls.apiserver, tenant.path + '/databases/' + name + '/query', {
+    method: 'POST', token: tenant.token, body: { sql: 'SELECT 1 AS value' },
+  });
+  const expectSql = async name => {
+    assert.deepEqual(json(await sql(name), 200, name).results, [{ value: 1 }]);
+  };
+  const readResidency = async () => (await durable()).entry.lifecycle.durableAdmission;
+  const objectPath = name => `/${objects.name}/${name}`;
+  let warmed = residentObjects ? residentObjects - 1 : settings.homes;
+  if (residentObjects) {
+    const name = workers[0];
+    const reply = await request(cluster.urls[owner], objectPath(name));
+    assert.equal(reply.status, 200, reply.text);
+  }
+  if (mixedCeiling === 'memory') {
+    // Keep the timed release clock near its initial value while filling hundreds
+    // of homes. Leave the process memory budget and routing tree limit at defaults.
+    const warmStart = performance.now();
+    const offset = join(cluster.durableLifecycleGate, 'idle-offset-ms');
+    const nextOffset = offset + '-next';
+    const setOffset = async milliseconds => {
+      await writeFile(nextOffset, String(milliseconds));
+      await rename(nextOffset, offset);
+    };
+    for (warmed = 0; warmed < settings.homes; ++warmed) {
+      if (warmed % 8 === 0) await setOffset(180000 - Math.floor(performance.now() - warmStart));
+      await expectSql(databases[warmed]);
+      if ((await readResidency()).admissionRetirements > 0) {
+        ++warmed;
+        break;
+      }
+    }
+    await setOffset(0);
+    const { entry, processPool, log } = await durable();
+    const treeLimit = log.settings.residentObjects;
+    await record('mixed-memory-warmup', {
+      warmed, elapsedMs: performance.now() - warmStart, rssBytes: entry.residentBytes,
+      memoryBudgetBytes: processPool.threadedMemoryBytes, isolateLimit: processPool.threadedResidentLimit,
+      treeLimit, residency: entry.lifecycle.durableAdmission,
+    });
+    assert.ok(warmed < settings.homes, 'memory admission started with spare homes');
+    assert.ok(warmed < processPool.threadedResidentLimit, 'isolate count has headroom');
+    assert.ok(warmed < treeLimit, 'routing tree count has headroom');
+    assert.equal(entry.lifecycle.durableAdmission.groupCreationRefusals, 0, 'isolate groups are available');
+  } else {
+    for (const name of databases.slice(0, warmed)) await expectSql(name);
+  }
+  const before = await eventually('databases settle at the chosen ceiling before competing traffic', async () => {
+    const residency = await readResidency();
+    assert.equal(residency.running, 0);
+    if (mixedCeiling === 'memory') {
+      assert.ok(residency.homes < settings.homes);
+      assert.ok(residency.admissionRetirements > 0);
+    } else {
+      assert.equal(residency.residentRoots, residentObjects ?? settings.homes);
+    }
+    return residency;
+  });
+  const scan = databases.slice(warmed, warmed + 116);
+  const start = performance.now();
+  let scanning = true;
+  let objectAttempts = 0;
+  const objectAdmissions = new Map();
+  const sqlStatuses = new Map();
+  let firstSqlFailure;
+  const objectTraffic = workers.map(async name => {
+    while (scanning && performance.now() - start < 20000) {
+      // At the tree ceiling a new key can claim the freed place through an
+      // already warm tenant copy, with no new home or isolate reservation.
+      const key = residentObjects ? '?object=candidate-' + objectAttempts : '';
+      const reply = await request(cluster.urls[owner], objectPath(name) + key);
+      ++objectAttempts;
+      if (reply.status === 200 && !objectAdmissions.has(name)) {
+        objectAdmissions.set(name, performance.now() - start);
+      }
+    }
+  });
+  // Capture early traffic failures immediately so they are reported after cleanup.
+  const objectResults = Promise.allSettled(objectTraffic);
+  try {
+    for (const name of scan) {
+      const reply = await sql(name);
+      sqlStatuses.set(reply.status, (sqlStatuses.get(reply.status) ?? 0) + 1);
+      if (reply.status === 200) assert.deepEqual(JSON.parse(reply.text).results, [{ value: 1 }]);
+      else firstSqlFailure ??= { name, status: reply.status, body: reply.text };
+    }
+  } finally {
+    scanning = false;
+    for (const result of await objectResults) {
+      if (result.status === 'rejected') throw result.reason;
+    }
+  }
+  const { entry, processPool } = await durable();
+  assert.equal(entry.pid, child.pid);
+  assert.equal(entry.generation, child.generation);
+  await record('mixed-admission-result', {
+    ceiling: mixedCeiling, warmed, databasesOffered: scan.length, before, residentObjects,
+    memoryBudgetBytes: processPool.threadedMemoryBytes, rssBytes: entry.residentBytes,
+    elapsedMs: performance.now() - start, objectsOffered: workers.length, objectAttempts,
+    objectAdmissions: Object.fromEntries(objectAdmissions), sqlStatuses: Object.fromEntries(sqlStatuses),
+    firstSqlFailure,
+    residency: entry.lifecycle.durableAdmission,
+  });
+  assert.ok(objectAttempts >= workers.length);
+  assert.equal(sqlStatuses.get(200), scan.length);
+  assert.ok(entry.lifecycle.durableAdmission.admissionRetirements > before.admissionRetirements);
 }
 
 async function runDefaultAdmission(kernelHash) {
@@ -501,9 +1090,20 @@ async function runDefaultAdmission(kernelHash) {
 try {
   const kernelHash = await provenance();
   await cluster.start();
-  await setup();
+  if (!idleAdmission) await setup();
   await identify(kernelHash);
-  if (defaultAdmission) {
+  if (busyProcesses) {
+    await runBusyAdmission();
+  } else if (mixedAdmission) {
+    await runMixedAdmission();
+  } else if (idleAdmission) {
+    await runIdleAdmission();
+  } else if (throughput) {
+    await runNetworkThroughput();
+  } else if (idleWindow) {
+    const lastReadCompleted = await runDensity(kernelHash);
+    await runIdleReopen(lastReadCompleted);
+  } else if (defaultAdmission) {
     await runDefaultAdmission(kernelHash);
   } else if (coldFollowUp) {
     await validateConfirmation();

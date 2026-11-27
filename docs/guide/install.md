@@ -489,6 +489,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `drainTimeoutMs` | `30000` | How long to wait for in-flight calls when exiting; `0` turns the drain off (a drain closes the node's WebSocket connections with `1001` at its start) |
 | `ingress.tcpKeepalive.idleSeconds`, `intervalSeconds`, `probes` | `30`, `10`, `3` | TCP keepalive for accepted ingress connections. With the defaults, an unresponsive TCP endpoint is detected in about 60 seconds even while the response is silent. A write-side shutdown still permits an ordinary HTTP response. |
 | `ingress.webSocketsPerNode` | `0` (use the default) | Ceiling shared by all tenants on this ingress node, capped by the available descriptors. See [inbound WebSocket capacity](#inbound-websocket-capacity) |
+| `durableObjects.socketFrameBytesPerNode` | `134217728` (128 MiB) | Budget shared by all tenants for text and binary payloads in transit to threaded homes on this node. Each message reserves twice its payload size. `0` refuses all nonempty data messages that need home delivery. See [Durable Object WebSockets](durable-objects.md#4-websockets-and-hibernation) |
 | `rotation.*` | see the schema | Process rotation, which replaces a process by a new generation with in-flight requests completing in the old one: `binaryCheckMs` (rotate when the workerd file changes, default 1000), `residentBytes` (rotate a process whose resident memory reaches it; left out, 70% of the node's memory -- its container's `memory.max`, else `memoryBudgetBytes`, else the machine's), `maxAgeMs` (default `0`, off; a value replaces every process after that long, as releases before 0.4.1 did every hour), `maxRequests`, `drainTimeoutMs` and others |
 | `gc.*` | see the schema | Garbage collection in the workerd processes ([process isolation](../process-isolation.md), section 4): `budgetMs` / `refillMsPerSecond` (`2000` / `100`: each Worker's budget of full-collection CPU the CPU limit does not charge to the request it runs in; `0` charges every collection), `longPauseMs` (`100`: a collection that pauses a process that long is named in `logs/workerd.log`; `0`: none), `idleCollectAfterMs` / `idleCollectMinGrowthMiB` (`50` / `4`: an idle Worker's isolate is collected between its requests; `0` turns it off), `initialOldSpaceMiB` (`8`: V8's initial old generation), `runtimeHeapMiB` (`128`: the runtime's heap; `0` leaves V8's own) |
 | `sandbox.mode` | `auto` | The least-privilege environment of workerd ("Sandbox" in section 4): `auto` turns it on when the prerequisites are met, otherwise runs without it and warns; `launcher` refuses to start without them; `off` turns it off |
@@ -517,6 +518,12 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `placement.*`, `membership.*`, `desiredState.*` | see the schema | Detailed parameters of placement, membership and the desired state; `storage` is the shorthand of `desiredState.objectStore` (they cannot both be given) and puts the desired state and the membership on the object store, which a node requires. Entries in `placements` use `nodeId`, and Workers their full name `tenant/Worker` |
 | `control.*` | see "The control plane" in section 4 | Used only by `coworkerd-apiserver` (`listenAddress`, `adminCredential`, `pathRouting`, `maxUploadBytes`, `serverTimeoutMs`, `pollIntervalMs`, `temporaryDirectory`), but every daemon validates the section: a malformed `control` section stops a node too |
 
+With dynamic ingress placement, a candidate can decline a new stateless root at 90% isolate busy
+time or 95% of available node CPU over about 3 s. The isolate reading requires a threaded kernel
+with busy-time reporting. Linux cgroup v2 CPU usage covers the node's own cgroup and its
+descendants. When the first pass finds no candidate, ingress can retry soft refusals while
+enforcing the usual limits. [Cluster placement](../cluster-state.md#7-placement)
+
 The experimental `processPool.tenantInFlightLimit` is disabled by default (`0`). When omitted, it creates no tenant execution counters or waiters and imposes no per-tenant call limit. It is not recommended for use; CPU-share fairness remains under evaluation. Explicit nonzero settings retain the experimental borrowable limit and `tenantAdmissionWaitMs` wait setting for development only. Per-request CPU and memory limits, process memory admission, node watermarks, and total process safety limits still apply.
 
 All fields are in `ServerConfig` of the source `common/schema/coworkerd.capnp`. Fields with `ForTest` are for tests only; do not set them in production. A configuration that names `etcdEndpoint` or `etcdCredentialsFile`, or `etcd` as a backend, is refused with a sentence that says 0.4 has no etcd (section 9).
@@ -530,7 +537,7 @@ All fields are in `ServerConfig` of the source `common/schema/coworkerd.capnp`. 
 `COWORKERD_GC_BUDGET_MS`, `COWORKERD_GC_REFILL_MS_PER_S`, `COWORKERD_GC_LONG_PAUSE_MS`, `COWORKERD_IDLE_GC_MS`, `COWORKERD_IDLE_GC_MIN_MIB`, `COWORKERD_GC_INITIAL_OLD_SPACE_MIB`, `COWORKERD_STATIC_HEAP_MIB` (the `gc` fields, in that order),
 `COWORKERD_SANDBOX_MODE`, `COWORKERD_SANDBOX_SYSCALLS`, `COWORKERD_SANDBOX_ALLOWLIST`, `COWORKERD_SANDBOX_SYSCALLS_STEADY`, `COWORKERD_SANDBOX_STEADY_ALLOWLIST`, `COWORKERD_EGRESS_MODE`, `COWORKERD_EGRESS_DEFAULT_POLICY`,
 and for the Workers' logs `COWORKERD_TENANT_LOG_BUFFER_BYTES`, `COWORKERD_WORKER_LOG_TOTAL_BYTES`, `COWORKERD_WORKER_LOG_LINES_PER_SECOND`, `COWORKERD_WORKER_LOG_MAX_LINE_BYTES`, `COWORKERD_WORKERD_LOG_MAX_BYTES`, `COWORKERD_WORKERD_LOG_FILES`.
-Some settings have no field in the file and are set only this way: the call lease's `COWORKERD_LEASE_TTL_MS` (default `30000`), `COWORKERD_SUBREQUEST_BUDGET` (`8`) and `COWORKERD_SUBREQUEST_GRANT` (`1`);
+Some settings have no field in the file and are set only this way: the call lease's `COWORKERD_LEASE_TTL_MS` (default `30000`) and the legacy overrides described under [invocation budgets](#invocation-budgets);
 the limits on a package's assets, `COWORKERD_ASSET_MAX_COUNT` (`20000`), `COWORKERD_ASSET_MAX_FILE_BYTES` (25 MiB) and `COWORKERD_ASSET_MAX_TOTAL_BYTES` (100 MiB); and the log buffers `COWORKERD_LOG_BUFFER_BYTES` and `COWORKERD_WORKERD_LOG_BUFFER_BYTES` (4 MiB each).
 Names ending in `_FOR_TEST` are for tests only.
 
@@ -540,6 +547,23 @@ Names ending in `_FOR_TEST` are for tests only.
 `COWORKERD_PEER_KEY_FILE` (by default `cluster-key.json` there, used when present), `COWORKERD_PEER_ADDRESS`, `COWORKERD_LISTEN_ADDRESS`, `COWORKERD_PEER_LISTEN_ADDRESS`,
 `COWORKERD_PROCESS_COUNT`, `COWORKERD_STACK_DIR`, and `COWORKERD_CONTROL_ADDRESS` (the control plane's address, written into `egress.clusterAddresses`, default `apiserver:8940`);
 with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give the same configuration. The secrets directory is `COWORKERD_SECRETS_DIR` (default `/var/lib/coworkerd-secrets`); either way the management token, `COWORKERD_MANAGEMENT_TOKEN` or else the secrets directory's `management-token`, reaches the node through its environment, so it takes precedence over a file's `management.token`.
+
+### Invocation budgets
+
+Each invocation starts with 10,000 subrequests by default, including invocations through Service Bindings and Durable Object calls. Set `limits.subrequests` in a Worker's Wrangler configuration to give that version a limit from 1 through 10,000,000. An administrator can set a lower tenant default for versions that omit the field.
+
+```toml
+[limits]
+subrequests = 20000
+```
+
+```sh
+cowctl tenant update T --default-subrequests 50 --default-d1-queries 50
+```
+
+`defaultLimits.subrequests` accepts 1 through 10,000. `defaultLimits.d1Queries` accepts 1 through 1,000 and applies across the tenant's database bindings. Each invocation gets its own D1 allowance. A query, a `batch()`, or an `exec()` spends a single D1 request and one subrequest. The administrator sets the full `defaultLimits` object in one update. Include any CPU and memory defaults you want to keep.
+
+Existing Worker versions inherit the tenant or node default. `COWORKERD_SUBREQUEST_BUDGET` still supplies the node's fallback in lieu of 10,000. An existing `COWORKERD_SUBREQUEST_GRANT` setting is accepted with a startup warning. Each callee resolves its own limit. Upgrade the nodes, control plane and kernel together before deploying versions with `limits.subrequests`. See [the call lease](../architecture.md#3-the-path-of-one-call) for counted operations and [error codes](errors.md) for quota refusals.
 
 ### Inbound WebSocket capacity
 
@@ -564,7 +588,7 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | `durableObjects` key | Default | Meaning |
 | --- | --- | --- |
 | `processes` | `1` | Number of durable workerd slots, not per tenant |
-| `threadedStorage` | `false` | Experimental Linux opt-in for isolated tests with object-store membership. Serves Worker Durable Object HTTP requests, JavaScript RPC and local alarm delivery. Alarm attempts have the same 15-minute wall limit as on the upstream backend. D1, WebSocket upgrades, and persistent facet cloning are refused as `NOT_SUPPORTED`. Keep the default upstream backend for product deployments. |
+| `threadedStorage` | `false` | Experimental Linux opt-in with object-store membership. Serves Worker Durable Object HTTP requests and JavaScript RPC. When this node owns a database shard, it serves [HTTP SQL and D1](databases.md#threaded-database-capacity) on the threaded backend. Persistent facet cloning is refused as `NOT_SUPPORTED`. Keep the default upstream backend for product deployments. |
 | `peers` | `2` | Reachable peers that hold committed frames in memory; at most 8; fewer reachable peers reduce K; an empty selected list uses a local flush, but an entirely unreachable nonempty list waits / times out |
 | `confirmTimeoutMs` | `5000` | Confirmation deadline; range 100–29000 ms |
 | `recoverTimeoutMs` | `30000` | How long an object request waits for recovery; at least 1000 ms |
@@ -575,6 +599,8 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | `peerBufferBytes` | `268435456` | 256 MiB total memory for other owners' tails; refusal beyond it |
 | `objectBytes` | `10737418240` | 10 GiB per object including its facet databases, based on reported checkpoint / open / close sizes |
 | `checkpointBytes` / `idleCheckpointMs` | `4194304` / `10000` | Checkpoint threshold 4 MiB and idle delay 10 s |
+| `sqlDatabaseSpillBytes` | `1073741824` | Uncommitted WAL plus live SQLite temporary files for one threaded platform database. Range 64 KiB–1 TiB |
+| `sqlProcessSpillBytes` | `0` | Combined spill in one persistent durable process. `0` uses four times the per-database limit (4 GiB with defaults). Explicit range 64 KiB–4 TiB |
 | `uploadRetryMs` / `uploadRetryMaxMs` | `500` / `30000` | Upload retry backoff, doubling to 30 s |
 | `recoverParallelism` | `4` | Downloads in flight per recovery; range 1–16 |
 | `rebuildConcurrency` | `4` | Concurrent rebuilds doing work per node, range 1–64. Foreground and alarm recoveries share the slots. Collecting evidence or waiting for a holder releases the rebuild slot |
@@ -585,12 +611,20 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
 | `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
 
+See [threaded object admission](durable-objects.md#threaded-object-admission) for the experimental
+backend's per-object waiting limits.
+
 A single encoded WAL record is limited to `min(64 MiB, 256 MiB, peerBufferBytes, UInt32 message limit) - 4 KiB`
 (67,104,768 bytes with defaults), so an acknowledged record fits the existing peer recovery RPC. The normal
 32 MiB page budget permits one larger record by itself. `durableLog.settings.recordLimitBytes` reports the
 limit; it is not a new configuration key. Oversized commits fail with `STORAGE_UNAVAILABLE` before replication
 and are discarded by the existing repair path; split large transactions. CPU and memory limits can reject
 smaller transactions. See the record-size discussion in cluster-state section 12.
+
+For threaded platform database tests, allow `durableObjects.processes ×` the effective
+`sqlProcessSpillBytes` per node for uncommitted WAL and live temporary files, plus space for
+committed WAL, database images, logs, and recovery. Each threaded platform database opens its
+SQLite temporary files under the durable storage directory in either launch mode.
 
 A takeover starts each object's `membership.ttlSeconds * 1000 + membership.livenessGraceMs` deadline (25 s by default)
 when its preparation begins. A complete owner answer ends collection early. Otherwise the node checks the silent
@@ -605,7 +639,10 @@ See [cluster state, section 12](../cluster-state.md#12-durable-object-durability
 
 **Database recovery after a node loss.** A query to a database whose shard is in its first
 ownership epoch uses a rebuild slot for its initial epoch read and local tail collection.
-When a node takes over a shard it acquires a later epoch and uses the waiting-recovery gate.
+On takeover, the new owner can reuse the predecessor epoch it verified while acquiring the shard.
+Shared member discovery and owner checks can proceed while other databases queue their epoch reads.
+Each database becomes readable after its own evidence checks, replay, and publication. The missing-owner
+wait remains 25 s by default.
 
 In a three-node test with default recovery settings, one node held all databases and each database
 held one confirmed SQLite row on its own shard. After `SIGKILL`, both survivors detected the
@@ -614,16 +651,22 @@ it verified every row. Times are measured from the kill request, in seconds.
 
 | Databases on the lost node | Failure detected | First read | Median read | Last read | Last read after detection |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 100 | 33.66 | 59.50 | 59.50 | 59.61 | 25.96 |
-| 500 | 26.38 | 59.45 | 59.91 | 59.93 | 33.55 |
-| 1,000 | 27.32 | 91.52 | 93.76 | 95.16 | 67.84 |
-| 2,000 | 33.99 | 198.92 | 208.60 | 240.52 | 206.53 |
+| 100 | 33.54 | 58.97 | 59.41 | 59.86 | 26.32 |
+| 500 | 34.74 | 60.59 | 62.30 | 64.25 | 29.51 |
+| 1,000 | 34.69 | 60.83 | 64.57 | 73.42 | 38.73 |
+| 2,000 | 22.24 | 47.88 | 61.11 | 105.79 | 83.54 |
 
-From 500 to 1,000 databases, the post-detection time doubled as each survivor queued two epoch reads
-per database at 16 metadata requests per second. In the 2,000-database run, the survivors issued
-2,646 and 3,236 waiting metadata requests. The latter also logged two durable process watchdog exits
-and 599 additional rebuilds. Failure detection, the number of surviving nodes, object-store latency
-and the size of snapshots and tails also affect recovery time.
+Each survivor allows 16 waiting-recovery metadata requests per second, with a burst of four, at most
+two in flight, and a 16 MiB rebuild metadata budget that reserves 4 MiB for foreground requests.
+Earlier runs saw a wave of cold database opens overwhelm the durable process's health probes. The
+watchdog killed processes whose probes went unanswered for 3 seconds, forcing some databases to rebuild
+again. Survivors start at most 64 publications per second for recoveries that waited for evidence, with
+a burst of four. At 2,000 databases, this reduced peak first rebuild completions in one second from 236
+to 68 and the longest observed probe from 2.58 s to 1.41 s. The first and median reads came 25.64 s
+and 38.87 s after detection. Both durable processes stayed up and all databases rebuilt once. The
+survivors issued 1,334 and 1,333 waiting-recovery metadata requests, with a peak of two in flight on each.
+Failure detection, the number of surviving nodes, object-store latency, and the size of snapshots and
+tails also affect recovery time.
 [Measurement commands and conditions](../../tests/cluster/README.md#database-first-access-and-node-loss)
 
 The stack directory holds `cache/` for verified code and assets, `do/` for object databases and facet indexes, and `do/log/` for append logs and local recovery metadata, alongside `processes/`, `run/` and `logs/`. Each namespace stores object files by their hashed storage ids under `do/coworkerd-do-root-v1-<namespace>/`; facet zero is the root database. Keep the volume writable and leave room for SQLite WAL, logs and snapshot staging. `diskBytes` is an eviction target, not a limit on all disk use. Active, incomplete and power-loss-crossed logs can exceed it after every eligible cache has been evicted; filesystem capacity is the ultimate limit, and a full disk refuses writes. Complete, released predecessor logs can be replaced by small `.closed` summaries after their recovery state is carried forward. Do not manually remove a cache or log that may hold the only surviving tail.
@@ -682,6 +725,7 @@ these ports either (section 11).
 | `GET /__coworkerd/ready` | Readiness (503 while draining, and while an ordinary process slot is not ready -- the quarantine shards, where trial loads and suspect tenants run, do not count, and `state` shows them under `readiness`; load balancers take the node out on it) | Not needed |
 | `GET /__coworkerd/probe` | Liveness (200 as long as the process is there) | Not needed |
 | `GET /__coworkerd/state` | State: `nodeId`, members (`membership`), the object store (`storage`: its create-if-absent measurement, the clock check and `appliedTenantsRevision`, the tenant index revision it serves), tenants (`tenants`), per-tenant usage (`usage`), processes (including the quarantine shards and the per-tenant suspects), deployment, version (`version`), effective configuration (`configuration`), the Durable Object shards it holds, its takeovers, releases and refusals and its owner cache (`durableShards`), the objects' log -- the confirmation latency, what is not confirmed and not sealed, the segments and uploads, the peers, the rebuilds, this machine's files, the resident objects of each durable process with its evictions and wakes, the alarms it has to fire, the namespaces it holds objects of and what each tenant's objects hold (`durableLog`) --, counters; on both the ingress and the peer port | Needed |
+| `state.processes.entries[].lifecycle.residentWorkers[].isolateBusy` | For a loaded threaded stateless isolate, wall time under its lock in the latest 3,000 ms window, in nanoseconds and thousandths. Each row identifies the Worker, version and isolate instance within its process generation. See [stateless isolate busy time](../cluster-state.md#7-placement) for the time base and what counts. | Needed |
 | `state.host` | First-touch diagnostics: whether enabled/available, completed and skipped rounds, total MiB, counts of chunks at least 20/100 ms, the maximum chunk's wall and system CPU, last stall time, last result/error and balloon features | Needed |
 | `state.memory.daemon` | Daemon RSS/PSS/anonymous/swap and `anonHugeBytes` (Linux smaps; macOS RSS), glibc allocator in-use/free/mmap bytes, and retained container entries/payload bytes (including the log drainer's tenant buffers); unavailable measurements are `null` | Needed |
 | `GET /__coworkerd/logs?worker=<tenant>/<worker>` | A Worker's recent log lines on this node, what `/v1`'s logs gather (on both the ingress and the peer port) | Needed |

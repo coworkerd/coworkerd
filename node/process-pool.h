@@ -4,6 +4,7 @@
 
 #include "coworkerd.capnp.h"
 #include "config.h"
+#include "egress.h"
 #include "suspects.h"
 #include "tenancy.h"
 #include "tenant-execution.h"
@@ -24,6 +25,8 @@ namespace coworkerd {
 struct OpenEvent {
   v1::rpc::EventDispatcher::Client dispatcher;
   kj::Promise<void> ready;
+  // The threaded durable child confirmed a refusal at admission or while reserving a cold copy.
+  kj::Promise<bool> capacityRejected = false;
 };
 
 struct ProcessGeneration;
@@ -36,6 +39,9 @@ public:
   void finish();
   // Exceptional completion only: capture a dying generation before its calls are released.
   void snapshotAfterFailure() noexcept;
+  void sqlClientDisconnected() noexcept;
+  bool sqlClientGone = false;
+  std::function<void()> closeSqlInput;
   kj::Promise<void> rejectAfterCrash(kj::Exception&& error);
   kj::Promise<void> onExit();
   bool threadedServer() const;
@@ -124,6 +130,8 @@ public:
   WorkerLimits effectiveLimits(const std::string& workerId, bool durable = false) const;
   bool hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const;
   std::shared_ptr<ProcessCall> select(const std::string& worker);
+  kj::Promise<void> sampleWorkerSaturation();
+  bool workerSaturated(const std::string& worker, std::string_view planRevision, double nowMs) const;
   // Scheduling hint only: no refresh, process admission, or dispatch commitment.
   std::optional<std::pair<std::string, uint64_t>> threadedGenerationHint(const std::string& worker) const;
   // A trial load's process: a quarantine process, the tenant's shard.
@@ -167,6 +175,7 @@ public:
   OpenEvent open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor,
       const std::string& definitionHash,
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps = {},
+      kj::Maybe<capnp::Capability::Client> budgetLifetime = kj::none, bool threadedSql = false,
       std::shared_ptr<RequestLease> requestLease = {});
   kj::Promise<std::string> stateJson(uint32_t idleMs, kj::Timer& timer) const;
   std::string culpritRecordsJson() const;
@@ -187,7 +196,7 @@ public:
   // and its own egress token (EGRESS_TOKEN), which the runtime sends with each request and only the runtime holds.
   void enableEgress(std::string address);
   // The live generation (slot id, generation) a token belongs to, if any.
-  std::optional<std::pair<std::string, uint64_t>> egressSource(const std::string& token) const;
+  std::optional<EgressSource> egressSource(const std::string& token) const;
 
   // Server exit. beginShutdown(): no further rotation starts (one in progress
   // finishes). drainState(): the rotation's drain criterion over every live generation, with
@@ -211,6 +220,7 @@ public:
   kj::Promise<std::string> closeAll();
   Killed killAll(const std::string& reason);
 private:
+  std::shared_ptr<ProcessGeneration> ordinaryProcess(const std::string& worker, bool quarantine) const;
   class Impl;
   std::unique_ptr<Impl> impl;
 };

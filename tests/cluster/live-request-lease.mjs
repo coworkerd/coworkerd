@@ -6,14 +6,46 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { eventually, json, request } from './cluster.mjs';
 
 const serviceWorker = `
-  import { RpcTarget, WorkerEntrypoint } from 'cloudflare:workers';
+  import { DurableObject, RpcTarget, WorkerEntrypoint } from 'cloudflare:workers';
 
   class Handle extends RpcTarget {
     value() { return 'rpc'; }
   }
 
+  export class DrainMarkers extends DurableObject {
+    async fetch(request) {
+      const marker = new URL(request.url).pathname.slice(1);
+      if (request.method === 'PUT') {
+        await this.ctx.storage.put(marker, Date.now());
+        return new Response(null, { status: 204 });
+      }
+      return Response.json(Object.fromEntries(await this.ctx.storage.list()));
+    }
+  }
+
   export default class LeaseService extends WorkerEntrypoint {
-    fetch() { return new Response('service'); }
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      if (!path.startsWith('/drain')) return new Response('service');
+      const ledger = this.env.DRAIN_MARKERS.getByName('response');
+      const record = async marker => {
+        const response = await ledger.fetch('https://object.test/' + marker, { method: 'PUT' });
+        if (response.status !== 204) throw new Error('Could not record ' + marker + ': ' + response.status);
+      };
+      if (path === '/drain-markers') return ledger.fetch('https://object.test/');
+      if (path.startsWith('/drain-record/')) {
+        await record(path.slice('/drain-record/'.length));
+        return new Response(null, { status: 204 });
+      }
+      await record('child-started');
+      this.ctx.waitUntil((async () => {
+        await scheduler.wait(8_000);
+        await record('child-within-drain');
+        await scheduler.wait(8_000);
+        await record('child-after-drain');
+      })());
+      return new Response('child-response');
+    }
     openHandle() { return new Handle(); }
   }
 `;
@@ -30,8 +62,18 @@ const worker = `
       if (path === '/markers') return Response.json(Array.from((await this.ctx.storage.list()).keys()));
       if (path === '/timer') {
         setTimeout(async () => {
-          const leaf = await this.env.OBJECT.getByName('leaf').fetch('https://object.test/leaf');
-          await this.ctx.storage.put('timer', await leaf.text());
+          let result;
+          try {
+            const response = await fetch('http://budget-origin:8080/');
+            if (await response.text() !== 'origin') throw new Error('unexpected timer egress response');
+            if (this.env.DB && await this.env.DB.prepare('SELECT 41 AS value').first('value') !== 41)
+              throw new Error('unexpected timer query result');
+            const leaf = await this.env.OBJECT.getByName('leaf').fetch('https://object.test/leaf');
+            result = await leaf.text();
+          } catch (error) {
+            result = error.message;
+          }
+          await this.ctx.storage.put('timer', result);
         }, 32_000);
         return new Response('scheduled');
       }
@@ -95,6 +137,31 @@ const worker = `
         const actor = new URL(request.url).searchParams.get('actor');
         return env.OBJECT.getByName(actor).fetch('https://object.test/' + path);
       }
+      if (path === 'response-drain') {
+        const record = async marker => {
+          const response = await env.SERVICE.fetch('https://service.test/drain-record/' + marker);
+          if (response.status !== 204) throw new Error('Could not record ' + marker + ': ' + response.status);
+        };
+        ctx.waitUntil((async () => {
+          await scheduler.wait(23_000);
+          const child = await env.SERVICE.fetch('https://service.test/drain-child');
+          if (await child.text() !== 'child-response') throw new Error('Unexpected nested response');
+          await record('root-child-response');
+        })());
+        ctx.waitUntil((async () => {
+          await scheduler.wait(32_000);
+          await record('root-within-drain');
+          await scheduler.wait(7_000);
+          await record('root-after-drain');
+        })());
+        return new Response(new ReadableStream({ async start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode('started\\n'));
+          await scheduler.wait(5_000);
+          controller.enqueue(encoder.encode('finished\\n'));
+          controller.close();
+        } }));
+      }
       if (path === 'decline-upgrade') {
         return scheduler.wait(32_000).then(async () => {
           const response = await env.SERVICE.fetch('https://service.test/');
@@ -140,14 +207,22 @@ const worker = `
   };
 `;
 
-async function prepareLeaseWorker(cluster, tenantName) {
+async function prepareLeaseWorker(cluster, tenantName, withD1 = false) {
   const tenant = await cluster.tenant(tenantName);
-  await cluster.deploy(tenant, 'lease-service', serviceWorker);
+  if (withD1) await cluster.api(`${tenant.path}/databases/timer-db`, { method: 'POST', token: tenant.token });
+  const drainMarkers = tenantName === 'live-request-drain' ? {
+    wrangler: {
+      durable_objects: { bindings: [{ name: 'DRAIN_MARKERS', class_name: 'DrainMarkers' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['DrainMarkers'] }],
+    },
+  } : {};
+  await cluster.deploy(tenant, 'lease-service', serviceWorker, drainMarkers);
   await cluster.deploy(tenant, 'lease-stream', worker, { wrangler: {
     compatibility_flags: ['enable_request_signal'],
     services: [{ binding: 'SERVICE', service: 'lease-service' }],
     durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'LeaseObject' }] },
     migrations: [{ tag: 'v1', new_sqlite_classes: ['LeaseObject'] }],
+    ...(withD1 ? { d1_databases: [{ binding: 'DB', database_name: 'timer-db' }] } : {}),
   } });
   await cluster.api(`${tenant.path}/workers/lease-stream`, {
     token: tenant.token, method: 'PATCH', body: { limits: { cpuMs: 1500 } },
@@ -210,6 +285,33 @@ export async function connectedRequestLease(cluster) {
   } finally {
     controller.abort();
   }
+}
+
+export async function responseDrainRequestLease(cluster) {
+  const tenantName = 'live-request-drain';
+  const { base, path } = await prepareLeaseWorker(cluster, tenantName);
+  const started = performance.now();
+  assert.deepEqual(await request(base, path + '/response-drain', { timeout: 15_000 }),
+    { status: 200, text: 'started\nfinished\n' });
+  const ended = performance.now();
+  const endedAt = Date.now();
+  assert.ok(ended - started >= 4_900, 'the client received the delayed end of the body');
+  const markers = async () => json(await request(base, `/${tenantName}/lease-service/drain-markers`),
+    200, 'read response drain markers');
+  const expected = ['child-started', 'child-within-drain', 'root-child-response', 'root-within-drain'];
+  const observed = await eventually('both events can make calls late in the shared drain', async () => {
+    const result = await markers();
+    assert.deepEqual(Object.keys(result).sort(), expected);
+    return result;
+  }, { timeout: 31_000, interval: 250 });
+  const rootMs = observed['root-within-drain'] - endedAt;
+  const childMs = observed['child-within-drain'] - endedAt;
+  assert.ok(rootMs >= 25_000 && rootMs < 30_000, 'root work ran near the end of the drain');
+  assert.ok(childMs >= 24_000 && childMs < 30_000, 'a nested event survived into the same drain');
+  await delay(Math.max(0, ended + 37_000 - performance.now()), undefined, { signal: cluster.signal });
+  assert.deepEqual(await markers(), observed, 'neither event recorded work after the shared cutoff');
+  console.log(`HTTP body ended after ${((ended - started) / 1000).toFixed(1)} s. Root and child recorded work ` +
+    `${rootMs} ms and ${childMs} ms after EOF. Both beyond-cutoff writes were absent at +37 s.`);
 }
 
 export async function upgradeRequestLease(cluster) {
@@ -345,16 +447,28 @@ export async function silentRequestLease(cluster) {
 }
 
 export async function actorRequestLease(cluster) {
-  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-timers');
+  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-timers', cluster.threadedNodes.size === 0);
   const call = (event, actor, timeout = 5000) => request(base, `${path}/${event}?actor=${actor}`, { timeout });
+  const executions = async () => (await Promise.all(cluster.nodes.map(node => cluster.state(node))))
+    .flatMap(state => state.executions).filter(event => event.target === 'live-request-timers/lease-stream@v1');
   for (const actor of ['idle', 'taken-over']) {
     assert.deepEqual(await call('timer', actor), { status: 200, text: 'scheduled' });
   }
   await delay(16_000, undefined, { signal: cluster.signal });
+  const previous = new Set((await executions()).map(event => event.invocationId));
   const takeover = call('take-over', 'taken-over', 30_000);
   assert.deepEqual(await takeover, { status: 200, text: 'object' }, 'the newer event can hold the timer work');
+  const next = (await executions()).filter(event => !previous.has(event.invocationId));
+  const root = next.find(event => event.kind === 'ingress');
+  assert.ok(root, 'the newer request has an ingress invocation');
+  const actor = next.find(event => event.kind === 'durable' && event.parentInvocationId === root.invocationId);
+  assert.ok(actor, 'the newer request invokes the object');
+  assert.ok(next.some(event => event.kind === 'durable' && event.parentInvocationId === actor.invocationId &&
+    event.treeId === root.treeId), 'the timer inherits the newer event’s live lease');
   assert.deepEqual(await call('timer-result', 'idle'), { status: 200, text: 'object' },
     'an actor timer can make a bounded call with no live ingress event');
+  assert.ok(next.some(event => event.kind === 'durable' && event.parentInvocationId === '' &&
+    event.treeId !== root.treeId), 'the idle timer opens a fresh tree');
 }
 
 export async function alarmRequestLease(cluster) {

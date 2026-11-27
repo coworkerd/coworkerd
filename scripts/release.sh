@@ -100,8 +100,15 @@ command -v node >/dev/null && command -v npm >/dev/null || { echo "node and npm 
 # ---- Release metadata: the version, the source, the workerd the binary expects --------------------------
 COMMIT=$(git -C "$ROOT" rev-parse --short=12 HEAD)
 # Uncommitted changes to what the binary is built from: the hash of their diff, untracked files included.
-source_hash_inputs=(common node apiserver launcher CMakeLists.txt 'patches/kj-*.diff')
-DIRTY=$(cd "$ROOT" && { git diff --full-index HEAD -- "${source_hash_inputs[@]}"; git ls-files --others --exclude-standard -- "${source_hash_inputs[@]}" | LC_ALL=C sort | while read -r f; do printf 'untracked %s\n' "$f"; cat "$f"; done; } |
+SOURCE_INPUTS=(common node apiserver launcher runtime CMakeLists.txt
+  patches/kj-http-abort.diff patches/capnp-http-upload.diff patches/kj-peer-half-close.diff)
+DIRTY=$(cd "$ROOT" && {
+  git diff --full-index HEAD -- "${SOURCE_INPUTS[@]}"
+  git ls-files --others --exclude-standard -- "${SOURCE_INPUTS[@]}" | LC_ALL=C sort | while IFS= read -r file; do
+    printf 'untracked %s\n' "$file"
+    cat "$file"
+  done
+} |
   { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; } | cut -c1-12)
 EMPTY=$(printf '' | { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; } | cut -c1-12)
 SOURCE=$COMMIT

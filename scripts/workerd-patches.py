@@ -57,6 +57,10 @@ def git(checkout, *args, env=None, input=None):
 # live below the server package. Startup identity only forwards one owned value.
 SERVER_CPP_ROOTS = ("src/workerd/server/factory/",)
 RUST_PATHS = {
+    "0140-invocation-budget-identity.patch": frozenset({
+        "src/workerd/server/server/bridge.rs",
+        "src/workerd/server/server/root_loader.rs",
+    }),
     "0041-ordinary-lease-deadline.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0038-preparation-queue-and-failure-cache.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
     "0035-preparation-failure-recovery.patch": frozenset({"src/workerd/server/server/root_loader.rs"}),
@@ -301,6 +305,34 @@ def allowed_path(name, path):
                               'src/workerd/threaded/protocol.capnp',
                               'src/workerd/threaded/threaded-server-test.c++',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0109-deliver-threaded-websocket-bytes.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name in {'0140-invocation-budget-identity.patch', '0141-ordinary-binding-caller.patch'} and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0142-hold-invocation-budget-through-drain.patch' and path in {
+                              'src/workerd/io/io-channels.h',
+                              'src/workerd/io/worker-entrypoint.c++',
+                              'src/workerd/io/worker-interface.capnp',
+                              'src/workerd/threaded/protocol.capnp',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0143-release-durable-budgets-over-parent-socket.patch' and path in {
+                              'src/workerd/io/io-channels.h',
+                              'src/workerd/io/worker-entrypoint.c++',
+                              'src/workerd/io/worker-interface.capnp',
+                              'src/workerd/threaded/protocol.capnp',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0144-retry-durable-budget-release-errors.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0122-order-threaded-wal-home-teardown.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0185-measure-isolate-busy-time.patch' and path in {
+                              'src/workerd/jsg/jsg.c++',
+                              'src/workerd/jsg/observer.h',
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/isolate-busy-test.c++',
+                              'src/workerd/threaded/isolate-busy.h',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == '0130-ordinary-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',
@@ -319,6 +351,60 @@ def allowed_path(name, path):
                               'src/workerd/threaded/fatal-attribution-scope-test.c++',
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
+                          name in {'0150-platform-durable-definition.patch',
+                                   '0151-reserve-platform-execution-identity.patch',
+                                   '0170-place-platform-databases-in-exclusive-copies.patch',
+                                   '0176-attribute-platform-databases-to-database-worker.patch'} and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0171-bound-threaded-sql-wall-time.patch' and path in {
+                              'src/workerd/api/sql.c++', 'src/workerd/api/sql.h',
+                              'src/workerd/api/actor-state.c++', 'src/workerd/io/actor-sqlite.c++',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h',
+                              'src/workerd/util/sqlite-test.c++'} or
+                          name == '0172-time-wal-confirmation-after-threaded-sql.patch' and path in {
+                              'src/workerd/io/worker.c++', 'src/workerd/io/worker.h',
+                              'src/workerd/threaded/threaded-server.c++', 'src/workerd/util/sqlite-test.c++'} or
+                          name == '0173-bound-platform-sql-transactions.patch' and path in {
+                              'src/workerd/api/actor-state.c++', 'src/workerd/io/actor-sqlite.c++',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h'} or
+                          name == '0175-harden-platform-sql-transaction-settlement.patch' and path in {
+                              'src/workerd/api/actor-state.c++',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h'} or
+                          name == '0174-release-idle-platform-database-copies.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name in {'0177-retire-idle-databases-at-admission.patch',
+                                   '0180-fix-database-admission-accounting.patch'} and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0178-keep-platform-databases-open-after-sql-interruption.patch' and path in {
+                              'src/workerd/api/actor-state.c++',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h',
+                              'src/workerd/util/sqlite-test.c++'} or
+                          name == '0179-size-default-object-mailbox.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0181-report-durable-copy-reservation-refusal.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0182-bound-platform-sqlite-memory.patch' and path in {
+                              'src/workerd/api/actor-state.c++', 'src/workerd/io/actor-sqlite.c++',
+                              'src/workerd/threaded/BUILD.bazel', 'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite-metering.c++', 'src/workerd/util/sqlite-metering.h',
+                              'src/workerd/util/sqlite-test.c++', 'src/workerd/util/sqlite.c++',
+                              'src/workerd/util/sqlite.h'} or
+                          name == '0183-bound-platform-sqlite-spill.patch' and path in {
+                              'src/workerd/api/actor-state.c++', 'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite-test.c++', 'src/workerd/util/sqlite.c++',
+                              'src/workerd/util/sqlite.h'} or
+                          name == '0184-charge-database-sqlite-heap-to-process.patch' and path in {
+                              'src/workerd/api/actor-state.c++',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++',
+                              'src/workerd/util/sqlite-metering.c++',
+                              'src/workerd/util/sqlite-metering.h',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 16:08:46 +0800
+Subject: [PATCH] Reserve a distinct platform object execution identity
+
+
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index aaf24cdd0d4e58fc2d959afd20e04b619cef87cb..7451f2ee2c20206d35cb59ff1954bd39467f97fe 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -41,11 +41,11 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
+ }
+ 
+ KJ_TEST("platform durable plans pin the class and copy to the tenant") {
+-  JsonDoc input(kj::str(R"({"workerId":"alpha/__platform","format":"v2","versionId":"build-a",
++  JsonDoc input(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
+       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
+-  JsonDoc otherTenant(kj::str(R"({"workerId":"beta/__platform","format":"v2","versionId":"build-a",
++  JsonDoc otherTenant(kj::str(R"({"workerId":"beta/:platform","format":"v2","versionId":"build-a",
+       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
+-  JsonDoc bound(kj::str(R"({"workerId":"alpha/__platform","format":"v2","versionId":"build-a",
++  JsonDoc bound(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
+       "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64,
+       "variables":[{"name":"TENANT_SECRET","value":"fixture"}]})"));
+   JsonDoc alpha(kj::str(R"({"tenant":"alpha","definitionName":"coworkerd:platform-test"})"));
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 178f4c0f1455ead73382f19fe5c5b5430fc7646c..c5ac43c87884319b81013709250a6a4c8c65efb6 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2121,7 +2121,7 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan) {
+ bool platformDurablePlan(Json::Reader input, Json::Reader plan, Json::Reader selection,
+     const DurableRoute &route) {
+   const auto tenant = text(plan, "tenant");
+-  if (tenant.size() == 0 || text(input, "workerId") != kj::str(tenant, "/__platform") ||
++  if (tenant.size() == 0 || text(input, "workerId") != kj::str(tenant, "/:platform") ||
+       text(input, "format") != "v2" || text(selection, "className") != route.open.className.c_str() ||
+       platformCopyKey(input, plan) != route.open.definition) return false;
+   auto empty = [](Json::Reader value) {

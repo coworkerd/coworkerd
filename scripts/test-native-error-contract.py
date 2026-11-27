@@ -29,4 +29,4 @@ for code in codes:assert table[code]['status']==503 and table[code]['executed'] 
 assert table['NOT_SUPPORTED']['executed']=='Partly executed'
 assert table['OVERLOADED']['executed']=='Not executed'
 print(json.dumps({'passed':True,'codes':sorted(codes|statuses.keys()),'tableSha256':hashlib.sha256(args.errors.read_bytes()).hexdigest(),
- 'scope':'Native emitted codes and refusal statuses versus the current public table; ordinary JavaScript preparation is retired by S1d.'}))
+ 'scope':'Native emitted codes and refusal statuses checked against the public error table.'}))

@@ -5,25 +5,28 @@ Subject: [PATCH] End nested Worker background work with the ingress lease
 
 
 diff --git a/src/workerd/threaded/protocol.capnp b/src/workerd/threaded/protocol.capnp
-index be4772b1936089b2d8326fae2ecf5c859a5f2430..229c1b025400958b79aa3487ed5cd6a889992e1a 100644
+index 21f3e6a6878c75062824ae8eee91c60cb0fb348b..29cac2ec2db8d1d0a3b47de134b73abfd8b02399 100644
 --- a/src/workerd/threaded/protocol.capnp
 +++ b/src/workerd/threaded/protocol.capnp
-@@ -100,4 +100,10 @@ interface Bootstrap @0xa0c731b2df279451 extends(Worker.WorkerdBootstrap) {
-   startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :Props)
-       -> (dispatcher :Worker.EventDispatcher);
+@@ -97,7 +97,12 @@ interface ThreadedSocketControl @0xdc432f018090bcc4 {
+ }
+ 
+ interface Bootstrap @0xa0c731b2df279451 extends(Worker.WorkerdBootstrap) {
+-  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :Props, budgetLifetime :Capability, budgetTicket :UInt64)
++  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :Props, budgetLifetime :Capability,
++                       budgetTicket :UInt64, lease :NativeLeaseControl)
+       -> (dispatcher :Worker.EventDispatcher, budgetAccepted :Bool);
    socketControl @1 () -> (control :ThreadedSocketControl);
-+  startLeasedEvent @2 (cfBlobJson :Text, coworkerdProps :Props, lease :NativeLeaseControl)
-+      -> (dispatcher :Worker.EventDispatcher);
-+}
+ }
 +
 +interface NativeLeaseControl @0xbbb54ed58665162a $Cxx.allowCancellation {
 +  whenEnded @0 () -> ();
- }
++}
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 67eb486f1d73adba9a141bd82f17d3cdf8faffd1..9d001eafc0af2a944b0bb28b827b508cf7f029a1 100644
+index 2d0a094081c3ec544e1c62a186b5bd3ce7a8adad..40ff83e4802178c38acb33621cd7850a5f94cee1 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -1623,6 +1623,27 @@ KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handl
+@@ -2273,6 +2273,27 @@ KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handl
    if (ended) drain.wait(waitScope);
  }
  
@@ -52,10 +55,10 @@ index 67eb486f1d73adba9a141bd82f17d3cdf8faffd1..9d001eafc0af2a944b0bb28b827b508c
    kj::EventLoop loop;
    kj::WaitScope waitScope(loop);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index d4e25ce3a279612b199fe70dded87b1eb1576cc3..27b2c59658de3f9863f9ef70f766c5cd11c13828 100644
+index ff2270b2c72fe622a2cb77b2f26fa596d038b532..4cc20abd03719fb1e801867cad135316157cd22b 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1424,8 +1424,16 @@ struct Measurement {
+@@ -1563,8 +1563,16 @@ struct Measurement {
    // An HTTP call's response end: its body sent to the end, or the client gone
    // (Invocation::request). Without it the drain limit runs from its call.
    kj::Maybe<kj::ForkedPromise<void>> responseEnded;
@@ -72,7 +75,7 @@ index d4e25ce3a279612b199fe70dded87b1eb1576cc3..27b2c59658de3f9863f9ef70f766c5cd
  struct DurableEventCpu {
    DurableEventCpu(kj::String identity, uint32_t memoryMiB)
        : identity(kj::mv(identity)),
-@@ -1645,10 +1653,12 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1788,10 +1796,12 @@ struct RequestLimits final: LimitEnforcer {
      auto deadline = [this]() {
        return timer.timer.atTime(kj::max(kj::systemPreciseMonotonicClock().now(), timer.timer.now()) + WAIT_UNTIL_LIMIT);
      };
@@ -88,82 +91,83 @@ index d4e25ce3a279612b199fe70dded87b1eb1576cc3..27b2c59658de3f9863f9ef70f766c5cd
    }
    kj::Promise<void> limitScheduled() override {
      return kj::NEVER_DONE;
-@@ -2256,11 +2266,12 @@ struct InvocationState: kj::Refcounted {
- 
+@@ -2498,12 +2508,14 @@ struct InvocationState: kj::Refcounted {
  class Invocation final: public kj::HttpService {
   public:
--  Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props)
-+  Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
+   Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
+-      BudgetLifetime budgetLifetime)
++      BudgetLifetime budgetLifetime,
 +      kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease)
        : server(server),
          state(state),
          descriptor(kj::mv(descriptor)),
--        props(kj::mv(props)) {}
-+        props(kj::mv(props)), lease(kj::mv(lease)) {}
+         props(kj::mv(props)),
+-        budgetLifetime(kj::mv(budgetLifetime)) {}
++        budgetLifetime(kj::mv(budgetLifetime)),
++        lease(kj::mv(lease)) {}
    kj::Promise<void> request(kj::HttpMethod method,
        kj::StringPtr url,
        const kj::HttpHeaders &headers,
-@@ -2272,21 +2283,23 @@ class Invocation final: public kj::HttpService {
-   ThreadState &state;
+@@ -2516,23 +2528,26 @@ class Invocation final: public kj::HttpService {
    kj::String descriptor;
    Frankenvalue props;
+   BudgetLifetime budgetLifetime;
 +  kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease;
    bool used = false;
  };
  
  class Dispatcher final: public rpc::EventDispatcher::Server {
   public:
--  Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props)
-+  Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
+   Dispatcher(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
+-      BudgetLifetime budgetLifetime)
++      BudgetLifetime budgetLifetime,
 +      kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease = kj::none)
        : server(server),
          state(state),
          descriptor(kj::mv(descriptor)),
--        props(kj::mv(props)) {}
-+        props(kj::mv(props)), lease(kj::mv(lease)) {}
+         props(kj::mv(props)),
+-        budgetLifetime(kj::mv(budgetLifetime)) {}
++        budgetLifetime(kj::mv(budgetLifetime)),
++        lease(kj::mv(lease)) {}
    kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
      KJ_REQUIRE(!used, "NOT_SUPPORTED: one HTTP event per invocation");
      used = true;
      context.initResults().setHttp(state.http.kjToCapnp(
--        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props))));
-+        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props), kj::mv(lease))));
+-        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props), kj::mv(budgetLifetime))));
++        kj::heap<Invocation>(server, state, kj::mv(descriptor), kj::mv(props), kj::mv(budgetLifetime), kj::mv(lease))));
      return kj::READY_NOW;
    }
    kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override;
-@@ -2296,6 +2309,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
-   ThreadState &state;
+@@ -2543,6 +2558,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
    kj::String descriptor;
    Frankenvalue props;
+   BudgetLifetime budgetLifetime;
 +  kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease;
    bool used = false;
  };
  
-@@ -2322,6 +2336,16 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2565,9 +2581,11 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+     KJ_REQUIRE(!used, "one startEvent per connection");
+     used = true;
+     auto params = context.getParams();
++    kj::Maybe<threaded::rpc::NativeLeaseControl::Client> lease;
++    if (params.hasLease()) lease = params.getLease();
+     context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
+         kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()),
+-        std::make_shared<capnp::Capability::Client>(params.getBudgetLifetime())));
++        std::make_shared<capnp::Capability::Client>(params.getBudgetLifetime()), kj::mv(lease)));
      return kj::READY_NOW;
    }
  
-+  kj::Promise<void> startLeasedEvent(StartLeasedEventContext context) override {
-+    KJ_REQUIRE(!used, "one startEvent per connection");
-+    used = true;
-+    auto params = context.getParams();
-+    KJ_REQUIRE(params.hasLease(), "a leased event needs its caller's authority");
-+    context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
-+        kj::str(params.getCfBlobJson()), readNativeProps(state, params.getCoworkerdProps()), params.getLease()));
-+    return kj::READY_NOW;
-+  }
-+
-  private:
-   ThreadedServer &server;
-   ThreadState &state;
-@@ -6826,6 +6850,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
+@@ -7587,6 +7605,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
    }
-   auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(props),
+   auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props),
        std::move(preparation), std::move(tenant));
 +  watchRequestLease(prepared.invocation->measurement, kj::mv(lease));
    auto identity = invocationIdentity(*slot, input);
    startBoundRpcSession(context.getResults(),
        kj::mv(prepared.entry).attach(kj::mv(prepared.invocation)), std::move(slot),
-@@ -6970,6 +6995,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
+@@ -7731,6 +7750,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
        httpEntryObserver(input, entrypoint.c_str(), headers, state.placementCallId));
    auto &invocation = prepared.invocation;
    auto &entry = prepared.entry;

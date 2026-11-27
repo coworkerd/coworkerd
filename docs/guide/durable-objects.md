@@ -87,7 +87,7 @@ const again = env.COUNTERS.get(env.COUNTERS.idFromString(id.toString()));
 
 A stub exposes `fetch` and the class's public methods. workerd serializes RPC arguments and results in the isolates; the node validates the trusted envelope and proxies the capability, also across nodes. Returned capabilities last only for the tree's lease. See [compatibility](../compatibility.md), section 7, for RPC types, the 32 MiB serialized limit and exception shapes.
 
-A stateless Worker's call to an object consumes its call tree's subrequest budget. An object's call to another object starts a fresh tree and is not charged to the caller's budget; a chain longer than eight object hops is refused with `508 DO_HOP_LIMIT`. These calls follow ownership, independently of `placement.subcalls`, which controls stateless Service Binding placement.
+A Worker calling an object spends one subrequest. An object's outgoing calls charge the event running them while it has an active allowance. When a newer request takes over background work, its balance pays for that work. The callee starts with its own invocation allowance and inherits a live HTTP or alarm lease when one is available. A timer between events can start a bounded call tree of its own. A chain longer than eight object-to-object hops is refused with `508 DO_HOP_LIMIT`. These calls follow ownership, independently of `placement.subcalls`, which controls stateless Service Binding placement.
 
 ## 4. WebSockets and hibernation
 
@@ -111,6 +111,20 @@ The upstream host keeps connections in its durable process. Process rotation, no
 On the experimental threaded host, an eligible tree retires after about ten seconds from its last event or the end of its last blocker. An otherwise idle tree with a standard `ws.accept()` connection has a deadline between 70 and 140 seconds. An I/O or wait-until operation can protect the tree for up to 15 minutes from that operation's start. The home checks for queued and live requests before retiring a tree and closes its idle standard sockets on retirement.
 
 When a threaded tree retires, the node parks the upgraded hibernatable WebSockets accepted by its root and facets. The home transfers them before canceling expired work or closing ordinary sockets. While parking is in progress, changes to hibernatable sockets such as `send()`, `close()`, `serializeAttachment()` and `ctx.setWebSocketAutoResponse()` throw `InvalidStateError`. The node answers WebSocket pings and matching auto-responses while the tree sleeps. An application message or a close requiring a handler opens the tree on its current shard owner and reaches the root or facet that accepted the socket. Each actor gets its sockets, tags, serialized attachments and automatic response configuration before its constructor runs.
+
+For deliveries to threaded homes, the shard owner's node shares a 128 MiB budget across tenants, configured by
+`durableObjects.socketFrameBytesPerNode`. A text or binary message reserves twice its payload size in bytes
+from receipt by the managed relay until the home acknowledges the internal upload, covering the received
+message and room for its copy in the internal byte stream. A canceled upload returns the reservation too.
+If the reservation would exceed the budget, the node discards the message
+and closes the socket with `1013` and reason `Durable Object socket frame capacity`. The node attempts to
+deliver a close event to the object during the close grace period. A close reason longer than 123 bytes
+instead gets a protocol-error close with `1002`. The object's close handler can call `ws.close()` for
+either node-initiated close while the transport is still settling. Empty messages, close and error events,
+and automatic replies do not draw from the budget. The budget covers the handoff to the home. Network and
+relay buffering before the managed relay receives the message, protocol overhead, and memory in workerd
+are outside this accounting. Node state reports the limit, current reservations and cumulative refusals
+under `webSockets.homeFrames`.
 
 Parking and adoption calls each have a five-second response bound. After a lost reply the home gives the node another five seconds to confirm the transfer. A pending write can defer parking for five seconds from the first refusal it causes. If the write still blocks parking, the node closes that connection.
 
@@ -178,6 +192,31 @@ An acknowledged alarm whose hint or owner marker has not published before its no
 An ordinary class exception leaves the instance available; fetch returns `500 EXECUTION_FAILED` with its message. CPU or memory termination invalidates the version's isolate in that durable process: all its objects there are constructed again on their next event, recovering storage subject to the limitations in section 7. A durable slot does not move a suspect tenant into quarantine.
 
 A write past the object or tenant cap is refused at confirmation with `413 DO_OBJECT_TOO_LARGE` or `422 QUOTA_EXCEEDED`; reads and transactions that do not grow the database remain possible, including deleting rows. The size estimate can lag. A refusal immediately marks the object for repair; later requests wait for one consistent recovered history. The SQL statement may already have executed locally. A failed response alone does not prove rollback: records without a persistent exclusion remain possible writes. See [error codes](errors.md).
+
+### Threaded object admission
+
+On a node running the experimental `durableObjects.threadedStorage` backend, while one event is
+executing, up to **512 events** can wait in the object's mailbox, each bounded by its existing request
+deadline. The root and its facets share that capacity. The home frees an entry when it begins delivery,
+or when the queued event expires or is canceled. Events already delivered, including events suspended
+at an `await`, are outside the waiting count.
+
+Those entries share **2 MiB (2,097,152 bytes)** for encoded invocation descriptors and any
+node-delivered WebSocket message payloads. HTTP bodies stream separately. A large descriptor or
+message can fill the byte allowance with fewer events. The child can also refuse while the mailbox
+has room if it cannot reserve memory or descriptors from the shared budget, it cannot place a cold
+tree, or the assigned home is resetting. Node admission limits can refuse a call before it reaches
+the child.
+
+The node leaves `threadedStorage` off by default. The cluster suite exercises these mailbox limits
+with separate bursts of 128 concurrent single-row reads through public HTTP SQL and a Worker D1
+binding to one threaded database. The Worker runs on a peer of the database owner. Worker roots
+and local binding calls share the node's root admission threshold when they run on the same node.
+The test uses the experimental database placement executable.
+The hosted Linux x86-64 and ARM64 clusters each served all 128 reads on both routes at the
+compiled defaults.
+[Cluster test](../../tests/cluster/README.md#threaded-sql-default-mailbox) ·
+[Measurement environment](../threaded-durable-processes.md#per-object-admission-mailbox).
 
 ## 7. When ownership changes
 

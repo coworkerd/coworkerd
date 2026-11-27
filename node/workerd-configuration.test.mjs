@@ -34,9 +34,9 @@ const rows = [
   ['event-fd-empty', '200', ''], ['event-fd-text', '200', '3a'], ['event-fd-unopened', '200', '987'],
 ];
 const memoryRows = [
-  ['v33-default-effective-128', '128', 96, 503],
-  ['v33-explicit-64', '64', 48, 503],
-  ['v33-disabled-0', '0', 96, 200],
+  ['memory-default-effective-128-mib', '128', 96, 503],
+  ['memory-explicit-64-mib', '64', 48, 503],
+  ['memory-disabled', '0', 96, 200],
 ];
 const request = (port, path) => fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(4000) })
   .then(async response => ({ status: response.status, body: await response.text() }))

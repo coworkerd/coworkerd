@@ -32,11 +32,11 @@ check the new instance and stored value, while the child must retain its ready P
 It does not send JavaScript RPC calls.
 The disposable role defaults to four home loops, capped by the startup thread limit, and 64 roots per
 copy. Cold placement closes at 64 MiB or 3000 ms busy time in a four-second window. The per-object
-waiting mailbox defaults to four events/64 KiB. Reservations keep 256 descriptors plus five per home
+waiting mailbox defaults to 512 events/2 MiB. Reservations keep 256 descriptors plus five per home
 outside admission, then charge 16 KiB/four descriptors per root and 4 KiB/one descriptor per event plus
-declared waiting bytes. Facets reserve their own metadata and descriptors. These test-role defaults are
-supported by the source-tagged capacity, queue, pressure and overlap measurements in PR #43; actual
-body execution remains subject to the copy/process memory limits.
+declared waiting bytes. Facets reserve their own metadata and descriptors. The capacity, queue,
+pressure and overlap measurements in PR #43 cover these reservation costs. Actual body execution
+remains subject to the copy/process memory limits.
 The `http-overlap` mode observes 16 fully read and written 16 KiB bodies held across four facets while
 same-object and neighboring-object requests continue. It records RSS, threads and descriptors, verifies
 facet state and exact event-credit return, and checks the original child remains ready. The ordinary
@@ -65,7 +65,8 @@ include transport and scheduling, so they are not direct samples of the kernel's
 With `placement-control 4 64 4000`, the same workload runs 32 rounds and must keep one copy;
 the four-second threshold excludes busy-triggered splitting while leaving capacity and memory limits unchanged.
 
-The `queues 4 64` mode measures admission for 64 objects with four events each, declaring 16 KiB per
+The queue modes set a four-event and 64 KiB mailbox. The `queues 4 64` mode measures admission for
+64 objects with four events each, declaring 16 KiB per
 event. It checks the four-event count limit separately using one-byte declarations, with another object
 still admitted. This is a measurement before request bodies are read, not an actor execution or payload
 allocation workload. It records reservations, RSS, threads and descriptors, cancels the queued calls,
@@ -109,6 +110,7 @@ const boundedEvents = events || httpIsolation;
 const queueLimit = scenario === 'queue-limit';
 const queueMemory = scenario === 'queue-memory';
 const queues = scenario === 'queues' || queueLimit || queueMemory;
+const mailboxBytes = queues ? 64 * 1024 : 2 * 1024 * 1024;
 const placementControl = scenario === 'placement-control';
 const placement = scenario === 'placement' || placementControl;
 const exerciseEvents = loadCancel || cpuEvents || warmCopies || boundedEvents || measure || placement || httpLifecycle || outputGate || httpMemory || groupRefusal || overlap;
@@ -126,8 +128,6 @@ const scratch = await mkdtemp(join(tmpdir(), 'cwkd-durable-'));
 const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
-  // The outer actor must be able to delegate one call and allow its peer to call back.
-  ...(events ? { COWORKERD_SUBREQUEST_GRANT: '2' } : {}),
   ...(outputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
   ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
   ...(overlap ? { COWORKERD_DO_TEST_HOME_COUNT: '4' } : {}),
@@ -135,7 +135,8 @@ const env = {
   ...(loadCancel ? { COWORKERD_DO_TEST_HOME_COUNT: '2', COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST: '2500',
     COWORKERD_LEASE_TTL_MS: '4000' } : {}),
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
-  ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg } : {}),
+  ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg, COWORKERD_DO_TEST_MAILBOX_EVENTS: '4',
+    COWORKERD_DO_TEST_MAILBOX_BYTES: String(mailboxBytes) } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
   ...(cpuEvents ? { COWORKERD_CPU_LIMIT_MS: '250', COWORKERD_THREADED_TRACE_FOR_TEST: '1',
     COWORKERD_DO_TEST_HOME_COUNT: '1' } : {}),
@@ -245,15 +246,17 @@ function durablePreface(objectId, invocationId, queuedBytes, expiry = process.hr
   }) + '\n';
 }
 
-async function waitForAdmission(path, waiting, homeSessions = 0) {
+async function waitForAdmission(path, waiting, homeSessions = 0, { running } = {}) {
   let state;
   const until = performance.now() + 2000;
   do {
     state = await readAdmission(path);
-    if (state.waiting === waiting && state.homeSessions === homeSessions) return state;
+    if (state.waiting === waiting && state.homeSessions === homeSessions &&
+        (running === undefined || state.running === running)) return state;
     await delay(20);
   } while (performance.now() < until);
-  assert.fail(`Admission counters did not reach ${waiting} waiting and ${homeSessions} home sessions: ${JSON.stringify(state)}`);
+  const expected = JSON.stringify({ waiting, homeSessions, running });
+  assert.fail(`Admission counters did not reach ${expected}: ${JSON.stringify(state)}`);
 }
 
 let child, exited;
@@ -531,8 +534,8 @@ try {
   const held = [];
   try {
     for (const [id, sequence, bytes, expected] of [
-      [objectId, 'first', 32768, 'A'],
-      [objectId, 'second', 32768, 'A'],
+      [objectId, 'first', mailboxBytes / 2, 'A'],
+      [objectId, 'second', mailboxBytes / 2, 'A'],
       [objectId, 'overflow', 1, 'R'],
       ['c'.repeat(64), 'unrelated', 1024, 'A'],
     ]) {
@@ -543,7 +546,7 @@ try {
     const loaded = await readAdmission(socketPath);
     assert.equal(loaded.trees, 2);
     assert.equal(loaded.waiting, 3);
-    assert.equal(loaded.waitingBytes, 66560);
+    assert.equal(loaded.waitingBytes, mailboxBytes + 1024);
     assert.equal(loaded.overloaded, 1);
     assert.ok(loaded.reservedDescriptors > 0);
     assert.ok(loaded.reservedBytes > loaded.waitingBytes);
@@ -939,7 +942,7 @@ try {
     let loaded, counts;
     for (const until = performance.now() + 2000; performance.now() < until;) {
       loaded = await readAdmission(socketPath);
-      // Wait until delivery has freed the four waiting slots before adding observation calls.
+      // Wait until the held calls have reached their handlers before adding observation calls.
       if (loaded.running === held.length) {
         counts = await Promise.all(facets.map((_, index) => request(`/overlap-${index}?facet&overlapState`)));
         if (counts.every(count => count === 4)) break;
@@ -1375,8 +1378,8 @@ try {
 
     if (httpIsolation) {
       for (let attempt = 0; attempt < 3; ++attempt) {
-        const before = await waitForAdmission(socketPath, 0);
-        assert.equal(before.running, 0);
+        // The HTTP response can arrive before its event finishes retiring.
+        const before = await waitForAdmission(socketPath, 0, 0, { running: 0 });
         let caller;
         const aborted = new Promise((resolve, reject) => {
           caller = get(`http://127.0.0.1:${port}/first?hold&cancelable`, response => {
@@ -1400,8 +1403,7 @@ try {
         // Aborting fetch alone may close only its write side, which still permits a response.
         caller.socket.resetAndDestroy();
         assert.equal((await aborted).code, 'ECONNRESET');
-        const drained = await waitForAdmission(socketPath, 0);
-        assert.equal(drained.running, 0);
+        const drained = await waitForAdmission(socketPath, 0, 0, { running: 0 });
         for (const field of ['reservedBytes', 'reservedDescriptors', 'residentRoots',
           'actorResets', 'isolateResets']) assert.equal(drained[field], before[field], field);
         assert.equal(await request('/first?aborts'), attempt + 1);

@@ -5,6 +5,7 @@ import test from 'node:test';
 const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
 const node = read('./main.c++');
 const runtime = read('../runtime/runtime.js');
+const placement = read('./placement-contract.h');
 const guide = read('../docs/guide/errors.md');
 
 function section(source, start, end) {
@@ -65,6 +66,13 @@ function workerResponses() {
     /\brefusal\(error\.quarantine \? "([A-Z_]+)" : "([A-Z_]+)",[\s\S]*?, (\d{3}), root\);/);
   for (const code of [quarantine, unavailable]) add(processStatus, code);
 
+  const [, isolateBusy, cpuFull, saturationStatus] = evidence(generic,
+    /refusal\(workerBusy \? coworkerd::(\w+) : coworkerd::(\w+),\s*workerBusy \? "[^"]+" : "[^"]+", (\d{3}), root\)/);
+  for (const symbol of [isolateBusy, cpuFull]) {
+    const [, code] = evidence(placement, new RegExp(`const char\\* ${symbol} = "([A-Z_]+)"`));
+    add(saturationStatus, code);
+  }
+
   const [, missing, brokenRoute, brokenWorker] = evidence(generic,
     /std::string code = missing \? "([A-Z_]+)" : selected\.kind == Kind::ROUTE_INVALID \? "([A-Z_]+)" : "([A-Z_]+)"/);
   const [, missingStatus, invalidStatus] = evidence(generic, /refusal\(code, reason, missing \? (\d{3}) : (\d{3})/);
@@ -98,11 +106,13 @@ function workerResponses() {
   const [, budgetStatus, expiredStatus] = evidence(node,
     /const uint status = budget \? (\d{3}) : expired \? (\d{3}) : (\d{3});/);
   add(budgetStatus, budget);
+  const [, hopCode, hopStatus] = evidence(node, /server\.refusal\("(BINDING_HOP_LIMIT)", detail, (\d{3})\)/);
+  add(hopStatus, hopCode);
   add(expiredStatus, expired);
   // The ordering refusal is only reachable in the intentionally incorrect
   // lease counterexample. Check that guard before excluding it from the table.
   assert.equal(outOfOrder, 'BINDING_ARRIVAL_OUT_OF_ORDER');
-  const orderCheck = section(node, '    if (leaseConfig.naive()) {\n      auto orderKey', '      ++expected;');
+  const orderCheck = section(node, '    if (leaseConfig.naive()) {\n      auto orderKey', '    debitBinding(budget');
   evidence(orderCheck, /if \(orderSequence != expected\)[\s\S]*lastRejection = "Binding arrival out of order:/);
   for (const [, status, code] of node.matchAll(/sendText\(response, (\d{3}), "[^"]+",\s*rejectionJson\("([A-Z_]+)"/g)) {
     add(status, code, code === uncertain ? 'Result uncertain' : 'Not executed');

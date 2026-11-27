@@ -24,21 +24,34 @@ export class BenchmarkDatabase extends SqlDatabase {
   }
 }
 
+export class BenchmarkNoop extends DurableObject {
+  fetch() {
+    return Response.json([{ value: 1 }]);
+  }
+}
+
 function rows(result) {
   const { columns, rows } = result.results;
   return rows.map(row => Object.fromEntries(columns.map((column, i) => [column, row[i]])));
 }
 
-export default { async fetch(request, { DB }) {
+export default { async fetch(request, { DB, NOOP }) {
   const url = new URL(request.url);
   const operation = url.pathname.split('/').at(-1);
   if (operation === 'ping') return Response.json('ready');
+  if (operation === 'worker-only') return Response.json([{ value: 1 }]);
+  if (operation === 'object-noop') {
+    const target = NOOP.get(NOOP.idFromName('control'));
+    const response = await target.fetch('http://control/noop', { method: 'POST' });
+    // Decode and serialize as the SQL paths do in their calling Worker.
+    return Response.json(await response.json(), { status: response.status });
+  }
 
   const empty = operation === 'emptyBatch';
   const [sql] = statements[operation] ?? [];
   const params = operation === 'insert' ? [Number(url.searchParams.get('id'))] : [];
   const write = writes.has(operation);
-  if (native) {
+  if (useD1Binding) {
     if (empty) {
       // The pinned D1 HTTP wrapper sends [], decodes [] and dereferences the absent first result.
       try {

@@ -4,12 +4,13 @@ import { test } from 'node:test';
 import vm from 'node:vm';
 import { DatabaseSync } from 'node:sqlite';
 
-const source = await readFile(new URL('../runtime.js', import.meta.url), 'utf8');
-const classSource = source.slice(source.indexOf('export class SqlDatabase extends'), source.indexOf('export class BoundWorker extends')).replace('export class', 'class');
-function fixture() {
+const source = await readFile(new URL('../sql-database.js', import.meta.url), 'utf8');
+const classSource = source.replace(/^import .*;$/m, '').replace(/^export /gm, '');
+function fixture({ wallDeadline = false } = {}) {
   const db = new DatabaseSync(':memory:');
   const sqlite = {
     get databaseSize() { return db.prepare('PRAGMA page_count').get().page_count * 4096; },
+    checkExecutionDeadline() {},
     prepare(text) {
       return (...params) => {
         const statement = db.prepare(text), columns = statement.columns().map(column => column.name);
@@ -22,20 +23,44 @@ function fixture() {
       };
     },
   };
-  const storage = { sql: sqlite, transactionSync(fn) {
+  const storage = { sql: sqlite, async sync() {}, transactionSync(fn) {
     db.exec('SAVEPOINT batch');
     try { const result = fn(); db.exec('RELEASE batch'); return result; }
     catch (error) { db.exec('ROLLBACK TO batch; RELEASE batch'); throw error; }
   } };
   const C = vm.runInNewContext(classSource + '; SqlDatabase', {
     DurableObject: class { constructor(ctx) { this.ctx = ctx; } },
-    ArrayBuffer, Uint8Array, Request, Response, URL, TextEncoder, DO_ALARM_HEADER: 'x-test-alarm',
+    ArrayBuffer, Uint8Array, Error, Request, Response, URL, TextEncoder,
   });
+  C.wallDeadline = wallDeadline;
   const worker = new C({ storage });
-  return { db, close: () => db.close(), async query(body, endpoint = 'query', format = 'ARRAY_OF_OBJECTS') {
-    return (await worker.fetch(new Request(`http://sql/${endpoint}?resultsFormat=${format}`, { method: 'POST', body: JSON.stringify(body) }))).json();
+  const fetch = (body, endpoint = 'query', format = 'ARRAY_OF_OBJECTS') =>
+    worker.fetch(new Request(`http://sql/${endpoint}?resultsFormat=${format}`, { method: 'POST', body: JSON.stringify(body) }));
+  return { db, storage, fetch, close: () => db.close(), async query(body, endpoint, format) {
+    return (await fetch(body, endpoint, format)).json();
   } };
 }
+
+test('threaded SQL waits for a pending metadata write before entering its transaction', async () => {
+  const f = fixture({ wallDeadline: true });
+  try {
+    f.db.exec('CREATE TABLE ledger (value); BEGIN; INSERT INTO ledger VALUES (1)');
+    let metadataCommitted = false;
+    f.storage.sync = async () => {
+      await Promise.resolve();
+      f.db.exec('COMMIT');
+      metadataCommitted = true;
+    };
+    const transactionSync = f.storage.transactionSync;
+    f.storage.transactionSync = (fn) => {
+      assert.ok(metadataCommitted);
+      return transactionSync(fn);
+    };
+    const answer = await f.query({ sql: 'SELECT value FROM ledger' });
+    assert.equal(answer.success, true, answer.error);
+    assert.deepEqual(answer.results, [{ value: 1 }]);
+  } finally { f.close(); }
+});
 
 test('byte parameters including empty and all byte values round trip in both result formats', async () => {
   const f = fixture();
@@ -85,5 +110,82 @@ test('execute converts parameters and BLOB cells while retaining earlier success
     const answers=await f.query([{sql:'INSERT INTO executed VALUES(1,?)',params:[[127]]},{sql:'INSERT INTO executed VALUES(2,?)',params:[[256]]},{sql:'INSERT INTO executed VALUES(3,?)',params:[[1]]}],'execute');
     assert.equal(answers.length,2);assert.equal(answers[0].success,true);assert.match(answers[1].error,/D1_TYPE_ERROR/);
     assert.deepEqual((await f.query({sql:'SELECT id,b FROM executed'})).results,[{id:1,b:[127]}]);
+  } finally { f.close(); }
+});
+
+test('threaded execute syncs each successful statement before executing the next', async () => {
+  const f = fixture({ wallDeadline: true });
+  try {
+    await f.query({ sql: 'CREATE TABLE entries(id INTEGER PRIMARY KEY)' });
+    const ids = () => f.db.prepare('SELECT id FROM entries ORDER BY id').all().map(row => row.id);
+    const synced = [];
+    f.storage.sync = async () => { synced.push(ids()); };
+    const statements = [1, 2, 2, 3].map(id => ({ sql: 'INSERT INTO entries VALUES (?)', params: [id] }));
+    const response = await f.fetch(statements, 'execute');
+    assert.equal(response.status, 200);
+    const answers = await response.json();
+    assert.deepEqual(answers.map(answer => answer.success), [true, true, false]);
+    assert.match(answers[2].error, /UNIQUE constraint failed/);
+    assert.deepEqual(synced, [[], [1], [1, 2]]);
+    assert.deepEqual(ids(), [1, 2]);
+  } finally { f.close(); }
+});
+
+test('a threaded deadline returns the typed 503 and rolls back a statement or batch', async () => {
+  const f = fixture({ wallDeadline: true });
+  try {
+    await f.query({ sql: 'CREATE TABLE entries(id)' });
+    const reason = 'SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded';
+    const error = Object.assign(new Error(reason), { code: 'SQL_LIMIT_EXCEEDED' });
+    const statement = { sql: 'INSERT INTO entries VALUES (1)' };
+    for (const body of [statement, [statement]]) {
+      let checks = 0;
+      f.storage.sql.checkExecutionDeadline = () => { if (++checks === 2) throw error; };
+      const response = await f.fetch(body);
+      assert.equal(response.status, 503);
+      assert.deepEqual(await response.json(), { success: false, error: reason, code: error.code, reason });
+      assert.equal(f.db.prepare('SELECT count(*) AS count FROM entries').get().count, 0);
+    }
+  } finally { f.close(); }
+});
+
+test('a threaded disconnect is passed to the runtime as the original exception', async () => {
+  const f = fixture({ wallDeadline: true });
+  try {
+    const error = Object.assign(new Error('SQL client disconnected'), { code: 'SQL_CLIENT_DISCONNECTED' });
+    f.storage.sql.checkExecutionDeadline = () => { throw error; };
+    const statement = { sql: 'SELECT 1' };
+    await assert.rejects(f.fetch(statement), actual => actual === error);
+    await assert.rejects(f.fetch([statement]), actual => actual === error);
+  } finally { f.close(); }
+});
+
+test('threaded SQL reports a pre-commit interruption after assembling a successful reply', async () => {
+  const f = fixture({ wallDeadline: true });
+  try {
+    f.db.exec('CREATE TABLE ledger(id); INSERT INTO ledger VALUES (1)');
+    const read = { sql: 'SELECT id FROM ledger ORDER BY id' };
+    const write = { sql: 'INSERT INTO ledger VALUES (2)' };
+    const transactionSync = f.storage.transactionSync;
+    const reason = 'SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded';
+    const deadline = Object.assign(new Error(reason), { code: 'SQL_LIMIT_EXCEEDED' });
+    const disconnected = Object.assign(new Error('SQL client disconnected'), { code: 'SQL_CLIENT_DISCONNECTED' });
+    for (const error of [deadline, disconnected]) {
+      f.storage.transactionSync = fn => transactionSync(() => {
+        const response = fn();
+        assert.equal(response.status, 200);
+        assert.deepEqual(f.db.prepare(read.sql).all().map(row => row.id), [1, 2]);
+        throw error;
+      });
+      if (error === deadline) {
+        const response = await f.fetch(write);
+        assert.equal(response.status, 503);
+        assert.deepEqual(await response.json(), { success: false, error: reason, code: error.code, reason });
+      } else {
+        await assert.rejects(f.fetch(write), actual => actual === error);
+      }
+      f.storage.transactionSync = transactionSync;
+      assert.deepEqual((await f.query(read)).results, [{ id: 1 }]);
+    }
   } finally { f.close(); }
 });

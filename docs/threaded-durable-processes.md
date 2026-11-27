@@ -56,9 +56,7 @@ seconds, the next woken tree of that Worker goes to another copy. A tree and its
 Choose placement before constructing the actor, and reserve thread, address space, heap and native charges
 before publishing it. Count initializing and closing trees against the backstop until their reservations
 are released. Include native databases in the process backstop, as database objects count today. Preserve the
-version pin and actor input/output gates, including supported
-interleaving across awaits. The mailbox bounds waiting events, rather than turning every event into a
-run-to-completion lock.
+version pin and actor input/output gates, including supported interleaving across awaits.
 
 An isolate-wide V8 interrupt needs a stricter contract for object-local CPU reset than the ordinary path
 does. Consume CPU only while that event executes (including its synchronous SQLite work). Once an interrupt
@@ -74,6 +72,73 @@ Choose the 30 s default and resolve the existing Worker `limits.cpuMs` and tenan
 admitting the event. The threaded durable ceiling is 300,000 ms. A higher per-Worker setting
 still needs room under the tenant's `maxWorkerCpuMs`, which defaults to 30,000 ms.
 [Worker limits](control-plane-api.md) · [Tenant defaults](../common/tenancy.h).
+
+### Per-object admission mailbox
+
+The threaded durable child keeps one FIFO of waiting events per root object tree, shared by the
+root and its facets for events admitted through the child. When the experimental
+`durableObjects.threadedStorage` backend is enabled, a tree can hold **512 waiting events**
+(`mailboxDepth`) and **2 MiB of declared waiting bytes** (`mailboxBytes`). Waiting events remain
+subject to their original request deadlines. Admission refuses an event when the count is already
+full or its addition would exceed the byte limit.
+
+The child charges a mailbox entry on accepting the routing preface and frees its waiting count and
+bytes when the home begins delivery, or when the queued event is canceled, expires or is refused.
+The node declares the byte charge as the encoded invocation descriptor size plus the payload bytes
+of a node-delivered WebSocket message, when present. HTTP bodies stream separately after admission.
+Delivered events, including those suspended at an `await` or waiting at an actor input gate, can
+still hold process resources. The input and output gates govern execution and allow supported
+interleaving across awaits. See [kernel admission](../patches/workerd/0045-threaded-durable-admission.patch)
+and [node routing](../node/main.c++).
+
+The count matches the node's default `processPool.inFlightLimit` of 512. The byte limit budgets
+4 KiB of declared bytes per waiting slot on average. Each admitted event reserves one descriptor
+and a separate 4 KiB of metadata plus its declared bytes from the child's shared budget. A single
+full mailbox therefore charges up to 512 descriptors and 4 MiB of memory for waiting events.
+Delivered events and resident trees also draw on shared reservations. Admission can refuse earlier
+if the child lacks memory or descriptor reservations, a cold tree hits the resident limit or cannot
+reserve a home, or its assigned home is resetting. These conditions can produce the same `R`
+receipt as a full mailbox.
+See the [original queue profiles](https://github.com/coworkerd/coworkerd/pull/43) and the
+[operator guide](guide/durable-objects.md#threaded-object-admission).
+
+The cluster suite uses the compiled mailbox defaults. Its database test runs separate bursts of
+128 public HTTP SQL requests and 128
+Worker requests through a D1 binding from a peer of the database owner. Each request selects the
+same seeded row by primary key in one threaded database. The test checks all results and the
+owner process generation.
+[Cluster test](../tests/cluster/README.md#threaded-sql-default-mailbox).
+
+The node's default root admission threshold of 128 counts both active roots and nested calls on
+that node. A colocated D1 Worker and database share this accounting, so existing binding calls
+can cause the node to refuse new Worker requests during a burst. The cluster case puts the
+Worker roots on a peer and the 128 database calls on one owner. Both nodes use their default
+limits.
+
+In a three-node Docker cluster on Linux ARM64 (10 vCPUs, 7.75 GiB of RAM, Node.js 22.22.2
+driving the load from macOS), a local build of the ordered series through 0179 returned the row
+to all 128 HTTP SQL callers and all 128 D1 callers from a peer. The owner kept its process
+generation without counting any admission overloads. The two bursts took 201 ms and 207 ms
+respectively. The same case with the published 0176 kernel and its 4-event and 64 KiB defaults
+returned the row to 9 of 128 HTTP SQL callers and 5 of 128 D1 callers.
+
+The hosted kernel build also ran both 128-client bursts on Ubuntu 24.04 with the compiled
+0179 defaults. [Hosted build](https://github.com/coworkerd/coworkerd/actions/runs/45765527350) ·
+[Verified kernel archives](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-a572c9630e5c-run-45765527350-1).
+
+| Hosted runner | HTTP SQL reads | D1 reads from a peer |
+| --- | ---: | ---: |
+| Linux x86-64 | 128/128 in 309 ms | 128/128 in 397 ms |
+| Linux ARM64 | 128/128 in 418 ms | 128/128 in 515 ms |
+
+At `f1e41d5`, the hibernation cluster fixture already allowed 32 waiting events with the default
+64 KiB byte bound. The diagnostics for the parallel batch of 16 facet calls recorded a refusal
+before execution, with the same child PID and generation, zero actor or isolate resets, and further
+events delivered on the same home. Each deletion also schedules a close event on that home, and
+#93 changed the fixture to issue deletions one at a time. The recorded receipt and overload count
+leave the specific admission condition undetermined. See the
+[failure record](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7161010583) and
+[fixture change](https://github.com/coworkerd/coworkerd/pull/93).
 
 ## Node and child protocol
 
@@ -201,46 +266,154 @@ Cloudflare. Two things therefore go with this choice: another copy is used when 
 only when the copy is full, and the guide tells authors that objects of one class may share an isolate and
 that synchronous work should be short.
 
-### Databases: native execution, not an isolate per database
+### Platform Durable Object definitions
 
-A database could instead stay a Durable Object of the JavaScript `SqlDatabase` class with an isolate copy, and
-so a home, of its own. That would reuse steps 1 to 3, and Cloudflare describes D1 as built on SQLite in Durable
-Objects. Native execution is kept. The reasons first given, the resident memory of an isolate and a smaller
-shared lock, are weak: a minimal isolate measured about 2 MiB (about 2.8 MiB with the V8 sandbox), small next to
-the 64 MiB of SQLite memory a database home reserves, and a database runs one statement at a time either way.
-The reasons that decide it:
+The threaded durable host loads the product's own Durable Object classes from the
+`coworkerd:platform` definition. Its entry module exports the classes. The node daemon
+carries an immutable ES module package built with the product. The private source service gives
+the durable host the package for the admitted invocation, using the existing module manifest
+and hash checks. The host compiles the package on a durable home with the same compiler
+and exported-class checks as a Worker's package. `runtime.js` continues to provide the process
+entrypoint and its runtime services. Adding a class consists of exporting it from the platform
+entry module, with its module included in the package when it lives in a separate file.
 
-- **Isolates are what a process runs short of.** In the default build all isolates of a process share one
-  4 GiB pointer cage; with the V8 sandbox each reserves about 136 GiB of address space ([CHANGELOG](../CHANGELOG.md)).
-  Measured on x86_64 Linux, a process held about 1,400 minimal isolates in the default build and about 650
-  with the sandbox. A database with an isolate of its own takes one of them from the objects of its process;
-  a native database takes none. Threads are not the limit: about 97.5 KiB each, one per working database in
-  both arrangements.
-- **No V8 on the data path.** Stopping a statement works the same way in both, through SQLite's progress
-  callback and the execution budget in `util/sqlite` ([patch 0021](../patches/workerd/0021-sql-execution-limit.patch)),
-  because `ctx.storage.sql` runs SQLite synchronously on the isolate's thread. An isolate per database adds
-  V8 work that native execution does not have: `JSON.parse` of the request, rows held as JavaScript values and
-  `JSON.stringify` of the answer, on the isolate's heap and under V8's interrupts and heap limit. Native
-  execution meters a database's memory in one place, SQLite's metered memory, and fails with SQLite's codes.
-- **A deadline of its own.** A D1 query and a batch have a 30 s wall deadline; a Durable Object event has a
-  CPU budget that each request refills. An isolate per database would need a wall deadline the object path
-  does not have.
-- **The native code is mostly our own.** Step 4's patches, 0110 and following, put nearly all of their code
-  in files of their own (`coworkerd-native-sql.*` and the threaded server); a few dozen changed lines are in
-  upstream's `util/sqlite`. Upstream changed `util/sqlite` about four times a month in the half year before this review,
-  and those changes reach the JavaScript class too, through `ctx.storage.sql`. The lasting cost is a second
-  implementation of the D1 contract while the JavaScript class exists; step 4's comparison tests cover it.
+The definition pin is the product release version and a SHA-256 of the canonical definition.
+The digest covers the definition name, entry module, ordered module manifest and content
+hashes, and the compatibility date and flags. The digest distinguishes development builds
+with the same version label. The source service matches the complete pin and process generation
+to the admitted invocation before returning the immutable package. A platform package comes
+from the daemon that admitted it.
 
-Not measured yet: how long a native database takes to open, against a new isolate. The baseline's cold reopen
-(about 70 ms p50 against 15 ms with the isolate warm) restarted the whole durable process, so it is not the
-cost of creating one isolate.
+A platform namespace records its tenant and a class reference consisting of the definition name
+and case-sensitive Durable Object export name. The namespace still has its own stable ID and
+shard count. The node resolves the reference through trusted namespace ownership. A new pin
+leaves the namespace, object IDs and storage identities in place. Only the platform can assign
+a platform class reference. Tenant deployment data can declare classes of its own Worker. A
+call needs authority for the exact namespace it targets, including a match with the namespace
+owner's tenant. A test-only node executable accepts fixture definitions and namespace mappings
+from its startup fixture. The released executable has no fixture injection path. Test Workers
+call the installed objects through existing Durable Object bindings.
 
-**Fallback.** Once step 4 lands, the JavaScript class runs only on the upstream backend, so until step 5 the
-fallback is the whole old backend. An isolate per database on threaded homes does not exist. It would need `SqlDatabase` moved
-out of the runtime isolate, which is also the process's entry and hosts `Egress`, `TenantLog` and
-`DurableNamespace`, into a platform definition of its own; a placement rule of one database per copy, or a
-pool of copies reused one database at a time; and the 30 s wall deadline on that path. That is about one step
-of work. Step 5 deletes the JavaScript class only under the conditions it lists.
+Placement and loaded-copy reuse use a definition key with separate fields for definition kind,
+tenant ID, definition name and pin, and the effective bindings and limits of the copy. The node
+gets the tenant from the validated namespace owner. The selected namespace and export identify
+an object and its class within the copy. This permits compatible objects of one tenant to share
+a copy. The loader verifies the namespace selection, the actor export and the copy identity
+before admitting the event to JavaScript. Platform objects have an empty `env` and run under
+the usual tenant Durable Object event limits, using the node's defaults where the tenant has
+no override.
+
+The forwarding node sends the namespace and object IDs. The shard owner resolves the namespace
+against its local catalog and selects its own build's class and pin. A class reference carried by
+a peer is advisory. Database forwarders omit it so that nodes with the first version of the
+platform loader can continue to serve the upstream SQL class. Future namespace mappings must
+preserve the meaning of the namespace on owners that predate the mapping. A queued
+or running event and its retained work use the pin and copy they acquired. The package stays fixed
+for the lifetime of the node daemon. The daemon alone holds each child's parent-liveness write
+end, and the threaded child exits on EOF. The sandbox launcher also sets a parent-death signal.
+Replacing the daemon therefore uses ordinary process shutdown and shard fencing. The next owner
+can reopen the same storage and fire later alarms under its own definition. The node's durable
+log, confirmation, takeover, alarm and idle-release paths remain the common path for the object.
+
+### Database placement
+
+The owner can map a database namespace to the `SqlDatabase` export of `coworkerd:platform`.
+Both backends use the same SQL module and address the stored data by the same namespace,
+object ID and data epoch. On the threaded host the platform copy key also binds the validated
+namespace and object IDs. Two open databases therefore have separate isolate copies even
+when their tenant, package and limits match. The product definition enables the experimental
+SQLite methods used by the SQL class. Tenant Workers keep their existing compatibility flags.
+
+Each open platform database reserves process memory for its SQLite heap in 1 MiB steps.
+The byte counter on the SQLite connection enforces the per-database limit. Inside a SQL transaction,
+growth into a new step needs room in the same process budget that holds the copy's V8 heap and external
+allocations. A SQL transaction that cannot get the next step rolls back and returns HTTP 503
+`OVERLOADED`. An atomic query can be retried. Exceeding the database's own heap limit returns
+HTTP 422 `SQL_MEMORY_LIMIT_EXCEEDED`. Opening, recovery and maintenance account for their heap
+as well. SQLite returns whole steps as its live heap shrinks and releases the remaining step on close.
+
+A release node uses the threaded database mapping when it owns the shard and explicitly enables
+`durableObjects.threadedStorage`. An upstream owner serves its database through the runtime.
+[Release acceptance (#81)](https://github.com/coworkerd/coworkerd/issues/81) ·
+[Database guide](guide/databases.md#threaded-database-capacity)
+
+### Databases
+
+**Decided.** A stateful platform service runs on the object path as a Durable Object class owned by
+the platform. Native execution requires a measured reason recorded in the design. For threaded
+databases, the class is `SqlDatabase` from the shared `coworkerd:platform` definition, outside
+the runtime isolate. Each open database has an exclusive isolate copy and home because SQLite
+runs synchronously and a long statement would delay any other object sharing its copy. A
+single query and an entire batch each have a 30 s wall deadline. [Decision](https://github.com/coworkerd/coworkerd/issues/79#issuecomment-7155649275) ·
+[Platform definition (#82)](https://github.com/coworkerd/coworkerd/issues/82) ·
+[Database scope and acceptance (#81)](https://github.com/coworkerd/coworkerd/issues/81) ·
+[Database placement and activation](#database-placement)
+
+The object path reuses loading, admission and retirement. A node can spread isolates across
+several durable processes through `durableObjects.processes`, so a single process's isolate
+limit alone did not justify a separate path. The native prototype added about 1,450 lines
+specific to native execution outside tests, including a second SQL service and idle-home
+retirement. Upstream workerd's D1, KV, queues and workflows use Durable Object classes.
+Queues, workflows and KV are future uses of the platform definition. [Design rationale](https://github.com/coworkerd/coworkerd/issues/79)
+
+#### Measurements behind the decision
+
+The paired run used one threaded node in the same ARM64 Linux Docker VM, with both paths
+called through stateless Worker bindings and inserts confirmed by local WAL flush. The
+Object fixture gave a `SqlDatabase` stand-in its own isolate copy. Native execution needed
+to clear at least one of the three criteria set before the run. It cleared none.
+[Builds, paths and workload](database-home-benchmark.md#builds-and-paths) ·
+[Decision criteria](database-home-benchmark.md#predeclared-decision-criteria)
+
+| Criterion | Predeclared bar for native execution | Result at the ruling |
+| --- | --- | --- |
+| Warm latency | At least 5 ms and at least 30% lower at p50 or p99 for a one-row read or confirmed one-row insert. | Native reads were 0.26 ms (17%) lower at p50 and 0.50 ms (15%) lower at p99. Native inserts were 0.28 ms lower at p50 and 0.14 ms higher at p99. |
+| Throughput of one database | At least 2× the one-row reads or confirmed one-row inserts per second. | Native reached at most 1.53× with one client reading and 0.97× to 1.03× across the eight-client read and insert cells. |
+| Density | At least 4 MiB more per warm idle database as an object, and a cold open with a new copy at least 20 ms slower at p50. | The 0–500 warm RSS slopes were 2.49 MiB per database on Object and 0.23 MiB on Native, a gap of 2.26 MiB. The memory result alone ruled out this line. |
+
+The eight-client read cells reached about 1,300 reads/s through the measured route on both
+paths. The durable child was below saturation, and the shared limiting stage was unresolved
+at the ruling. A later Linux-runner study identified the node main thread as the limit on
+the Object read path in its own setup. [Original throughput](database-home-benchmark.md#what-the-throughput-measures) ·
+[Linux follow-up (#85)](database-throughput.md)
+
+For one-row reads, the durable child spent 0.57 ms of CPU per query on Object and 0.33 ms
+on Native, a difference of 0.24 ms. The roughly 1 MiB read had a Native p99 of 18 ms versus
+48 ms on Object, with a higher p50 (11.9 versus 9.4 ms) and about twice the durable-child
+CPU (5.56 versus 2.71 ms per query). The large read was outside the latency criterion.
+In a separate 1.55 GiB
+process-budget sweep with 520 test homes, Native held 519 live homes. Object reached
+372 live roots and validated 365 of 388 reads. Native's measured reservation was about
+0.24 MiB per home including its root, and the Object budget upper bound was 4.27 MiB
+per live root.
+These are admission charges and bounds. The density line uses RSS.
+[Latency](database-home-benchmark.md#end-to-end-latency-in-the-original-pair) ·
+[CPU](database-home-benchmark.md#durable-child-cpu) ·
+[Admission](database-home-benchmark.md#default-budget-admission)
+
+The original unpaced cold opens were about 62 ms at p50 on both paths. A shared WAL-tail
+recovery gate dominated that reading. After the ruling, #84 paced requests with the same
+builds and measured cold-new p50 at 26.173 ms on Object and 23.997 ms on Native, a gap of
+2.176 ms. [Cold-open follow-up](database-home-benchmark.md#cold-open-follow-up)
+
+A later test of the platform class measured an RSS slope of 2.88 MiB per database from
+1 to 64 open databases. It also measured reopening previously confirmed data in the same
+epoch with the 10 s idle release. The first read after full release took an extra 9.46 ms
+at p50 and 14.38 ms at p99 compared with its immediate warm repeat.
+[Idle-window verification](database-home-benchmark.md#verification-with-patch-0174)
+
+#### Databases: original native execution proposal
+
+The decision table above and the original migration steps record the native-home proposal.
+It expected native SQLite homes to save isolate capacity and avoid JavaScript parsing and
+serialization on the SQL path. On x86_64 Linux, one process held about 1,400 minimal
+isolates with the shared 4 GiB pointer cage and about 650 with the V8 sandbox, which
+reserved about 136 GiB of address space per isolate. Both paths could interrupt SQLite
+through its progress callback. The proposal also identified the need for a SQL wall
+deadline in addition to the Durable Object CPU budget. Its early cold-reopen baseline
+included a whole-process restart. [Original design](https://github.com/coworkerd/coworkerd/blob/7f0f6bb9a54d3cbf9c1bef2df5b2c171818eaa92/docs/threaded-durable-processes.md#databases-native-execution-not-an-isolate-per-database) ·
+[V8 sandbox notes](../CHANGELOG.md) ·
+[Original SQL execution limits](../patches/workerd/0021-sql-execution-limit.patch)
 
 ### Lifecycle and alarms
 
@@ -256,6 +429,45 @@ transfer its transport state before closing the actor. An otherwise idle ineligi
 15 min from its start. Cancel expired work before final retirement and close non-hibernatable sockets when
 evicting. Active request wall limits and their invocation leases are separate. An event racing the retirement
 either saves the old actor before close begins or joins the next open, once.
+
+An eligible threaded platform database closes its tree and releases its exclusive copy about
+10 seconds after its last request finishes. Retaining empty copies exhausted the process
+admission budget in a serial scan of distinct databases. Releasing the copy with the tree
+returns that reservation. With timed release enabled, the first read after full release
+took an extra 9.46 ms at p50 and 14.38 ms at p99 compared with its immediate warm repeat
+in the same-epoch D1 profile.
+[Idle-window measurements](database-home-benchmark.md#verification-with-patch-0174)
+
+A threaded database can also retire under admission pressure before its idle timer fires.
+The process ranks eligible database trees across its homes by the last completed call.
+The selected home rechecks the mailbox, active calls, tracked background work and WAL
+confirmation before closing the tree. The admission retry follows the normal close and
+copy release. After a routing retirement, the home and one routing tree credit give
+databases 100 ms to retry at the native preface. Existing tenant trees can continue
+serving calls during that interval.
+A cold load that cannot register its initial reservation may retire one database whose
+charge would cover the shortfall, then retry the reservation once. Retirement selected
+by routing or cold-load admission holds one preparation credit for a database while the
+reservation returns and for up to 100 ms afterward.
+Above the initial-admission ceiling, a database can only replace one idle database.
+Its first reservation must fit within the returned charge and leave the reserved total
+at or below its pre-release value. In that band, reserved memory plus lent heap headroom
+must fit the hard process budget. In the memory probe the existing copies charged 1,974,448,702
+bytes against the initial-admission ceiling of 1,973,251,124 bytes. A typical copy
+returned 2,732,370 bytes, and the new copy's first reservation was 2,621,440 bytes.
+At the one-second deadline, the process honors a recorded release even if the home has
+yet to observe it. If the charge is still held, the process clears the victim, counts
+an overload, logs the home and tree, and refuses capacity waiters. The process can use
+the home once its normal close is complete.
+If every victim's reservation stays held, one refused call can retire several databases
+within the node's five-second routing retry window, with at most one victim per retry
+and each new selection waiting for the previous victim's one-second deadline.
+
+The earlier archive completed 1 of 116 queries with `residentObjects: 4` and
+105 of 116 at the default memory budget with extra homes. The revised kernel completed
+116 of 116 in both mixed probes while six tenant definitions competed for the returned
+credits.
+[Admission measurements](database-home-benchmark.md#database-admission-at-the-ceiling)
 
 Use the node's WebSocket registry and transport loop for parked connections. The handoff carries the
 owner/shard epoch, object and attachment identity, ordered frame position, tags, serialized attachments and
@@ -298,6 +510,28 @@ and binding `D1_ERROR` mapping for a timed-out query, including existing precede
 Preserve local filesystem bounds and declare
 any native operation without a proven interruption path a release blocker for that execution path.
 [Existing database API and error contract](guide/databases.md).
+
+The threaded database path starts one 30-second monotonic deadline at the HTTP SQL
+handler or D1 binding dispatch. Nodes forward the time remaining. Time spent receiving the HTTP
+body, waiting for placement or storage recovery, preparing and stepping SQLite, and encoding
+results counts against the same deadline. Every statement in a batch sees that deadline. The
+home releases the prior database response before advancing its queue, so the next synchronous
+statement cannot delay delivery of an earlier result. The public timeout is `503 SQL_LIMIT_EXCEEDED`.
+A binding query or batch reports `D1_ERROR` with that code. WAL confirmation starts with a fresh
+clock after SQLite work and retains its error priority. The platform database's output gate allows
+time for both phases before its watchdog fires.
+
+A detected full disconnect on the HTTP SQL route cancels the relay and closes the write side of
+the event's dedicated kernel connection. The SQLite progress callback detects it during synchronous
+execution. A client can shut down its TCP write side and still receive the complete SQL reply.
+A D1 call can continue to its SQL deadline after the Worker’s HTTP caller disconnects. Propagating
+that outer disconnect to the binding call depends on [#66](https://github.com/coworkerd/coworkerd/pull/66).
+
+An expected SQLite interruption or a failed deadline or disconnect check before commit rolls back
+the current transaction and removes its spilled WAL tail. A queued HTTP or D1 query can read the last
+confirmed rows on the same open database. Storage failures still follow the existing storage error
+handling. SQLite functions and file operations without progress callbacks remain release blockers
+wherever they can outlast the deadline.
 
 ### Decisions taken in review
 

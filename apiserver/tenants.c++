@@ -121,7 +121,7 @@ std::optional<ApiAnswer> applyTenantFields(TenantRecord& tenant, capnp::JsonValu
       } else if (name == "quotas") {
         applyTenantQuotas(tenant.quotas, value);
       } else if (name == "defaultLimits") {
-        tenant.defaultLimits = readWorkerLimits(value);
+        tenant.defaultLimits = readWorkerLimits(value, true);
       } else {
         return invalid("unknown field " + name + " (name, hostnames, quotas, defaultLimits)");
       }

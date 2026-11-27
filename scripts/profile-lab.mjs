@@ -4,8 +4,8 @@
 // unprivileged user (uid 10001, as in the image and the systemd unit), the harness as root reads every process's /proc.
 // The binary directory needs a `coworkerd-server` that executes the node daemon `coworkerd` with its arguments: this
 // environment starts the node by that name (a two-line shell script will do).
-//   V45_BIN    the node, the launcher, workerd, coworkerd-threaded and the two system call tables (Linux, this machine's architecture)
-//   V45_STACK  the stack directory (default /tmp/coworkerd-lab-stack, inside the container)
+//   COWORKERD_PROFILE_BIN_DIR    directory with the node, launcher, workerd, coworkorkerd-threaded and syscall tables
+//   COWORKERD_PROFILE_STACK_DIR  disposable stack directory (default /tmp/coworkerd-lab-stack inside the container)
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -16,8 +16,8 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-export const BIN = process.env.V45_BIN;
-export const STACK = process.env.V45_STACK ?? "/tmp/coworkerd-lab-stack";
+export const BIN = process.env.COWORKERD_PROFILE_BIN_DIR;
+export const STACK = process.env.COWORKERD_PROFILE_STACK_DIR ?? "/tmp/coworkerd-lab-stack";
 export const USER = "10001";
 export const base = "http://127.0.0.1:8930";
 export const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -110,18 +110,19 @@ export async function setup({ sandbox, syscalls = null, workers = { ordinary }, 
   await writeFile(`${STACK}/server-config.json`, JSON.stringify(configuration));
   execFileSync("chown", ["-R", `${USER}:${USER}`, STACK]);
   if (bin !== BIN) execFileSync("chown", ["-R", "root:root", `${STACK}/bin`]);
-  const environment = { COWORKERD_LEASE_MODE: "correct", COWORKERD_SUBREQUEST_GRANT: "2", COWORKERD_LEASE_TTL_MS: "10000",
+  const environment = { COWORKERD_LEASE_MODE: "correct", COWORKERD_LEASE_TTL_MS: "10000",
     COWORKERD_LOG_BUFFER_BYTES: "4194304", ...env };
   const child = spawn("setpriv", ["--reuid", USER, "--regid", USER, "--clear-groups",
     ...(trace ? ["--inh-caps", "+sys_ptrace", "--ambient-caps", "+sys_ptrace"] : []), "--", `${bin}/coworkerd-server`,
     `${STACK}/workers/manifest.json`, workerdPath ?? `${bin}/workerd`, "0.0.0.0:8930", "127.0.0.1:8932", "127.0.0.1:8933", `${STACK}/server-config.json`],
     { env: { ...process.env, ...environment }, stdio: ["ignore", "pipe", "pipe"], detached: true, cwd: "/" });
   const output = collector();
-  // V45_SERVER_LOG: the Server's output also appended to that file as it comes (diagnosis).
-  const mirror = process.env.V45_SERVER_LOG ? (await import("node:fs")).createWriteStream(process.env.V45_SERVER_LOG, { flags: "a" }) : null;
+  // Append the Server's output to the configured log file as it arrives.
+  const mirror = process.env.COWORKERD_PROFILE_SERVER_LOG
+    ? (await import("node:fs")).createWriteStream(process.env.COWORKERD_PROFILE_SERVER_LOG, { flags: "a" }) : null;
   child.stdout.on("data", chunk => { output.take("stdout", chunk); mirror?.write(chunk); });
   child.stderr.on("data", chunk => { output.take("stderr", chunk); mirror?.write(chunk); });
-  const exited = new Promise(resolve => child.on("exit", (code, signal) => { mirror?.write(`[v45-lab] Server ${child.pid} exited code=${code} signal=${signal}\n`); resolve({ code, signal, atUnixMs: Date.now() }); }));
+  const exited = new Promise(resolve => child.on("exit", (code, signal) => { mirror?.write(`[profile-lab] Server ${child.pid} exited code=${code} signal=${signal}\n`); resolve({ code, signal, atUnixMs: Date.now() }); }));
   server = { child, output, exited, sandbox, exit: null };
   exited.then(result => { if (server?.child === child) server.exit = result; });
   const startedAtUnixMs = Date.now();
