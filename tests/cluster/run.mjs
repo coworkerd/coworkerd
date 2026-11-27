@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { cases, durableGatedCases, fatalAttribution, webSocketCases } from './cases.mjs';
 import { Cluster } from './cluster.mjs';
 import { ingressPlacementDefault, ingressPlacementEnabled } from './ingress-placement.mjs';
+import { isolateBusy } from './isolate-busy.mjs';
 
 async function runSuite(selected, kernel, signal, options) {
   const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-cluster-')), kernel, signal, options);
@@ -36,7 +37,7 @@ async function runSuite(selected, kernel, signal, options) {
 
 async function main(args) {
   const regularCases = { 'ingress-placement-default': ingressPlacementDefault, ...cases };
-  const placementCases = { 'ingress-placement': ingressPlacementEnabled };
+  const placementCases = { 'ingress-placement': ingressPlacementEnabled, 'isolate-busy': isolateBusy };
   const all = { ...regularCases, ...placementCases, ...webSocketCases, ...durableGatedCases,
     'fatal-attribution': fatalAttribution };
   const help = `Usage: node tests/cluster/run.mjs <kernel-directory> [${Object.keys(all).join('|')}]`;

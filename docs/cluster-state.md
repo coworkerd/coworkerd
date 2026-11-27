@@ -195,6 +195,25 @@ With `ingressPlacement` off (it is on by default), and for a Worker with a stati
 
 **Admission limits apply before any wait.** A node refuses new tree roots once `placement.rootLimit` (128) calls are in flight and nested calls only at `placement.nestedLimit` (384) (`503 OVERLOADED`): under overload new trees are held off first, while trees already admitted can finish. The memory band ([process isolation](process-isolation.md)) adds to it: in yellow a node refuses forwarded roots and nested calls for versions cold on it, in red all of them (`LOAD_BAND_REJECTED`); a request executing where it arrived is never refused by the band. A refusal carries the reason, the node's band and load and a suggested avoidance time.
 
+**Stateless isolate busy time.** The threaded kernel reports `isolateBusy` on each loaded stateless
+isolate in the node's lifecycle snapshot. The reading covers the 3,000 ms sliding window ending at
+`throughMonotonicMs`, the latest completed 100 ms boundary on the node's monotonic clock. `busyNs`
+is the wall time under the isolate lock in that window, including the part of any current hold that
+falls within the window. `permille` is that fraction rounded down in thousandths (0–1,000). Time
+queued for the lock or awaiting asynchronous I/O outside it is excluded. JavaScript, synchronous
+work and garbage collection under the lock count.
+
+Each reading belongs to one Worker, version, plan revision and isolate instance in one process
+generation. The window starts empty on load, counts lock holds during setup, and ages to zero when
+idle. Distinct instances and nodes have independent windows. A retiring isolate and its replacement
+can appear in the same snapshot with the same plan revision and different instance IDs. A new
+snapshot drops an isolate's reading when it leaves.
+
+The lifecycle publisher targets a 100 ms cadence. A busy maintenance thread can delay publication,
+and an exited process entry can still show its final snapshot. Use the process PID and sample
+timestamp to identify a live, recent reading. The field is absent while an isolate is loading and
+on backends that lack the measurement, including Durable Object homes. The signal is observational.
+
 `placement.tenantRootLimit` and `placement.tenantNestedLimit` add independent per-tenant limits to those same calls. Both default to `0` (disabled); the node-wide limit is checked first. A tenant refusal is `503 OVERLOADED` with reason `tenant ingress concurrency limit reached` and reports that tenant's count and limit. It does not cause peers to avoid the node. `placement.tenantAdmission` lists only tenants that currently hold a slot or have received such a refusal since this node started; root and nested in-flight counts and refusals are separate. Scheduled background alarms still use node-wide admission.
 
 A live paused process is the one exception to immediate refusal. `processPool.pausedAdmissionWaitMs` defaults to 1000 ms (0 disables it) and is shorter than `stuckTimeoutMs`. Waiting occupies the same root or nested admission slot as execution and ends at the earlier of that budget and the call's lease. Admission is checked again after asynchronous package fetching and load checks, immediately before dispatch. These checks reuse the same slot and share one cumulative paused-wait budget. Other ready processes and candidate nodes are tried immediately; only when every candidate explicitly refuses because its eligible processes are paused may one candidate wait. Dynamic placement waits on the local node when it is among the candidates; static placement to a remote node waits on that remote node with serial retries. Pause hints do not trigger avoidance: requests arriving during a pause still try that node first, so `reroutes` can be higher than in 0.5.4. The existing refusal category carries the pause hint, without a new wire field. Exit, kill, disconnection, retirement or a full process does not queue a request for a restart. Expiration retains the existing refusal codes; a lease expires through `LEASE_EXPIRED`. A peer retry is permitted only after an explicit pre-execution refusal; an accepted or uncertain attempt ends retries. The wait budget only decides whether to start another peer retry; an open already sent awaits its normal `peerTimeoutMs`, even if the wait budget expires meanwhile. The wait loop and the receiver enforce the lease. While waiting for a remote node, the sender rechecks its lease and concurrency slot; memory-band admission applies at the executing node.
