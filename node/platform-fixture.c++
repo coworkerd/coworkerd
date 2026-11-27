@@ -30,8 +30,6 @@ const std::string& sqlDatabaseSource() {
 PlatformDefinitions loadPlatformDefinitions() {
   PlatformDefinitions result;
 #ifdef COWORKERD_PLATFORM_FIXTURE
-  const char* threadedDatabases = std::getenv("COWORKERD_TEST_THREADED_DATABASES");
-  result.threadedDatabasesForTest = threadedDatabases != nullptr && std::string_view(threadedDatabases) == "1";
   const char* fixturePath = std::getenv("COWORKERD_PLATFORM_FIXTURE");
   if (fixturePath == nullptr) return result;
   const std::filesystem::path file(fixturePath);
