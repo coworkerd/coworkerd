@@ -644,6 +644,23 @@ async function threadedSqlTransactionLimit(cluster) {
   const insert = 'INSERT INTO ledger VALUES (?, zeroblob(?))';
   const fill = (id, pages) => ({ sql: insert, params: [id, pages * 4092] });
   const read = { sql: 'SELECT id, length(value) AS bytes FROM ledger ORDER BY id' };
+  // Deploy the probe first to keep its setup outside the open database's idle window.
+  const oversizedInsert = `INSERT INTO ledger VALUES (6, zeroblob(${253 * 4092}))`;
+  await cluster.deploy(tenant, 'probe', `export default { async fetch(request, { DB }) {
+    try {
+      if (new URL(request.url).searchParams.has('exec')) {
+        await DB.exec("INSERT INTO ledger VALUES (5, x'05')\\n" +
+          ${JSON.stringify(oversizedInsert + '\n')} +
+          "INSERT INTO ledger VALUES (7, x'07')");
+      } else {
+        await DB.batch([DB.prepare("INSERT INTO ledger VALUES (4, x'04')"),
+          DB.prepare(${JSON.stringify(insert)}).bind(6, ${253 * 4092})]);
+      }
+      return Response.json({ success: true });
+    } catch (error) {
+      return Response.json({ message: error.message, cause: error.cause?.message });
+    }
+  } };`, { wrangler: { d1_databases: [{ binding: 'DB', database_name: db.name }] } });
   await query([
     { sql: 'CREATE TABLE ledger (id INTEGER PRIMARY KEY, value BLOB)' },
     { sql: 'INSERT INTO ledger VALUES (1, x\'01\')' },
@@ -673,22 +690,6 @@ async function threadedSqlTransactionLimit(cluster) {
   const committed = [{ id: 1, bytes: 1 }, { id: 2, bytes: 252 * 4092 }];
   assert.deepEqual((await query(read)).results, committed);
 
-  const oversizedInsert = `INSERT INTO ledger VALUES (6, zeroblob(${253 * 4092}))`;
-  await cluster.deploy(tenant, 'probe', `export default { async fetch(request, { DB }) {
-    try {
-      if (new URL(request.url).searchParams.has('exec')) {
-        await DB.exec("INSERT INTO ledger VALUES (5, x'05')\\n" +
-          ${JSON.stringify(oversizedInsert + '\n')} +
-          "INSERT INTO ledger VALUES (7, x'07')");
-      } else {
-        await DB.batch([DB.prepare("INSERT INTO ledger VALUES (4, x'04')"),
-          DB.prepare(${JSON.stringify(insert)}).bind(6, ${253 * 4092})]);
-      }
-      return Response.json({ success: true });
-    } catch (error) {
-      return Response.json({ message: error.message, cause: error.cause?.message });
-    }
-  } };`, { wrangler: { d1_databases: [{ binding: 'DB', database_name: db.name }] } });
   const binding = async (suffix = '') => json(await request(cluster.urls[ingress],
     `/${tenant.name}/probe${suffix}`), 200, 'D1 transaction limit');
   assert.deepEqual(await binding(), { message: `D1_ERROR: ${failure}`, cause: failure });
@@ -1172,6 +1173,95 @@ async function threadedSqlMemoryLimit(cluster) {
     'SQLite checkpoint allocations and frees balance');
   assert.equal(Array.from(childLogs.matchAll(/SQL transaction refusal cleanup did not finish/g)).length, 0,
     'the implicit rollback was settled before handling another request');
+}
+
+async function threadedSqlProcessMemory(cluster) {
+  const MiB = 1024 ** 2;
+  const [owner] = cluster.nodes;
+  const tenant = await cluster.tenant('sql-process-memory', { durableObjectNamespaces: 8 });
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[owner, 3]]));
+  const selected = databases.get(owner);
+  const query = (db, body, status = 200) => cluster.api(`${db.path}/query`, {
+    method: 'POST', token: tenant.token, body, status,
+  });
+  const read = { sql: 'SELECT value FROM ledger' };
+  const original = await durableGeneration(cluster, owner);
+  const snapshot = async () => {
+    const child = await durableGeneration(cluster, owner);
+    assert.equal(child.pid, original.pid);
+    assert.equal(child.generation, original.generation);
+    return child.lifecycle.durableAdmission;
+  };
+
+  for (const [index, db] of selected.entries()) {
+    await query(db, [
+      { sql: 'CREATE TABLE ledger (value INTEGER)' },
+      { sql: 'INSERT INTO ledger VALUES (?)', params: [index] },
+    ]);
+    await eventually(`${index + 1} open databases have separate SQLite heap reservations`, async () => {
+      const state = await snapshot();
+      assert.equal(state.residentRoots, index + 1);
+      assert.equal(state.sqliteHeapReservedBytes, (index + 1) * MiB);
+    });
+  }
+
+  const opens = async () => (await cluster.state(owner)).durableLog.threadedHomeIo.openSamples;
+  const allOpen = await snapshot();
+  const openSamples = await opens();
+  const room = allOpen.copyMemoryMaximum - allOpen.copyMemoryReservedBytes;
+  // SQLite evaluates all four arguments before entering printf. Each blob
+  // stays below the per-value limit, and only the small string goes to V8.
+  // Keep six MiB above the sampled headroom so a collection cannot hide the refusal.
+  const blobBytes = (Math.ceil(room / MiB) + 6) * MiB / 4;
+  assert.ok(blobBytes >= MiB && blobBytes <= 7 * MiB,
+    `expected room for a process-only refusal, got ${room} bytes`);
+  const materialize = {
+    sql: "SELECT printf('fits', randomblob(?), randomblob(?), randomblob(?), randomblob(?)) AS value",
+    params: Array(4).fill(blobBytes),
+  };
+  const first = selected[0];
+  const reason = 'the durable process SQLite memory budget is full';
+  const batch = [{ sql: 'INSERT INTO ledger VALUES (9)' }, materialize];
+  const refused = await query(first, batch, 503);
+  assert.deepEqual(refused, {
+    success: false, error: `OVERLOADED: ${reason}`, code: 'OVERLOADED', reason, retryable: true,
+  });
+  assert.deepEqual((await query(first, read)).results, [{ value: 0 }]);
+  await eventually('the refused query returns temporary heap without closing its database', async () => {
+    const afterRefusal = await snapshot();
+    assert.equal(afterRefusal.residentRoots, 3);
+    assert.equal(afterRefusal.sqliteHeapReservedBytes, 3 * MiB);
+    assert.equal(afterRefusal.actorResets, allOpen.actorResets);
+  }, { timeout: 3000 });
+  assert.equal(await opens(), openSamples, 'the same database handled the next query');
+
+  const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
+  await writeFile(advance, '180000');
+  await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
+  const idle = await eventually('closing the three databases returns their heap and copy reservations', async () => {
+    const state = await snapshot();
+    assert.equal(state.residentRoots, 0);
+    assert.equal(state.homes, 0);
+    assert.equal(state.sqliteHeapReservedBytes, 0);
+    assert.ok(state.copyMemoryReservedBytes < allOpen.copyMemoryReservedBytes);
+    return state;
+  });
+
+  assert.deepEqual((await query(first, read)).results, [{ value: 0 }]);
+  assert.deepEqual((await query(first, materialize)).results, [{ value: 'fits' }]);
+  await eventually('the reopened database returns the temporary heap after executing the same query', async () => {
+    const state = await snapshot();
+    assert.equal(state.residentRoots, 1);
+    assert.equal(state.sqliteHeapReservedBytes, MiB);
+    assert.equal(await opens(), openSamples + 1);
+  });
+  const childLogs = await cluster.compose(['logs', '--no-color', owner], { maxBuffer: 8 * 1024 * 1024 });
+  assert.doesNotMatch(childLogs, /did not find a valid scope|memoryBytes underflow|SQL transaction refusal cleanup did not finish/);
+  assert.doesNotMatch(childLogs, /SQLite heap (charge remained|change exceeded|changed before)/);
+  console.log(`SQLite heap steps with 3 databases: ${allOpen.sqliteHeapReservedBytes} bytes, `
+    + `close returned ${allOpen.copyMemoryReservedBytes - idle.copyMemoryReservedBytes} copy bytes, `
+    + `${4 * blobBytes} bytes of SQLite arguments refused with ${room} bytes of headroom `
+    + 'and accepted after reopen');
 }
 
 async function threadedDatabaseAccounting(cluster) {
@@ -4211,6 +4301,14 @@ export const durableGatedCases = {
       durableObjects: { threadedStorage: true, sqlDatabaseSpillBytes, sqlProcessSpillBytes,
         checkpointBytes: 32 * 1024 * 1024 },
     }) : ({}),
+  },
+  'threaded-sql-process-memory': {
+    test: threadedSqlProcessMemory, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    singleNode: true, controlDurableLifecycle: true, holdPeerAcks: false,
+    configureNode: () => ({
+      processPool: { count: 1, inFlightLimit: 16, threadedMemoryBytes: 112 * 1024 ** 2 },
+      durableObjects: { threadedStorage: true, processes: 1, peers: 0 },
+    }),
   },
   'threaded-sql-cli-parity': {
     test: threadedSqlCliParity, nodes: ['node-1', 'node-2', 'node-3'],
