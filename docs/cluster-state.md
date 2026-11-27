@@ -205,11 +205,14 @@ work and garbage collection under the lock count.
 
 Each reading belongs to one Worker, version, plan revision and isolate instance in one process
 generation. The window starts empty on load, counts lock holds during setup, and ages to zero when
-idle. Distinct instances and nodes have independent windows. A new snapshot drops an isolate's
-reading when the isolate leaves. An exited process entry can still show its final snapshot, so use
-the process PID and sample timestamp to identify a live, recent reading. The field is absent while
-an isolate is loading and on backends that lack the measurement, including Durable Object homes.
-The signal is observational.
+idle. Distinct instances and nodes have independent windows. A retiring isolate and its replacement
+can appear in the same snapshot with the same plan revision and different instance IDs. A new
+snapshot drops an isolate's reading when it leaves.
+
+The lifecycle publisher targets a 100 ms cadence. A busy maintenance thread can delay publication,
+and an exited process entry can still show its final snapshot. Use the process PID and sample
+timestamp to identify a live, recent reading. The field is absent while an isolate is loading and
+on backends that lack the measurement, including Durable Object homes. The signal is observational.
 
 `placement.tenantRootLimit` and `placement.tenantNestedLimit` add independent per-tenant limits to those same calls. Both default to `0` (disabled); the node-wide limit is checked first. A tenant refusal is `503 OVERLOADED` with reason `tenant ingress concurrency limit reached` and reports that tenant's count and limit. It does not cause peers to avoid the node. `placement.tenantAdmission` lists only tenants that currently hold a slot or have received such a refusal since this node started; root and nested in-flight counts and refusals are separate. Scheduled background alarms still use node-wide admission.
 
