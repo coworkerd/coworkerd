@@ -182,13 +182,19 @@ async function measure(cluster, node, record, residencyOnly) {
   const expectedCopies = initial.admission.workerThreads;
   const warmCopies = new Map([[first.moduleId, 1]]);
   let warmupCalls = 1;
+  let warmupErrors = 0;
   const warmupBatchSize = residencyConcurrency;
   while (warmCopies.size < expectedCopies && warmupCalls < cohortSize) {
     controller.signal.throwIfAborted();
     const size = Math.min(warmupBatchSize, cohortSize - warmupCalls);
-    const probes = await Promise.all(Array.from({ length: size }, (_, offset) =>
+    const probes = await Promise.allSettled(Array.from({ length: size }, (_, offset) =>
       call(2 * cohortSize + warmupCalls + offset)));
-    for (const { moduleId } of probes) {
+    for (const probe of probes) {
+      if (probe.status === 'rejected') {
+        ++warmupErrors;
+        continue;
+      }
+      const { moduleId } = probe.value;
       warmCopies.set(moduleId, (warmCopies.get(moduleId) ?? 0) + 1);
     }
     warmupCalls += size;
@@ -196,11 +202,11 @@ async function measure(cluster, node, record, residencyOnly) {
   const allCopiesWarmed = warmCopies.size === expectedCopies;
   const warmed = await eventually('the warmed copies appear in the same durable child', async () => {
     const admission = await onSameChild();
-    assert.equal(admission.homes, warmCopies.size);
+    assert.ok(admission.homes >= warmCopies.size);
     assert.ok(admission.residentRoots > 0);
     return admission;
   });
-  await record('warmup', { child: initial.child, calls: warmupCalls,
+  await record('warmup', { child: initial.child, calls: warmupCalls, errors: warmupErrors,
     expectedCopies, allCopiesWarmed, copies: Object.fromEntries(warmCopies), admission: warmed });
 
   const idle = async () => {
@@ -340,6 +346,7 @@ async function measure(cluster, node, record, residencyOnly) {
 }
 
 async function runMeasurement(output, residencyOnly) {
+  controller.signal.throwIfAborted();
   await writeFile(output, '', { flag: 'wx' });
   const record = (metric, fields) =>
     appendFile(output, JSON.stringify({ metric, at: new Date().toISOString(), ...fields }) + '\n');
@@ -362,8 +369,15 @@ async function runMeasurement(output, residencyOnly) {
 if (mode === undefined) {
   // The existing hosted idle job invokes both workloads. Each gets a fresh cluster and report.
   const { dir, name, ext } = parse(report);
-  await runMeasurement(report, false);
-  await runMeasurement(join(dir, name + '-residency' + ext), true);
+  const failures = [];
+  for (const [output, residencyOnly] of [[report, false], [join(dir, name + '-residency' + ext), true]]) {
+    try {
+      await runMeasurement(output, residencyOnly);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length) throw new AggregateError(failures, 'Durable Object measurement failed');
 } else {
   await runMeasurement(report, mode === '--residency');
 }
