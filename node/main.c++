@@ -9999,7 +9999,7 @@ kj::Promise<void> watchDurableEpoch(coworkerd::DurableLog& durableLog, coworkerd
     const auto& current = membership.view().epoch;
     if (current == epoch) continue;
     epoch = current;
-    durableLog.setNodeEpoch(std::strtoull(epoch.c_str(), nullptr, 10));
+    co_await durableLog.setNodeEpoch(std::strtoull(epoch.c_str(), nullptr, 10));
   }
 }
 
@@ -10897,7 +10897,7 @@ int run(Launch launch) {
   });
 
   // This machine's Durable Object files are judged and this node's own log read before anything is served.
-  durableLog.setNodeEpoch(std::strtoull(membership->view().epoch.c_str(), nullptr, 10));
+  durableLog.setNodeEpoch(std::strtoull(membership->view().epoch.c_str(), nullptr, 10)).wait(waitScope);
   durableLog.start().wait(waitScope);
 
   std::cout << "[server] ready http=" << launch.listenAddress

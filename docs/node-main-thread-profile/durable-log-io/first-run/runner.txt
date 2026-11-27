@@ -1,0 +1,60 @@
+Linux runnervm0j63q 7.0.0-1020-azure #21~24.04.2-Ubuntu SMP PREEMPT Tue Nov 10 01:36:36 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           48 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  4
+On-line CPU(s) list:                     0-3
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD EPYC 9V74 80-Core Processor
+CPU family:                              25
+Model:                                   17
+Thread(s) per core:                      2
+Core(s) per socket:                      2
+Socket(s):                               1
+Stepping:                                1
+BogoMIPS:                                5192.30
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology tsc_reliable nonstop_tsc cpuid extd_apicid aperfmperf tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves user_shstk avx512_bf16 clzero xsaveerptr rdpru arat npt nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold v_vmsave_vmload avx512vbmi umip avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid fsrm
+Virtualization:                          AMD-V
+Hypervisor vendor:                       Microsoft
+Virtualization type:                     full
+L1d cache:                               64 KiB (2 instances)
+L1i cache:                               64 KiB (2 instances)
+L2 cache:                                2 MiB (2 instances)
+L3 cache:                                32 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-3
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Vulnerable: Safe RET, no microcode
+Vulnerability Spec store bypass:         Vulnerable
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Retpolines; STIBP disabled; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Vulnerable: No microcode
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Not affected
+Runner image ubuntu24 20261122.23.1
+Docker Engine 28.0.4
+TARGET SOURCE         FSTYPE OPTIONS
+/      /dev/nvme0n1p1 ext4   rw,relatime,discard,journal_async_commit,nobarrier,errors=remount-ro,commit=30,data=writeback
+TARGET                   SOURCE                                     FSTYPE OPTIONS
+/tmp/tmp.yly3z9dGeR/slow /dev/mapper/coworkerd-log-io-tmpyly3z9dGeR ext4   rw,noatime
+NAME                             TYPE  SIZE MOUNTPOINTS
+loop0                            loop  768M
+└─coworkerd-log-io-tmpyly3z9dGeR dm    768M /tmp/tmp.yly3z9dGeR/slow
+0 1572864 delay 7:0 0 0 7:0 0 0 7:0 0 20
+write back
+7a8ec3eadb3731a5eaf87b24c584db2a9ef3f1ad8585b6111f36a011a74fcbb8  /home/runner/work/_temp/plain/coworkerd
+7fec562aeb14a03f8c52d901089a0a1eb8b6716c8194e36305f3a4e52816e493  /home/runner/work/_temp/log-baseline/build/coworkerd
+203fb7f312e380bd84df9773d05761a22f90ee98694bc89e9cf83270cbd2806a  /home/runner/work/coworkerd/coworkerd/build/kernel/kernel-v1.20261114.1-1b5ef7fba7e4-run-45880301452-1/linux-x86_64/0c08913a587f2afe4694c6ddb33e1e4104c8fb79c999e83acd6280ae09ea8ec1/workerd
+ca11f88180486e19778d54717c2503996a6ce2d9c986ed5dfcf3cc7ee0ae0ac0  /home/runner/work/coworkerd/coworkerd/build/kernel/kernel-v1.20261114.1-1b5ef7fba7e4-run-45880301452-1/linux-x86_64/0c08913a587f2afe4694c6ddb33e1e4104c8fb79c999e83acd6280ae09ea8ec1/coworkerd-threaded

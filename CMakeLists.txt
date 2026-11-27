@@ -265,7 +265,7 @@ add_test(NAME durable-restored-tail-negative-controls COMMAND coworkerd-durable-
 # Freed memory is overwritten, so that a load touching its destroyed cache fails this test instead of passing by luck.
 set_tests_properties(durable-segment-cache PROPERTIES ENVIRONMENT "MALLOC_PERTURB_=165")
 add_test(NAME durable-lease-tracker COMMAND coworkerd-durable-channel-test lease-tracker)
-foreach(case held expired stale-timer slow-flush wait wait-expired old-epoch not-held)
+foreach(case held expired stale-timer slow-flush rotate completion-error wait wait-expired old-epoch not-held)
   add_test(NAME durable-lease-${case} COMMAND coworkerd-durable-channel-test lease-confirm ${case})
 endforeach()
 foreach(case raise unverified old-ask coalesce outage)
