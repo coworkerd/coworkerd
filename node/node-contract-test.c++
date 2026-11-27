@@ -19,6 +19,7 @@
 #include "process-culprit.h"
 #include "manifests.h"
 
+#include <array>
 #include <bit>
 #include <capnp/message.h>
 #include <cmath>
@@ -74,12 +75,12 @@ void httpReadBeforeFin() {
   struct SilentService final: kj::HttpService {
     kj::PromiseFulfillerPair<void> started = kj::newPromiseAndFulfiller<void>();
     kj::PromiseFulfillerPair<void> read = kj::newPromiseAndFulfiller<void>();
-    kj::String received;
+    std::array<char, 4> received{};
     kj::Promise<void> request(kj::HttpMethod, kj::StringPtr, const kj::HttpHeaders&,
         kj::AsyncInputStream& body, Response&) override {
       started.fulfiller->fulfill();
       co_await read.promise;
-      received = co_await body.readAllText();
+      co_await body.tryRead(received.data(), received.size(), received.size());
       co_await kj::Promise<void>(kj::NEVER_DONE);
     }
   } service;
@@ -98,7 +99,8 @@ void httpReadBeforeFin() {
   KJ_REQUIRE(!served.poll(io.waitScope), "a FIN must leave the buffered request body available");
   service.read.fulfiller->fulfill();
   timer.timeoutAfter(2 * kj::SECONDS, kj::mv(served)).wait(io.waitScope);
-  KJ_REQUIRE(service.received == "body", "the handler read the complete request before cancellation");
+  KJ_REQUIRE(std::string_view(service.received.data(), service.received.size()) == "body",
+      "the parser delivered all request bytes before cancellation");
 }
 
 void peerSessionLiveness() {
