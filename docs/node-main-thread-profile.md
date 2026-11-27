@@ -191,3 +191,57 @@ COWORKERD_PROFILE_CONTROL=plain COWORKERD_CLUSTER_BIN_DIR="$PWD/build/plain" \
   "$PWD/reports/plain-after.jsonl" --main-thread-profile
 python3 "$report_checkout/tests/cluster/main-thread-profile/tables.py" --controls reports
 ```
+
+## Durable log I/O
+
+The append worker owns the active log descriptor. A completed append makes a record eligible for replication. With no selected peer, a successful local flush makes the covered prefix eligible for confirmation. The node rechecks the lease before each positive reply and preserves confirmation order within each database. Writes queued during I/O can share a flush. Epoch rotation drains the old file's queue before switching descriptors and refuses outstanding confirmations under the old identity. If a request's WAL record arrives while the old file drains or the new descriptor opens, the node refuses the write and uses the existing repair path. That window lasts through the drain and descriptor handoff.
+
+### Paired measurement
+
+Both builds ran in one job on `runnervm0j63q`, an Ubuntu 24.04 x86-64 VM with four vCPUs on an AMD EPYC 7763 and Linux `7.0.0-1020-azure`. They used the same published workerd kernel. Each build served through a single standalone node. The driver alternated builds on each volume, with five five-second one-client insert windows before three five-second 16-client windows. The seven-second mixed windows used one insert client and one client reading a warm SQLite Durable Object in a different tenant. Every insert request wrote one row. The driver checked every reply and verified a total of 42,281 confirmed inserts including warm-up. [Runner record](node-main-thread-profile/durable-log-io/runner.txt) · [Source revisions](node-main-thread-profile/durable-log-io/revisions.txt) · [Same-runner job and recording](https://github.com/coworkerd/coworkerd/actions/runs/45911331184)
+
+The slow volume used ext4 on a loop device with a 20 ms device-mapper delay on block flushes. The delayed image had its own backing ext4 filesystem and journal, with no other files written there during the run. Both loop images were fully written before measurement and used direct I/O. The SQLite files, ordinary-volume log and probe output used separate mounts. The node probe records the thread, file and monotonic interval for writes and syncs on the log mounts. A read qualifies as concurrent when its complete HTTP round trip fits within one recorded `fdatasync` interval. [Linux `dm-delay` documentation](https://docs.kernel.org/admin-guide/device-mapper/delay.html)
+
+| Log volume | Insert clients | Baseline confirmed inserts/s | Candidate confirmed inserts/s |
+| --- | ---: | ---: | ---: |
+| Ordinary ext4 | 1 | 245.8 | 239.0 |
+| Ordinary ext4 | 16 | 413.0 | 463.6 |
+| Delayed ext4 | 1 | 38.8 | 38.8 |
+| Delayed ext4 | 16 | 40.8 | 312.0 |
+
+Rates are medians. On the delayed volume, the 16-client rate rose 7.65×. Across the five one-client windows on that volume, baseline flush p99 ranged from 22.97 to 25.99 ms and candidate flush p99 ranged from 22.88 to 25.99 ms. Baseline insert p50 ranged from 25.16 to 25.61 ms and candidate insert p50 ranged from 25.32 to 25.76 ms.
+
+| Log volume | Baseline longest main-thread stall | Candidate longest main-thread stall | Baseline reads wholly inside a flush | Candidate reads wholly inside a flush |
+| --- | ---: | ---: | ---: | ---: |
+| Ordinary ext4 | 5.269 ms | 4.787 ms | 0 / 1,304 | 0 / 1,452 |
+| Delayed ext4 | 43.771 ms | 4.822 ms | 0 / 279 | 1,319 / 1,857 |
+
+A stall is the interval between returning from one `epoll_wait` or `epoll_pwait` and entering the next. It includes time spent in blocking calls and time descheduled between polls. The table takes the maximum across all nine timed windows per cell. The ordinary-volume candidate maximum occurred in the second one-client insert-only window and included 0.236 ms of main-thread CPU. The delayed-volume maximum occurred in the second one-client insert-only window and included 0.396 ms of main-thread CPU. The delayed volume passed the 5 ms threshold. One recorded 3.50 ms read took place from 1.22 to 4.72 ms into a 21.55 ms flush.
+
+All 19,934 observed candidate append calls and all 13,980 observed candidate flushes ran outside the main thread. The largest candidate flush was 26.961 ms on the delayed volume and 6.238 ms on the ordinary volume. The overlap recordings contain zero rows because no candidate flush exceeded 40 ms. [Delayed-volume overlap recording](node-main-thread-profile/durable-log-io/slow-long-flushes.jsonl) · [Ordinary-volume overlap recording](node-main-thread-profile/durable-log-io/normal-long-flushes.jsonl)
+
+### Earlier run on shared backing storage
+
+The first run put the delayed volume's backing image on the ordinary filesystem and ran each build's windows consecutively. It measured 2.878 ms as the candidate's longest main-thread stall on the delayed volume. The 5.035 ms ordinary-volume peak occurred in the first 16-client insert-only window with zero main-thread append or flush calls. That run measured a delayed-volume one-client rate of 28.8 inserts/s with the worker, down from 38.4. The candidate's flush p99 varied from 84.8 to 337.8 ms across those windows. The first recording retained flush summaries and one example per window, so concurrent file operations during those old outliers cannot be reconstructed. The alternating run with a private backing filesystem did not reproduce the one-client drop or the long candidate flushes. [First recording](node-main-thread-profile/durable-log-io/first-run/) · [First Actions job](https://github.com/coworkerd/coworkerd/actions/runs/45907925121)
+
+### Reproduce the log comparison
+
+Use one quiet Ubuntu 24.04 x86-64 machine with the [build dependencies](../CONTRIBUTING.md#building), Docker Compose, Node.js 22, and root access for the private loop mounts. The driver creates fresh clusters and removes its test volumes when done.
+
+```sh
+git fetch origin refs/pull/122/head
+git worktree add --detach ../coworkerd-log-before 01a9af30fdca886e1cc4ae3b82399c202099fe78
+git worktree add --detach ../coworkerd-log-after e938d72ed1fd4c6fabcce7617853359cd6845cbc
+export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4
+(cd ../coworkerd-log-before && bash scripts/build.sh)
+(cd ../coworkerd-log-after && bash scripts/build.sh && npm ci --prefix cli)
+cd ../coworkerd-log-after
+kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64)
+bash tests/cluster/durable-log-io/run.sh ../coworkerd-log-before/build build "$kernel" reports/durable-log-io
+```
+
+Verify the checked-in recording from the checkout containing this report.
+
+```sh
+node tests/cluster/durable-log-io/verify.mjs docs/node-main-thread-profile/durable-log-io
+```
