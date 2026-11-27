@@ -8,7 +8,7 @@ A pending home task can hold an actor whose shipper and SQLite close callback bo
 Exercise scope teardown with a real actor and SQLite connection, an unresolved task and lifetime markers that can report an early release safely.
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index d1164d9463d31ce41fce91019133458f2aac7308..b50e8eca1cff4bac2c9dc20f6448f5287361add8 100644
+index d1164d9463d31ce41fce91019133458f2aac7308..35ad70bd08aacd062b892baf9810e9ba86813f9f 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -4,6 +4,8 @@
@@ -20,7 +20,7 @@ index d1164d9463d31ce41fce91019133458f2aac7308..b50e8eca1cff4bac2c9dc20f6448f528
  #include <spawn.h>
  #include <sys/wait.h>
  
-@@ -2139,6 +2141,114 @@ KJ_TEST("a call thread cancels background work that outlives the drain limit") {
+@@ -2139,6 +2141,115 @@ KJ_TEST("a call thread cancels background work that outlives the drain limit") {
    KJ_EXPECT(BACKGROUND_BACKSTOP > WAIT_UNTIL_LIMIT);
  }
  
@@ -109,7 +109,8 @@ index d1164d9463d31ce41fce91019133458f2aac7308..b50e8eca1cff4bac2c9dc20f6448f528
 +          [shipper = kj::mv(shipper)](SpanParent) mutable { return shipper->onCommit(); });
 +    };
 +    // This observer only touches the recorder, so even a broken order can be reported safely.
-+    auto observer = kj::refcounted<ActorObserver>().attach(kj::defer([&events, copy] {
++    auto observer =
++        kj::refcounted<ActorObserver>().attachToThisReference(kj::defer([&events, copy] {
 +      KJ_EXPECT(!copy.expired());
 +      events.add("release actor observer"_kj);
 +    }));
