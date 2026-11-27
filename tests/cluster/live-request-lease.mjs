@@ -622,7 +622,10 @@ export async function alarmRequestLease(cluster) {
     import { DurableObject } from 'cloudflare:workers';
     export class Clock extends DurableObject {
       async alarm(info) {
-        if (info.retryCount) return;
+        if (info.retryCount) {
+          await this.ctx.storage.put('retried', true);
+          return;
+        }
         await this.ctx.storage.put('started', true);
         const wait = await this.ctx.storage.get('wait');
         await scheduler.wait(wait);
@@ -637,6 +640,7 @@ export async function alarmRequestLease(cluster) {
         return Response.json({
           started: await this.ctx.storage.get('started') ?? false,
           finished: await this.ctx.storage.get('finished') ?? false,
+          retried: await this.ctx.storage.get('retried') ?? false,
         });
       }
     }
@@ -651,16 +655,18 @@ export async function alarmRequestLease(cluster) {
   const path = `/${tenant.name}/alarm`;
   const read = async key => json(await request(base, `${path}/${key}`), 200, `read ${key} alarm`);
   await eventually('the alarm Worker is ready', async () => {
-    assert.deepEqual(await read('short'), { started: false, finished: false });
+    assert.deepEqual(await read('short'), { started: false, finished: false, retried: false });
   });
   for (const [key, duration] of [['short', 150], ['long', 3500]]) {
     assert.deepEqual(await request(base, `${path}/${key}`, { method: 'POST', body: duration }),
       { status: 200, text: 'scheduled' });
   }
   await eventually('both alarm handlers start', async () => {
-    assert.deepEqual(await read('short'), { started: true, finished: true });
+    assert.deepEqual(await read('short'), { started: true, finished: true, retried: false });
     assert.equal((await read('long')).started, true);
   });
   await delay(4000, undefined, { signal: cluster.signal });
-  assert.deepEqual(await read('long'), { started: true, finished: false }, 'the wall limit cancelled the long handler');
+  await eventually('the timed-out alarm retries without the original handler finishing', async () => {
+    assert.deepEqual(await read('long'), { started: true, finished: false, retried: true });
+  });
 }

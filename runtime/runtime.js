@@ -24,6 +24,28 @@ const PRELUDE_MODULE = "__coworkerd_console__.js";
 // the rest, objects shown to depth 2); the original console.log stays available to the bridge only.
 function preludeSource() {
   return `const original = { debug: console.debug, info: console.info, log: console.log, warn: console.warn, error: console.error };
+// Capture the timer primitives before loading tenant code. Each bridge owns its actor state map.
+const startTimer = setTimeout.bind(globalThis);
+const stopTimer = clearTimeout.bind(globalThis);
+const WeakContexts = WeakMap;
+const readContext = Function.call.bind(WeakMap.prototype.get);
+const writeContext = Function.call.bind(WeakMap.prototype.set);
+const apply = Reflect.apply;
+export function __coworkerdCreateAlarmTimers() {
+  const contexts = new WeakContexts();
+  let abort;
+  return {
+    bind(state) {
+      abort ??= state.abort;
+      return object => writeContext(contexts, object, state);
+    },
+    arm(object, milliseconds, reason) {
+      const state = readContext(contexts, object);
+      const timer = startTimer(() => apply(abort, state, [reason]), milliseconds);
+      return () => stopTimer(timer);
+    },
+  };
+}
 function show(value, depth) {
   switch (typeof value) {
     case "string": return depth ? JSON.stringify(value) : value;
@@ -237,6 +259,8 @@ const DO_HOPS_HEADER = "x-coworkerd-do-hops";
 // The object's alarm: the time the node scheduled and how many times the handler has been tried. The node sets them
 // on a request of its own; the runtime sets them from the trusted descriptor alone.
 const DO_ALARM_RETRY_HEADER = "x-coworkerd-do-alarm-retry";
+const MAX_ALARM_WALL_MS = 15 * 60 * 1000;
+const ALARM_WALL_REASON = "Alarm exceeded its allowed execution time";
 const DURABLE_EXPORT_PREFIX = "__coworkerd_do_";
 const DURABLE_SOURCE = `
 const __coworkerdK = new Uint32Array([0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -506,6 +530,7 @@ function __coworkerdD1(entry) {
   return Object.freeze(database);
 }
 const __coworkerdObjectEnvs = new WeakMap();
+const __coworkerdAlarmTimers = __coworkerdCreateAlarmTimers();
 // The class a declared class runs as: the tenant's, constructed with its object's env, and its fetch run within it
 // (import { env } from "cloudflare:workers" sees the same). A class that is not exported fails when its object starts
 // (the trial load refuses such a version first).
@@ -513,7 +538,7 @@ const __coworkerdObjectEnvs = new WeakMap();
 // database is the truth: a firing the node asked for that the database does not hold any more runs nothing. A
 // handler that ran leaves no alarm behind -- the delete is part of the object's own transaction, which its peers
 // confirm before this answer leaves, so the shard's next owner never fires it again.
-async function __coworkerdAlarm(object, scheduledAtUnixMs, retryCount) {
+async function __coworkerdAlarm(object, scheduledAtUnixMs, retryCount, wallMs, timeoutReason) {
   const storage = object?.ctx?.storage;
   if (!storage) return Response.json({ outcome: "notDue", atUnixMs: 0, reason: "the object has no storage" });
   const held = await storage.getAlarm();
@@ -525,10 +550,15 @@ async function __coworkerdAlarm(object, scheduledAtUnixMs, retryCount) {
     await storage.deleteAlarm();
     return Response.json({ outcome: "fired", atUnixMs: 0, reason: "the class has no alarm() handler" });
   }
+  // This bridge delivers a JS RPC method, so the native alarm timer is not active here.
+  // Abort the actor context on expiry before the node can retry its handler.
+  const cancelTimeout = __coworkerdAlarmTimers.arm(object, wallMs, timeoutReason);
   try {
     await object.alarm({ retryCount, isRetry: retryCount > 0 });
   } catch (error) {
     return Response.json({ outcome: "failed", reason: String(error?.message ?? error).slice(0, 300) });
+  } finally {
+    cancelTimeout();
   }
   if ((await storage.getAlarm()) === held) await storage.deleteAlarm();
   return Response.json({ outcome: "fired", atUnixMs: 0 });
@@ -539,8 +569,10 @@ function __coworkerdDurableClass(namespace, name) {
   try {
     const wrapped = class extends base {
       constructor(ctx, variables) {
+        const rememberAlarmContext = __coworkerdAlarmTimers.bind(ctx);
         const env = { ...variables, ...__coworkerdNamespaces(ctx?.props?.durableObjects) };
         super(ctx, env);
+        rememberAlarmContext(this);
         __coworkerdObjectEnvs.set(this, env);
       }
     };
@@ -553,9 +585,9 @@ function __coworkerdDurableClass(namespace, name) {
     } });
     Object.defineProperty(wrapped.prototype, "__coworkerdAlarm", {
       configurable: true,
-      value: function (scheduledAtUnixMs, retryCount) {
+      value: function (scheduledAtUnixMs, retryCount, wallMs, timeoutReason) {
         const env = __coworkerdObjectEnvs.get(this);
-        return withEnv(env, async () => (await __coworkerdAlarm(this, Number(scheduledAtUnixMs), Number(retryCount))).json());
+        return withEnv(env, async () => (await __coworkerdAlarm(this, scheduledAtUnixMs, retryCount, wallMs, timeoutReason)).json());
       },
     });
     // The object as a capability for a method call on its stub. The node hands it to the caller, so workerd's
@@ -679,6 +711,7 @@ function durableFieldsValid(value) {
       DECIMAL.test(String(target.dataEpoch ?? "0")) &&
       (target.database === undefined || target.database === "" || RESOURCE_NAME.test(target.database)) &&
       (target.alarmAtUnixMs === undefined || DECIMAL.test(String(target.alarmAtUnixMs))) &&
+      (target.alarmWallMs === undefined || (limit(target.alarmWallMs) && target.alarmWallMs <= MAX_ALARM_WALL_MS)) &&
       limit(target.alarmFacetId) && limit(target.alarmRetryCount))) return false;
   if (classes !== undefined && !(Array.isArray(classes) && classes.every(name => typeof name === "string" && CLASS_NAME.test(name)))) return false;
   return true;
@@ -868,7 +901,7 @@ async function makeWorkerCode(descriptor, env, ctx, root = false) {
     const classes = Array.isArray(descriptor.durableObjectClasses) ? descriptor.durableObjectClasses : [];
     // A trial load shares this isolate's loader key but has no bindings. Include the namespace helpers here;
     // install bindings from each call's props, independently of the classes declared by this Worker.
-    const bridge = `import { __coworkerdLog } from "./${PRELUDE_MODULE}";
+    const bridge = `import { __coworkerdLog, __coworkerdCreateAlarmTimers } from "./${PRELUDE_MODULE}";
 import { withEnv, DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import * as tenant from ${JSON.stringify("./" + descriptor.mainModule)};
 ${root ? `export * from ${JSON.stringify("./" + descriptor.mainModule)};\n` : ""}${TRIAL_SOURCE}
@@ -1352,21 +1385,26 @@ async function trialRoot(descriptor, env, ctx) {
 async function serveRoot(request, descriptor, env, ctx) {
   const target = descriptor.durableObject;
   const preparationNonce = crypto.randomUUID();
+  const scheduled = Number(target.alarmAtUnixMs ?? 0);
+  // Recognize only the abort from this alarm's private timer when counting a handler retry.
+  const timeoutReason = scheduled > 0 && !target.database ? `${ALARM_WALL_REASON}: ${crypto.randomUUID()}` : null;
   try {
     const root = await selectedRoot(descriptor, env, ctx, preparationNonce);
     const headers = new Headers(request.headers);
     headers.set(DO_HOPS_HEADER, String(target.hops ?? 0));
     headers.delete(DO_ALARM_HEADER);
     headers.delete(DO_ALARM_RETRY_HEADER);
-    const scheduled = Number(target.alarmAtUnixMs ?? 0);
     if (scheduled > 0) {
       if (!target.database)
-        return Response.json(await root.__coworkerdAlarm(scheduled, Number(target.alarmRetryCount ?? 0)));
+        return Response.json(await root.__coworkerdAlarm(scheduled, Number(target.alarmRetryCount ?? 0),
+          target.alarmWallMs || MAX_ALARM_WALL_MS, timeoutReason));
       headers.set(DO_ALARM_HEADER, String(scheduled));
       headers.set(DO_ALARM_RETRY_HEADER, String(Number(target.alarmRetryCount ?? 0)));
     }
     return await root.fetch(new Request(request, { headers, cf: tenantCf(descriptor, env) }));
   } catch (error) {
+    if (timeoutReason !== null && error?.durableObjectReset === true && error.message === timeoutReason)
+      return Response.json({ outcome: "failed", reason: ALARM_WALL_REASON });
     const preparation = rootPreparationKind(error, preparationNonce);
     const reason = cleanDurableReason({ message: rootFailureReason(error) }, descriptor.secrets);
     const sqlLimit = target.database && error?.code === "SQL_LIMIT_EXCEEDED";

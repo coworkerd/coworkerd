@@ -1169,6 +1169,8 @@ struct InvocationDescriptor {
     # How many times its handler has already been tried (alarmInfo.retryCount).
     alarmRetryCount @9 :UInt32;
     alarmFacetId @10 :UInt32 = 1;
+    # The node's wall limit for one alarm attempt on the legacy host.
+    alarmWallMs @11 :UInt32;
   }
 }
 

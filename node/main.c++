@@ -3857,6 +3857,7 @@ private:
       target.setAlarmAtUnixMs(durable->alarmAtUnixMs);
       target.setAlarmRetryCount(durable->alarmRetryCount);
       target.setAlarmFacetId(durable->alarmFacetId);
+      if (durable->alarmAtUnixMs) target.setAlarmWallMs(leaseConfig.alarmWallMs);
       descriptor.initBindings(0);
       capnp::JsonCodec json;
       holdSecrets(root != nullptr ? root->plan : std::string());
