@@ -185,9 +185,9 @@ async function measure() {
     await record('window', busy);
     currentBurner = reopened;
   }
-  const logs = await cluster.api(`${first.path}/workers/burner/logs?limit=1000`, { token: first.token });
-  const starts = new Map(logs.lines.flatMap(line => {
-    const match = line.message?.match(/cpu-window (\d+) (\d+)/);
+  const childLog = await cluster.compose(['exec', '-T', node, 'cat', '/var/lib/coworkerd/logs/workerd.log']);
+  const starts = new Map(childLog.split('\n').flatMap(line => {
+    const match = line.match(/^cpu-window (\d+) (\d+)$/);
     return match ? [[Number(match[1]), Number(match[2])]] : [];
   }));
   const trace = await cluster.compose(['logs', '--no-color', node], { maxBuffer: 16 * 1024 * 1024 });

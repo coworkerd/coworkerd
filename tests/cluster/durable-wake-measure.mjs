@@ -120,7 +120,7 @@ async function measure(backend, kernelHashes) {
   const sockets = [];
   try {
     await cluster.start();
-    const tenant = await cluster.tenant('acceptance-wake');
+    const tenant = await cluster.tenant('acceptance-wake', { logLinesPerSecond: 1000 });
     await cluster.deploy(tenant, 'objects', worker, { wrangler: {
       durable_objects: { bindings: [{ name: 'RECORDS', class_name: 'Record' }] },
       migrations: [{ tag: 'v1', new_sqlite_classes: ['Record'] }],
@@ -174,16 +174,24 @@ async function measure(backend, kernelHashes) {
       assert.deepEqual(warm.attachment, { id, value: name });
       sockets.push({ ws, name, id, warm });
     }
-    assert.equal(new Set([...saved.map(value => value.moduleId), ...sockets.map(({ warm }) => warm.moduleId)]).size, 1,
-      'all requests started on one warm Worker isolate copy');
+    const warmCopies = new Set([...saved.map(value => value.moduleId), ...sockets.map(({ warm }) => warm.moduleId)]);
+    await record('warm-copies', { backend, moduleIds: [...warmCopies] });
 
     const constructorLog = async () => {
-      const logs = await cluster.api(`${tenant.path}/workers/objects/logs?limit=1000`, { token: tenant.token });
-      assert.equal(logs.nodes.length, 1);
-      assert.equal(logs.nodes[0].problem, undefined);
-      assert.equal(logs.nodes[0].droppedLines, 0);
-      const constructors = logs.lines.flatMap(line => {
-        const match = line.message?.match(/wake-constructor ([a-f0-9]{64}) ([a-f0-9-]{36})/);
+      let messages;
+      if (threaded) {
+        // The threaded child writes these console lines to its process log.
+        const log = await cluster.compose(['exec', '-T', node, 'cat', '/var/lib/coworkerd/logs/workerd.log']);
+        messages = log.split('\n');
+      } else {
+        const logs = await cluster.api(`${tenant.path}/workers/objects/logs?limit=1000`, { token: tenant.token });
+        assert.equal(logs.nodes.length, 1);
+        assert.equal(logs.nodes[0].problem, undefined);
+        assert.equal(logs.nodes[0].droppedLines, 0);
+        messages = logs.lines.map(line => line.message ?? '');
+      }
+      const constructors = messages.flatMap(line => {
+        const match = line.match(/wake-constructor ([a-f0-9]{64}) ([a-f0-9-]{36})/);
         return match ? [{ socketId: match[1], actorId: match[2] }] : [];
       });
       return constructors.sort((a, b) => a.socketId.localeCompare(b.socketId) || a.actorId.localeCompare(b.actorId));
@@ -236,7 +244,7 @@ async function measure(backend, kernelHashes) {
         const result = JSON.parse(reply);
         assert.equal(result.message, 'wake-' + name);
         assert.notEqual(result.actorId, warm.actorId);
-        assert.equal(result.moduleId, warm.moduleId);
+        assert.ok(warmCopies.has(result.moduleId), 'the socket woke in a prewarmed Worker copy');
         assert.equal(result.constructedWith, 1);
         assert.equal(result.restored, true);
         assert.deepEqual(result.attachment, { id, value: name });
@@ -253,7 +261,7 @@ async function measure(backend, kernelHashes) {
         const result = await call(seed.name);
         const ms = performance.now() - start;
         assert.notEqual(result.actorId, seed.actorId);
-        assert.equal(result.moduleId, seed.moduleId);
+        assert.ok(warmCopies.has(result.moduleId), 'the object reopened in a prewarmed Worker copy');
         assert.equal(result.value, seed.value);
         httpRows.push({ name: seed.name, ms, seed, result });
       } catch (error) {

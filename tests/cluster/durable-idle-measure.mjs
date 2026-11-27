@@ -89,7 +89,11 @@ async function measure() {
     assert.ok(lifecycle?.durableAdmission);
     return { child: { processId, pid, generation }, admission: lifecycle.durableAdmission };
   };
-  const initial = await eventually('durable admission telemetry', state);
+  const initial = await eventually('the baseline actor is resident in the durable process', async () => {
+    const reading = await state();
+    assert.equal(reading.admission.residentRoots, 1);
+    return reading;
+  });
   await record('initial', initial);
   const onSameChild = async () => {
     const reading = await state();
@@ -104,8 +108,14 @@ async function measure() {
     assert.equal(admission.waiting, 0);
     return admission;
   };
+  let retirements = initial.admission.idleRetirements;
   const resources = async phase => {
-    const retirement = await eventually(phase + ' retirement', idle, { timeout: 35000 });
+    const retirement = await eventually(phase + ' retirement', async () => {
+      const reading = await idle();
+      assert.ok(reading.idleRetirements > retirements);
+      return reading;
+    }, { timeout: 35000 });
+    retirements = retirement.idleRetirements;
     const samples = [];
     for (let i = 0; i < 6; ++i) {
       const before = await idle();
