@@ -1,0 +1,19 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sat, 28 Nov 2026 05:56:51 +0800
+Subject: [PATCH] Pass the optional lease to the isolate busy test invocation
+
+
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 36322625deeb2b69763e3103d8105468f69d0ecb..c289c19b59fa32682f79d6933c093e5a98d5d996 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -109,7 +109,7 @@ KJ_TEST("a stateless isolate starts idle after loading and counts its next HTTP
+   // The first lock taken while serving the request lasts 200 ms on the controlled clock.
+   clock.time = 2875 * kj::MILLISECONDS;
+   clock.advanceAfterRead = 200 * kj::MILLISECONDS;
+-  Invocation invocation(server, state, kj::mv(descriptor), Frankenvalue(), {});
++  Invocation invocation(server, state, kj::mv(descriptor), Frankenvalue(), {}, kj::none);
+   auto client = kj::newHttpClient(invocation);
+   auto response =
+       client->request(kj::HttpMethod::GET, "http://test/busy", kj::HttpHeaders(*state.headers))

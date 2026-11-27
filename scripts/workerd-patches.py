@@ -157,6 +157,8 @@ def allowed_path(name, path):
                           name in {'0162-alarm-limit-visibility.patch', '0163-drain-promise-branch.patch',
                                    '0164-own-drain-continuation.patch', '0165-finish-http-before-drain.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0167-update-isolate-busy-test-invocation.patch' and
+                              path == 'src/workerd/threaded/threaded-server-test.c++' or
                           name == '0042-threaded-server-s1a.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',
