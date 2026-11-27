@@ -63,6 +63,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0123 reserves a durable storage identity before its WAL scan. A replacement tree waits for
   the previous root and facets to confirm SQLite close. A BUSY close keeps that identity fenced in
   the child, and the node's existing generation-exit check protects the next child.
+  Patch 0185 measures wall time under the isolate lock for threaded stateless Workers. The JSG lock
+  notifies the existing isolate observer at acquire and release. The threaded lifecycle publishes
+  a bounded sliding-window reading for each loaded isolate.
   Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
   quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and
