@@ -160,7 +160,7 @@ const worker = `
           await scheduler.wait(5_000);
           controller.enqueue(encoder.encode('finished\\n'));
           controller.close();
-        } }));
+        } }), { headers: { 'x-drain-invocation': request.cf.invocationId } });
       }
       if (path === 'decline-upgrade') {
         return scheduler.wait(32_000).then(async () => {
@@ -243,7 +243,14 @@ async function prepareLeaseWorker(cluster, tenantName, withD1 = false) {
 }
 
 export async function connectedRequestLease(cluster) {
-  const { ingress, base, path } = await prepareLeaseWorker(cluster, 'live-request-lease');
+  const tenantName = 'live-request-lease';
+  const { ingress, base, path } = await prepareLeaseWorker(cluster, tenantName);
+  const tenantCpuMs = async () => {
+    const states = await Promise.all(cluster.nodes.map(node => cluster.state(node)));
+    return states.flatMap(state => Object.values(state.usage.hours))
+      .reduce((total, hour) => total + (hour[tenantName]?.cpuMs ?? 0), 0);
+  };
+  const cpuBefore = await tenantCpuMs();
   const controller = new AbortController();
   const signal = AbortSignal.any([cluster.signal, controller.signal, AbortSignal.timeout(145_000)]);
   try {
@@ -281,7 +288,12 @@ export async function connectedRequestLease(cluster) {
     assert.deepEqual(observed, expected);
     const elapsed = performance.now() - sentAt;
     assert.ok(elapsed >= 120_000, 'the connected stream completed after 120 seconds');
-    console.log(`A half-closed HTTP client received the complete ${(elapsed / 1000).toFixed(1)} s stream`);
+    const { usage: { sampleIntervalMs } } = await cluster.state(ingress);
+    await delay(2 * sampleIntervalMs, undefined, { signal });
+    const cpuMs = await tenantCpuMs() - cpuBefore;
+    assert.ok(cpuMs > 0 && cpuMs < 150, `the stream and its children used ${cpuMs.toFixed(2)} ms CPU`);
+    console.log(`A half-closed HTTP client received the complete ${(elapsed / 1000).toFixed(1)} s stream, ` +
+      `with ${cpuMs.toFixed(2)} ms of measured tenant CPU across the cluster`);
   } finally {
     controller.abort();
   }
@@ -289,10 +301,11 @@ export async function connectedRequestLease(cluster) {
 
 export async function responseDrainRequestLease(cluster) {
   const tenantName = 'live-request-drain';
-  const { base, path } = await prepareLeaseWorker(cluster, tenantName);
+  const { ingress, base, path } = await prepareLeaseWorker(cluster, tenantName);
   const started = performance.now();
-  assert.deepEqual(await request(base, path + '/response-drain', { timeout: 15_000 }),
-    { status: 200, text: 'started\nfinished\n' });
+  const response = await fetch(base + path + '/response-drain', { signal: AbortSignal.timeout(15_000) });
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), 'started\nfinished\n');
   const ended = performance.now();
   const endedAt = Date.now();
   assert.ok(ended - started >= 4_900, 'the client received the delayed end of the body');
@@ -308,10 +321,30 @@ export async function responseDrainRequestLease(cluster) {
   const childMs = observed['child-within-drain'] - endedAt;
   assert.ok(rootMs >= 25_000 && rootMs < 30_000, 'root work ran near the end of the drain');
   assert.ok(childMs >= 24_000 && childMs < 30_000, 'a nested event survived into the same drain');
+
+  const states = () => Promise.all(cluster.nodes.map(node => cluster.state(node)));
+  const active = (snapshots, invocation) => snapshots.some(snapshot =>
+    snapshot.leases.some(lease => lease.invocationId === invocation.invocationId));
+  const snapshots = await states();
+  const executions = snapshots.flatMap(state => state.executions);
+  const root = executions.find(event => event.invocationId === response.headers.get('x-drain-invocation'));
+  assert.ok(root && root.nodeId !== ingress, 'the root ran on a peer');
+  const child = executions.filter(event => event.parentInvocationId === root.invocationId && event.kind === 'binding')
+    .sort((left, right) => left.observedAtUnixMs - right.observedAtUnixMs)[0];
+  assert.ok(child && child.treeId === root.treeId, 'the late Service Binding inherited the root tree');
+  assert.ok(active(snapshots, root) && active(snapshots, child), 'both native events were still draining');
+  const released = await eventually('both native events settled at the ingress cutoff', async () => {
+    const snapshots = await states();
+    assert.ok(!active(snapshots, root) && !active(snapshots, child));
+    return performance.now() - ended;
+  }, { timeout: 6000, interval: 100 });
+  assert.ok(released >= 29_500 && released <= 32_000, `both events had settled by ${released.toFixed(1)} ms after EOF`);
+
   await delay(Math.max(0, ended + 37_000 - performance.now()), undefined, { signal: cluster.signal });
   assert.deepEqual(await markers(), observed, 'neither event recorded work after the shared cutoff');
   console.log(`HTTP body ended after ${((ended - started) / 1000).toFixed(1)} s. Root and child recorded work ` +
-    `${rootMs} ms and ${childMs} ms after EOF. Both beyond-cutoff writes were absent at +37 s.`);
+    `${rootMs} ms and ${childMs} ms after EOF and had both settled by ${released.toFixed(1)} ms after EOF. ` +
+    'Both beyond-cutoff writes were absent at +37 s.');
 }
 
 export async function upgradeRequestLease(cluster) {
