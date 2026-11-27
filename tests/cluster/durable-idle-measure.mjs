@@ -182,7 +182,7 @@ async function measure(cluster, node, record, residencyOnly) {
   const expectedCopies = initial.admission.workerThreads;
   const warmCopies = new Map([[first.moduleId, 1]]);
   let warmupCalls = 1;
-  const warmupBatchSize = Math.min(8, expectedCopies);
+  const warmupBatchSize = residencyConcurrency;
   while (warmCopies.size < expectedCopies && warmupCalls < cohortSize) {
     controller.signal.throwIfAborted();
     const size = Math.min(warmupBatchSize, cohortSize - warmupCalls);
@@ -193,15 +193,15 @@ async function measure(cluster, node, record, residencyOnly) {
     }
     warmupCalls += size;
   }
-  assert.equal(warmCopies.size, expectedCopies, 'every home opened a copy of the measured Worker');
-  const warmed = await eventually('all copies appear in the same durable child', async () => {
+  const allCopiesWarmed = warmCopies.size === expectedCopies;
+  const warmed = await eventually('the warmed copies appear in the same durable child', async () => {
     const admission = await onSameChild();
-    assert.equal(admission.homes, expectedCopies);
+    assert.equal(admission.homes, warmCopies.size);
     assert.ok(admission.residentRoots > 0);
     return admission;
   });
   await record('warmup', { child: initial.child, calls: warmupCalls,
-    copies: Object.fromEntries(warmCopies), admission: warmed });
+    expectedCopies, allCopiesWarmed, copies: Object.fromEntries(warmCopies), admission: warmed });
 
   const idle = async () => {
     const admission = await onSameChild();
@@ -222,15 +222,15 @@ async function measure(cluster, node, record, residencyOnly) {
     const samples = [];
     for (let i = 0; i < 6; ++i) {
       const before = await idle();
-      assert.equal(before.homes, expectedCopies, 'every warmed copy remains present for the RSS sample');
       const status = await cluster.compose(['exec', '-T', '--user', '0', node, 'cat', `/proc/${initial.child.pid}/status`]);
       const fds = await cluster.compose(['exec', '-T', '--user', '0', node, 'ls', '-1', `/proc/${initial.child.pid}/fd`]);
-      assert.equal((await idle()).homes, expectedCopies);
+      const after = await idle();
       const threadMatch = status.match(/^Threads:\s+(\d+)$/m);
       const rssMatch = status.match(/^VmRSS:\s+(\d+) kB$/m);
       assert.ok(threadMatch && rssMatch);
       const values = { threads: Number(threadMatch[1]), rssKiB: Number(rssMatch[1]),
-        descriptors: fds.split('\n').filter(Boolean).length };
+        descriptors: fds.split('\n').filter(Boolean).length,
+        keptWarmCopies: before.homes === expectedCopies && after.homes === expectedCopies };
       samples.push(values);
       await record('resources', { phase, index: i, child: initial.child, admission: before, ...values });
       if (i < 5) await delay(2000);
@@ -307,12 +307,12 @@ async function measure(cluster, node, record, residencyOnly) {
       const keptWarmCopies = [...observedCopies].every(copy => warmCopies.has(copy)) &&
         residency.every(sample => sample.homes === expectedCopies);
       const result = { ...summary(samples), peakResidentRoots, keptWarmCopies };
-      if (result.successes !== cohortSize || !keptWarmCopies) workloadPassed = false;
+      if (result.successes !== cohortSize) workloadPassed = false;
       await record('pass-residency', { cohort, phase, child: initial.child, observedCopies: [...observedCopies],
         peakResidentRoots, samples: residency });
       await record('workload-summary', { cohort, phase, ...result });
       console.log(JSON.stringify({ cohort, phase, ...result }));
-      finish.push({ cohort, phase, samples: await resources(`cohort-${cohort}-after-${phase}`) });
+      finish.push({ cohort, phase, keptWarmCopies, samples: await resources(`cohort-${cohort}-after-${phase}`) });
     }
   }
 
@@ -329,10 +329,14 @@ async function measure(cluster, node, record, residencyOnly) {
     return { cohort, phase, threadDelta, descriptorDelta, rssDeltaFromBaselineMaxKiB, pass };
   });
   const gateEligible = offerPeriodMs === 0;
-  const pass = gateEligible && workloadPassed && comparisons.every(comparison => comparison.pass);
-  await record('gate-summary', { child: initial.child, baselineStable, rssVariationKiB,
-    gateEligible, workloadPassed, comparisons, pass });
-  console.log(JSON.stringify({ baselineStable, rssVariationKiB, gateEligible, workloadPassed, comparisons, pass }));
+  const warmCopiesComparable = allCopiesWarmed && baseline.every(sample => sample.keptWarmCopies) &&
+    finish.every(phase => phase.keptWarmCopies && phase.samples.every(sample => sample.keptWarmCopies));
+  const pass = gateEligible && workloadPassed && warmCopiesComparable &&
+    comparisons.every(comparison => comparison.pass);
+  const result = { baselineStable, rssVariationKiB, gateEligible, workloadPassed,
+    warmCopiesComparable, comparisons, pass };
+  await record('gate-summary', { child: initial.child, ...result });
+  console.log(JSON.stringify(result));
 }
 
 async function runMeasurement(output, residencyOnly) {
