@@ -66,9 +66,16 @@ constraint failure retain their ordinary error results.
 
 ### Single-node waiting-call baseline
 
-The [waiting-call baseline](../../docs/waiting-call-capacity.md) uses ingress placement and a fixed
-local upstream. It records overlapping two-second HTTP waits, completed replies, and per-process
-RSS, threads and descriptors before, during and after each batch.
+The fixture enables ingress placement and sends fixed batches of 8, 16 and 24 stateless Worker
+requests to a private HTTP upstream with a two-second delay. It verifies the actual upstream
+overlap and completed replies. The JSONL records RSS, threads and open descriptors per process
+before, during, after drain and after recovery.
+
+```sh
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-capacity.jsonl
+```
+
+Use a new output path for each run. The fixture removes its disposable cluster and upstream.
 
 ### Stateless Worker ingress placement
 
