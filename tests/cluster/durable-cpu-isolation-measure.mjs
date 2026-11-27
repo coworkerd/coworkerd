@@ -224,9 +224,12 @@ async function measure() {
         `client overlap for window ${window.index} ${role}`);
       const firstSend = Math.min(...successful.map(row => row.sentAt));
       const lastReply = Math.max(...successful.map(row => row.doneAt));
+      // The owner may finish logging after the response body reaches the client.
       const actual = ownerEvents.filter(row => row.className === className && row.status === 200 &&
-        row.observedAtUnixMs >= firstSend && row.observedAtUnixMs <= lastReply);
-      assert.equal(actual.length, successful.length, `owner overlap for window ${window.index} ${role}`);
+        row.observedAtUnixMs >= firstSend && row.observedAtUnixMs <= lastReply + 25);
+      assert.equal(actual.length, successful.length, `owner dispatch count for window ${window.index} ${role}`);
+      assert.ok(actual.every(row => row.observedAtUnixMs > entered && row.observedAtUnixMs < limit.observedAtUnixMs),
+        `owner overlap for window ${window.index} ${role}`);
     }
   }
   const results = Object.fromEntries(Object.keys(roles).map(role => {

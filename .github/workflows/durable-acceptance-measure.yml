@@ -2,13 +2,6 @@ name: Durable acceptance measurement
 
 on:
   workflow_dispatch:
-  push:
-    branches: [codex/40-threaded-acceptance]
-    paths:
-      - .github/workflows/durable-acceptance-measure.yml
-      - tests/cluster/durable-wake-measure.mjs
-      - tests/cluster/durable-idle-measure.mjs
-      - tests/cluster/durable-cpu-isolation-measure.mjs
 
 permissions:
   contents: read
