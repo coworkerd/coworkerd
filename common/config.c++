@@ -256,6 +256,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.quarantineProcesses = root.getQuarantineProcesses();
   auto durable = root.getDurableObjects();
   result.processPool.durableProcesses = durable.getProcesses();
+  result.durableSocketFrameBytesPerNode = durable.getSocketFrameBytesPerNode();
   result.durableLog.peers = durable.getPeers();
   result.durableLog.confirmTimeoutMs = durable.getConfirmTimeoutMs();
   result.durableLog.versionDrainTimeoutMs = durable.getVersionDrainTimeoutMs();

@@ -295,6 +295,8 @@ def allowed_path(name, path):
                               'src/workerd/threaded/protocol.capnp',
                               'src/workerd/threaded/threaded-server-test.c++',
                               'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0109-deliver-threaded-websocket-bytes.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name in {'0140-invocation-budget-identity.patch', '0141-ordinary-binding-caller.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0142-hold-invocation-budget-through-drain.patch' and path in {

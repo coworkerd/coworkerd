@@ -114,7 +114,10 @@ Durable objects run in a separate category of workerd processes, `d0`, `d1`, …
 | `docs/` | The user guide and these design documents |
 
 - **Building.** CMake (3.24 or newer) builds the static library `common` and the executables `coworkerd` and `coworkerd-apiserver`, plus two libraries from Cap'n Proto's own sources: `capnp-http-over`, which `common` links, and `kj-tls-local`, KJ's TLS layer against the system OpenSSL, which only `coworkerd` links, for egress. On Linux it also builds `coworkerd-launcher`, which `coworkerd` depends on. `scripts/build.sh` builds the two daemons, and through that dependency the launcher.
-- **Cap'n Proto** is not in the repository: CMake fetches it from GitHub at a pinned commit, which needs network access and Git, and applies `patches/kj-http-abort.diff` to it. `CMakeLists.txt` names the pin as aligned with workerd `v1.20260827.1`, not the `v1.20261012.1` the product ships.
+- **Cap'n Proto** is fetched by CMake from GitHub at a pinned commit, which needs network access and Git.
+  CMake applies `patches/kj-http-abort.diff` and `patches/capnp-http-upload.diff`. `CMakeLists.txt`
+  records the pin aligned with workerd `v1.20260827.1`. The shipped kernel's upstream tag is recorded in
+  `patches/workerd/UPSTREAM`.
 - **workerd** is not built here: build it from the tag in `patches/workerd/UPSTREAM` plus every patch in `patches/workerd/series`; and the release takes a prebuilt binary and refuses one whose SHA-256 is not the one pinned for its architecture. [patches/README.md](../patches/README.md) describes the series and how it follows upstream.
 
 ## 8. The release package
