@@ -20,7 +20,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 await writeFile(report, '', { flag: 'wx' });
 const record = (metric, data) => appendFile(report, JSON.stringify({ metric, ...data }) + '\n');
 const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-sql-isolation-')), resolve(kernel), controller.signal, {
-  singleNode: true, threadedNodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+  singleNode: true, threadedNodes: ['node-1'],
   configureNode: () => ({ durableObjects: { processes: 1, threadedStorage: true, peers: 0 } }),
 });
 const [owner] = cluster.nodes;
@@ -129,7 +129,7 @@ async function run() {
     commit: await cluster.command('git', ['rev-parse', 'HEAD'], { cwd: root }),
     architecture: manifest.architecture, kernelRelease: pins.releaseTag,
     archiveSha256: pins.archives[manifest.architecture], kernelHash,
-    platformTestSha256: await sha256(join(binaries, 'coworkerd-platform-test')),
+    daemonSha256: await sha256(join(binaries, 'coworkerd')),
     apiServerSha256: await sha256(join(binaries, 'coworkerd-apiserver')),
     docker: await cluster.command('docker', ['info', '--format',
       '{{.ServerVersion}} {{.OSType}}/{{.Architecture}} {{.NCPU}} CPU {{.MemTotal}} B'], { cwd: root }),

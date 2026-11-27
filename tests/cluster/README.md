@@ -57,8 +57,7 @@ constraint failure retain their ordinary error results.
 ### Threaded SQL deadline and disconnect
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matching Linux
-kernel and product binaries. The case uses the `coworkerd-platform-test` executable from the
-database placement fixture on its threaded owner. It times HTTP and D1 statements and batches,
+kernel and release daemons. The case times HTTP and D1 statements and batches on its threaded owner,
 including writes with a connected client. It checks the complete reply on a half-closed HTTP
 connection and terminates an active HTTP writer with a TCP reset. Reads already queued behind
 the interrupted writes must return the earlier confirmed value, with no additional SQLite opens.
@@ -66,7 +65,7 @@ the interrupted writes must return the earlier confirmed value, with no addition
 ### Long SQL isolation
 
 Run this measurement on a dedicated Linux machine after finishing any builds and other load tests.
-Use the verified kernel pin and the matching `coworkerd-platform-test` executable.
+Use the verified kernel pin and the matching release daemons.
 
 ```sh
 node tests/cluster/long-sql-isolation.mjs "$kernel" "$PWD/long-sql-isolation.jsonl"
@@ -101,7 +100,7 @@ window is compared with its adjacent quiet windows against the 5 ms gate in the
 ### Threaded SQL default mailbox
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-default-mailbox` on Linux x86-64 or arm64
-with the matching kernel and `coworkerd-platform-test` binaries. The three-node Compose fixture
+with the matching kernel and release daemons. The three-node Compose fixture
 enables threaded database placement on one owner. It uses the compiled mailbox limits, the default
 process in-flight limit, and ordinary request deadlines. The case warms one database, launches 128
 concurrent HTTP SQL requests through the control plane, and then launches 128 concurrent requests
@@ -126,15 +125,15 @@ WAL checkpoint and checks the child logs for allocator scope and accounting erro
 ### Threaded SQL and CLI parity
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-cli-parity` to run `sql-atomicity` with the
-`coworkerd-platform-test` executable on all three threaded nodes. The case applies a `cowctl d1` migration,
+release daemon on all three threaded nodes. The case applies a `cowctl d1` migration,
 imports a small SQL file, and restores both a SQL export and a published bookmark into new databases. It compares
 the schema, migration ledger and confirmed rows, then writes through a D1 binding and reads the result through the
 CLI. Owner dispatch records verify that the SQL calls reached the platform database in a threaded process.
 
 ### Threaded SQL limits
 
-`threaded-sql-transaction-limit` uses the test executable on the threaded owner. It sets the peer
-buffer to allow a 254-frame SQL transaction including the record envelope and RPC headroom. It
+`threaded-sql-transaction-limit` sets the peer buffer on the threaded owner to allow a 254-frame
+SQL transaction including the record envelope and RPC headroom. It
 checks peer confirmation at the limit, HTTP 422 one frame over the limit, D1 batch rollback and the
 confirmed `exec()` prefix. A follow-up write and read run on the same open database.
 
@@ -156,12 +155,12 @@ one-second deadline so the case also verifies that the refusal is counted and th
 `durable-threaded-database-admission-mixed` fills the four default homes and runs a serial SQL scan
 while tenant objects from six definitions compete for the released homes in the same process.
 
-`durable-threaded-database-placement` uses the test executable on the threaded owner and the upstream
+`durable-threaded-database-placement` uses the release daemon on the threaded owner and the upstream
 database backend on the other nodes. It checks HTTP SQL and D1 in both directions, batch rollback, two
 same-tenant databases in separate isolate copies of the same threaded process generation before and after
 idle release, and acknowledged writes recovered at a later shard epoch after either build's owner is killed.
-`durable-threaded-database-release` checks that a public SQL query on a threaded owner returns the release
-executable's `501 NOT_SUPPORTED` response. To run the placement test with an actual older node build,
+`durable-threaded-database-release` checks that a public SQL query succeeds through the platform
+database in the threaded owner's release daemon. To run the placement test with an actual older node build,
 point the runner at a checkout containing its built Linux `build/coworkerd` and its original `runtime/runtime.js`.
 
 ```sh
@@ -245,8 +244,9 @@ background processes. A process or thread at 100% uses one logical CPU. Compare 
 total logical CPUs, and check I/O wait, steal time, CPU pressure and any cgroup CPU limit when interpreting a
 plateau. The diagnostic output and per-window verification counts follow the same report.
 
-Set `COWORKERD_BENCHMARK_THREADED_SQL=1` for the read and insert cells through the product's
-test-only threaded database mapping. The client uses D1 bindings and checks that each seeded
+Set `COWORKERD_BENCHMARK_THREADED_SQL=1` to measure reads and inserts through the product's
+threaded database mapping. The benchmark also supports archived builds that use the placement
+test executable. The client uses D1 bindings and checks that each seeded
 database has its own threaded home before measuring. To compare kernel builds, run both
 `object --throughput` trials in one job with the same product checkout and binaries and
 a fresh stack and report for each kernel. Point `COWORKERD_BENCHMARK_KERNEL_CHECKOUT` at
@@ -254,7 +254,7 @@ the checkout with the tested kernel's patch series when it differs from the prod
 
 ### Threaded SQL process memory
 
-`node tests/cluster/run.mjs "$KERNEL_DIR" threaded-sql-process-memory` exercises the test-only
+`node tests/cluster/run.mjs "$KERNEL_DIR" threaded-sql-process-memory` exercises the
 threaded database mapping with a 112 MiB configured process budget. It checks that three open
 databases reserve 3 MiB of SQLite heap. An atomic batch exceeding shared headroom rolls back and
 returns retryable HTTP 503 `OVERLOADED`. The same child serves the confirmed row and accepts the

@@ -224,16 +224,23 @@ async function createDatabaseHomes(cluster, tenant, counts, { limit = 36, candid
 }
 
 async function threadedDatabaseRelease(cluster) {
-  const { path, token } = await cluster.tenant('sql-release');
-  const database = `${path}/databases/ledger`;
-  await cluster.api(database, { method: 'POST', token });
-  const processes = await Promise.all(cluster.nodes.map(node => durableGeneration(cluster, node)));
-  assert.ok(processes.every(process => process.lifecycle.durableServer === 'threaded'));
-  await eventually('the public SQL route preserves the threaded database refusal in the release executable', async () => {
-    const refusal = await cluster.api(`${database}/query`, {
-      method: 'POST', token, body: { sql: 'SELECT 1' }, status: 501,
-    });
-    assert.equal(refusal.code, 'NOT_SUPPORTED');
+  const tenant = await cluster.tenant('sql-release');
+  const path = `${tenant.path}/databases/ledger`;
+  await waitForDurableMembership(cluster);
+  const { database } = await cluster.api(path, { method: 'POST', token: tenant.token });
+  await waitForDatabaseCatalog(cluster);
+  const result = await cluster.api(`${path}/query`, {
+    method: 'POST', token: tenant.token, body: { sql: 'SELECT 1 AS ready' },
+  });
+  assert.deepEqual(result.results, [{ ready: 1 }]);
+  const owner = await databaseShardOwner(cluster, database);
+  const process = await durableGeneration(cluster, owner);
+  assert.equal(process.lifecycle.durableServer, 'threaded');
+  await eventually('the release executable dispatched SQL on the threaded owner', async () => {
+    const rows = await databaseDispatches(cluster, database, owner);
+    assert.ok(rows.some(row => row.workerId === `${tenant.name}/__databases` &&
+      row.className === '__coworkerdSqlDatabase' && row.processId === process.processId &&
+      row.processGeneration === process.generation));
   });
 }
 
@@ -519,6 +526,7 @@ async function threadedDatabasePlacement(cluster) {
   };
   const process = await durableGeneration(cluster, threaded);
   assert.equal(process.lifecycle.durableServer, 'threaded');
+  assert.equal((await durableGeneration(cluster, upstream)).sandbox.durableServer, 'upstream');
   assert.equal(process.lifecycle.durableAdmission.residentRoots, 0);
   assert.equal(process.lifecycle.durableAdmission.homes, 0);
   for (const db of selected) {
@@ -4237,31 +4245,31 @@ export const durableGatedCases = {
     test: threadedDatabaseRelease, nodes: ['node-1', 'node-2', 'node-3'], holdPeerAcks: false,
   },
   'durable-threaded-database-alarm': {
-    test: threadedDatabaseAlarm, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    test: threadedDatabaseAlarm, nodes: ['node-1'],
     databaseAlarmFixture: true, holdPeerAcks: false,
   },
   'durable-threaded-database-placement': {
-    test: threadedDatabasePlacement, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    test: threadedDatabasePlacement, nodes: ['node-1'],
     publishPeerPorts: true, controlDurableLifecycle: true, holdPeerAcks: false,
     // Keep a third node for ingress and leave exactly one eligible owner after either kill.
     configureNode: node => node === 'node-3' ? { durableObjects: { processes: 0 } } : {},
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
   },
   'durable-threaded-database-admission': {
-    test: threadedDatabaseAdmission, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    test: threadedDatabaseAdmission, nodes: ['node-1'],
     controlDurableLifecycle: true, confirmTimeoutMs: 15000,
     nodeEnvironment: () => ({ COWORKERD_DO_TEST_HOME_COUNT: '3' }),
   },
   'durable-threaded-database-admission-mixed': {
-    test: threadedDatabaseAdmissionMixed, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    test: threadedDatabaseAdmissionMixed, nodes: ['node-1'],
     singleNode: true, holdPeerAcks: false,
   },
   'durable-threaded-database-accounting': {
-    test: threadedDatabaseAccounting, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
+    test: threadedDatabaseAccounting, nodes: ['node-1'], holdPeerAcks: false,
     platformFixture: () => [{ worker: 'sql-accounting/object', bindingClass: 'Echo', className: 'PlatformEcho' }],
   },
   'durable-threaded-admission-refusal': {
-    test: durableAdmissionRefusal, nodes: ['node-1', 'node-2'], databaseFixtureNodes: ['node-2'],
+    test: durableAdmissionRefusal, nodes: ['node-1', 'node-2'],
     controlDurableLifecycle: true, confirmTimeoutMs: 25000,
     configureNode: node => node === 'node-1' ? ({
       durableObjects: { threadedStorage: true, residentObjects: 1, confirmTimeoutMs: 25000 },
@@ -4269,17 +4277,17 @@ export const durableGatedCases = {
     nodeEnvironment: node => node === 'node-2' ? { COWORKERD_DO_TEST_MAILBOX_EVENTS: '1' } : {},
   },
   'durable-threaded-copy-reservation-refusal': {
-    test: durableCopyReservationRefusal, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    test: durableCopyReservationRefusal, nodes: ['node-1'],
     controlDurableLifecycle: true, holdPeerAcks: false,
   },
   'threaded-sql-deadline': {
-    test: threadedSqlDeadline, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    test: threadedSqlDeadline, nodes: ['node-1'],
   },
   'threaded-sql-default-mailbox': {
-    test: threadedSqlDefaultMailbox, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
+    test: threadedSqlDefaultMailbox, nodes: ['node-1'], holdPeerAcks: false,
   },
   'threaded-sql-transaction-limit': {
-    test: threadedSqlTransactionLimit, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
+    test: threadedSqlTransactionLimit, nodes: ['node-1'], holdPeerAcks: false,
     // Only the owner uses the small record cap. Its two peers need room to
     // hold the schema record and the boundary record together.
     configureNode: node => node === 'node-1' ? ({
@@ -4288,14 +4296,14 @@ export const durableGatedCases = {
     }) : ({}),
   },
   'threaded-sql-memory-limit': {
-    test: threadedSqlMemoryLimit, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
+    test: threadedSqlMemoryLimit, nodes: ['node-1'], holdPeerAcks: false,
     configureNode: node => node === 'node-1' ? ({
       durableObjects: { threadedStorage: true, checkpointBytes: 65536 },
     }) : ({}),
     nodeEnvironment: node => node === 'node-1' ? { COWORKERD_DO_TEST_SQL_MEMORY_BYTES: '1048576' } : {},
   },
   'threaded-sql-spill-limit': {
-    test: threadedSqlSpillLimit, nodes: ['node-1'], databaseFixtureNodes: ['node-1'], holdPeerAcks: false,
+    test: threadedSqlSpillLimit, nodes: ['node-1'], holdPeerAcks: false,
     configureNode: node => node === 'node-1' ? ({
       sandbox: { mode: 'off' },
       durableObjects: { threadedStorage: true, sqlDatabaseSpillBytes, sqlProcessSpillBytes,
@@ -4303,7 +4311,7 @@ export const durableGatedCases = {
     }) : ({}),
   },
   'threaded-sql-process-memory': {
-    test: threadedSqlProcessMemory, nodes: ['node-1'], databaseFixtureNodes: ['node-1'],
+    test: threadedSqlProcessMemory, nodes: ['node-1'],
     singleNode: true, controlDurableLifecycle: true, holdPeerAcks: false,
     configureNode: () => ({
       processPool: { count: 1, inFlightLimit: 16, threadedMemoryBytes: 112 * 1024 ** 2 },
@@ -4312,7 +4320,7 @@ export const durableGatedCases = {
   },
   'threaded-sql-cli-parity': {
     test: threadedSqlCliParity, nodes: ['node-1', 'node-2', 'node-3'],
-    databaseFixtureNodes: ['node-1', 'node-2', 'node-3'], holdPeerAcks: false,
+    holdPeerAcks: false,
     configureNode: () => ({ durableObjects: { threadedStorage: true, segmentIntervalMs: 1000 } }),
   },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
