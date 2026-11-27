@@ -50,6 +50,12 @@ inline const char* placementExhaustionReason(uint8_t hops) {
 }
 
 inline constexpr const char* PACKAGE_UNAVAILABLE = "package-unavailable";
+inline constexpr const char* WORKER_SATURATED = "WORKER_SATURATED";
+inline constexpr const char* NODE_CPU_SATURATED = "NODE_CPU_SATURATED";
+inline bool placementSaturationRefusal(std::string_view code) {
+  return code == WORKER_SATURATED || code == NODE_CPU_SATURATED;
+}
+
 inline bool placementRetryable(std::string_view code, std::string_view category) {
   return code != "RESULT_UNCERTAIN" && (code != "LOAD_FAILED" || category == PACKAGE_UNAVAILABLE);
 }

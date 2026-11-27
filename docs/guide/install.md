@@ -517,6 +517,12 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `placement.*`, `membership.*`, `desiredState.*` | see the schema | Detailed parameters of placement, membership and the desired state; `storage` is the shorthand of `desiredState.objectStore` (they cannot both be given) and puts the desired state and the membership on the object store, which a node requires. Entries in `placements` use `nodeId`, and Workers their full name `tenant/Worker` |
 | `control.*` | see "The control plane" in section 4 | Used only by `coworkerd-apiserver` (`listenAddress`, `adminCredential`, `pathRouting`, `maxUploadBytes`, `serverTimeoutMs`, `pollIntervalMs`, `temporaryDirectory`), but every daemon validates the section: a malformed `control` section stops a node too |
 
+With dynamic ingress placement, a candidate can decline a new stateless root at 90% isolate busy
+time or 95% of available node CPU over about 3 s. The isolate reading requires a threaded kernel
+with busy-time reporting. Linux cgroup v2 CPU usage covers the node's own cgroup and its
+descendants. When the first pass finds no candidate, ingress can retry soft refusals while
+enforcing the usual limits. [Cluster placement](../cluster-state.md#7-placement)
+
 The experimental `processPool.tenantInFlightLimit` is disabled by default (`0`). When omitted, it creates no tenant execution counters or waiters and imposes no per-tenant call limit. It is not recommended for use; CPU-share fairness remains under evaluation. Explicit nonzero settings retain the experimental borrowable limit and `tenantAdmissionWaitMs` wait setting for development only. Per-request CPU and memory limits, process memory admission, node watermarks, and total process safety limits still apply.
 
 All fields are in `ServerConfig` of the source `common/schema/coworkerd.capnp`. Fields with `ForTest` are for tests only; do not set them in production. A configuration that names `etcdEndpoint` or `etcdCredentialsFile`, or `etcd` as a backend, is refused with a sentence that says 0.4 has no etcd (section 9).

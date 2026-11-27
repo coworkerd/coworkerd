@@ -127,6 +127,8 @@ public:
   WorkerLimits effectiveLimits(const std::string& workerId, bool durable = false) const;
   bool hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const;
   std::shared_ptr<ProcessCall> select(const std::string& worker);
+  kj::Promise<void> sampleWorkerSaturation();
+  bool workerSaturated(const std::string& worker, std::string_view planRevision, double nowMs) const;
   // Scheduling hint only: no refresh, process admission, or dispatch commitment.
   std::optional<std::pair<std::string, uint64_t>> threadedGenerationHint(const std::string& worker) const;
   // A trial load's process: a quarantine process, the tenant's shard.
@@ -214,6 +216,7 @@ public:
   kj::Promise<std::string> closeAll();
   Killed killAll(const std::string& reason);
 private:
+  std::shared_ptr<ProcessGeneration> ordinaryProcess(const std::string& worker, bool quarantine) const;
   class Impl;
   std::unique_ptr<Impl> impl;
 };

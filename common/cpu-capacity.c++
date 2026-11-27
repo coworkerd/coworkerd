@@ -12,9 +12,15 @@
 
 namespace coworkerd {
 
-uint32_t cpusWithinQuota(uint32_t affinity, std::filesystem::path directory,
+struct CpuCapacity {
+  uint32_t rounded;
+  double exact;
+};
+
+static CpuCapacity cpuCapacityWithinQuota(uint32_t affinity, std::filesystem::path directory,
     const std::filesystem::path& root) {
-  auto count = std::max(affinity, 1u);
+  affinity = std::max(affinity, 1u);
+  CpuCapacity capacity{affinity, double(affinity)};
   directory = directory.lexically_normal();
   const auto boundary = root.lexically_normal();
   for (;;) {
@@ -30,15 +36,44 @@ uint32_t cpusWithinQuota(uint32_t affinity, std::filesystem::path directory,
         if (c < '0' || c > '9' || value > (UINT64_MAX - (c - '0')) / 10) { valid = false; break; }
         value = value * 10 + c - '0';
       }
-      if (const auto cap = valid ? quotaCpuCount(value, period) : 0) count = std::min(count, cap);
+      if (const auto cap = valid ? quotaCpuCount(value, period) : 0) {
+        capacity.rounded = std::min(capacity.rounded, cap);
+        capacity.exact = std::min(capacity.exact, double(value) / period);
+      }
     }
     if (directory == boundary || directory == directory.parent_path()) break;
     directory = directory.parent_path();
   }
-  return count;
+  return capacity;
 }
 
-uint32_t availableProcessCpus() {
+uint32_t cpusWithinQuota(uint32_t affinity, std::filesystem::path directory,
+    const std::filesystem::path& root) {
+  return cpuCapacityWithinQuota(affinity, std::move(directory), root).rounded;
+}
+
+#ifdef __linux__
+static constexpr auto CGROUP_ROOT = "/sys/fs/cgroup";
+#endif
+
+std::filesystem::path cpuCgroupFromMembership(std::istream& membership, const std::filesystem::path& root) {
+  for (std::string line; std::getline(membership, line);) if (line.starts_with("0::/")) {
+    const auto relative = std::filesystem::path(line.substr(3)).relative_path();
+    return relative.empty() ? root : (root / relative).lexically_normal();
+  }
+  return {};
+}
+
+std::filesystem::path processCpuCgroup() {
+#ifdef __linux__
+  std::ifstream membership("/proc/self/cgroup");
+  return cpuCgroupFromMembership(membership, CGROUP_ROOT);
+#else
+  return {};
+#endif
+}
+
+static CpuCapacity processCpuCapacity() {
   auto cpus = std::max(std::thread::hardware_concurrency(), 1u);
 #ifdef __linux__
   // Grow the affinity mask for hosts with more than CPU_SETSIZE logical CPUs.
@@ -51,16 +86,13 @@ uint32_t availableProcessCpus() {
     }
     if (errno != EINVAL) break;
   }
-  const std::filesystem::path root = "/sys/fs/cgroup";
-  auto directory = root;
-  std::ifstream membership("/proc/self/cgroup");
-  for (std::string line; std::getline(membership, line);) if (line.starts_with("0::/")) {
-    const auto candidate = root / line.substr(4);
-    if (std::filesystem::exists(candidate / "cpu.max")) directory = candidate;
-  }
-  cpus = cpusWithinQuota(cpus, directory, root);
+  return cpuCapacityWithinQuota(cpus, processCpuCgroup(), CGROUP_ROOT);
+#else
+  return {cpus, double(cpus)};
 #endif
-  return std::max(cpus, 1u);
 }
+
+double availableProcessCpuCapacity() { return processCpuCapacity().exact; }
+uint32_t availableProcessCpus() { return processCpuCapacity().rounded; }
 
 }  // namespace coworkerd

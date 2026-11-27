@@ -10,6 +10,8 @@
 #include "tenant-execution.h"
 #include "process-heat.h"
 #include "cpu-capacity.h"
+#include "node-cpu.h"
+#include "isolate-saturation.h"
 #include "placement-contract-test.h"
 #include "json.h"
 #include "process-culprit.h"
@@ -41,6 +43,64 @@ struct TempDir {
 void write(const std::filesystem::path& path, const std::string& bytes) {
   std::ofstream file(path, std::ios::binary);
   KJ_REQUIRE(bool(file << bytes), path.c_str());
+}
+
+void nodeCpuUse() {
+  TempDir directory;
+  const auto root = std::filesystem::path(directory.path);
+  const auto group = root / "system.slice/worker.service";
+  std::filesystem::create_directories(group);
+  write(root / "cpu.max", "50000 100000\n");
+  std::istringstream membership("9:cpu:/legacy\n0::/system.slice/worker.service\n");
+  const auto ownGroup = cpuCgroupFromMembership(membership, root);
+  KJ_REQUIRE(ownGroup == group);  // The service has a cpu.stat and inherits its parent quota.
+  KJ_REQUIRE(cpusWithinQuota(8, ownGroup, root) == 1);
+  std::istringstream legacyOnly("9:cpu:/legacy\n");
+  KJ_REQUIRE(cpuCgroupFromMembership(legacyOnly, root).empty());
+
+  const auto stat = ownGroup / "cpu.stat";
+  NodeCpuUse cpu(stat, 0.5);
+  auto sample = [&](double nowMs, uint64_t usec) {
+    write(stat, "user_usec 10\nusage_usec " + std::to_string(usec) + "\nsystem_usec 0\n");
+    cpu.sample(nowMs);
+  };
+  sample(0, 0);
+  sample(1000, 500000);
+  KJ_REQUIRE(!cpu.full(1000), "two seconds of history are required");
+  sample(2000, 949999);
+  KJ_REQUIRE(!cpu.full(2000), "one microsecond below the threshold");
+  sample(3000, 1425000);
+  KJ_REQUIRE(cpu.full(3000), "950 permille of half a CPU");
+  KJ_REQUIRE(!cpu.full(5001), "stale samples do not refuse");
+  sample(4000, 1425000);
+  KJ_REQUIRE(!cpu.full(4000), "idle clears saturation as the window moves");
+  sample(5000, 100000);
+  KJ_REQUIRE(!cpu.full(5000), "a counter reset discards the old window");
+  write(stat, "user_usec 10\n");
+  cpu.sample(6000);
+  KJ_REQUIRE(!cpu.full(6000), "missing usage clears the reading");
+}
+
+void isolateSaturation() {
+  const auto readings = parseIsolateSaturation(R"JSON({"residentWorkers":[
+    {"planRevision":"agree", "instance":2, "isolate":"worker-a", "isolateBusy":{"throughMonotonicMs":5000,"permille":900}},
+    {"planRevision":"agree", "instance":1, "isolate":"worker-a", "isolateBusy":{"throughMonotonicMs":4800,"permille":1000}},
+    {"planRevision":"below", "instance":1, "isolate":"worker-b", "isolateBusy":{"throughMonotonicMs":5000,"permille":899}},
+    {"planRevision":"loading", "instance":1, "isolate":"worker-c", "isolateBusy":{"throughMonotonicMs":5000,"permille":1000}},
+    {"planRevision":"loading", "instance":2, "isolate":"worker-c"},
+    {"planRevision":"multiple", "instance":1, "isolate":"worker-d", "isolateBusy":{"throughMonotonicMs":5000,"permille":1000}},
+    {"planRevision":"multiple", "instance":2, "isolate":"worker-e", "isolateBusy":{"throughMonotonicMs":5000,"permille":1000}},
+    {"planRevision":"missing", "instance":1, "isolate":"worker-f"},
+    {"planRevision":"invalid", "instance":1, "isolate":"worker-g", "isolateBusy":{"throughMonotonicMs":5000,"permille":1001}}
+  ]})JSON");
+  KJ_REQUIRE(readings.size() == 1 && readings.at("agree") == 5000,
+      "only the latest valid, unambiguous sample at the inclusive threshold should survive");
+  KJ_REQUIRE(hasSaturatedPlan(readings, "agree", 7500));
+  KJ_REQUIRE(!hasSaturatedPlan(readings, "agree", 7501), "stale window end");
+  KJ_REQUIRE(!hasSaturatedPlan(readings, "agree", 4999), "future window end");
+  KJ_REQUIRE(!hasSaturatedPlan(readings, "absent", 5000));
+  KJ_REQUIRE(parseIsolateSaturation("{").empty());
+  KJ_REQUIRE(parseIsolateSaturation(R"({"residentWorkers":[]})").empty());
 }
 
 void nativeConfig() {
@@ -829,6 +889,8 @@ int main(int argc, char* argv[]) {
   else if (name == "identity") identity();
   else if (name == "admission") admission();
   else if (name == "placement") placementContracts();
+  else if (name == "cpu-saturation") nodeCpuUse();
+  else if (name == "isolate-saturation") isolateSaturation();
   else if (name == "cpu-culprit-current-behavior") cpuCulpritCurrentBehavior();
   else if (name == "memory-culprit") memoryCulprit();
   else if (name == "package") package();
