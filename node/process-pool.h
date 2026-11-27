@@ -21,11 +21,13 @@
 
 namespace coworkerd {
 
+enum class PreExecutionRefusal { NONE, CAPACITY, STORAGE_CLOSE_UNCONFIRMED };
+
 struct OpenEvent {
   v1::rpc::EventDispatcher::Client dispatcher;
   kj::Promise<void> ready;
-  // The threaded durable child confirmed a refusal at admission or while reserving a cold copy.
-  kj::Promise<bool> capacityRejected = false;
+  // The threaded durable child can confirm a refusal before issuing the event dispatcher.
+  kj::Promise<PreExecutionRefusal> preExecutionRefusal = PreExecutionRefusal::NONE;
 };
 
 struct ProcessGeneration;
@@ -54,7 +56,7 @@ public:
   double startedAtMonotonicMs = 0;
   uint64_t startedAtUnixMs = 0;
   bool dispatched = false;
-  bool capacityRejected = false;
+  PreExecutionRefusal preExecutionRefusal = PreExecutionRefusal::NONE;
   std::function<void()> onCapacityRejected;
 private:
   friend class ProcessPool;
