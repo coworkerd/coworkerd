@@ -98,6 +98,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   platform transaction settles spill refusals on the open connection.
   Patch 0180 recognizes recorded database reservation returns at expiry, protects the returned
   preparation credit after routing retirement, and counts lent heap headroom in the replacement band.
+  Patch 0184 adds each platform database's SQLite heap to its copy's process memory reservation
+  in 1 MiB steps. The hooks use the existing allocator scope in `src/workerd/util/` and the copy
+  accounting in `src/workerd/threaded/`.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

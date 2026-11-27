@@ -44,9 +44,13 @@ export class SqlDatabase extends DurableObject {
         if (!deadline) this.ctx.storage.sql.abortExecutionLimit();
         return { success: false, error: message, code: error.code, reason: message };
       }
-      if (unprocessable(error?.code) || error?.code === "SQL_SPILL_LIMIT_EXCEEDED") {
+      if (unprocessable(error?.code) || error?.code === "SQL_SPILL_LIMIT_EXCEEDED" ||
+          error?.code === "OVERLOADED") {
         // D1 reads the error string and can discard the structured fields.
-        return { success: false, error: `${error.code}: ${message}`, code: error.code, reason: message };
+        const answer = { success: false, error: `${error.code}: ${message}`, code: error.code, reason: message };
+        // A multi-statement exec() can have committed earlier statements.
+        if (error.code === "OVERLOADED" && (query || !Array.isArray(body))) answer.retryable = true;
+        return answer;
       }
       return { success: false, error: message };
     };
