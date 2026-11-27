@@ -8,13 +8,14 @@ on:
       - .github/workflows/durable-acceptance-measure.yml
       - tests/cluster/durable-wake-measure.mjs
       - tests/cluster/durable-idle-measure.mjs
+      - tests/cluster/durable-cpu-isolation-measure.mjs
 
 permissions:
   contents: read
 
 jobs:
   wake:
-    name: Wake latency, hibernation and idle resources
+    name: Durable acceptance gates on Linux x86-64
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     env:
@@ -50,11 +51,19 @@ jobs:
           node tests/cluster/durable-wake-measure.mjs "$KERNEL_DIR" build/durable-acceptance/wake.jsonl \
             2>&1 | tee build/durable-acceptance/wake.log
         shell: bash
+      - name: Measure CPU isolation
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: |
+          test -z "$(docker ps -q)"
+          node tests/cluster/durable-cpu-isolation-measure.mjs "$KERNEL_DIR" build/durable-acceptance/cpu.jsonl \
+            2>&1 | tee build/durable-acceptance/cpu.log
+        shell: bash
       - name: Measure idle resources and recoverability
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         run: |
           test -z "$(docker ps -q)"
-          node tests/cluster/durable-idle-measure.mjs "$KERNEL_DIR" build/durable-acceptance/idle.jsonl             2>&1 | tee build/durable-acceptance/idle.log
+          node tests/cluster/durable-idle-measure.mjs "$KERNEL_DIR" build/durable-acceptance/idle.jsonl \
+            2>&1 | tee build/durable-acceptance/idle.log
         shell: bash
       - name: Upload measurements
         if: always()
