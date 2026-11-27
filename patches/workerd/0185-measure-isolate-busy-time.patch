@@ -69,10 +69,10 @@ index 1174e5a0fdea79713a88256b94006969f77212e0..b2d1c524acd9ca2f1aaddbde51c2ebda
      hdrs = ["fatal-attribution.h"],
 diff --git a/src/workerd/threaded/isolate-busy-test.c++ b/src/workerd/threaded/isolate-busy-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..6f387db8dacfc8a3a21d5c253a6d4ba88f14144f
+index 0000000000000000000000000000000000000000..ad481b7a1decfb1c825c471f58ee2a9570fd865e
 --- /dev/null
 +++ b/src/workerd/threaded/isolate-busy-test.c++
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,102 @@
 +// Copyright (c) 2026 Cloudflare, Inc.
 +// Licensed under the Apache 2.0 license found in the LICENSE file or at:
 +//     https://opensource.org/licenses/Apache-2.0
@@ -132,6 +132,23 @@ index 0000000000000000000000000000000000000000..6f387db8dacfc8a3a21d5c253a6d4ba8
 +  KJ_EXPECT(window.sample().permille() == 0);
 +}
 +
++KJ_TEST("a release without a matching isolate hold leaves the reading unchanged") {
++  TestClock clock;
++  IsolateBusyWindow window(clock);
++
++  clock.time = 100 * kj::MILLISECONDS;
++  window.releasing();
++  KJ_EXPECT(window.sample().busyNs == 0);
++
++  clock.time = 150 * kj::MILLISECONDS;
++  window.acquired();
++  clock.time = 200 * kj::MILLISECONDS;
++  window.releasing();
++  clock.time = 300 * kj::MILLISECONDS;
++  window.releasing();
++  KJ_EXPECT(window.sample().busyNs == 50000000);
++}
++
 +KJ_TEST("the published permille crosses an inclusive fractional threshold at the exact boundary") {
 +  TestClock clock;
 +  const auto readingAfter = [&](kj::Duration held) {
@@ -160,7 +177,7 @@ index 0000000000000000000000000000000000000000..6f387db8dacfc8a3a21d5c253a6d4ba8
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/isolate-busy.h b/src/workerd/threaded/isolate-busy.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..7f2e874e1ad0c2798a69f6e2be256d902975a3ac
+index 0000000000000000000000000000000000000000..4b0233b18b938e470f3c90a156cc3a15dcb5b11b
 --- /dev/null
 +++ b/src/workerd/threaded/isolate-busy.h
 @@ -0,0 +1,91 @@
@@ -170,7 +187,6 @@ index 0000000000000000000000000000000000000000..7f2e874e1ad0c2798a69f6e2be256d90
 +
 +#pragma once
 +
-+#include <kj/debug.h>
 +#include <kj/mutex.h>
 +#include <kj/time.h>
 +
@@ -204,9 +220,10 @@ index 0000000000000000000000000000000000000000..7f2e874e1ad0c2798a69f6e2be256d90
 +
 +  void releasing() {
 +    auto locked = state.lockExclusive();
++    const auto heldSince = KJ_UNWRAP_OR(locked->heldSince, return);
 +    const auto end = nowNs();
 +    const auto oldest = firstBucket(end / BUCKET_NS) * BUCKET_NS;
-+    auto start = kj::max(KJ_ASSERT_NONNULL(locked->heldSince), oldest);
++    auto start = kj::max(heldSince, oldest);
 +    while (start < end) {
 +      const auto index = start / BUCKET_NS;
 +      const auto through = kj::min(end, (index + 1) * BUCKET_NS);
