@@ -67,9 +67,11 @@ interface InvocationBudgetLifetime {
 }
 
 interface WorkerdBootstrap @0x878048cda334ade3 {
+  # A node binding bootstrap can wait for a cold Durable Object load. Abandoning
+  # the call must drop the connection that owns the load's waiter.
   startEvent @0 (cfBlobJson :Text, fromPersistentStub :Bool, fromHandoff :Bool,
                  forwardedBy :Text, causedBy :List(Text), budgetLifetime :Capability, budgetTicket :UInt64)
-      -> (dispatcher :EventDispatcher, budgetAccepted :Bool);
+      -> (dispatcher :EventDispatcher, budgetAccepted :Bool) $Cxx.allowCancellation;
 }
 
 # Native ordinary-process loopback props. The wire type and method are private
@@ -149,9 +151,10 @@ interface ThreadedSocketControl @0xdc432f018090bcc4 {
 }
 
 interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {
+  # The native binding bootstrap has the same cancellation contract as startEvent.
   startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer, budgetLifetime :Capability,
                        budgetTicket :UInt64, lease :NativeLeaseControl)
-      -> (dispatcher :EventDispatcher, budgetAccepted :Bool);
+      -> (dispatcher :EventDispatcher, budgetAccepted :Bool) $Cxx.allowCancellation;
   socketControl @1 () -> (control :ThreadedSocketControl);
 }
 
