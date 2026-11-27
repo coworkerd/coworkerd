@@ -580,7 +580,7 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | `durableObjects` key | Default | Meaning |
 | --- | --- | --- |
 | `processes` | `1` | Number of durable workerd slots, not per tenant |
-| `threadedStorage` | `false` | Experimental Linux opt-in for isolated tests with object-store membership. Serves Worker Durable Object HTTP requests and JavaScript RPC. D1, alarm delivery, WebSocket upgrades, and persistent facet cloning are refused as `NOT_SUPPORTED`. A due alarm remains scheduled for ownership by an upstream node. Keep the default upstream backend for product deployments. |
+| `threadedStorage` | `false` | Experimental Linux opt-in with object-store membership. Serves Worker Durable Object HTTP requests and JavaScript RPC. When this node owns a database shard, it serves [HTTP SQL and D1](databases.md#threaded-database-capacity) on the threaded backend. Persistent facet cloning is refused as `NOT_SUPPORTED`. Keep the default upstream backend for product deployments. |
 | `peers` | `2` | Reachable peers that hold committed frames in memory; at most 8; fewer reachable peers reduce K; an empty selected list uses a local flush, but an entirely unreachable nonempty list waits / times out |
 | `confirmTimeoutMs` | `5000` | Confirmation deadline; range 100–29000 ms |
 | `recoverTimeoutMs` | `30000` | How long an object request waits for recovery; at least 1000 ms |

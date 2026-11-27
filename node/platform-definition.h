@@ -24,7 +24,6 @@ struct PlatformDefinitions {
   // The fixture executable is the only caller that can install test namespace references.
   std::optional<PlatformClassRef> fixtureClassFor(const DeploymentState::NamespaceOwner& owner) const;
   const PlatformDefinition product;
-  bool threadedDatabasesForTest = false;
   std::optional<PlatformDefinition> fixture;
   std::map<std::pair<std::string, std::string>, PlatformClassRef> fixtureClasses;
 };
