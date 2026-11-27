@@ -78,6 +78,8 @@ namespace coworkerd {
 namespace {
 // Assigned by the durable copy reservation contract in the threaded kernel.
 constexpr kj::Exception::DetailTypeId DURABLE_COPY_RESERVATION_REFUSED = 0xe05c5dbb242a7eb4ull;
+// Assigned by ThreadedWalLog in the kernel.
+constexpr kj::Exception::DetailTypeId STORAGE_CLOSE_UNCONFIRMED = 0x997a5d73b0e11893ull;
 // Supervisor cadence for reading limit events (status, exits and failures read on demand).
 constexpr double LIMIT_EVENT_SYNC_MS = 1000;
 // A finished invocation without a `completed` row is forgotten after this long, or sooner
@@ -314,8 +316,8 @@ public:
   }
   kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor,
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
-      std::function<void()> onDispatched, std::function<void()> onCapacityRejected,
-      kj::Own<kj::PromiseFulfiller<void>> ready, kj::Own<kj::PromiseFulfiller<bool>> capacityRejected,
+      std::function<void()> onDispatched, std::function<void(PreExecutionRefusal)> onRefused,
+      kj::Own<kj::PromiseFulfiller<void>> ready, kj::Own<kj::PromiseFulfiller<PreExecutionRefusal>> refused,
       std::shared_ptr<ProcessCall> sqlCall, std::shared_ptr<RequestLease> lease,
       std::shared_ptr<const ProcessCall> call);
   kj::Own<kj::NetworkAddress> address;
@@ -326,15 +328,16 @@ public:
   bool disconnected = false;
   OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps,
       kj::Maybe<capnp::Capability::Client> budgetLifetime, std::function<void()> onDispatched,
-      std::function<void()> onCapacityRejected, std::shared_ptr<ProcessCall> sqlCall,
+      std::function<void(PreExecutionRefusal)> onRefused, std::shared_ptr<ProcessCall> sqlCall,
       std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call) {
     if (threaded) {
       auto ready = kj::newPromiseAndFulfiller<void>();
-      auto capacity = threadedDurable ? kj::newPromiseAndFulfiller<bool>() : kj::PromiseFulfillerPair<bool>{false, {}};
+      auto refusal = threadedDurable ? kj::newPromiseAndFulfiller<PreExecutionRefusal>()
+          : kj::PromiseFulfillerPair<PreExecutionRefusal>{PreExecutionRefusal::NONE, {}};
       return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
-          kj::mv(budgetLifetime), std::move(onDispatched), std::move(onCapacityRejected), kj::mv(ready.fulfiller),
-          kj::mv(capacity.fulfiller), std::move(sqlCall), std::move(lease), std::move(call))),
-          kj::mv(ready.promise), kj::mv(capacity.promise)};
+          kj::mv(budgetLifetime), std::move(onDispatched), std::move(onRefused), kj::mv(ready.fulfiller),
+          kj::mv(refusal.fulfiller), std::move(sqlCall), std::move(lease), std::move(call))),
+          kj::mv(ready.promise), kj::mv(refusal.promise)};
     }
     KJ_REQUIRE(!nativeProps, "native loopback props require a threaded process");
     onDispatched();
@@ -389,8 +392,8 @@ private:
 
 kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor,
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
-    std::function<void()> onDispatched, std::function<void()> onCapacityRejected,
-    kj::Own<kj::PromiseFulfiller<void>> ready, kj::Own<kj::PromiseFulfiller<bool>> capacityRejected,
+    std::function<void()> onDispatched, std::function<void(PreExecutionRefusal)> onRefused,
+    kj::Own<kj::PromiseFulfiller<void>> ready, kj::Own<kj::PromiseFulfiller<PreExecutionRefusal>> refused,
     std::shared_ptr<ProcessCall> sqlCall, std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call) {
   auto lifetime = shared_from_this();
   KJ_REQUIRE(deferredDeletes != nullptr);
@@ -427,9 +430,9 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
     KJ_REQUIRE(threadedProtocol == 3, "native invocation protocol 3 is required");
     auto retryDelay = 5 * kj::MILLISECONDS;
     const auto waitUntil = timer->now() + 5 * kj::SECONDS;
-    auto refuseForCapacity = [&] {
-      onCapacityRejected();
-      if (capacityRejected.get() != nullptr) capacityRejected->fulfill(true);
+    auto confirmRefusal = [&](PreExecutionRefusal reason) {
+      onRefused(reason);
+      if (refused.get() != nullptr) refused->fulfill(kj::mv(reason));
     };
     for (;;) {
       if (idle.empty()) connection->stream = co_await address->connect();
@@ -442,7 +445,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
       KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
       if (decision == 'R') {
-        refuseForCapacity();
+        confirmRefusal(PreExecutionRefusal::CAPACITY);
         kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, "native invocation queue is full; nothing executed"));
       }
       if (threadedDurable && decision == 'E') {
@@ -493,7 +496,12 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
         KJ_REQUIRE(budgetTicket == 0 || result.getBudgetAccepted(), "durable kernel did not accept the budget ticket");
         co_return result.getDispatcher();
       } catch (const kj::Exception& error) {
-        if (error.getDetail(DURABLE_COPY_RESERVATION_REFUSED) != kj::none) refuseForCapacity();
+        // Only the trusted start reply can establish that the event never ran.
+        if (error.getDetail(DURABLE_COPY_RESERVATION_REFUSED) != kj::none) {
+          confirmRefusal(PreExecutionRefusal::CAPACITY);
+        } else if (error.getDetail(STORAGE_CLOSE_UNCONFIRMED) != kj::none) {
+          confirmRefusal(PreExecutionRefusal::STORAGE_CLOSE_UNCONFIRMED);
+        }
         throw;
       }
     };
@@ -517,12 +525,12 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       else dispatcher = response.getDispatcher();
     }
     auto result = capnp::membrane(dispatcher, kj::refcounted<InvocationConnection>(connection));
-    if (capacityRejected.get() != nullptr) capacityRejected->fulfill(false);
+    if (refused.get() != nullptr) refused->fulfill(PreExecutionRefusal::NONE);
     if (threadedDurable) ready->fulfill();
     cancelBudget.cancel();
     co_return result;
   } catch (const kj::Exception& error) {
-    if (capacityRejected.get() != nullptr && capacityRejected->isWaiting()) capacityRejected->fulfill(false);
+    if (refused.get() != nullptr && refused->isWaiting()) refused->fulfill(PreExecutionRefusal::NONE);
     if (threadedDurable && ready->isWaiting()) ready->reject(error.clone());
     throw;
   }
@@ -4337,9 +4345,9 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
     p->openContexts[call->invocationId] = {call->workerId, call->versionId, 0, ticket};
   }
   // From this send onward, a lost connection or a dead child is never retried.
-  auto result = p->runtime->open(descriptor, std::move(nativeProps), kj::mv(budgetLifetime), [call] { call->dispatched = true; }, [call] {
-    call->capacityRejected = true;
-    if (call->onCapacityRejected) call->onCapacityRejected();
+  auto result = p->runtime->open(descriptor, std::move(nativeProps), kj::mv(budgetLifetime), [call] { call->dispatched = true; }, [call](PreExecutionRefusal reason) {
+    call->preExecutionRefusal = reason;
+    if (reason == PreExecutionRefusal::CAPACITY && call->onCapacityRejected) call->onCapacityRejected();
   }, threadedSql ? call : nullptr, std::move(requestLease), call);
   result.ready = kj::mv(result.ready).exclusiveJoin(call->onExit()).catch_([call](kj::Exception&& error) -> kj::Promise<void> {
     return call->rejectAfterCrash(kj::mv(error));

@@ -326,6 +326,10 @@ def allowed_path(name, path):
                           name == '0122-order-threaded-wal-home-teardown.patch' and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0123-confirm-threaded-storage-close-before-reopen.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/util/sqlite.c++',
+                              'src/workerd/util/sqlite.h'} or
                           name == '0185-measure-isolate-busy-time.patch' and path in {
                               'src/workerd/jsg/jsg.c++',
                               'src/workerd/jsg/observer.h',
