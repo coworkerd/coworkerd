@@ -439,6 +439,7 @@ struct DurableSocketEvent {
   coworkerd::DurableLog::ObjectIdentity object;
   std::string socketId;
   uint64_t frame;
+  std::optional<coworkerd::DurableSocketFrameBudget::Reservation> credit;
   kj::WebSocket::Message message;
   std::optional<uint64_t> autoResponseTime;
   bool wasClean = true;
@@ -4339,8 +4340,10 @@ public:
   std::string_view managedId() const override {
     return managed ? std::string_view(identity.invocationId) : std::string_view();
   }
-  bool managedAuthority(uint64_t nodeEpoch, rpc::ThreadedSocketAuthority::Reader authority) const {
-    return managed && !closing && authority.getDataEpoch() == durableObject.dataEpoch &&
+  bool managedAuthority(uint64_t nodeEpoch, rpc::ThreadedSocketAuthority::Reader authority,
+      bool closeReply = false) const {
+    return managed && (!closing || (closeReply && syntheticClose != SyntheticClose::NONE)) &&
+        authority.getDataEpoch() == durableObject.dataEpoch &&
         managed->authorized({nodeEpoch, authority.getShardEpoch()},
             {authority.getInvocationId().cStr(), authority.getGeneration()});
   }
@@ -4365,7 +4368,8 @@ public:
       if (--managedWrites == 0) parkWriteTimeout = kj::none;
     });
     KJ_IF_SOME(close, message.tryGet<kj::WebSocket::Close>()) {
-      return managedCommands.wrap(closeFrom(false, close.code, close.reason.cStr()).attach(kj::mv(writing)));
+      return managedCommands.wrap(closeFrom(false, close.code,
+          std::string(close.reason.begin(), close.reason.size())).attach(kj::mv(writing)));
     }
     ++toClient;
     return managedCommands.wrap(writeManaged(kj::mv(message)).attach(kj::mv(writing)));
@@ -4410,7 +4414,7 @@ public:
   bool parked() const override { return managed && managed->parked(managedOwner); }
   const ManagedSocket::Snapshot* adoptable(const coworkerd::DurableLog::ObjectIdentity& object,
       const ManagedSocket::Home& home) const {
-    return managed && (!closing || deliveringCapacityClose) && belongsTo(object)
+    return managed && (!closing || syntheticClose == SyntheticClose::DELIVERING) && belongsTo(object)
         ? managed->adoptable(managedOwner, home) : nullptr;
   }
   void adopt(ManagedSocket::Home home, std::string process) {
@@ -4492,7 +4496,9 @@ private:
       closed = true;
       closeCode = code;
       closeReason = reason;
-      return enqueue([this, code, reason = kj::str(reason.c_str())]() mutable { return socket.close(code, reason).attach(kj::mv(reason)); });
+      return enqueue([this, code, reason = kj::str(kj::arrayPtr(reason.data(), reason.size()))]() mutable {
+        return socket.close(code, reason).attach(kj::mv(reason));
+      });
     }
     bool hasClosed() const { return closed; }
     uint16_t sentCode() const { return closeCode; }
@@ -4555,26 +4561,31 @@ private:
       size_t payloadBytes = text ? text->size() : 0;
       KJ_IF_SOME(binary, message.tryGet<kj::Array<kj::byte>>()) { payloadBytes = binary.size(); }
       auto credit = registry.frameBudget().tryReserve(payloadBytes);
-      // Drop the data before any more awaits. The close uses the same delivery
+      size_t closeReasonBytes = 0;
+      KJ_IF_SOME(close, message.tryGet<kj::WebSocket::Close>()) { closeReasonBytes = close.reason.size(); }
+      // Drop a refused payload before any more awaits. The close uses the same delivery
       // path so a live or parked home can dispose of its socket and run its handler.
-      if (!credit) {
-        constexpr auto reason = "Durable Object socket frame capacity";
-        message = kj::WebSocket::Close{1013, kj::str(reason)};
-        deliveringCapacityClose = true;
-        nodeClose(1013, reason, "frame-capacity");
+      if (const auto refusal = coworkerd::durableSocketRefusal(closeReasonBytes, credit.has_value())) {
+        message = kj::WebSocket::Close{refusal->code, kj::str(refusal->reason)};
+        syntheticClose = SyntheticClose::DELIVERING;
+        nodeClose(refusal->code, refusal->reason, refusal->cause);
       }
-      KJ_DEFER(deliveringCapacityClose = false);
+      KJ_DEFER(if (syntheticClose == SyntheticClose::DELIVERING) syntheticClose = SyntheticClose::SETTLED);
       if (action.action == Action::WAKE) registry.recordSocketWake();
       const bool closingFrame = message.is<kj::WebSocket::Close>();
       const auto closeCode = closingFrame ? message.get<kj::WebSocket::Close>().code : 0;
-      const auto closeReason = closingFrame ? std::string(message.get<kj::WebSocket::Close>().reason.cStr()) : std::string();
+      std::string closeReason;
+      if (closingFrame && syntheticClose == SyntheticClose::NONE) {
+        auto& reason = message.get<kj::WebSocket::Close>().reason;
+        closeReason.assign(reason.begin(), reason.size());
+      }
       if (!closingFrame) ++toWorker;
       const auto result = co_await dispatchManaged({durableObject, identity.invocationId, action.position,
-          kj::mv(message), managed->autoResponseTime(), !disconnected && !deliveringCapacityClose,
+          std::move(credit), kj::mv(message), managed->autoResponseTime(),
+          !disconnected && syntheticClose == SyntheticClose::NONE,
           transportError, managedFacet});
-      credit.reset();
       managed->complete(managedOwner, action.position);
-      if (deliveringCapacityClose) co_return;
+      if (syntheticClose != SyntheticClose::NONE) co_return;
       if (!result.delivered) {
         if (!closing && result.terminalCode == "DO_CODE_UPDATED") goAway("definition-changed");
         else if (!closing && socketLimitCode(result.terminalCode)) actorReset(result.terminalCode);
@@ -4610,7 +4621,7 @@ private:
       auto message = kj::mv(KJ_ASSERT_NONNULL(received));
       if (message.is<kj::WebSocket::Close>()) {
         auto& close = message.get<kj::WebSocket::Close>();
-        co_await closeFrom(towardWorker, close.code, close.reason.cStr());
+        co_await closeFrom(towardWorker, close.code, std::string(close.reason.begin(), close.reason.size()));
         co_return;
       }
       ++(towardWorker ? toWorker : toClient);
@@ -4769,7 +4780,9 @@ private:
   kj::Promise<void> grace = nullptr;
   bool started = false, runEnded = false, closing = false, outerClosed = false, innerClosed = false, outerBroken = false,
       innerBroken = false, innerFailed = false;
-  bool deliveringCapacityClose = false;
+  // A parked home may adopt only during delivery. Its close reply can arrive later in the grace period.
+  enum class SyntheticClose { NONE, DELIVERING, SETTLED };
+  SyntheticClose syntheticClose = SyntheticClose::NONE;
   double startedAt = 0;
   uint64_t toWorker = 0, toClient = 0;
   // Who closed first (client, worker, node), with what; why the node ended it (drain, rotation, limit, peer-lost, ...);
@@ -7609,10 +7622,10 @@ private:
 // may be another node. There is no caller's call tree, so it opens one of its own, as an object's call does.
 kj::Promise<CollectedResponse> collectObjectResponse(BindingDispatch::Dispatched dispatched,
     capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, kj::StringPtr path,
-    kj::ArrayPtr<const kj::byte> body, kj::StringPtr contentType) {
+    kj::ArrayPtr<const kj::byte> body, kj::StringPtr contentType, kj::Own<void> bodyOwner = {}) {
   auto ready = kj::mv(dispatched.ready).eagerlyEvaluate([](kj::Exception&&) {});
   auto getHttp = dispatched.dispatcher.getHttpServiceRequest().send();
-  auto service = factory.capnpToKj(getHttp.getHttp());
+  auto service = factory.capnpToKj(getHttp.getHttp(), kj::mv(bodyOwner));
   kj::HttpHeaders headers(headerTable);
   headers.set(kj::HttpHeaderId::HOST, "coworkerd-node");
   headers.setPtr(kj::HttpHeaderId::CONTENT_TYPE, contentType);
@@ -7788,8 +7801,10 @@ kj::Promise<DurableSocketResult> deliverDurableSocket(DurableDispatch& durable, 
   request.target.shardEpoch = event.object.shardEpoch;
   auto& socket = request.target.socket.emplace(std::move(event.socketId), event.frame, event.facet,
       event.autoResponseTime);
+  const auto shard = event.object.shard;
+  auto upload = kj::heap<DurableSocketEvent>(kj::mv(event));
   kj::ArrayPtr<const kj::byte> body;
-  KJ_SWITCH_ONEOF(event.message) {
+  KJ_SWITCH_ONEOF(upload->message) {
     KJ_CASE_ONEOF(text, kj::String) {
       socket.kind = "text";
       body = text.asBytes();
@@ -7799,18 +7814,18 @@ kj::Promise<DurableSocketResult> deliverDurableSocket(DurableDispatch& durable, 
       body = binary.asPtr();
     }
     KJ_CASE_ONEOF(close, kj::WebSocket::Close) {
-      socket.kind = event.transportError ? "error" : "close";
-      if (!event.transportError) {
+      socket.kind = upload->transportError ? "error" : "close";
+      if (!upload->transportError) {
         socket.closeCode = close.code;
-        socket.wasClean = event.wasClean;
+        socket.wasClean = upload->wasClean;
         body = close.reason.asBytes();
       }
     }
   }
   socket.bytes = body.size();
-  auto opened = co_await durable.dispatchLocalEvent(std::move(request), event.object.shard);
+  auto opened = co_await durable.dispatchLocalEvent(std::move(request), shard);
   auto result = co_await collectObjectResponse(kj::mv(opened), factory, headers, DURABLE_SOCKET_PATH,
-      body, "application/octet-stream");
+      body, "application/octet-stream", kj::mv(upload));
   if (result.status == 204) co_return DurableSocketResult{true, {}};
   try {
     capnp::MallocMessageBuilder message;
@@ -7977,9 +7992,10 @@ public:
   kj::Promise<void> send(SendContext context) override {
     const auto params = context.getParams();
     const auto authority = params.getAuthority();
-    auto* relay = find(authority);
-    KJ_REQUIRE(relay != nullptr && relay->managedAuthority(epoch(), authority), "stale Durable Object socket");
     const auto frame = params.getFrame();
+    auto* relay = find(authority);
+    KJ_REQUIRE(relay != nullptr && relay->managedAuthority(epoch(), authority, frame.isClose()),
+        "stale Durable Object socket");
     switch (frame.which()) {
       case rpc::ThreadedSocketFrame::TEXT:
         KJ_REQUIRE(frame.getText().size() <= WebSocketRelay::MAX_MESSAGE_BYTES);
@@ -7993,7 +8009,7 @@ public:
       }
       case rpc::ThreadedSocketFrame::CLOSE: {
         auto close = frame.getClose();
-        KJ_REQUIRE(close.getReason().size() <= 123);
+        KJ_REQUIRE(close.getReason().size() <= coworkerd::WEBSOCKET_CLOSE_REASON_BYTES);
         co_await relay->managedSend(kj::WebSocket::Close{close.getCode(), kj::str(close.getReason())});
         break;
       }

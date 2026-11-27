@@ -3574,6 +3574,7 @@ async function threadedSocketFrameBudget(cluster) {
       }
       webSocketMessage(socket, message) { socket.send(message); }
       webSocketClose(socket, code, reason, wasClean) {
+        if (code === 1013) socket.close(code, reason);
         this.terminal = { code, reason, wasClean };
       }
     }
@@ -3627,7 +3628,7 @@ async function threadedSocketFrameBudget(cluster) {
         { code: 1013, reason, wasClean: false });
     });
     assert.equal((await echo)[0].toString(), 'hold');
-    await eventually('completion returns the reservation', async () => {
+    await eventually('the upload returns the reservation', async () => {
       assert.deepEqual(await budget(), { limitBytes: 8, reservedBytes: 0, refused: 1 });
     });
     const binary = next(first, 'message');
@@ -4015,10 +4016,13 @@ async function threadedSocketHibernation(cluster) {
     const clean = new PingSocket(socketUrl);
     await next(clean, 'open');
     const cleanClose = next(clean, 'close');
-    clean.close(1000, 'finished 雪');
-    assert.equal((await cleanClose)[0], 1000);
+    const reason = 'a\0' + '雪'.repeat(40) + 'b';
+    clean.close(1000, reason);
+    const [cleanCode, echoedReason] = await cleanClose;
+    assert.equal(cleanCode, 1000);
+    assert.equal(echoedReason.toString(), reason);
     await eventually('the actor receives the clean close code and its reason', async () => {
-      assert.deepEqual(await readTerminal(), { code: 1000, reason: 'finished 雪', wasClean: true });
+      assert.deepEqual(await readTerminal(), { code: 1000, reason, wasClean: true });
     }, { timeout: 7000 });
     const interrupted = new PingSocket(socketUrl);
     await next(interrupted, 'open');

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -8,6 +9,25 @@
 #include <vector>
 
 namespace coworkerd {
+
+inline constexpr std::size_t WEBSOCKET_CLOSE_REASON_BYTES = 123;
+
+struct DurableSocketRefusal {
+  uint16_t code;
+  const char* reason;
+  const char* cause;
+};
+
+constexpr std::optional<DurableSocketRefusal> durableSocketRefusal(
+    std::size_t closeReasonBytes, bool hasReservation) {
+  if (closeReasonBytes > WEBSOCKET_CLOSE_REASON_BYTES) {
+    return DurableSocketRefusal{1002, "WebSocket close reason too long", "protocol-error"};
+  }
+  if (!hasReservation) {
+    return DurableSocketRefusal{1013, "Durable Object socket frame capacity", "frame-capacity"};
+  }
+  return std::nullopt;
+}
 
 // Shared by all home deliveries on the node's event loop. Charge the received
 // payload and room for its copy in HTTP-over-Cap'n Proto.

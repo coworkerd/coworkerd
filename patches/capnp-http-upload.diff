@@ -1,0 +1,80 @@
+diff --git a/c++/src/capnp/compat/http-over-capnp.c++ b/c++/src/capnp/compat/http-over-capnp.c++
+index e6285fdc..b57cbded 100644
+--- a/c++/src/capnp/compat/http-over-capnp.c++
++++ b/c++/src/capnp/compat/http-over-capnp.c++
+@@ -546,12 +546,14 @@ private:
+ 
+ class HttpOverCapnpFactory::KjToCapnpHttpServiceAdapter final: public kj::HttpService {
+ public:
+-  KjToCapnpHttpServiceAdapter(HttpOverCapnpFactory& factory, capnp::HttpService::Client inner)
+-      : factory(factory), inner(kj::mv(inner)) {}
++  KjToCapnpHttpServiceAdapter(HttpOverCapnpFactory& factory, capnp::HttpService::Client inner,
++      kj::Own<void> nextRequestBodyOwner)
++      : factory(factory), inner(kj::mv(inner)), nextRequestBodyOwner(kj::mv(nextRequestBodyOwner)) {}
+ 
+   kj::Promise<void> request(
+       kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+       kj::AsyncInputStream& requestBody, kj::HttpService::Response& kjResponse) override {
++    auto bodyOwner = kj::mv(nextRequestBodyOwner);
+     auto rpcRequest = inner.requestRequest();
+ 
+     auto metadata = rpcRequest.initRequest();
+@@ -632,10 +634,15 @@ public:
+     kj::Maybe<kj::Promise<void>> pumpRequestTask;
+     KJ_IF_SOME(rb, maybeRequestBody) {
+       auto bodyOut = factory.streamFactory.capnpToKjExplicitEnd(pipeline.getRequestBody());
+-      pumpRequestTask = rb.pumpTo(*bodyOut)
++      auto pump = rb.pumpTo(*bodyOut)
+           .then([&bodyOut = *bodyOut](uint64_t) mutable {
+-        return bodyOut.end();
+-      }).eagerlyEvaluate([&pumpRequestFailedReason, bodyOut = kj::mv(bodyOut)]
++            return bodyOut.end();
++          });
++      if (bodyOwner.get() != nullptr) {
++        // Consume the attachment when the upload settles, independently of the response.
++        pump = pump.attach(kj::mv(bodyOwner)).then([]() {});
++      }
++      pumpRequestTask = pump.eagerlyEvaluate([&pumpRequestFailedReason, bodyOut = kj::mv(bodyOut)]
+                          (kj::Exception&& e) mutable {
+         // A DISCONNECTED exception probably means the server decided not to read the whole request
+         // before responding. In that case we simply want the pump to end, so that on this end it
+@@ -647,6 +654,7 @@ public:
+         }
+       });
+     }
++    bodyOwner = nullptr;
+ 
+     // Wait for the server to indicate completion. Meanwhile, if the
+     // promise is canceled from the client side, we propagate cancellation naturally.
+@@ -751,10 +759,13 @@ public:
+ private:
+   HttpOverCapnpFactory& factory;
+   capnp::HttpService::Client inner;
++  kj::Own<void> nextRequestBodyOwner;
+ };
+ 
+-kj::Own<kj::HttpService> HttpOverCapnpFactory::capnpToKj(capnp::HttpService::Client rpcService) {
+-  return kj::heap<KjToCapnpHttpServiceAdapter>(*this, kj::mv(rpcService));
++kj::Own<kj::HttpService> HttpOverCapnpFactory::capnpToKj(
++    capnp::HttpService::Client rpcService, kj::Own<void> nextRequestBodyOwner) {
++  return kj::heap<KjToCapnpHttpServiceAdapter>(
++      *this, kj::mv(rpcService), kj::mv(nextRequestBodyOwner));
+ }
+ 
+ // =======================================================================================
+diff --git a/c++/src/capnp/compat/http-over-capnp.h b/c++/src/capnp/compat/http-over-capnp.h
+index 2f5906d8..8dd62d6e 100644
+--- a/c++/src/capnp/compat/http-over-capnp.h
++++ b/c++/src/capnp/compat/http-over-capnp.h
+@@ -76,7 +76,10 @@ public:
+   // this option, you will need to roll back to an older version of Cap'n Proto for now, until you
+   // can update all code in production to pass LEVEL_2 here.
+ 
+-  kj::Own<kj::HttpService> capnpToKj(capnp::HttpService::Client rpcService);
++  kj::Own<kj::HttpService> capnpToKj(
++      capnp::HttpService::Client rpcService, kj::Own<void> nextRequestBodyOwner = {});
++  // An optional owner for the next request's borrowed body. The upload holds
++  // it through the peer's ByteStream.end() acknowledgment or until canceled.
+   capnp::HttpService::Client kjToCapnp(kj::Own<kj::HttpService> service);
+ 
+   kj::HttpHeaders capnpToKj(capnp::List<capnp::HttpHeader>::Reader capnpHeaders) const;

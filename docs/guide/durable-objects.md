@@ -114,10 +114,13 @@ When a threaded tree retires, the node parks the upgraded hibernatable WebSocket
 
 For deliveries to threaded homes, the shard owner's node shares a 128 MiB budget across tenants, configured by
 `durableObjects.socketFrameBytesPerNode`. A text or binary message reserves twice its payload size in bytes
-from receipt by the managed relay until delivery settles, covering the received message and room for its
-copy in the internal byte stream. If the reservation would exceed the budget, the node discards the message
+from receipt by the managed relay until the home acknowledges the internal upload, covering the received
+message and room for its copy in the internal byte stream. A canceled upload returns the reservation too.
+If the reservation would exceed the budget, the node discards the message
 and closes the socket with `1013` and reason `Durable Object socket frame capacity`. The node attempts to
-deliver a close event to the object during the close grace period. Empty messages, close and error events,
+deliver a close event to the object during the close grace period. A close reason longer than 123 bytes
+instead gets a protocol-error close with `1002`. The object's close handler can call `ws.close()` for
+either node-initiated close while the transport is still settling. Empty messages, close and error events,
 and automatic replies do not draw from the budget. The budget covers the handoff to the home. Network and
 relay buffering before the managed relay receives the message, protocol overhead, and memory in workerd
 are outside this accounting. Node state reports the limit, current reservations and cumulative refusals

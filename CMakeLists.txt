@@ -18,19 +18,21 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(capnproto)
 
-# KJ's HTTP entity writers must honor AsyncOutputStream::abortWrite(). Without
-# this, destroying a chunked writer after an upstream read failure sends EOF.
+# Patch KJ's HTTP writes to propagate aborts and the Cap'n Proto HTTP adapter
+# to hold borrowed request data through upload acknowledgment.
 find_package(Git REQUIRED)
-set(KJ_HTTP_ABORT_PATCH "${CMAKE_CURRENT_SOURCE_DIR}/patches/kj-http-abort.diff")
-execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${KJ_HTTP_ABORT_PATCH}"
-  WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" RESULT_VARIABLE patch_check
-  OUTPUT_QUIET ERROR_QUIET)
-if(NOT patch_check EQUAL 0)
-  execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check "${KJ_HTTP_ABORT_PATCH}"
-    WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
-  execute_process(COMMAND "${GIT_EXECUTABLE}" apply "${KJ_HTTP_ABORT_PATCH}"
-    WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
-endif()
+foreach(patch IN ITEMS kj-http-abort.diff capnp-http-upload.diff)
+  set(patch_file "${CMAKE_CURRENT_SOURCE_DIR}/patches/${patch}")
+  execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${patch_file}"
+    WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" RESULT_VARIABLE patch_check
+    OUTPUT_QUIET ERROR_QUIET)
+  if(NOT patch_check EQUAL 0)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check "${patch_file}"
+      WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" apply "${patch_file}"
+      WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
+  endif()
+endforeach()
 
 set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GENERATED_DIR}")
@@ -249,6 +251,7 @@ add_test(NAME durable-upstream-channel-eof COMMAND coworkerd-durable-channel-tes
 add_test(NAME durable-threaded-channel COMMAND coworkerd-durable-channel-test threaded-channel)
 add_test(NAME durable-parked-websocket COMMAND coworkerd-durable-channel-test parked-websocket)
 add_test(NAME durable-websocket-frame-budget COMMAND coworkerd-durable-channel-test websocket-frame-budget)
+add_test(NAME durable-websocket-upload-budget COMMAND coworkerd-durable-channel-test websocket-upload-budget)
 add_test(NAME durable-threaded-alarms COMMAND coworkerd-durable-channel-test threaded-alarms)
 add_test(NAME durable-index COMMAND coworkerd-durable-channel-test index)
 add_test(NAME durable-tail-equivalence COMMAND coworkerd-durable-channel-test tail)
