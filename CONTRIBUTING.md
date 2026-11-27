@@ -94,8 +94,9 @@ resolving to their original files.
 ## CI and local unit tests
 
 The `CI` workflow runs on every pull request and on pushes to `main`, on GitHub-hosted Ubuntu 24.04 x86_64
-and macOS 26 arm64 runners. Its checks are **`Build and unit tests (linux-x86_64)`** and
-**`Build and unit tests (macos-arm64)`** (`build-and-unit-tests` in [.github/workflows/ci.yml](.github/workflows/ci.yml)).
+and macOS 26 arm64 runners. The required **`Build and unit tests (linux-x86_64)`** check waits for
+the Linux build, unit tests and all four [cluster integration shards](tests/cluster/README.md).
+**`Build and unit tests (macos-arm64)`** reports the macOS job independently.
 Both runners build the daemons with `scripts/build.sh` and run the `check` target. The Ubuntu runner also builds the
 Linux launcher. Build dependencies come from Ubuntu or the macOS runner image, with the pinned Cap'n Proto source
 from public GitHub and CLI dependencies from the public npm registry (`cli/package-lock.json`). CTest fails on an
@@ -207,7 +208,7 @@ covers the configuration, the sandbox (sections 3 and 4: the default compose fil
 prepared as section 4 describes runs it with `docker-compose.sandbox.yml`) and operations.
 
 The [cluster integration suite](tests/cluster/README.md) starts its own three-node cluster and object store. Use its
-runner to check a change on Linux, with all cases or a single case. Linux pull-request CI runs the same command.
+runner to check all cases, one case or a shard on Linux.
 
 ## Sending a change
 
@@ -225,12 +226,21 @@ runner to check a change on Linux, with all cases or a single case. Linux pull-r
   for any reader on any machine: no names of your own hosts or paths, no references to notes kept outside this
   repository.
 - After a review, add commits to the same branch instead of force-pushing it. A maintainer merges the pull request.
-- A change to workerd is a commit on the fork's branch and the same change exported to `patches/workerd/` (`python3
-  scripts/workerd-patches.py export`, which takes one commit per patch named in `patches/workerd/series`, so a new
-  patch is named there first; it works on the checkout `workerd/`, or the one `--checkout` names, which must be clean
-  and hold `UPSTREAM`'s tag at its commit) in this repository; patches stay in `src/workerd/server/` (with the two documented exceptions in
-  [patches/README.md](patches/README.md)), with the logic in our own files and only hooks in upstream files.
 - The `/v1` API changes only by adding fields and endpoints until 1.0; changing or removing something in it needs a
   discussion first.
 - Never commit credentials, keys or tokens, including test values that look real.
 - Security issues are not reported in public issues: see [SECURITY.md](SECURITY.md).
+
+## Sending a kernel change
+
+1. Read `tag=` in [patches/workerd/UPSTREAM](patches/workerd/UPSTREAM) on product `main`. The per-tag base on
+   [coworkerd/workerd](https://github.com/coworkerd/workerd) is `coworkerd-<tag>`, including the `v` in the tag.
+   Start your topic branch from that base and open the kernel PR against it. Keep the implementation in our own
+   files and upstream hooks within the [documented patch scope](patches/README.md#how-the-series-is-maintained).
+2. Open a companion PR against `main` of [coworkerd/coworkerd](https://github.com/coworkerd/coworkerd). Record
+   new patch names in `patches/workerd/series` in replay order and export the corresponding fork changes to
+   `patches/workerd/` using the [series tools](patches/README.md#working-on-the-series). Put a link to the other PR
+   in each description.
+3. [Verify the fork tree](patches/README.md#verifying-a-kernel-pull-request) from the product PR checkout. Record
+   the full fork commit SHA and matching tree ID on the product PR, and rerun the check if either revision changes.
+   Follow the [kernel publishing steps](#publishing-a-changed-kernel-series) for the changed series and its archive pins.

@@ -37,8 +37,18 @@ node tests/cluster/run.mjs --help
 ```
 
 The runner reports every case, its elapsed time, and the total with cluster setup and teardown. A failed case,
-setup or teardown exits nonzero. Linux pull-request CI uses the same entry point. Each case that holds
-peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses upstream durable processes.
+setup or teardown exits nonzero. Linux pull-request CI runs four shards on separate Ubuntu runners,
+using the same daemons and verified kernel from the Linux build. Each shard runs its assigned projects
+sequentially. Cases that share a Compose project stay in their original order on the same shard.
+The required Linux check passes when the Linux build, unit tests and all four shards pass.
+
+```sh
+node tests/cluster/run.mjs --list
+node tests/cluster/run.mjs --list --shard 1/4
+node tests/cluster/run.mjs "$kernel" --shard 1/4
+```
+
+Each case that holds peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses upstream durable processes.
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
@@ -80,6 +90,16 @@ and use the same response field to see where each request ran.
 The `isolate-busy` case uses the placement-enabled fixture and reads the serving node's management
 state. An outstanding request waiting on a timer leaves a full idle window on its isolate. A second
 ordinary request adds hold time to the same isolate's reading.
+
+Run `ingress-placement-saturation` and `ingress-placement-all-busy` through the same runner
+to test deterministic readings at the isolate and CPU thresholds. These cases check that an
+ordinary request skips busy nodes and executes once on the idle candidate, that a lost peer
+open stops placement, and that explicit soft refusals can be revisited. The all-busy case
+fills the three root slots with sleeping requests to verify the hard concurrency limit.
+
+The default suite also runs `ingress-placement-live-saturation` with the pinned kernel to
+test the production reader without overrides. It warms an isolate on the Worker home,
+runs one CPU-bound request there, and checks that a subsequent probe executes on a peer.
 
 ### Threaded SQL deadline and disconnect
 
