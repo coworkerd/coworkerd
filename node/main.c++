@@ -1762,10 +1762,12 @@ public:
   }
 
   InvocationRejection durableStartRefusal(coworkerd::PreExecutionRefusal reason) {
-    auto value = reason == coworkerd::PreExecutionRefusal::STORAGE_CLOSE_UNCONFIRMED
+    const bool closeUnconfirmed = reason == coworkerd::PreExecutionRefusal::STORAGE_CLOSE_UNCONFIRMED;
+    auto value = closeUnconfirmed
         ? refusal("DO_UNAVAILABLE", DURABLE_CLOSE_UNCONFIRMED_REASON)
         : refusal("OVERLOADED", DURABLE_CAPACITY_REASON);
-    value.notExecuted = value.retryable = true;
+    value.notExecuted = true;
+    value.retryable = !closeUnconfirmed;
     return value;
   }
 
