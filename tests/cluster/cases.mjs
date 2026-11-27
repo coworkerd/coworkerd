@@ -3558,19 +3558,13 @@ async function threadedSocketFrameBudget(cluster) {
     export class Echo extends DurableObject {
       fetch(request) {
         const action = new URL(request.url).pathname.split('/').at(-1);
-        if (action === 'release') this.released = true;
         if (action === 'terminal') return Response.json(this.terminal ?? null);
         if (request.headers.get('upgrade')?.toLowerCase() !== 'websocket') return new Response('ready');
         const [client, socket] = Object.values(new WebSocketPair());
         this.ctx.acceptWebSocket(socket);
         return new Response(null, { status: 101, webSocket: client });
       }
-      async webSocketMessage(socket, message) {
-        if (message === 'hold') {
-          while (!this.released) await scheduler.wait(20);
-        }
-        socket.send(message);
-      }
+      webSocketMessage(socket, message) { socket.send(message); }
       webSocketClose(socket, code, reason, wasClean) {
         this.terminal = { code, reason, wasClean };
       }
@@ -3584,35 +3578,46 @@ async function threadedSocketFrameBudget(cluster) {
     durable_objects: { bindings: [{ name: 'ECHO', class_name: 'Echo' }] } } });
   const call = (suffix = '') => request(origin, path + suffix);
   await eventually('the two test objects answer on the same node', async () => {
-    assertStatus(await call(), 200);
-    assertStatus(await call('?id=second'), 200);
+    assertStatus(await call(), 200, 'first object');
+    assertStatus(await call('?id=second'), 200, 'second object');
   });
   const url = new URL(path, origin);
   url.protocol = 'ws:';
   const first = new Client(url);
-  const second = new Client(new URL('?id=second', url));
+  let second;
   const next = (socket, event) => once(socket, event, { signal: AbortSignal.timeout(7000) });
-  const budget = async () => (await cluster.state(node)).webSockets.homeFrames;
+  const sockets = async () => (await cluster.state(node)).webSockets;
+  const budget = async () => (await sockets()).homeFrames;
+  const control = file => join(cluster.durableLifecycleGate, file);
+  const gate = control('hold-socket-adopt');
   const reason = 'Durable Object socket frame capacity';
   try {
-    await Promise.all([next(first, 'open'), next(second, 'open')]);
+    await next(first, 'open');
+    await writeFile(control('idle-offset-next'), '60000');
+    await rename(control('idle-offset-next'), control('idle-offset-ms'));
+    await eventually('the first socket parks on the node', async () => {
+      assert.equal((await sockets()).parked, 1);
+    });
+    second = new Client(new URL('?id=second', url));
+    await next(second, 'open');
+    await writeFile(gate, '');
     const echo = next(first, 'message');
     void echo.catch(() => {});
     first.send('hold');
     await eventually('one delivery reserves the full eight-byte budget', async () => {
       assert.deepEqual(await budget(), { limitBytes: 8, reservedBytes: 8, refused: 0 });
-    });
+    }, { timeout: 3000 });
     const close = next(second, 'close');
     second.send(Buffer.from([1]));
     const [code, closeReason] = await close;
     assert.equal(code, 1013);
     assert.equal(closeReason.toString(), reason);
-    await eventually('the second home gets the terminal event while the first delivery holds the budget', async () => {
-      assert.deepEqual(await budget(), { limitBytes: 8, reservedBytes: 8, refused: 1 });
+    assert.deepEqual(await budget(), { limitBytes: 8, reservedBytes: 8, refused: 1 });
+    await unlink(gate);
+    await eventually('the second home gets the terminal event', async () => {
       assert.deepEqual(json(await call('/terminal?id=second'), 200, 'capacity close'),
         { code: 1013, reason, wasClean: false });
     });
-    assertStatus(await call('/release'), 200);
     assert.equal((await echo)[0].toString(), 'hold');
     await eventually('completion returns the reservation', async () => {
       assert.deepEqual(await budget(), { limitBytes: 8, reservedBytes: 0, refused: 1 });
@@ -3623,8 +3628,9 @@ async function threadedSocketFrameBudget(cluster) {
     assert.equal(isBinary, true);
     assert.deepEqual(bytes, Buffer.from([0, 128, 255]));
   } finally {
+    await unlink(gate).catch(() => {});
     first.terminate();
-    second.terminate();
+    second?.terminate();
   }
 }
 
@@ -4428,7 +4434,7 @@ export const durableGatedCases = {
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
   },
   'durable-threaded-socket-frame-budget': {
-    test: threadedSocketFrameBudget, nodes: ['node-1'], singleNode: true, holdPeerAcks: false,
+    test: threadedSocketFrameBudget, nodes: ['node-1'], singleNode: true, holdPeerAcks: false, controlDurableLifecycle: true,
     configureNode: () => ({ durableObjects: { threadedStorage: true, peers: 0, socketFrameBytesPerNode: 8 } }),
   },
   'durable-threaded-retirement': {
