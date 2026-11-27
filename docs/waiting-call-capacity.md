@@ -99,6 +99,26 @@ batches left at least eight outbound slots free.
 [Baseline egress limits](https://github.com/coworkerd/coworkerd/blob/dec0b3b816a70715760f12a6655a3a4c32fcfca8/docs/egress-and-auth.md#limits-and-metering) ·
 [Baseline placement admission](https://github.com/coworkerd/coworkerd/blob/dec0b3b816a70715760f12a6655a3a4c32fcfca8/docs/cluster-state.md#7-placement)
 
+### Resource budgets and the measured range
+
+The node's startup memory calculation uses 80% of its memory basis and divides it across five
+generation slots in this fixture, including the spare. Using the VM's 12,528,578,560 bytes yields
+the recorded ordinary workerd budget of 2,004,572,569 bytes (1.87 GiB), with integer rounding.
+The greatest sampled waiting RSS was 33,064 KiB for the node daemon and 74,320 KiB for ordinary
+workerd. The native budget and Linux RSS use different accounting. The recording contains
+process RSS and the node's green admission band. The node cgroup working set and the native
+budget's live usage were unmeasured. [Baseline memory calculation](https://github.com/coworkerd/coworkerd/blob/dec0b3b816a70715760f12a6655a3a4c32fcfca8/node/main.c++#L10254)
+
+Both processes had a soft descriptor limit of 1,048,576. The largest waiting samples were 220
+descriptors for the node daemon and 728 for ordinary workerd, each below 0.1% of its process
+limit. A linear interpolation of the median before-to-waiting changes at 16 and 24 estimates
+about 80 additional daemon descriptors and 40 workerd descriptors at 20 overlapping calls in
+this same warmed fixture. Memory changes varied between repeats, and all batches fit in the
+warm thread pool. The measurements leave memory cost and thread growth at higher concurrency
+unestimated.
+
+### Remaining acceptance readings
+
 The [#31 finish line](https://github.com/coworkerd/coworkerd/issues/31) requires two further readings.
 
 1. Complete 2,000 simultaneous two-second upstream waits on one node under the product defaults.
@@ -109,7 +129,13 @@ The [#31 finish line](https://github.com/coworkerd/coworkerd/issues/31) requires
    measurement leaves thread-pool growth, the physical ceiling and the production safety threshold
    open. The installation guide needs the eventual measured limit and the reading behind it.
 
-The multi-node hot-Worker, latency and overload comparisons in #31 also require separate measurements.
+The next acceptance check is to verify the effective default limits on the candidate product build.
+When those settings allow the acceptance case, the reading needs observed upstream overlap,
+completions and refusal codes alongside the node's cgroup working set, native budget use, threads,
+and descriptors.
+
+The hot-Worker placement and light-tenant latency readings are available separately. The
+cluster-wide overload comparison remains open in #31. [Hot-Worker placement report](https://github.com/coworkerd/coworkerd/blob/8b448dc/docs/hot-worker-placement.md)
 
 ## Reproduce
 
