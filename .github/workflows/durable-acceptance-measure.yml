@@ -7,15 +7,16 @@ on:
     paths:
       - .github/workflows/durable-acceptance-measure.yml
       - tests/cluster/durable-wake-measure.mjs
+      - tests/cluster/durable-idle-measure.mjs
 
 permissions:
   contents: read
 
 jobs:
   wake:
-    name: Paired wake latency and hibernation
+    name: Wake latency, hibernation and idle resources
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 50
     env:
       CC: clang-19
       CXX: clang++-19
@@ -36,9 +37,11 @@ jobs:
             clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3
           npm ci --prefix cli --registry=https://registry.npmjs.org
       - name: Build the release daemons and verify the published kernel
+        id: prepare
         run: |
           kernel=$(python3 scripts/fetch-kernel.py --arch linux-x86_64)
           bash scripts/build.sh -DCOWORKERD_TEST_WORKERD="$kernel/workerd"
+          cmake --build build --target coworkerd-launcher
           printf 'KERNEL_DIR=%s\n' "$kernel" >> "$GITHUB_ENV"
       - name: Measure upstream and threaded in sequence
         run: |
@@ -46,6 +49,12 @@ jobs:
           clang-19 --version > build/durable-acceptance/compiler.txt
           node tests/cluster/durable-wake-measure.mjs "$KERNEL_DIR" build/durable-acceptance/wake.jsonl \
             2>&1 | tee build/durable-acceptance/wake.log
+        shell: bash
+      - name: Measure idle resources and recoverability
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: |
+          test -z "$(docker ps -q)"
+          node tests/cluster/durable-idle-measure.mjs "$KERNEL_DIR" build/durable-acceptance/idle.jsonl             2>&1 | tee build/durable-acceptance/idle.log
         shell: bash
       - name: Upload measurements
         if: always()
