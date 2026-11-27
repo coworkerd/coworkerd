@@ -5,6 +5,7 @@ import { cases, durableGatedCases, fatalAttribution, webSocketCases } from './ca
 import { Cluster } from './cluster.mjs';
 import { ingressPlacementDefault, ingressPlacementEnabled, ingressPlacementSaturation, ingressPlacementAllBusy,
   ingressPlacementLiveSaturation } from './ingress-placement.mjs';
+import { isolateBusy } from './isolate-busy.mjs';
 
 async function runSuite(selected, kernel, signal, options) {
   const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-cluster-')), kernel, signal, options);
@@ -39,9 +40,10 @@ async function main(args) {
   const regularCases = { 'ingress-placement-default': ingressPlacementDefault, ...cases };
   const placementCases = {
     'ingress-placement': { test: ingressPlacementEnabled },
+    'isolate-busy': { test: isolateBusy },
     'ingress-placement-saturation': { test: ingressPlacementSaturation, isolatePermilleOnThird: 899 },
     'ingress-placement-all-busy': { test: ingressPlacementAllBusy, isolatePermilleOnThird: 900 },
-    'ingress-placement-live-saturation': { test: ingressPlacementLiveSaturation, manual: true },
+    'ingress-placement-live-saturation': { test: ingressPlacementLiveSaturation },
   };
   const all = { ...regularCases, ...placementCases, ...webSocketCases, ...durableGatedCases,
     'fatal-attribution': fatalAttribution };
@@ -65,7 +67,7 @@ async function main(args) {
   }
   const regular = fatalTest ? [['fatal-attribution', fatalAttribution]]
     : Object.entries(regularCases).filter(([name]) => !args[1] || args[1] === name);
-  const placement = Object.entries(placementCases).filter(([name, { manual }]) => args[1] ? args[1] === name : !manual);
+  const placement = Object.entries(placementCases).filter(([name]) => !args[1] || args[1] === name);
   const webSockets = Object.entries(webSocketCases).filter(([name]) => !args[1] || args[1] === name);
   const gated = Object.entries(durableGatedCases).filter(([name]) => !args[1] || args[1] === name);
   let failed = 0;

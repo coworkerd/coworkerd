@@ -71,13 +71,17 @@ To enable placement on all nodes for a new fixture, pass
 including two requests forwarded to a peer. Later cases can choose their own placement settings
 and use the same response field to see where each request ran.
 
+The `isolate-busy` case uses the placement-enabled fixture and reads the serving node's management
+state. An outstanding request waiting on a timer leaves a full idle window on its isolate. A second
+ordinary request adds hold time to the same isolate's reading.
+
 Run `ingress-placement-saturation` and `ingress-placement-all-busy` through the same runner
 to test deterministic readings at the isolate and CPU thresholds. These cases check that an
 ordinary request skips busy nodes and executes once on the idle candidate, that a lost peer
 open stops placement, and that explicit soft refusals can be revisited. The all-busy case
 fills the three root slots with sleeping requests to verify the hard concurrency limit.
 
-With a kernel that publishes isolate busy time, run `ingress-placement-live-saturation` to
+The default suite also runs `ingress-placement-live-saturation` with the pinned kernel to
 test the production reader without overrides. It warms an isolate on the Worker home,
 runs one CPU-bound request there, and checks that a subsequent probe executes on a peer.
 

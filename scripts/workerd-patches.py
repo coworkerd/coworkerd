@@ -316,6 +316,13 @@ def allowed_path(name, path):
                           name == '0122-order-threaded-wal-home-teardown.patch' and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0185-measure-isolate-busy-time.patch' and path in {
+                              'src/workerd/jsg/jsg.c++',
+                              'src/workerd/jsg/observer.h',
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/isolate-busy-test.c++',
+                              'src/workerd/threaded/isolate-busy.h',
+                              'src/workerd/threaded/threaded-server.c++'} or
                           name == '0130-ordinary-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',
