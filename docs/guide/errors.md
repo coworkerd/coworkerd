@@ -70,16 +70,6 @@ A caller's retry is a new binding call and uses its own subrequest and, for D1, 
 | 507 | `SQL_SPILL_LIMIT_EXCEEDED` | A threaded database exceeded its own or its durable process's budget for uncommitted WAL and live SQLite temporary files | Rolled back. The same database connection can serve the next request | Reduce the work in one transaction or query |
 | 422 | `QUOTA_EXCEEDED` | A write while the tenant's Durable Objects already hold more than its `durableObjectBytes` quota (10 GiB by default). What the tenant holds is what the nodes publish of their own objects every `durableObjects.usagePublishMs` (an hour), so enforcement lags; failed publication or reads can delay it beyond an hour. Only growing transactions are refused | Not durable; immediate repair and recovery before the next request, as above | Delete data, or ask the administrator to raise the quota (`cowctl tenant update T --quota durableObjectBytes=N`); transactions that do not grow their database are permitted |
 
-### SQLite errors inside a threaded Durable Object
-
-`ctx.storage.sql` throws these JavaScript errors inside the object. The fields describe the SQL
-operation. Catch the error in the object to choose what the handler returns.
-
-| `error.code` | Meaning | Outcome |
-| --- | --- | --- |
-| `SQL_MEMORY_LIMIT_EXCEEDED` | The connection reached its 32 MiB SQLite heap limit | The active storage transaction rolled back. The same connection can run later statements. Reduce the memory needed by the statement. |
-| `OVERLOADED` | The durable process could not reserve more SQLite heap | The active storage transaction rolled back and the same connection remains available. The SQL error has `dispatched: false` and `retryable: true`. Retry the transaction when process headroom returns. |
-
 **Oversized WAL records (0.5.5).** A record larger than `durableLog.settings.recordLimitBytes` is refused with
 `STORAGE_UNAVAILABLE` before it enters the node log or any peer. The default limit is 67,104,768 encoded bytes;
 WAL page headers and record metadata are included, so this is not the SQL value size. The node logs
@@ -100,6 +90,20 @@ above never need one.
 For a Worker without a static placement -- an ingress request while ingress placement is on (the default), and every Binding call --, a refusal another node may not share (every code but `RESULT_UNCERTAIN`, `LEASE_EXPIRED` -- the deadline is the call's own, so the call ends with it, and no node is avoided for it -- and a `LOAD_FAILED` other than `package-unavailable`) sends the call to the next candidate node, at most `initialPlacementHops` (8) of them; when every candidate tried refuses, the answer is `503 PLACEMENT_EXHAUSTED` (or `503 LOAD_FAILED` with `package-unavailable` when none could fetch or verify the code package), listing each candidate's `nodeId` and refusal under `attempts`, so codes such as `SECRET_UNAVAILABLE`, `OVERLOADED`, `PROCESS_UNAVAILABLE` or the code bundle's `VERSION_UNAVAILABLE` then appear only there.
 
 The fields in the call answers that refer to a node are called `nodeId`; `/v1`'s deployment answers name the node that ran the trial load in the trial record's `server` fields (`versions[].server`, `attempts[].server`) and as `nodeId` in its verdict, and a `LOAD_FAILED` answer also as a top-level `nodeId`.
+
+### SQLite errors inside a threaded Durable Object
+
+`ctx.storage.sql` throws these JavaScript errors inside the object. The fields describe the SQL
+operation. Catch the error in the object to choose what the handler returns.
+
+| `error.code` | Meaning | Outcome |
+| --- | --- | --- |
+| `SQL_MEMORY_LIMIT_EXCEEDED` | The connection reached its 32 MiB SQLite heap limit | The active transaction rolled back. Reduce the memory needed by the statement. |
+| `OVERLOADED` | The durable process could not reserve more SQLite heap | The active transaction rolled back. The SQL error has `dispatched: false` and `retryable: true`. Retry the transaction when process headroom returns. |
+
+A rolled-back implicit turn that included earlier writes or pending alarm changes fails the
+responses waiting for confirmation. Subsequent calls reopen the last confirmed storage. A rollback
+confined to an explicit transaction can leave the same connection available.
 
 ## 2. The control plane (`/v1` and `cowctl`)
 

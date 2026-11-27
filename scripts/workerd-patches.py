@@ -412,6 +412,8 @@ def allowed_path(name, path):
                               'src/workerd/jsg/coworkerd-rpc-code.h',
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++',
+                              'src/workerd/util/sqlite-metering.c++',
+                              'src/workerd/util/sqlite-metering.h',
                               'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or

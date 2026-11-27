@@ -1183,14 +1183,14 @@ async function threadedSqlMemoryLimit(cluster) {
     'the implicit rollback was settled before handling another request');
 }
 
-async function threadedObjectSqlHeap(cluster) {
-  const MiB = 1024 ** 2;
+async function objectSqlHeapFixture(cluster) {
   const [owner] = cluster.nodes;
   const tenant = await cluster.tenant('object-sqlite-heap');
   await cluster.deploy(tenant, 'object', `
     import { DurableObject } from 'cloudflare:workers';
     export class Store extends DurableObject {
       instance = crypto.randomUUID();
+      alarm() {}
       async fetch(request) {
         const { searchParams } = new URL(request.url);
         const storage = this.ctx.storage;
@@ -1202,18 +1202,51 @@ async function threadedObjectSqlHeap(cluster) {
         if (mode === 'seed') {
           sql.exec('CREATE TABLE ledger (value INTEGER)');
           insert(1);
-          if (searchParams.get('name') === '0') {
-            this.cursor = sql.exec('SELECT value FROM ledger UNION ALL SELECT 100');
-          }
           return Response.json({ instance: this.instance, values: values() });
         }
-        let code;
-        if (mode === 'sync') {
+        if (mode === 'probe') {
+          return Response.json({ instance: this.instance,
+            values: sql.exec('SELECT 1 AS value').toArray() });
+        }
+        if (mode === 'hold-cursor') {
+          this.cursor = sql.exec('SELECT value FROM ledger UNION ALL SELECT 100');
+        }
+        let code, dispatched, retryable, blockedWrite, alarm;
+        if (mode === 'alarm-seed') {
+          await storage.setAlarm(Date.now() + 3600000);
+        }
+        if (mode === 'alarm-refusal') {
+          const write = storage.deleteAlarm();
+          try { large(); } catch (e) {
+            if (e.code !== 'SQL_MEMORY_LIMIT_EXCEEDED') throw e;
+          }
+          await write;
+          return new Response('application reported success');
+        }
+        if (mode.startsWith('alarm-')) alarm = await storage.getAlarm();
+        if (mode === 'reserve') {
+          this.buffer = new ArrayBuffer(Number(searchParams.get('bytes')));
+        } else if (mode === 'process') {
+          try {
+            storage.transactionSync(() => {
+              insert(2);
+              sql.exec("SELECT printf('fits', randomblob(6291456), randomblob(6291456), "
+                + "randomblob(6291456), randomblob(6291456)) AS value").one();
+            });
+          } catch (e) {
+            ({ code, dispatched, retryable } = e);
+          }
+        } else if (mode === 'sync') {
           try {
             storage.transactionSync(() => {
               insert(2);
               try { large(); } catch (e) {
                 if (e.code !== 'SQL_MEMORY_LIMIT_EXCEEDED') throw e;
+              }
+              try {
+                blockedWrite = storage.put('escaped', true).then(() => null, error => error.code);
+              } catch (e) {
+                blockedWrite = Promise.resolve(e.code);
               }
             });
           } catch (e) { code = e.code; }
@@ -1228,9 +1261,15 @@ async function threadedObjectSqlHeap(cluster) {
           } catch (e) { code = e.code; }
         } else if (mode === 'implicit') {
           insert(2);
-          try { sql.exec('SELECT randomblob(1310720)'); } catch (e) { code = e.code; }
+          try { sql.exec('SELECT randomblob(1310720)'); } catch (e) {
+            if (e.code !== 'SQL_MEMORY_LIMIT_EXCEEDED') throw e;
+          }
+          return new Response('application reported success');
         }
-        return Response.json({ instance: this.instance, values: values(), code });
+        const blockedCode = await blockedWrite;
+        const escaped = mode === 'sync' ? (await storage.get('escaped')) ?? false : undefined;
+        return Response.json({ instance: this.instance, values: values(), code, dispatched, retryable,
+          blockedCode, escaped, alarm });
       }
     }
     export default { fetch(request, env) {
@@ -1241,7 +1280,8 @@ async function threadedObjectSqlHeap(cluster) {
     durable_objects: { bindings: [{ name: 'STORE', class_name: 'Store' }] },
     migrations: [{ tag: 'v1', new_sqlite_classes: ['Store'] }],
   } });
-  const call = (name, mode) => workerCall(cluster, owner, tenant, `object?name=${name}&mode=${mode}`);
+  const call = (name, mode, args = {}) => workerCall(cluster, owner, tenant,
+    `object?${new URLSearchParams({ name, mode, ...args })}`);
   const original = await durableGeneration(cluster, owner);
   const snapshot = async () => {
     const child = await durableGeneration(cluster, owner);
@@ -1250,40 +1290,72 @@ async function threadedObjectSqlHeap(cluster) {
     return child.lifecycle.durableAdmission;
   };
   const logs = async () => (await cluster.state(owner)).durableLog;
+  return { original, snapshot, call, logs };
+}
+
+async function threadedObjectSqlHeap(cluster) {
+  const step = 64 * 1024;
+  const { original, snapshot, call, logs } = await objectSqlHeapFixture(cluster);
   const baseline = await snapshot();
   assert.equal(baseline.residentRoots, 0);
   assert.equal(baseline.sqliteHeapReservedBytes, 0);
-  const first = json(await call(0, 'seed'), 200, 'open the first object and retain its cursor');
+  assert.equal(baseline.objectSqliteConnections, 0);
+  let first = json(await call(0, 'seed'), 200, 'open the first object');
   assert.deepEqual(first.values, [{ value: 1 }]);
-  const open = await eventually('the first connection is open', async () => {
+  const opened = await eventually('the first connection is open', async () => {
     const state = await snapshot();
-    assert.equal(state.residentRoots, 1);
-    assert.equal(state.sqliteHeapReservedBytes, MiB);
-    const log = await logs();
-    assert.equal(log.objects.activeConnections, 1);
-    return log;
-  });
-  for (const mode of ['sync', 'async', 'implicit']) {
-    assert.deepEqual(json(await call(0, mode), 200, mode + ' rolls back on heap refusal'),
-      { ...first, code: 'SQL_MEMORY_LIMIT_EXCEEDED' });
-    assert.equal((await logs()).threadedHomeIo.openSamples, open.threadedHomeIo.openSamples);
-  }
-  // Refresh the first tree after the failure checks, then fill the four copies.
-  assert.deepEqual(json(await call(0, 'read'), 200, 'reuse after refusal'), first);
+    assert.equal(state.residentRoots, 1, JSON.stringify(state));
+    assert.equal(state.objectSqliteConnections, 1, JSON.stringify(state));
+    assert.ok(state.sqliteHeapReservedBytes >= step, JSON.stringify(state));
+    assert.ok(state.sqliteHeapReservedBytes < 1024 ** 2, JSON.stringify(state));
+    return state;
+  }, { timeout: 5000 });
+  const firstOpenSample = (await logs()).threadedHomeIo.openSamples;
+  assert.deepEqual(json(await call(0, 'sync'), 200, 'the refused sync scope still fails after a caught error'),
+    { ...first, code: 'SQL_MEMORY_LIMIT_EXCEEDED', blockedCode: 'SQL_MEMORY_LIMIT_EXCEEDED', escaped: false });
+  assert.deepEqual(json(await call(0, 'async'), 200, 'the refused async scope still fails after a caught error'),
+    { ...first, code: 'SQL_MEMORY_LIMIT_EXCEEDED' });
+  assert.equal((await logs()).threadedHomeIo.openSamples, firstOpenSample);
+
+  const failedAndReopened = async (mode, checkMode) => {
+    const refused = await call(0, mode);
+    assert.ok(refused.status >= 500, JSON.stringify(refused));
+    assert.notEqual(refused.text, 'application reported success');
+    return eventually('a replacement actor opens confirmed storage', async () => {
+      const next = json(await call(0, checkMode), 200, 'reopen after rolling back implicit work');
+      assert.notEqual(next.instance, first.instance);
+      assert.deepEqual(next.values, first.values);
+      return next;
+    }, { timeout: 8000 });
+  };
+  first = await failedAndReopened('implicit', 'read');
+  const confirmed = json(await call(0, 'alarm-seed'), 200, 'confirm an alarm before refusal');
+  assert.ok(confirmed.alarm > Date.now());
+  const afterAlarm = await failedAndReopened('alarm-refusal', 'alarm-read');
+  assert.equal(afterAlarm.alarm, confirmed.alarm);
+  first = { instance: afterAlarm.instance, values: afterAlarm.values };
+
+  assert.deepEqual(json(await call(0, 'hold-cursor'), 200, 'keep a live cursor until retirement'), first);
   const count = 256;
   for (let offset = 1; offset < count; offset += 16) {
     await Promise.all(Array.from({ length: Math.min(16, count - offset) }, async (_, i) => {
-      const reply = json(await call(offset + i, 'seed'), 200, 'open an ordinary object');
+      const reply = json(await call(offset + i, 'probe'), 200, 'open an ordinary object');
       assert.deepEqual(reply.values, first.values);
     }));
   }
-  const full = await eventually('all 256 SQLite connections are open at the same time', async () => {
+  const allOpen = async () => {
     const state = await snapshot();
     assert.equal(state.residentRoots, count);
-    assert.equal(state.sqliteHeapReservedBytes, count * MiB);
-    assert.equal((await logs()).objects.activeConnections, count);
+    assert.equal(state.objectSqliteConnections, count);
+    assert.ok(state.sqliteHeapReservedBytes >= count * step);
+    assert.ok(state.sqliteHeapReservedBytes <= count * 4 * step);
     return state;
-  });
+  };
+  const full = await eventually('all 256 SQLite connections are open at the same time', allOpen,
+    { timeout: 5000 });
+  await delay(1600);
+  const idleOpen = await allOpen();
+  assert.ok(idleOpen.sqliteHeapReservedBytes <= full.sqliteHeapReservedBytes);
   const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
   await writeFile(advance, '180000');
   await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
@@ -1291,7 +1363,7 @@ async function threadedObjectSqlHeap(cluster) {
     const state = await snapshot();
     assert.equal(state.residentRoots, 0);
     assert.equal(state.sqliteHeapReservedBytes, 0);
-    assert.equal((await logs()).objects.activeConnections, 0);
+    assert.equal(state.objectSqliteConnections, 0);
     return state;
   });
   // One request must reopen the confirmed storage without waiting for the
@@ -1299,14 +1371,57 @@ async function threadedObjectSqlHeap(cluster) {
   const reopened = json(await call(0, 'read'), 200, 'first request after confirmed SQLite close');
   assert.notEqual(reopened.instance, first.instance);
   assert.deepEqual(reopened.values, first.values);
-  assert.equal((await logs()).objects.repairs, open.objects.repairs);
+  const after = await snapshot();
+  assert.equal(after.objectSqliteConnections, 1);
+  assert.doesNotMatch(await cluster.compose(['logs', '--no-color', cluster.nodes[0]], {
+    maxBuffer: 8 * 1024 ** 2,
+  }), /did not find a valid scope|memoryBytes underflow|SQLite heap charge remained/);
   console.log(JSON.stringify({
     pid: original.pid, generation: original.generation, openConnections: count,
-    oneConnectionReservedBytes: MiB, fullSqliteReservedBytes: full.sqliteHeapReservedBytes,
-    returnedSqliteBytes: full.sqliteHeapReservedBytes - idle.sqliteHeapReservedBytes,
+    oneConnectionReservedBytes: opened.sqliteHeapReservedBytes,
+    fullSqliteReservedBytes: full.sqliteHeapReservedBytes,
+    meanConnectionReservedBytesBeforeClose: idleOpen.sqliteHeapReservedBytes / count,
+    idleOpenSqliteReservedBytes: idleOpen.sqliteHeapReservedBytes,
+    freedAtIdleBytes: full.sqliteHeapReservedBytes - idleOpen.sqliteHeapReservedBytes,
+    returnedSqliteBytes: idleOpen.sqliteHeapReservedBytes - idle.sqliteHeapReservedBytes,
     copyMemoryMaximum: full.copyMemoryMaximum, fullCopyMemoryReservedBytes: full.copyMemoryReservedBytes,
     idleCopyMemoryReservedBytes: idle.copyMemoryReservedBytes,
   }));
+}
+
+async function threadedObjectSqlProcessMemory(cluster) {
+  const MiB = 1024 ** 2;
+  const { original, snapshot, call, logs } = await objectSqlHeapFixture(cluster);
+  const first = json(await call(0, 'seed'), 200, 'open an ordinary object');
+  const started = await eventually('the open SQLite heap is charged', async () => {
+    const state = await snapshot();
+    assert.equal(state.objectSqliteConnections, 1);
+    assert.ok(state.sqliteHeapReservedBytes > 0 && state.sqliteHeapReservedBytes < MiB);
+    return state;
+  }, { timeout: 5000 });
+  const openSamples = (await logs()).threadedHomeIo.openSamples;
+  const room = state => state.copyMemoryMaximum - state.copyMemoryReservedBytes;
+  assert.ok(room(started) >= 2 * MiB, JSON.stringify(started));
+  const bufferBytes = Math.max(0, room(started) - 12 * MiB);
+  if (bufferBytes > 0) {
+    assert.deepEqual(json(await call(0, 'reserve', { bytes: bufferBytes }), 200,
+      'hold process memory in a live ArrayBuffer'), first);
+  }
+  const constrained = await eventually('the array buffer leaves room for the subsequent small read', async () => {
+    const state = await snapshot();
+    assert.ok(room(state) >= MiB && room(state) < 20 * MiB, `room: ${room(state)}`);
+    return state;
+  });
+  assert.deepEqual(json(await call(0, 'process'), 200, 'roll back on shared SQLite heap refusal'),
+    { ...first, code: 'OVERLOADED', dispatched: false, retryable: true });
+  assert.deepEqual(json(await call(0, 'read'), 200, 'the same connection still reads'), first);
+  const reused = await snapshot();
+  assert.equal(reused.objectSqliteConnections, 1);
+  assert.ok(reused.sqliteHeapReservedBytes > 0 && reused.sqliteHeapReservedBytes < MiB);
+  assert.equal(reused.actorResets, started.actorResets);
+  assert.equal((await logs()).threadedHomeIo.openSamples, openSamples);
+  console.log(JSON.stringify({ pid: original.pid, generation: original.generation,
+    sqliteRequestedBytes: 24 * MiB, bufferBytes, processHeadroomBytes: room(constrained) }));
 }
 
 async function threadedSqlProcessMemory(cluster) {
@@ -4555,6 +4670,13 @@ export const durableGatedCases = {
     singleNode: true, controlDurableLifecycle: true, holdPeerAcks: false,
     configureNode: () => ({ durableObjects: { threadedStorage: true, processes: 1, peers: 0 } }),
     nodeEnvironment: () => ({ COWORKERD_DO_TEST_OBJECT_SQL_MEMORY_BYTES: '1048576' }),
+  },
+  'durable-threaded-object-sqlite-process-memory': {
+    test: threadedObjectSqlProcessMemory, nodes: ['node-1'], singleNode: true, holdPeerAcks: false,
+    configureNode: () => ({
+      processPool: { count: 1, inFlightLimit: 16, threadedMemoryBytes: 112 * 1024 ** 2 },
+      durableObjects: { threadedStorage: true, processes: 1, peers: 0 },
+    }),
   },
   'threaded-sql-process-memory': {
     test: threadedSqlProcessMemory, nodes: ['node-1'],

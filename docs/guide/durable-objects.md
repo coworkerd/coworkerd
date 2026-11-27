@@ -46,26 +46,29 @@ A statement exceeding the budget throws `SQL_LIMIT_EXCEEDED`; later SQL in that 
 An uncaught read error normally returns 500; a reset after an interrupted write returns 503. User error text or a user-set `code` does not create the platform's database error code. A smaller tenant CPU allowance does not take effect inside a running native SQL statement. With a 50 ms tenant CPU allowance and the default 200 ms SQL budget, a long SQL test returned `503 CPU_LIMIT_EXCEEDED` after about 220 ms, once native execution returned. Interruption is cooperative: a costly function or blocking I/O without progress callbacks can run past the SQL limit. A sequence of callback-free segments each taking more than 250 microseconds is undercounted by the sampled estimate, increasingly so as the segments become more expensive. The process watchdog, normally 3000 ms, remains its fallback.
 
 On the experimental threaded backend, each SQLite connection has a 32 MiB heap budget for
-`ctx.storage.sql`. The budget covers SQLite's live allocations, including prepared statements,
-page caches and working memory for queries. Each facet uses its own connection. The durable
-process counts live heap in 1 MiB reservation steps alongside its other memory use. Opening and
-trusted maintenance are accounted for as they run, and confirmed close returns the connection's
-remaining reservation.
+`ctx.storage.sql`. The budget covers SQLite's live allocations, including prepared statements, page caches and
+query working memory. Each facet uses its own connection. The durable process reserves the heap
+in 64 KiB steps alongside its other memory use. The connection retains one step across small
+drops while busy. After one second idle, the home releases reclaimable page cache and excess
+reserved credit. Opening and internal maintenance are accounted for. Confirmed close returns the
+connection's remaining reservation.
 
-If a statement exceeds the connection's budget or the process cannot reserve its next step, the
-open storage transaction rolls back. This includes writes already made in the same implicit
-transaction and enclosing savepoints. A caught exception still prevents a surrounding
-`transactionSync()` or `transaction()` from committing. After the transaction exits, new
-statements can use the same connection. Object heap exhaustion throws
-`SQL_MEMORY_LIMIT_EXCEEDED`. A shared reservation refusal throws `OVERLOADED` with
-`dispatched: false` and `retryable: true` for the rolled-back SQL operation. Retry the
-transaction once capacity is available. Side effects elsewhere in the handler may have run.
+A statement that exceeds the connection heap limit throws `SQL_MEMORY_LIMIT_EXCEEDED`. A shared
+reservation refusal throws `OVERLOADED` with `dispatched: false` and `retryable: true` for
+the failed SQL operation. The active transaction rolls back. A refused explicit transaction
+cannot commit, even if the callback catches the error. If a statement outside an explicit
+transaction rolls back an implicit write, or rollback affects earlier writes or pending alarm
+bookkeeping, responses waiting for those writes fail and the object resets. The next call
+opens the last confirmed storage. After rollback confined to an isolated transaction, the same
+connection can serve further statements. When shared headroom returns, retry the transaction.
+Side effects elsewhere in the handler may have run.
 
-The default 2 GiB durable process budget allocates 1,792 MiB to isolate copies and SQLite
-reservations. At a minimum of 1 MiB per open connection, that shared reservation bounds the
-number of open connections below the configured target of 4,096, even before accounting for
-isolate memory and native overhead. The current default placement holds up to 256 ordinary
-object trees in one process.
+Isolate copies and SQLite reservations share seven eighths of the configured
+`processPool.threadedMemoryBytes`. By default, the node derives that setting from its memory
+budget and process count. A connection retaining one 64 KiB step would reserve 256 MiB across
+the configured target of 4,096 root objects. Isolate memory, additional connections and larger
+live heaps also draw from this budget. Current default placement holds up to 256 ordinary
+object trees per process.
 
 After a declared secret or binding changes, the object's next request selects the updated definition. On the experimental threaded host, this uses the same bounded drain as a code update. Other objects reopen on their own next requests. Stateless Workers keep their loaded values until their isolates are evicted.
 
