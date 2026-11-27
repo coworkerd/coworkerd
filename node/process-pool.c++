@@ -4293,8 +4293,13 @@ kj::Promise<void> ProcessPool::sampleWorkerSaturation() {
     std::vector<std::map<std::string, double, std::less<>>> result;
     for (const auto& snapshot : snapshots) {
       auto& saturated = result.emplace_back();
-      // A replacement can share its predecessor's plan revision. Its latest instance owns the reading.
-      struct Reading { double instance, throughMs; bool busy; };
+      // Use the newest instance of one isolate label. Multiple labels for one plan
+      // revision can refer to different resolved bindings, so that plan is ambiguous.
+      struct Reading {
+        std::string label;
+        double instance, throughMs;
+        bool busy, ambiguous = false;
+      };
       std::map<std::string, Reading> readings;
       try {
         capnp::MallocMessageBuilder message;
@@ -4305,21 +4310,26 @@ kj::Promise<void> ProcessPool::sampleWorkerSaturation() {
         for (auto row : residents.getArray()) {
           const auto plan = json::field(row, "planRevision");
           const auto instance = json::field(row, "instance");
-          if (!plan.isString() || !instance.isNumber()) continue;
+          const auto label = json::field(row, "isolate");
+          if (!plan.isString() || !instance.isNumber() || !label.isString()) continue;
           const auto busy = json::field(row, "isolateBusy");
           const auto through = busy.isObject() ? json::field(busy, "throughMonotonicMs") : capnp::JsonValue::Reader();
           const auto permille = busy.isObject() ? json::field(busy, "permille") : capnp::JsonValue::Reader();
           const bool aboveThreshold = through.isNumber() && permille.isNumber() &&
               permille.getNumber() >= WORKER_BUSY_PERMILLE && permille.getNumber() <= 1000;
-          const Reading reading{instance.getNumber(), aboveThreshold ? through.getNumber() : 0, aboveThreshold};
-          auto [previous, inserted] = readings.try_emplace(plan.getString().cStr(), reading);
-          if (!inserted && reading.instance > previous->second.instance) previous->second = reading;
+          Reading reading{label.getString().cStr(), instance.getNumber(),
+              aboveThreshold ? through.getNumber() : 0, aboveThreshold};
+          auto [previous, inserted] = readings.try_emplace(plan.getString().cStr(), std::move(reading));
+          if (!inserted && !previous->second.ambiguous) {
+            if (reading.label != previous->second.label) previous->second.ambiguous = true;
+            else if (reading.instance > previous->second.instance) previous->second = std::move(reading);
+          }
         }
       } catch (const kj::Exception&) {
         continue;
       }
       for (const auto& [plan, reading] : readings)
-        if (reading.busy) saturated.emplace(plan, reading.throughMs);
+        if (reading.busy && !reading.ambiguous) saturated.emplace(plan, reading.throughMs);
     }
     return result;
   });

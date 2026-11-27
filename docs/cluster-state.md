@@ -197,7 +197,7 @@ With `ingressPlacement` off (it is on by default), and for a Worker with a stati
 the first pass lets a node refuse a root before dispatch with `WORKER_SATURATED` or
 `NODE_CPU_SATURATED`. The Worker threshold is 900 permille of isolate lock hold time over the
 threaded kernel's last 3 s. The node uses a recent sample for the requested plan revision in the
-process generation that would serve it. A missing or stale sample supplies no saturation signal.
+process generation that would serve it. A missing, stale or ambiguous sample supplies no saturation signal.
 The CPU threshold is 950 permille of the node's available CPU. On Linux this uses cgroup v2
 `cpu.stat` usage over approximately 3 s, bounded by CPU affinity and visible CPU quotas. A node
 without that reading can still use the isolate signal.
