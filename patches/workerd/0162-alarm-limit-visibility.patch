@@ -5,10 +5,10 @@ Subject: [PATCH] Expose the shared alarm limit to both kernel hosts
 
 
 diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
-index dd7b77dfa8ee69123ce699b9744e7ebfbf1185de..4c2a6ca7b72093d6b23a39f61e17783267f0b6f1 100644
+index 1003100d994a4d840cca4e87a0283b43a23f635a..dba4bddd03b375ee38e81c521b4471510a51eb50 100644
 --- a/src/workerd/server/factory/BUILD.bazel
 +++ b/src/workerd/server/factory/BUILD.bazel
-@@ -137,6 +137,7 @@ kj_test(
+@@ -141,6 +141,7 @@ kj_test(
  wd_cc_library(
      name = "coworkerd-alarm-limit",
      hdrs = ["coworkerd-alarm-limit.h"],
@@ -17,7 +17,7 @@ index dd7b77dfa8ee69123ce699b9744e7ebfbf1185de..4c2a6ca7b72093d6b23a39f61e177832
  )
  
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 4cc20abd03719fb1e801867cad135316157cd22b..029aac46131c697b13061ad1e6d88128b58053f6 100644
+index 42b04ee2a300782f847886d8c9c9efa3c158a2d2..30ebe9233a60bf3b45db2b6ba2d277d88454bfb9 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1783,15 +1783,11 @@ struct RequestLimits final: LimitEnforcer {

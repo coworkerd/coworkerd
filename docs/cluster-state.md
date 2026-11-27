@@ -225,10 +225,11 @@ queued for the lock or awaiting asynchronous I/O outside it is excluded. JavaScr
 work and garbage collection under the lock count.
 
 Each reading belongs to one Worker, version, plan revision and isolate instance in one process
-generation. The window starts empty on load, counts lock holds during setup, and ages to zero when
-idle. Distinct instances and nodes have independent windows. A retiring isolate and its replacement
-can appear in the same snapshot with the same plan revision and different instance IDs. A new
-snapshot drops an isolate's reading when it leaves.
+generation. The window starts empty when the Worker becomes ready, and only lock holds after
+initialization contribute. The reading ages to zero when idle. Distinct instances and nodes have
+independent windows. A retiring isolate and its replacement can appear in the same snapshot with
+the same plan revision and different instance IDs. A new snapshot drops an isolate's reading when
+it leaves.
 
 The lifecycle publisher targets a 100 ms cadence. A busy maintenance thread can delay publication,
 and an exited process entry can still show its final snapshot. Use the process PID and sample

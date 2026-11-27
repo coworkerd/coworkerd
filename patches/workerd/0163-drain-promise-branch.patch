@@ -5,7 +5,7 @@ Subject: [PATCH] Take a drain branch from the mutable response promise
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 029aac46131c697b13061ad1e6d88128b58053f6..bdd146284309c194dca07fc7c6b3a92aabdb8a2d 100644
+index 30ebe9233a60bf3b45db2b6ba2d277d88454bfb9..fb20abac448cf02eef2384673d03aa1b8b7408c0 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1792,8 +1792,12 @@ struct RequestLimits final: LimitEnforcer {

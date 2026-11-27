@@ -23,10 +23,10 @@ index 21f3e6a6878c75062824ae8eee91c60cb0fb348b..29cac2ec2db8d1d0a3b47de134b73abf
 +  whenEnded @0 () -> ();
 +}
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 2d0a094081c3ec544e1c62a186b5bd3ce7a8adad..40ff83e4802178c38acb33621cd7850a5f94cee1 100644
+index 974470feb6085ee0f537f33022c5fd492097f987..36322625deeb2b69763e3103d8105468f69d0ecb 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -2273,6 +2273,27 @@ KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handl
+@@ -2355,6 +2355,27 @@ KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handl
    if (ended) drain.wait(waitScope);
  }
  
@@ -55,7 +55,7 @@ index 2d0a094081c3ec544e1c62a186b5bd3ce7a8adad..40ff83e4802178c38acb33621cd7850a
    kj::EventLoop loop;
    kj::WaitScope waitScope(loop);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index ff2270b2c72fe622a2cb77b2f26fa596d038b532..4cc20abd03719fb1e801867cad135316157cd22b 100644
+index 3b76c416e8efacaee9d538d91e646116038bfc20..42b04ee2a300782f847886d8c9c9efa3c158a2d2 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1563,8 +1563,16 @@ struct Measurement {
@@ -91,7 +91,7 @@ index ff2270b2c72fe622a2cb77b2f26fa596d038b532..4cc20abd03719fb1e801867cad135316
    }
    kj::Promise<void> limitScheduled() override {
      return kj::NEVER_DONE;
-@@ -2498,12 +2508,14 @@ struct InvocationState: kj::Refcounted {
+@@ -2499,12 +2509,14 @@ struct InvocationState: kj::Refcounted {
  class Invocation final: public kj::HttpService {
   public:
    Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
@@ -108,7 +108,7 @@ index ff2270b2c72fe622a2cb77b2f26fa596d038b532..4cc20abd03719fb1e801867cad135316
    kj::Promise<void> request(kj::HttpMethod method,
        kj::StringPtr url,
        const kj::HttpHeaders &headers,
-@@ -2516,23 +2528,26 @@ class Invocation final: public kj::HttpService {
+@@ -2517,23 +2529,26 @@ class Invocation final: public kj::HttpService {
    kj::String descriptor;
    Frankenvalue props;
    BudgetLifetime budgetLifetime;
@@ -138,7 +138,7 @@ index ff2270b2c72fe622a2cb77b2f26fa596d038b532..4cc20abd03719fb1e801867cad135316
      return kj::READY_NOW;
    }
    kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override;
-@@ -2543,6 +2558,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
+@@ -2544,6 +2559,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
    kj::String descriptor;
    Frankenvalue props;
    BudgetLifetime budgetLifetime;
@@ -146,7 +146,7 @@ index ff2270b2c72fe622a2cb77b2f26fa596d038b532..4cc20abd03719fb1e801867cad135316
    bool used = false;
  };
  
-@@ -2565,9 +2581,11 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2566,9 +2582,11 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
      KJ_REQUIRE(!used, "one startEvent per connection");
      used = true;
      auto params = context.getParams();
@@ -159,7 +159,7 @@ index ff2270b2c72fe622a2cb77b2f26fa596d038b532..4cc20abd03719fb1e801867cad135316
      return kj::READY_NOW;
    }
  
-@@ -7587,6 +7605,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
+@@ -7633,6 +7651,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
    }
    auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props),
        std::move(preparation), std::move(tenant));
@@ -167,7 +167,7 @@ index ff2270b2c72fe622a2cb77b2f26fa596d038b532..4cc20abd03719fb1e801867cad135316
    auto identity = invocationIdentity(*slot, input);
    startBoundRpcSession(context.getResults(),
        kj::mv(prepared.entry).attach(kj::mv(prepared.invocation)), std::move(slot),
-@@ -7731,6 +7750,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
+@@ -7777,6 +7796,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
        httpEntryObserver(input, entrypoint.c_str(), headers, state.placementCallId));
    auto &invocation = prepared.invocation;
    auto &entry = prepared.entry;
