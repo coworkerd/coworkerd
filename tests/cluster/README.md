@@ -78,6 +78,19 @@ the times recorded by the rotation supervisor. The old report stays in place. Th
 a second report queued behind another rotation while the reported process exits. Once the queue
 advances, the node skips the stale request and the ready replacement keeps serving.
 
+### Single-node waiting-call baseline
+
+The fixture enables ingress placement and sends fixed batches of 8, 16 and 24 stateless Worker
+requests to a private HTTP upstream with a two-second delay. It verifies the actual upstream
+overlap and completed replies. The JSONL records RSS, threads and open descriptors per process
+before, during, after drain and after recovery.
+
+```sh
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-capacity.jsonl
+```
+
+Use a new output path for each run. The fixture removes its disposable cluster and upstream.
+
 ### Stateless Worker ingress placement
 
 ```sh
