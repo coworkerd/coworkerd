@@ -354,7 +354,8 @@ def allowed_path(name, path):
                           name == '0174-release-idle-platform-database-copies.patch' and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
-                          name == '0177-retire-idle-databases-at-admission.patch' and path in {
+                          name in {'0177-retire-idle-databases-at-admission.patch',
+                                   '0180-fix-database-admission-accounting.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name == '0178-keep-platform-databases-open-after-sql-interruption.patch' and path in {
@@ -375,6 +376,13 @@ def allowed_path(name, path):
                               'src/workerd/api/actor-state.c++', 'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/util/sqlite-test.c++', 'src/workerd/util/sqlite.c++',
                               'src/workerd/util/sqlite.h'} or
+                          name == '0184-charge-database-sqlite-heap-to-process.patch' and path in {
+                              'src/workerd/api/actor-state.c++',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++',
+                              'src/workerd/util/sqlite-metering.c++',
+                              'src/workerd/util/sqlite-metering.h',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h'} or
                           name == IDENTITY_PATCH and path in IDENTITY_PATHS or
                           name == STARTUP_IDENTITY_PATCH and path in STARTUP_IDENTITY_PATHS or
                           name == CREATION_IDENTITY_PATCH and path in CREATION_IDENTITY_PATHS or

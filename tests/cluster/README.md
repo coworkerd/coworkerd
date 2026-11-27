@@ -245,6 +245,22 @@ background processes. A process or thread at 100% uses one logical CPU. Compare 
 total logical CPUs, and check I/O wait, steal time, CPU pressure and any cgroup CPU limit when interpreting a
 plateau. The diagnostic output and per-window verification counts follow the same report.
 
+Set `COWORKERD_BENCHMARK_THREADED_SQL=1` for the read and insert cells through the product's
+test-only threaded database mapping. The client uses D1 bindings and checks that each seeded
+database has its own threaded home before measuring. To compare kernel builds, run both
+`object --throughput` trials in one job with the same product checkout and binaries and
+a fresh stack and report for each kernel. Point `COWORKERD_BENCHMARK_KERNEL_CHECKOUT` at
+the checkout with the tested kernel's patch series when it differs from the product checkout.
+
+### Threaded SQL process memory
+
+`node tests/cluster/run.mjs "$KERNEL_DIR" threaded-sql-process-memory` exercises the test-only
+threaded database mapping with a 112 MiB configured process budget. It checks that three open
+databases reserve 3 MiB of SQLite heap. An atomic batch exceeding shared headroom rolls back and
+returns retryable HTTP 503 `OVERLOADED`. The same child serves the confirmed row and accepts the
+query after idle retirement returns the reservations. The separate `threaded-sql-memory-limit` case
+checks HTTP 422 `SQL_MEMORY_LIMIT_EXCEEDED` at the database cap.
+
 ### Fatal attribution with the test kernel
 
 In the imported Linux kernel checkout, build the separate shared-cage test executable and run the focused

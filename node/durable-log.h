@@ -373,7 +373,7 @@ public:
   ~DurableLog() noexcept(false);
 
   // The node's membership epoch, as its records carry it; set at registration and at every new epoch.
-  void setNodeEpoch(uint64_t nodeEpoch);
+  kj::Promise<void> setNodeEpoch(uint64_t nodeEpoch);
   // The two hooks that need the dispatcher, which is built after this: firing an object's alarm as a request of its
   // Worker, and the tenant's durableObjectBytes quota.
   void setAlarmHook(std::function<kj::Promise<AlarmResult>(DurableAlarm alarm)> hook) {
@@ -786,7 +786,18 @@ private:
 
   // ---- the log ----
   Object* objectOf(const std::string& objectName);
-  bool appendToLogFile(const std::string& encoded);
+  class LogWorker;
+  struct LogAppend {
+    std::shared_ptr<const std::string> encoded;
+    uint64_t sequence;  // Zero for a seal marker, which does not advance the record watermark.
+    bool flush;
+  };
+  kj::Promise<void> rotateNodeEpoch(uint64_t epoch);
+  kj::Promise<void> waitForLogWrites();
+  void driveLogWrites();
+  kj::Promise<void> writeLogBatch(std::vector<LogAppend>, bool flush);
+  void failLogWrites(const std::string& reason);
+  void sendAppendedRecords(uint64_t from, uint64_t through);
   uint64_t recordLimitBytes() const;
   void takeRecord(Channel& channel, LogRecord&& record, uint64_t request);
   void sendOne(PeerStream& peer, uint64_t sequence, const std::string& encoded);
@@ -805,7 +816,7 @@ private:
   void wakeForLease(double untilMs);
   // COWORKERD_SLOW_FLUSH_FOR_TEST names a file; a confirmation flush that finds it sleeps the milliseconds it holds,
   // once, and removes it. Without the variable nothing is read.
-  void slowFlushOnceForTest();
+
   // Before a cut without a complete owner proof, recoveries share observations of each silent holder's heartbeat.
   enum class OwnerHeartbeat : uint8_t { GONE, LIVE, UNKNOWN };
   struct RebuildRun;
@@ -889,8 +900,7 @@ private:
   // them, through the per-object index.
   void retireEarlierObject(uint64_t epoch, const std::string& hostName, uint64_t firstSeq, uint64_t lastSeq);
   void noteEarlierRetired(uint64_t epoch, const LogRecord& record);
-  void persistEarlierSeals();
-  // The same, with the writes and their synchronization on a worker thread (the reseal's calls).
+  // Append and synchronize seal markers in predecessor logs.
   kj::Promise<void> persistEarlierSealsAsync();
   kj::Promise<void> cleanupClosedEpoch();
   kj::Promise<void> dropColdFiles(uint64_t reservedBytes = 0);
@@ -1040,8 +1050,13 @@ private:
   uint64_t nextSeq = 0;             // the node sequence of the next record
   uint64_t sealedSeq = 0;           // every record up to here is in a segment
   uint64_t segmentNumber = 0;
-  int logFd = -1;                   // the append file of this node epoch's log
+  std::unique_ptr<LogWorker> logWorker;
+  bool epochChanging = false, logWriting = false, logFlushRequested = false;
   bool logAppendFailed = false;     // no more appends after a possibly partial record
+  uint64_t appendedSeq = 0, flushedSeq = 0;
+  std::vector<LogAppend> pendingLogAppends;
+  std::optional<kj::ForkedPromise<void>> epochChange, logDrained;
+  kj::Own<kj::PromiseFulfiller<void>> logDrainFulfiller;
   int recoveryFd = -1;
   bool recoveryWriteFailed = false;
   uint64_t recoverySerial = 0, recoveryWriteFailures = 0;
@@ -1049,7 +1064,7 @@ private:
   std::map<std::string, RecoveryState> recoveryStates;
   std::filesystem::path logPath;
   // The records this node holds: those not yet in a segment (by sequence), and how many bytes they take.
-  std::map<uint64_t, std::string> records;
+  std::map<uint64_t, std::shared_ptr<const std::string>> records;
   // Changes that invalidate a pending normal-seal selection; appends are outside its fixed prefix.
   uint64_t sealSelectionRevision = 0;
   std::map<uint64_t, LogRecord> parsed;
