@@ -1438,11 +1438,14 @@ async function threadedObjectSqlProcessMemory(cluster) {
   assert.deepEqual(json(await call(0, 'process'), 200, 'roll back on shared SQLite heap refusal'),
     { ...first, code: 'OVERLOADED', dispatched: false, retryable: true });
   assert.deepEqual(json(await call(0, 'read'), 200, 'the same connection still reads'), first);
-  const reused = await snapshot();
-  assert.equal(reused.objectSqliteConnections, 1);
-  assert.ok(reused.sqliteHeapReservedBytes > 0 && reused.sqliteHeapReservedBytes < MiB);
-  assert.equal(reused.actorResets, started.actorResets);
-  assert.equal((await logs()).threadedHomeIo.openSamples, openSamples);
+  await eventually('the same connection returns unused SQLite heap', async () => {
+    const reused = await snapshot();
+    assert.equal(reused.objectSqliteConnections, 1);
+    assert.ok(reused.sqliteHeapReservedBytes > 0 && reused.sqliteHeapReservedBytes < MiB,
+      JSON.stringify(reused));
+    assert.equal(reused.actorResets, started.actorResets);
+    assert.equal((await logs()).threadedHomeIo.openSamples, openSamples);
+  }, { timeout: 5000 });
   console.log(JSON.stringify({ pid: original.pid, generation: original.generation,
     sqliteRequestedBytes: 24 * MiB, bufferBytes, processHeadroomBytes: room(constrained) }));
 }
