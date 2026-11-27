@@ -6,15 +6,17 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
 
-const [mode, productArg, kernelArg, reportArg, iterationsArg, hotRateArg, ...extra] = process.argv.slice(2);
+const [mode, productArg, kernelArg, reportArg, iterationsArg, hotRateArg, option, ...extra] = process.argv.slice(2);
 const iterations = Number(iterationsArg);
 const hotRate = Number(hotRateArg);
 const calibrate = mode === 'calibrate';
+const longRun = option === '--long';
 assert.ok(['dynamic', 'pinned', 'calibrate'].includes(mode) && productArg && kernelArg && reportArg &&
   Number.isSafeInteger(iterations) && iterations > 0 && iterations <= 500_000_000 && !extra.length &&
+  (option === undefined || (!calibrate && longRun)) &&
   (calibrate ? hotRateArg === undefined : Number.isInteger(hotRate) && hotRate > 0 && hotRate <= 100),
   'Usage: node tests/cluster/hot-worker-placement.mjs <dynamic|pinned|calibrate> <product-checkout> ' +
-  '<verified-kernel-directory> <new-report.jsonl> <iterations> [hot-requests-per-second]');
+  '<verified-kernel-directory> <new-report.jsonl> <iterations> [hot-requests-per-second [--long]]');
 
 const productRoot = resolve(productArg);
 const kernel = resolve(kernelArg);
@@ -40,7 +42,10 @@ const record = value => appendFile(report, JSON.stringify(value) + '\n');
 const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-hot-placement-')), kernel, controller.signal, {
   productRoot,
   configureNode: () => ({
-    ingressPlacement: true, placement: { homeProbability: 1 },
+    ingressPlacement: true,
+    // This enables per-tenant slot accounting. The fixture sends only roots and the
+    // tenant ceiling for nested calls is the same as the node-wide nested ceiling.
+    placement: { homeProbability: 1, ...(longRun && { tenantNestedLimit: 384 }) },
     ...(pinned && { placements: [{ workerId: hot, nodeId: home }] }),
   }),
 });
@@ -69,7 +74,7 @@ async function measure() {
   const kernelHashes = Object.fromEntries(await Promise.all(kernels.map(async name => [name, await sha256(join(kernel, name))])));
   for (const name of kernels) assert.equal(kernelHashes[name], manifest.files[name]);
   const binaries = resolve(process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(productRoot, 'build'));
-  await record({ metric: 'provenance', mode, iterations, hotRate: calibrate ? null : hotRate, home,
+  await record({ metric: 'provenance', mode, longRun, iterations, hotRate: calibrate ? null : hotRate, home,
     commit: await cluster.command('git', ['rev-parse', 'HEAD'], { cwd: productRoot }),
     cliVersion: JSON.parse(await readFile(join(productRoot, 'cli/package.json'), 'utf8')).version,
     productBinarySha256: await sha256(join(binaries, 'coworkerd')),
@@ -101,7 +106,7 @@ async function measure() {
   const daemonVersion = await cluster.compose(['exec', '-T', home, 'coworkerd', '--version']);
   await record({ metric: 'daemon-version', lines: daemonVersion.split('\n') });
   const input = join(cluster.directory, 'placement-measure.json');
-  await writeFile(input, JSON.stringify({ home, hot, light, hotRate: calibrate ? null : hotRate, calibrate, checksum: checksum(),
+  await writeFile(input, JSON.stringify({ home, hot, light, hotRate: calibrate ? null : hotRate, calibrate, longRun, checksum: checksum(),
     nodes: cluster.nodes, management: cluster.management }), { mode: 0o600 });
   const client = fileURLToPath(new URL('./hot-worker-placement-client.mjs', import.meta.url));
   const result = await cluster.command('docker', ['run', '--rm', '--network', `${cluster.project}_frontend`,

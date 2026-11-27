@@ -14,9 +14,9 @@ Both product revisions declare cowctl `0.5.6`. The daemon binaries are local CMa
 The test machine was an Apple M4 with a Docker Desktop Linux ARM64 VM (`6.12.72-linuxkit`)
 and 10 vCPUs. The client used Node.js `22.23.5`. Each node's CPU affinity and the client and
 node cpusets covered `0–9`. The client and all three nodes reported `cpu.max = max 100000`,
-so there was no container CPU quota. The three fixtures ran serially after both builds finished.
+so there was no container CPU quota. The fixtures ran serially after both builds finished.
 
-## Results
+## 15-second windows
 
 The landed policy served the hot Worker on all three nodes in every loaded window. It completed
 451 requests in 45 measured seconds (10.02/s), 1.79× the matched pinned control (5.60/s).
@@ -51,6 +51,63 @@ one-second idle fraction in those windows was 66.3%, equivalent to 6.6 idle vCPU
 The before and pinned loaded windows averaged 86.5–86.8% idle, with a lowest one-second reading
 of 85.4% across both configurations.
 
+## One minute at the same offer rate
+
+The 15 s windows ended while the single-isolate controls still had room under the 128-root ceiling.
+A follow-up used one 60 s loaded window per configuration to see what happens when the queue reaches
+that ceiling. It kept the same product and kernel pairs, workload, ingress, and offer rates. Each
+run offered 660 hot requests and 6,000 light requests with a 15 s quiet window on either side.
+
+The driver sampled the home node's management state every five seconds. The `hot-placement` tenant
+has just one Worker, so its admitted root count is the hot Worker's home occupancy. The fixture
+enables per-tenant accounting with `tenantNestedLimit: 384`, equal to the aggregate nested ceiling.
+The tenant root limit is zero and the node root limit is 128. The fixture checks that no nested
+requests are in flight and that the two tenants account for all sampled home root slots. Light
+replies record the actual execution node, including peers selected when the home fills.
+
+Both controls reached 128 hot roots at home by the 25 s sample. Each sent about 29% of its light
+replies through a peer. Landed dynamic placement kept all 6,000 light replies on the home node
+and had at most 17 hot roots there in the samples. The number of hot calls still awaiting a
+reply across all nodes peaked at 19 and ended the loaded window at 17 for landed dynamic
+placement. Both controls had 128 calls awaiting a reply at the end of that window.
+
+| Time (s) | Before hot roots at home | Landed pinned hot roots at home | Landed dynamic hot roots at home |
+| ---: | ---: | ---: | ---: |
+| 0 | 1 | 1 | 1 |
+| 5 | 28 | 29 | 4 |
+| 10 | 55 | 55 | 17 |
+| 15 | 82 | 82 | 8 |
+| 20 | 109 | 109 | 0 |
+| 25 | 128 | 128 | 11 |
+| 30 | 128 | 128 | 13 |
+| 35 | 128 | 128 | 2 |
+| 40 | 128 | 128 | 5 |
+| 45 | 128 | 128 | 17 |
+| 50 | 128 | 128 | 8 |
+| 55 | 128 | 128 | 0 |
+| 60 | 127 | 128 | 11 |
+
+| Configuration | Loaded light p99 (ms) | Quiet p99 before / after (ms) | Largest absolute difference (ms) | Loaded light replies (nodes 1/2/3) | Other loaded light outcomes |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Before | 3.34 | 6.97 / 6.49 | 3.63 | 1,764 / 0 / 4,235 | 1 `CLIENT_MISSED_OFFER` |
+| Landed pinned | 3.25 | 6.92 / 6.24 | 3.67 | 1,760 / 0 / 4,239 | 1 `CLIENT_MISSED_OFFER` |
+| Landed dynamic | 3.22 | 6.60 / 6.28 | 3.39 | 0 / 0 / 6,000 | 0 |
+
+The light p99 criterion held with all three configurations, including the controls that rerouted
+light traffic. No light request received an HTTP failure. The first quiet window of the landed
+dynamic run missed one scheduled offer. The other five quiet windows completed all 1,500 offers.
+Every valid quiet reply came from `node-3`.
+
+| Configuration | Hot completions in 60 s (nodes 1/2/3) | Hot completions including drain (nodes 1/2/3) | Completed/s | Hot client refusals | Admission refusals by node |
+| --- | ---: | ---: | ---: | --- | --- |
+| Before | 0 / 196 / 336 | 0 / 197 / 463 | 8.87 | 0 | 325 `OVERLOADED` on node 3 |
+| Landed pinned | 0 / 0 / 336 | 0 / 0 / 464 | 5.60 | 196 `OVERLOADED` | 445 `OVERLOADED` on node 3 |
+| Landed dynamic | 91 / 268 / 284 | 91 / 274 / 295 | 10.72 | 0 | `WORKER_SATURATED` on node 2 (91) and node 3 (365) |
+
+All other admission and hot-client error counts were zero. The VM averaged 80.6% idle in the
+before loaded window, 86.5% pinned, and 77.0% landed dynamic. The respective lowest one-second
+idle readings were 75.8%, 85.0%, and 65.4%.
+
 ## Method
 
 - Use the three-node [ingress placement fixture](../tests/cluster/README.md#stateless-worker-ingress-placement)
@@ -62,7 +119,7 @@ of 85.4% across both configurations.
   The client sends every request to `node-3` over the Compose frontend network. The hot Worker
   performs 150 million fixed integer loop iterations per request and returns a checksum, request ID,
   and its execution node from `request.cf.nodeId`. The second tenant's Worker just returns its
-  execution node. The driver requires every valid light reply to come from `node-3`.
+  execution node. In the 15 s runs the driver requires every valid light reply to come from `node-3`.
 - Warm each Worker at home with six sequential calls. For each product revision, first measure one
   statically pinned isolate with four continuously outstanding requests and count replies in 15 s.
   Each revision completed 85 requests inside the window (5.67/s) and four more during the drain.
@@ -81,9 +138,9 @@ of 85.4% across both configurations.
   internally by trying another candidate. Sample the aggregate Linux `/proc/stat` idle fraction
   in 1 s intervals in every window.
 
-The measurements cover one co-located ARM64 VM, one initial ingress, one compute loop and one
-offered rate. The light p99 includes client scheduling and the Compose network. The throughput
-includes each window's ramp into load and uses the 15 s measurement interval.
+The measurements cover one colocated ARM64 VM, one initial ingress, one compute loop and one
+offered rate. The light p99 includes client scheduling and the Compose network. Throughput includes
+each window's ramp into load and uses only completions inside that window.
 
 ## Reproduction
 
@@ -113,8 +170,13 @@ node "$driver" calibrate "$before" "$before_kernel" build/before-calibration.jso
 node "$driver" dynamic "$before" "$before_kernel" build/before-results.jsonl 150000000 11
 node "$driver" pinned "$landed" "$landed_kernel" build/pinned-results.jsonl 150000000 11
 node "$driver" dynamic "$landed" "$landed_kernel" build/landed-results.jsonl 150000000 11
+
+node "$driver" dynamic "$before" "$before_kernel" build/before-long.jsonl 150000000 11 --long
+node "$driver" pinned "$landed" "$landed_kernel" build/pinned-long.jsonl 150000000 11 --long
+node "$driver" dynamic "$landed" "$landed_kernel" build/landed-long.jsonl 150000000 11 --long
 ```
 
 The JSONL includes build and CPU readings, per-offer timing and outcomes, per-window summaries,
-and refusal counts for each node. On a different machine, calibrate first and set the same hot offer
-rate near twice that calibration for all three conditions.
+and refusal counts for each node. `--long` also records the home root counts. On a different
+machine, calibrate first and set the same hot offer rate near twice that calibration for all three
+conditions.
