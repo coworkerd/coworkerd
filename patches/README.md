@@ -64,7 +64,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   the previous root and facets to confirm SQLite close. The SQLite wrapper reports final close even
   when reset already closed the handle and failed to reopen it. When close remains unconfirmed,
   further preparations for that identity return `DO_UNAVAILABLE` for this generation.
-  The private threaded start reply lets the node report a retryable refusal before event dispatch.
+  The private threaded start reply lets the node report the refusal with `dispatched: false` and
+  `retryable: false`.
   `durableAdmission.unconfirmedCloseIdentities` counts the affected identities, and the node's
   existing generation-exit check protects the next child.
   Patch 0185 measures wall time under the isolate lock for threaded stateless Workers. The JSG lock
