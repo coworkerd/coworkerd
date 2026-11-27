@@ -121,6 +121,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0184 adds each platform database's SQLite heap to its copy's process memory reservation
   in 1 MiB steps. The hooks use the existing allocator scope in `src/workerd/util/` and the copy
   accounting in `src/workerd/threaded/`.
+  Patch 0188 extends admission-time idle retirement to ordinary trees. The threaded server selects a tree,
+  and its home rechecks live work before closing it and returning its routing credit. Patch 0189 extends
+  the native test to exercise a new event arriving after the home last reported the object idle.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

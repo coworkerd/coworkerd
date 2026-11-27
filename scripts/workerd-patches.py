@@ -379,6 +379,8 @@ def allowed_path(name, path):
                                    '0188-retire-idle-objects-at-admission.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0189-test-busy-objects-with-stale-idle-observations.patch' and path ==
+                              'src/workerd/threaded/threaded-server-test.c++' or
                           name == '0178-keep-platform-databases-open-after-sql-interruption.patch' and path in {
                               'src/workerd/api/actor-state.c++',
                               'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h',

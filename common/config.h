@@ -237,9 +237,9 @@ struct DurableLogConfig {
   uint32_t recoverParallelism = 4;
   uint32_t rebuildConcurrency = 4;
   uint32_t alarmFireConcurrency = 2;
-  // How many objects one durable process keeps resident (COWORKERD_DO_RESIDENT_OBJECTS; 0: no limit). Past it the
-  // least recently used objects are evicted: their hibernatable WebSockets hibernate, so the connections stay up
-  // and the next message wakes the object on the same storage.
+  // Resident tree target per durable process (COWORKERD_DO_RESIDENT_OBJECTS; 0 disables the count limit).
+  // A threaded process at the target retires the least recently used eligible idle tree to admit a new ordinary
+  // object. The upstream backend evicts idle trees after crossing the target.
   uint32_t residentObjects = 4096;
   // How often a node publishes what its objects hold, per tenant, for the durableObjectBytes quota.
   uint32_t usagePublishMs = 3600000;

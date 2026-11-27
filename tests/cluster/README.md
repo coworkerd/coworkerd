@@ -64,6 +64,19 @@ after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` eac
 did not start and that one retry applies it once. A Durable Object exception after writing and a SQL
 constraint failure retain their ordinary error results.
 
+### Threaded object residency
+
+Run the acceptance fixture in residency mode with a verified kernel that reports
+`objectSqliteConnections`. It probes 4,096 ordinary roots with bounded concurrency and
+checks the resident count and open SQLite count in the same publication from one child.
+The JSONL records the copy and SQLite reservations, process limits and any refused probes.
+Use `--sequential` to run only the sequential seed and reopen passes. The hosted idle job runs both
+workloads in separate clusters and uploads `idle.jsonl` and `idle-residency.jsonl`.
+
+```sh
+node tests/cluster/durable-idle-measure.mjs "$kernel" build/durable-residency.jsonl --residency
+```
+
 ### Single-node waiting-call baseline
 
 The fixture enables ingress placement and sends fixed batches of 8, 16 and 24 stateless Worker

@@ -2,14 +2,16 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { appendFile, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, parse, resolve } from 'node:path';
 import { setInterval as interval, setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
 
-const [kernelArg, reportArg, ...extra] = process.argv.slice(2);
-assert.ok(kernelArg && reportArg && extra.length === 0,
-  'Usage: node tests/cluster/durable-idle-measure.mjs <verified-kernel-directory> <new-report.jsonl>');
+const [kernelArg, reportArg, mode, ...extra] = process.argv.slice(2);
+assert.ok(kernelArg && reportArg && [undefined, '--sequential', '--residency'].includes(mode) && !extra.length,
+  'Usage: node tests/cluster/durable-idle-measure.mjs <verified-kernel-directory> <new-report.jsonl> [--sequential|--residency]');
+const residentTarget = 4096;
+const residencyConcurrency = 48;
 assert.equal(process.platform, 'linux');
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const kernel = resolve(kernelArg);
@@ -23,14 +25,6 @@ const controller = new AbortController();
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => controller.abort(new Error(`Interrupted by ${signal}`)));
 }
-await writeFile(report, '', { flag: 'wx' });
-const record = (metric, fields) => appendFile(report, JSON.stringify({ metric, at: new Date().toISOString(), ...fields }) + '\n');
-const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-durable-idle-')), kernel, controller.signal, {
-  singleNode: true, threadedNodes: ['node-1'],
-  configureNode: () => ({ durableObjects: { processes: 1, peers: 0, threadedStorage: true } }),
-});
-const [node] = cluster.nodes;
-
 const worker = `
   import { DurableObject } from 'cloudflare:workers';
   let moduleId;
@@ -55,7 +49,81 @@ function summary(rows) {
     p99Ms: times[Math.ceil(0.99 * times.length) - 1] ?? null };
 }
 
-async function measure() {
+async function measureResidency(cluster, node, record, call, onSameChild, child) {
+  const initial = await onSameChild();
+  assert.ok(Number.isSafeInteger(initial.objectSqliteConnections),
+    'the kernel must publish the ordinary SQLite connection count');
+  const samples = [];
+  let peak;
+  const started = performance.now();
+  const sample = async () => {
+    const admission = await onSameChild();
+    const row = { elapsedMs: performance.now() - started, ...admission };
+    samples.push(row);
+    const simultaneous = Math.min(row.residentRoots, row.objectSqliteConnections);
+    if (!peak || simultaneous > Math.min(peak.residentRoots, peak.objectSqliteConnections)) {
+      peak = row;
+    }
+  };
+  await sample();
+  const stopSampling = new AbortController();
+  const sampling = (async () => {
+    try {
+      for await (const _ of interval(residencyPollMs, undefined, { signal: stopSampling.signal })) {
+        await sample();
+      }
+    } catch (error) {
+      if (error.name !== 'AbortError') throw error;
+    }
+  })();
+  // Mark the rejection handled while the requests settle. The finally block still observes it.
+  void sampling.catch(() => {});
+  const rounds = [];
+  const errors = [];
+  const copies = new Set();
+  try {
+    // A bounded rolling load keeps earlier opens within the normal idle timeout. A successful
+    // run needs a single publication with both full counts, regardless of total replies.
+    for (let round = 1; round <= 3; ++round) {
+      let next = 0;
+      let successes = 0;
+      const roundStarted = performance.now();
+      await Promise.all(Array.from({ length: residencyConcurrency }, async () => {
+        for (;;) {
+          controller.signal.throwIfAborted();
+          const index = next++;
+          if (index >= residentTarget) return;
+          try {
+            const result = await call(index);
+            assert.match(result.actorId, /^[a-f0-9-]{36}$/);
+            copies.add(result.moduleId);
+            ++successes;
+          } catch (error) {
+            errors.push({ round, index, error: error.message });
+          }
+        }
+      }));
+      rounds.push({ round, successes, errors: residentTarget - successes,
+        elapsedMs: performance.now() - roundStarted });
+      await sample();
+      if (peak.residentRoots === residentTarget && peak.objectSqliteConnections === residentTarget) break;
+    }
+  } finally {
+    stopSampling.abort();
+    await sampling;
+  }
+  const limits = await cluster.compose(['exec', '-T', '--user', '0', node, 'cat', `/proc/${child.pid}/limits`]);
+  const result = { child, residentTarget, rounds, copies: copies.size, peak, limits, errors };
+  await record('simultaneous-residency-samples', { child, samples });
+  await record('simultaneous-residency-summary', result);
+  console.log(JSON.stringify({ ...result, errors: errors.length }));
+  assert.equal(errors.length, 0, 'each offered residency probe succeeded');
+  assert.equal(peak.residentRoots, residentTarget, 'simultaneously resident ordinary root trees');
+  assert.equal(peak.objectSqliteConnections, residentTarget, 'simultaneously open ordinary SQLite connections');
+  assert.ok(peak.sqliteHeapReservedBytes > 0, 'the live SQLite heap was charged');
+}
+
+async function measure(cluster, node, record, residencyOnly) {
   const pins = JSON.parse(await readFile(join(root, 'patches/workerd/artifacts.json'), 'utf8'));
   const manifest = JSON.parse(await readFile(join(kernel, 'kernel.json'), 'utf8'));
   assert.equal(manifest.patchSeriesSha256, pins.patchSeriesSha256);
@@ -65,7 +133,9 @@ async function measure() {
   await record('provenance', { commit: await run('git', ['rev-parse', 'HEAD']),
     kernelRelease: pins.releaseTag, archiveSha256: pins.archives[manifest.architecture],
     architecture: manifest.architecture, binaryHash, os: await run('uname', ['-a']),
-    cpu: await run('lscpu', []), node: process.version, cohorts: 2, cohortSize, batchSize, concurrency: 1, offerPeriodMs,
+    cpu: await run('lscpu', []), node: process.version,
+    ...(residencyOnly ? { residentTarget, concurrency: residencyConcurrency }
+      : { cohorts: 2, cohortSize, batchSize, concurrency: 1, offerPeriodMs }),
     residencyPollMs, placements: 'One durable child, one shard, no peers' });
   await cluster.start();
   const tenant = await cluster.tenant('acceptance-idle');
@@ -104,6 +174,9 @@ async function measure() {
     assert.deepEqual(reading.child, initial.child);
     return reading.admission;
   };
+  if (residencyOnly) {
+    return measureResidency(cluster, node, record, call, onSameChild, initial.child);
+  }
   // Placement packs live trees into an existing copy first. Open read-only
   // warmup IDs outside both measured cohorts to fill every home with this Worker.
   const expectedCopies = initial.admission.workerThreads;
@@ -262,12 +335,31 @@ async function measure() {
   console.log(JSON.stringify({ baselineStable, rssVariationKiB, gateEligible, workloadPassed, comparisons, pass }));
 }
 
-try {
-  await measure();
-} catch (error) {
-  await record('measurement-error', { error: error.stack });
-  await cluster.diagnostics('idle-measurement', error);
-  throw error;
-} finally {
-  await cluster.close();
+async function runMeasurement(output, residencyOnly) {
+  await writeFile(output, '', { flag: 'wx' });
+  const record = (metric, fields) =>
+    appendFile(output, JSON.stringify({ metric, at: new Date().toISOString(), ...fields }) + '\n');
+  const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-durable-idle-')), kernel, controller.signal, {
+    singleNode: true, threadedNodes: ['node-1'],
+    configureNode: () => ({ durableObjects: { processes: 1, peers: 0, threadedStorage: true } }),
+  });
+  const [node] = cluster.nodes;
+  try {
+    await measure(cluster, node, record, residencyOnly);
+  } catch (error) {
+    await record('measurement-error', { error: error.stack });
+    await cluster.diagnostics(residencyOnly ? 'residency-measurement' : 'idle-measurement', error);
+    throw error;
+  } finally {
+    await cluster.close();
+  }
+}
+
+if (mode === undefined) {
+  // The existing hosted idle job invokes both workloads. Each gets a fresh cluster and report.
+  const { dir, name, ext } = parse(report);
+  await runMeasurement(report, false);
+  await runMeasurement(join(dir, name + '-residency' + ext), true);
+} else {
+  await runMeasurement(report, mode === '--residency');
 }
