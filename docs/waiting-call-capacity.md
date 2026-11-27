@@ -59,7 +59,9 @@ waiting sample fit within an observation bracket of 228–278 ms. The drained sa
 - The host was an Apple M4 with 10 logical CPUs and 16 GiB RAM. Docker Desktop's ARM64 Linux VM
   reported 10 CPUs, 12,528,578,560 bytes of RAM, Linux `6.12.72-linuxkit` and Docker Engine 29.2.1.
   The daemons were Release builds with Debian Clang 19.1.7. The fixture client and upstream ran in one
-  Node.js 22.23.5 process on the same VM. [Raw readings](waiting-call-capacity/arm64.jsonl)
+  Node.js 22.23.5 process on the same VM. The full JSONL recording is retained in the PR history.
+  Its SHA-256 is `9226967456feace3650121cf9563291e9435b7d6d25a6db893207f7968c42b6c`.
+  [Raw readings](https://github.com/coworkerd/coworkerd/blob/9afff58f4a66df392520c5ac7cf6b391b4c2a9de/docs/waiting-call-capacity/arm64.jsonl)
 - The public `linux-arm64` kernel archive was
   `kernel-v1.20261114.1-ce00bd62d2d6-run-45983799782-1`, SHA-256
   `9092f174c8af28d1c6e4a7a821401be054cc00c5d2e556db3b09737572946112`.
@@ -86,20 +88,28 @@ waiting sample fit within an observation bracket of 228–278 ms. The drained sa
   generation throughout. Process reads are snapshots and were taken sequentially within each
   container.
 
-## Current limits and remaining measurements
+## Baseline defaults and pending acceptance
 
-The default outbound concurrency limit on this path is 32 per tenant. The same configuration has a
-node-wide root admission threshold of 128, a nested threshold of 384, and an in-flight limit of 512
-on the ordinary process. The per-tenant placement limits are disabled. The outbound setting is the
-first configured concurrency ceiling for this one-tenant workload. These batches leave at least
-eight outbound slots free. [Egress limits](egress-and-auth.md#limits-and-metering) · [Placement admission](cluster-state.md#7-placement)
+At `dec0b3b`, the node limits each tenant to 32 concurrent outbound requests and 100 starts per
+second on this path. The fixture's egress policy restricted the destination and inherited both
+limits. The node-wide admission thresholds were 128 roots and 384 nested calls. The ordinary
+process allowed 512 calls in flight, and both per-tenant placement limits were disabled. The
+outbound concurrency limit was the first configured ceiling for this one-tenant workload. These
+batches left at least eight outbound slots free.
+[Baseline egress limits](https://github.com/coworkerd/coworkerd/blob/dec0b3b816a70715760f12a6655a3a4c32fcfca8/docs/egress-and-auth.md#limits-and-metering) ·
+[Baseline placement admission](https://github.com/coworkerd/coworkerd/blob/dec0b3b816a70715760f12a6655a3a4c32fcfca8/docs/cluster-state.md#7-placement)
 
-The [#31 finish line](https://github.com/coworkerd/coworkerd/issues/31) calls for 2,000 simultaneous
-two-second waits without refusal, and for the largest supported waiting population and its limiting
-resource to be measured. Those measurements remain open. The current outbound and root admission
-limits are both below 2,000. The measured range also fits inside the threaded kernel's 32 warm call
-threads, so it leaves the cost of growing the pool unmeasured. The production safety threshold and
-the multi-node hot-Worker, latency and overload comparisons in #31 require further measurements.
+The [#31 finish line](https://github.com/coworkerd/coworkerd/issues/31) requires two further readings.
+
+1. Complete 2,000 simultaneous two-second upstream waits on one node under the product defaults.
+   This depends on the planned defaults that disable per-tenant egress concurrency and rate limits,
+   and on shipped node and ordinary process admission settings that permit the same number.
+2. Measure the largest supported overlapping waiting population and identify its limiting resource.
+   The maximum here was a fixed operating point of 24, within the 32 warm call threads. The
+   measurement leaves thread-pool growth, the physical ceiling and the production safety threshold
+   open. The installation guide needs the eventual measured limit and the reading behind it.
+
+The multi-node hot-Worker, latency and overload comparisons in #31 also require separate measurements.
 
 ## Reproduce
 
