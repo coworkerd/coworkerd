@@ -33,6 +33,7 @@ async function deployment(cluster) {
         Object.fromEntries(cluster.nodes.map(node => [node, { status: 200, text: expected }])));
     });
   }
+  assert.fail('Intentional #131 probe of cluster failure propagation');
 }
 
 async function webSocketAdmission(cluster) {
