@@ -30,10 +30,11 @@ const [node] = cluster.nodes;
 
 const worker = `
   import { DurableObject } from 'cloudflare:workers';
-  const moduleId = crypto.randomUUID();
+  let moduleId;
   export class Record extends DurableObject {
     actorId = crypto.randomUUID();
     async fetch(request) {
+      moduleId ??= crypto.randomUUID();
       if (request.method === 'POST') await this.ctx.storage.put('saved', await request.json());
       return Response.json({ actorId: this.actorId, moduleId, value: await this.ctx.storage.get('saved') });
     }

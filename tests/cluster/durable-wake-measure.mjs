@@ -32,10 +32,11 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 
 const worker = `
   import { DurableObject } from 'cloudflare:workers';
-  const moduleId = crypto.randomUUID();
+  let moduleId;
   export class Record extends DurableObject {
     constructor(ctx, env) {
       super(ctx, env);
+      moduleId ??= crypto.randomUUID();
       this.actorId = crypto.randomUUID();
       this.id = ctx.id.toString();
       const sockets = ctx.getWebSockets('retained');

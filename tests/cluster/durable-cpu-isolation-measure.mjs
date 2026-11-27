@@ -33,10 +33,11 @@ const [node] = cluster.nodes;
 function source(className) {
   return `
     import { DurableObject } from 'cloudflare:workers';
-    const copy = crypto.randomUUID();
+    let copy;
     export class ${className} extends DurableObject {
       instance = crypto.randomUUID();
       async fetch(request) {
+        copy ??= crypto.randomUUID();
         const url = new URL(request.url);
         const phase = url.searchParams.get('phase');
         if (phase === 'warm') this.sentinel = 'preserved ' + this.instance;
@@ -167,9 +168,19 @@ async function measure() {
       error => ({ error: error.message, doneAt: Date.now() }));
     const probes = await offers();
     const [burn, watcher] = await Promise.all([burning, watching]);
-    const reopened = await ok(path.burner);
+    const resetAttempts = [];
+    const reopened = await eventually('the CPU-limited object can reopen', async () => {
+      try {
+        const value = await ok(path.burner);
+        assert.notEqual(value.instance, currentBurner.instance);
+        return value;
+      } catch (error) {
+        resetAttempts.push(error.message);
+        throw error;
+      }
+    }, { timeout: 2500, interval: 25 });
     const busy = { index, condition: 'busy', startedAt, probes, burn, watcherSentAt, watcher, reopened,
-      previousBurner: currentBurner, admission: await checkGeneration() };
+      resetAttempts, previousBurner: currentBurner, admission: await checkGeneration() };
     windows.push(busy);
     await record('window', busy);
     currentBurner = reopened;
