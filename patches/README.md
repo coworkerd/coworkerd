@@ -68,6 +68,12 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   `retryable: false`.
   `durableAdmission.unconfirmedCloseIdentities` counts the affected identities, and the node's
   existing generation-exit check protects the next child.
+  Patch 0124 reserves one pending notification per type for each of up to 4,096 live WAL
+  registrations per Home. A full Home refuses new registrations before sending `OPEN`.
+  The Home retains open results, the first break reason, and each close reason in arrival order.
+  Repeated checkpoint requests share a slot, and a newer seal replaces the pending seal for that
+  open. Write acknowledgements still settle by request ID on the session. SQLite close still
+  queues `CLOSED` ahead of any replacement `OPEN` for that storage identity.
   Patch 0185 measures wall time under the isolate lock for threaded stateless Workers. The JSG lock
   notifies the existing isolate observer at acquire and release. The threaded lifecycle publishes
   a bounded sliding-window reading for each loaded isolate.
