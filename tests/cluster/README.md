@@ -74,6 +74,19 @@ after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` eac
 did not start and that one retry applies it once. A Durable Object exception after writing and a SQL
 constraint failure retain their ordinary error results.
 
+### Single-node waiting-call baseline
+
+The fixture enables ingress placement and sends fixed batches of 8, 16 and 24 stateless Worker
+requests to a private HTTP upstream with a two-second delay. It verifies the actual upstream
+overlap and completed replies. The JSONL records RSS, threads and open descriptors per process
+before, during, after drain and after recovery.
+
+```sh
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-capacity.jsonl
+```
+
+Use a new output path for each run. The fixture removes its disposable cluster and upstream.
+
 ### Stateless Worker ingress placement
 
 ```sh
