@@ -4546,9 +4546,6 @@ export const durableGatedCases = {
     test: durableCopyReservationRefusal, nodes: ['node-1'],
     controlDurableLifecycle: true, holdPeerAcks: false,
   },
-  'durable-threaded-unconfirmed-close': {
-    test: durableUnconfirmedClose, nodes: ['node-1'], controlDurableLifecycle: true, confirmTimeoutMs: 10000,
-  },
   'threaded-sql-deadline': {
     test: threadedSqlDeadline, nodes: ['node-1'],
   },
@@ -4625,5 +4622,8 @@ export const durableGatedCases = {
   },
   'durable-threaded-retirement': {
     test: threadedSocketRetirement, nodes: ['node-1', 'node-2', 'node-3'], controlDurableLifecycle: true,
+  },
+  'durable-threaded-unconfirmed-close': {
+    test: durableUnconfirmedClose, nodes: ['node-1'], controlDurableLifecycle: true, confirmTimeoutMs: 10000,
   },
 };
