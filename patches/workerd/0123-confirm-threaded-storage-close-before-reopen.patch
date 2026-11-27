@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Fri, 27 Nov 2026 19:01:43 +0800
+Date: Fri, 27 Nov 2026 19:40:46 +0800
 Subject: [PATCH] Confirm threaded SQLite close before preparing a replacement
 
 Reserve the storage identity before the WAL scan and carry that reservation through the SQLite connection. On synchronous close, enqueue the existing CLOSED record and then release the reservation. A replacement tree waits for every connection of the previous tree, including retained facets. An unconfirmed close keeps the reservation until this child generation exits.
@@ -562,7 +562,7 @@ index f49268a48222ee29dd41f0e5aab49b6d4b4169fb..8a906acb41176e4468eaf9fec3cbd015
    // ActorSqlite's commit callback: the frames of everything committed since the last one go to the replicator and
    // the promise resolves when it confirms them. It is rejected -- which breaks the output gate, so the object is
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 477cef832e7392b3c9c2135cf6a8230266e6314d..866b6b58d495913fd66d3a658983162fc2188d5f 100644
+index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436962af6ae 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1986,8 +1986,9 @@ struct ThreadState {
@@ -631,7 +631,7 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..866b6b58d495913fd66d3a658983162f
        KJ_REQUIRE(slot != nullptr, "database storage opened without its isolate reservation");
        sqliteProcessBudget = slot->reservation;
      }
-+    KJ_ASSERT(tree->server.durableLog == nullptr || prepared != kj::none,
++    KJ_ASSERT(tree->server.durableLog.get() == nullptr || prepared != kj::none,
 +        "persistent SQLite open without WAL preparation");
 +    server::DurableWalPosition position;
 +    KJ_IF_SOME(open, prepared) position = open.positionForOpen();
