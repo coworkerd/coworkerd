@@ -65,8 +65,7 @@ Side effects elsewhere in the handler may have run.
 
 Isolate copies and SQLite reservations share seven eighths of the configured
 `processPool.threadedMemoryBytes`. By default, the node derives that setting from its memory
-budget and process count. A connection retaining one 64 KiB step would reserve 256 MiB across
-the configured target of 4,096 root objects. Isolate memory, additional connections and larger
+budget and process count. At 128 KiB per idle connection, 4,096 root objects reserve 512 MiB for SQLite. Isolate memory, additional connections and larger
 live heaps also draw from this budget. Current default placement holds up to 256 ordinary
 object trees per process.
 

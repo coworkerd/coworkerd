@@ -1208,6 +1208,10 @@ async function objectSqlHeapFixture(cluster) {
           return Response.json({ instance: this.instance,
             values: sql.exec('SELECT 1 AS value').toArray() });
         }
+        if (mode === 'warm-cache') {
+          sql.exec('CREATE TABLE warm_pages AS SELECT zeroblob(196608) AS payload');
+          sql.exec('SELECT length(payload) FROM warm_pages').one();
+        }
         if (mode === 'hold-cursor') {
           this.cursor = sql.exec('SELECT value FROM ledger UNION ALL SELECT 100');
         }
@@ -1335,6 +1339,20 @@ async function threadedObjectSqlHeap(cluster) {
   assert.equal(afterAlarm.alarm, confirmed.alarm);
   first = { instance: afterAlarm.instance, values: afterAlarm.values };
 
+  assert.deepEqual(json(await call(0, 'warm-cache'), 200, 'warm the ordinary SQLite page cache'), first);
+  const warmed = await eventually('the larger page cache is charged', async () => {
+    const state = await snapshot();
+    assert.equal(state.objectSqliteConnections, 1);
+    assert.ok(state.sqliteHeapReservedBytes > opened.sqliteHeapReservedBytes, JSON.stringify(state));
+    return state;
+  }, { timeout: 1000, interval: 20 });
+  const trimmed = await eventually('idle SQLite gives back unpinned cache and unused credit', async () => {
+    const state = await snapshot();
+    assert.equal(state.objectSqliteConnections, 1);
+    assert.ok(state.sqliteHeapReservedBytes < warmed.sqliteHeapReservedBytes, JSON.stringify(state));
+    return state;
+  }, { timeout: 5000 });
+
   assert.deepEqual(json(await call(0, 'hold-cursor'), 200, 'keep a live cursor until retirement'), first);
   const count = 256;
   for (let offset = 1; offset < count; offset += 16) {
@@ -1371,14 +1389,19 @@ async function threadedObjectSqlHeap(cluster) {
   const reopened = json(await call(0, 'read'), 200, 'first request after confirmed SQLite close');
   assert.notEqual(reopened.instance, first.instance);
   assert.deepEqual(reopened.values, first.values);
-  const after = await snapshot();
-  assert.equal(after.objectSqliteConnections, 1);
+  await eventually('the reopened SQLite connection is charged', async () => {
+    const after = await snapshot();
+    assert.equal(after.objectSqliteConnections, 1);
+    assert.ok(after.sqliteHeapReservedBytes > 0);
+  }, { timeout: 5000 });
   assert.doesNotMatch(await cluster.compose(['logs', '--no-color', cluster.nodes[0]], {
     maxBuffer: 8 * 1024 ** 2,
   }), /did not find a valid scope|memoryBytes underflow|SQLite heap charge remained/);
   console.log(JSON.stringify({
     pid: original.pid, generation: original.generation, openConnections: count,
     oneConnectionReservedBytes: opened.sqliteHeapReservedBytes,
+    warmedConnectionReservedBytes: warmed.sqliteHeapReservedBytes,
+    warmedConnectionIdleBytes: trimmed.sqliteHeapReservedBytes,
     fullSqliteReservedBytes: full.sqliteHeapReservedBytes,
     meanConnectionReservedBytesBeforeClose: idleOpen.sqliteHeapReservedBytes / count,
     idleOpenSqliteReservedBytes: idleOpen.sqliteHeapReservedBytes,
