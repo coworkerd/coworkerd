@@ -27,6 +27,19 @@ const std::string& sqlDatabaseSource() {
   return source;
 }
 
+std::optional<uint64_t> alarmWallOverrideForTest(uint64_t maximum) {
+#ifdef COWORKERD_PLATFORM_FIXTURE
+  if (const auto* setting = std::getenv("COWORKERD_TEST_ALARM_WALL_MS")) {
+    auto limit = kj::StringPtr(setting).parseAs<uint64_t>();
+    KJ_REQUIRE(limit > 0 && limit <= maximum, "invalid test alarm wall time");
+    return limit;
+  }
+#else
+  (void)maximum;
+#endif
+  return std::nullopt;
+}
+
 PlatformDefinitions loadPlatformDefinitions() {
   PlatformDefinitions result;
 #ifdef COWORKERD_PLATFORM_FIXTURE

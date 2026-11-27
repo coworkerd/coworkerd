@@ -6,8 +6,9 @@ import { Cluster } from './cluster.mjs';
 import { ingressPlacementDefault, ingressPlacementEnabled, ingressPlacementSaturation, ingressPlacementAllBusy,
   ingressPlacementLiveSaturation } from './ingress-placement.mjs';
 import { isolateBusy } from './isolate-busy.mjs';
-import { alarmRequestLease, actorRequestLease, connectedRequestLease, disconnectedRequestLease,
-  responseDrainRequestLease, silentRequestLease, upgradeRequestLease }
+import { alarmRequestLease, actorRequestLease, boundedChildRequestLeases, connectedRequestLease,
+  disconnectedRequestLease, gracefulCloseRequestLease, peerPartitionRequestLease, responseDrainRequestLease,
+  silentRequestLease, upgradeRequestLease }
   from './live-request-lease.mjs';
 import { liveRequestCapacity } from './live-request-load.mjs';
 
@@ -17,11 +18,14 @@ const leaseCases = {
   'disconnected-request-lease': disconnectedRequestLease,
   'response-drain-request-lease': responseDrainRequestLease,
   'silent-request-lease': silentRequestLease,
+  'graceful-close-request-lease': gracefulCloseRequestLease,
+  'bounded-child-request-leases': boundedChildRequestLeases,
+  'peer-partition-request-lease': peerPartitionRequestLease,
 };
 const actorLeaseCases = { 'actor-request-lease': [], 'threaded-actor-request-lease': ['node-1', 'node-2', 'node-3'] };
 const alarmCases = { 'alarm-wall-time': [], 'threaded-alarm-wall-time': ['node-1', 'node-2', 'node-3'] };
 const requestLeaseNode = () => ({
-  ingressPlacement: true, placement: { homeProbability: 1 },
+  ingressPlacement: true, placement: { homeProbability: 1, subcalls: 'home' },
   ingress: { tcpKeepalive: { idleSeconds: 1, intervalSeconds: 1, probes: 2 } },
 });
 
@@ -109,7 +113,7 @@ function defaultSuites() {
     })),
     ...Object.entries(alarmCases).map(([name, threadedNodes]) => ({
       selected: [[name, alarmRequestLease]],
-      options: { threadedNodes, nodeEnvironment: () => ({ COWORKERD_TEST_ALARM_WALL_MS: '1000' }) },
+      options: { threadedNodes, alarmWallMs: 1000 },
     })),
   ];
 }

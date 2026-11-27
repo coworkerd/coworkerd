@@ -9,7 +9,7 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 | `workerd/0001-native-binding.patch` ... | One patch per file; the header of each states its purpose |
 | `kj-http-abort.diff` | A change to Cap'n Proto's KJ that `CMakeLists.txt` applies when it builds the daemons: KJ's HTTP entity writers honor `abortWrite()`, so a response that fails midway ends with an error instead of looking complete |
 | `capnp-http-upload.diff` | The node's HTTP-over-Cap'n Proto adapter can own a borrowed body through upload acknowledgment and release it while the HTTP reply is pending |
-| `kj-peer-half-close.diff` | Exposes a peer's write-side shutdown without consuming any input so ingress can cancel a pending WebSocket upgrade |
+| `kj-peer-half-close.diff` | Exposes a peer's write-side shutdown without consuming any input so ingress can cancel an HTTP response when the client sends FIN after the request is complete |
 
 ## How the series is maintained
 

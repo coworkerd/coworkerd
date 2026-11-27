@@ -95,38 +95,51 @@ index f4efdcd21a2cf0b9250f8363d5acf4fe326023c4..c12e7e33ce79fbe655c6e0c686291de0
    // null every time an event is fired.
  
 diff --git a/c++/src/kj/compat/http.c++ b/c++/src/kj/compat/http.c++
-index e3458f16b13166014a12006e8245cef048ecb275..63067201a34171f232e4e363a5ed0e7a2027c698 100644
+index e3458f16b13166014a12006e8245cef048ecb275..32b8cc5d7855b71c0738eec833b60fe578b34457 100644
 --- a/c++/src/kj/compat/http.c++
 +++ b/c++/src/kj/compat/http.c++
-@@ -8061,8 +8061,35 @@ private:
+@@ -1623,6 +1623,13 @@ public:
+     }
+   }
+ 
++  kj::Promise<void> whenMessageRead() {
++    if (onMessageDone == kj::none) return kj::READY_NOW;
++    auto fork = messageReadQueue.fork();
++    messageReadQueue = fork.addBranch();
++    return fork.addBranch();
++  }
++
+   bool isCleanDrain() {
+     // Returns whether we can cleanly drain the stream at this point.
+     if (onMessageDone != kj::none) return false;
+@@ -8053,16 +8060,29 @@ private:
+     auto service = KJ_ASSERT_NONNULL(kj::mv(maybeService),
+         "SuspendableHttpServiceFactory did not suspend, but returned kj::none.");
+ 
+-    // TODO(perf): If the client disconnects, should we cancel the response? Probably, to
+-    //   prevent permanent deadlock. It's slightly weird in that arguably the client should
+-    //   be able to shutdown the upstream but still wait on the downstream, but I believe many
+-    //   other HTTP servers do similar things.
+-
      auto body = httpInput.getEntityBody(
          HttpInputStreamImpl::REQUEST, request.method, 0, headers);
  
 -    co_await service->request(
-+    const bool upgrade = request.method == HttpMethod::GET && headers.isWebSocket();
-+    const bool watchHandshake = server.settings.cancelWebSocketHandshakeOnEof && upgrade;
-+    const bool watchHttp = server.settings.cancelHttpOnWriteDisconnect;
 +    auto handling = service->request(
          request.method, request.url, headers, *body, *this).attach(kj::mv(service));
-+    if (watchHandshake || watchHttp) {
-+      Promise<bool> disconnectedDuringRequest = NEVER_DONE;
-+      if (watchHttp) {
-+        disconnectedDuringRequest = stream.whenWriteDisconnected().then([this]() -> Promise<bool> {
-+          // After a 101 the WebSocket relay owns the socket.
-+          if (upgraded) return NEVER_DONE;
-+          return true;
-+        });
-+      }
-+      if (watchHandshake) {
-+        auto handshakeEnded = stream.whenPeerClosedWrite().then([this]() -> Promise<bool> {
-+          // Once it has headers, a declined upgrade can write its HTTP body across a half-close.
-+          if (currentMethod == kj::none) return NEVER_DONE;
-+          return true;
-+        });
-+        disconnectedDuringRequest = mv(disconnectedDuringRequest).exclusiveJoin(mv(handshakeEnded));
-+      }
-+      if (co_await kj::mv(handling).then([] { return false; })
-+          .exclusiveJoin(kj::mv(disconnectedDuringRequest))) {
++    if (server.settings.cancelHttpOnClientDisconnect) {
++      auto peerClosed = stream.whenPeerClosedWrite().then([this]() {
++        // A FIN can arrive while the parser or application still has request
++        // bytes buffered. Let the body reader finish framing the request first.
++        return httpInput.whenMessageRead();
++      });
++      auto disconnected = stream.whenWriteDisconnected().exclusiveJoin(kj::mv(peerClosed))
++          .then([this]() -> kj::Promise<bool> {
++        // After a 101 the WebSocket relay owns the socket.
++        if (upgraded) return kj::NEVER_DONE;
++        return true;
++      });
++      if (co_await kj::mv(handling).then([] { return false; }).exclusiveJoin(kj::mv(disconnected))) {
 +        co_return BREAK_LOOP_CONN_ERR;
 +      }
 +    } else {
@@ -136,19 +149,17 @@ index e3458f16b13166014a12006e8245cef048ecb275..63067201a34171f232e4e363a5ed0e7a
  
      KJ_IF_SOME(p, webSocketError) {
 diff --git a/c++/src/kj/compat/http.h b/c++/src/kj/compat/http.h
-index e0d1dc0d7d98e5a597ca065ded9537e24eca380c..66ce265531b576fe5cec90ae1d6ba818c591c7ec 100644
+index e0d1dc0d7d98e5a597ca065ded9537e24eca380c..33d3a485b519940c3531cf62d3e38ac675191f80 100644
 --- a/c++/src/kj/compat/http.h
 +++ b/c++/src/kj/compat/http.h
-@@ -1241,6 +1241,12 @@ struct HttpServerSettings {
+@@ -1241,6 +1241,10 @@ struct HttpServerSettings {
      AUTOMATIC_COMPRESSION, // Will perform compression parameter negotiation if client requests it.
    };
    WebSocketCompressionMode webSocketCompressionMode = NO_COMPRESSION;
 +
-+  bool cancelWebSocketHandshakeOnEof = false;
-+  // Cancel an upgrade request if the client half-closes before response headers are sent.
-+
-+  bool cancelHttpOnWriteDisconnect = false;
-+  // Cancel an HTTP request if the socket can no longer write a response to its client.
++  bool cancelHttpOnClientDisconnect = false;
++  // Cancel a pending HTTP response on a socket error or a FIN after the complete request.
++  // An upgraded WebSocket handles its own disconnect.
  };
  
  class HttpServerErrorHandler {

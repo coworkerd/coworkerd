@@ -435,8 +435,12 @@ get those files and the cluster runner's combined output in `cluster.log`.
 | --- | --- |
 | `deployment` | A new Worker version never reaches one of the three nodes, or an ingress continues to serve the previous version. |
 | `websocket-admission` | The fixture starts with a soft descriptor limit of 1,024 and sets one ingress to two places. Two tenants fill it, and a third upgrade gets a retryable `503 WEBSOCKET_NODE_CAPACITY` before dispatch. A clean close, disconnect after upgrade and a declined handshake release places. A FIN during a pending upgrade returns its place promptly. Ordinary HTTP and another ingress keep serving. |
-| `live-request-lease` | An HTTP client half-closes its write side and keeps the exchange open for over two minutes, then receives results from a remote Service Binding, a nested Durable Object and a retained RPC target. |
+| `live-request-lease` | A fully connected HTTP client receives the complete 120-second stream, including results from a Service Binding, a nested Durable Object and a retained RPC target. Total measured tenant CPU stays under 150 ms. |
 | `disconnected-request-lease` | A reset cancels foreground work when no `waitUntil` is registered, notifies `request.signal` before headers, and cancels a response body after headers. Registered work can still make a child call inside the single drain window. No work can produce a write after the cutoff. |
+| `graceful-close-request-lease` | A FIN on a silent request with complete headers triggers `request.signal` promptly. Registered work can write inside the shared drain and is canceled at its cutoff. |
+| `response-drain-request-lease` | The streamed body reaches EOF while root and child background work remain live. Both can write near the deadline and both settle at the same ingress cutoff. |
+| `bounded-child-request-leases` | Completed Binding events on peer nodes release their lease records while a root remains live across three batches. |
+| `peer-partition-request-lease` | A paused peer with an open TCP connection produces `RESULT_UNCERTAIN` within the watchdog window. The resumed callee releases its old call and cannot write. |
 | `silent-request-lease` | A client isolated at the network layer is released by the configured TCP keepalive. |
 | `actor-request-lease`, `threaded-actor-request-lease` | An object timer between events can fetch and start a fresh object call tree. The upstream role also exercises D1. A callback taken over by a newer event uses that event's lease. |
 | `alarm-wall-time`, `threaded-alarm-wall-time` | Both Durable Object backends end an alarm at the same test-shortened wall limit and continue serving the object. |

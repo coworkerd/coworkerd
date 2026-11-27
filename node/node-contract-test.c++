@@ -24,6 +24,7 @@
 #include <cmath>
 #include <fstream>
 #include <kj/async-io.h>
+#include <kj/compat/http.h>
 #include <limits>
 #include <sstream>
 #include <string_view>
@@ -69,43 +70,98 @@ void peerHalfClose() {
       "the peer can still read after shutting down its writes");
 }
 
+void httpReadBeforeFin() {
+  struct SilentService final: kj::HttpService {
+    kj::PromiseFulfillerPair<void> started = kj::newPromiseAndFulfiller<void>();
+    kj::PromiseFulfillerPair<void> read = kj::newPromiseAndFulfiller<void>();
+    kj::String received;
+    kj::Promise<void> request(kj::HttpMethod, kj::StringPtr, const kj::HttpHeaders&,
+        kj::AsyncInputStream& body, Response&) override {
+      started.fulfiller->fulfill();
+      co_await read.promise;
+      received = co_await body.readAllText();
+      co_await kj::Promise<void>(kj::NEVER_DONE);
+    }
+  } service;
+  auto io = kj::setupAsyncIo();
+  auto& timer = io.provider->getTimer();
+  auto table = kj::HttpHeaderTable::Builder().build();
+  kj::HttpServer server(timer, *table, service, {.cancelHttpOnClientDisconnect = true});
+  int fds[2];
+  KJ_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+  auto served = server.listenHttp(io.lowLevelProvider->wrapSocketFd(fds[0], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP));
+  auto client = io.lowLevelProvider->wrapSocketFd(fds[1], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+  client->write(kj::StringPtr("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody").asBytes())
+      .wait(io.waitScope);
+  client->shutdownWrite();
+  timer.timeoutAfter(2 * kj::SECONDS, kj::mv(service.started.promise)).wait(io.waitScope);
+  KJ_REQUIRE(!served.poll(io.waitScope), "a FIN must leave the buffered request body available");
+  service.read.fulfiller->fulfill();
+  timer.timeoutAfter(2 * kj::SECONDS, kj::mv(served)).wait(io.waitScope);
+  KJ_REQUIRE(service.received == "body", "the handler read the complete request before cancellation");
+}
+
 void peerSessionLiveness() {
   kj::EventLoop loop;
   kj::WaitScope waitScope(loop);
   const auto start = kj::origin<kj::TimePoint>();
-  kj::TimerImpl clock(start);
-  PeerReceiveLiveness receiver(clock);
-  auto expired = receiver.whenExpired();
-  unsigned sent = 0;
-  bool timedOut = false;
-  auto unanswered = kj::newPromiseAndFulfiller<void>();
-  auto active = runPeerKeepalive(clock, [&]() -> kj::Promise<void> {
-    ++sent;
-    if (sent == 1) {
-      receiver.receivedPing();
-      return kj::READY_NOW;
-    }
-    return kj::mv(unanswered.promise);
-  }).catch_([&](kj::Exception&&) { timedOut = true; });
+  for (const bool stall : {false, true}) {
+    kj::TimerImpl timer(start);
+    PeerLivenessClock clock(timer);
+    PeerReceiveLiveness receiver(clock);
+    auto expired = receiver.whenExpired();
+    const auto advance = [&](kj::Duration elapsed) {
+      const auto target = start + elapsed;
+      while (timer.now() < target) {
+        timer.advanceTo(kj::min(target, timer.now() + 250 * kj::MILLISECONDS));
+        waitScope.poll();
+      }
+    };
+    unsigned sent = 0;
+    bool timedOut = false;
+    auto unanswered = kj::newPromiseAndFulfiller<void>();
+    auto inFlight = runPeerKeepalive(clock, [&]() -> kj::Promise<void> {
+      ++sent;
+      if (sent == 1) {
+        receiver.receivedPing();
+        return kj::READY_NOW;
+      }
+      if (sent == 2) return kj::mv(unanswered.promise);
+      return kj::NEVER_DONE;
+    }).catch_([&](kj::Exception&&) { timedOut = true; });
+    advance(1999 * kj::MILLISECONDS);
+    KJ_REQUIRE(sent == 0);
+    advance(2 * kj::SECONDS);
+    KJ_REQUIRE(sent == 1);
+    advance(4 * kj::SECONDS);
+    KJ_REQUIRE(sent == 2);
+    auto lastAcknowledgement = 2 * kj::SECONDS;
 
-  clock.advanceTo(start + 1999 * kj::MILLISECONDS);
-  KJ_REQUIRE(!active.poll(waitScope) && sent == 0);
-  clock.advanceTo(start + 2 * kj::SECONDS);
-  KJ_REQUIRE(!active.poll(waitScope) && sent == 1);
-  clock.advanceTo(start + 4 * kj::SECONDS);
-  KJ_REQUIRE(!active.poll(waitScope) && sent == 2);
-  clock.advanceTo(start + 6999 * kj::MILLISECONDS);
-  KJ_REQUIRE(!expired.poll(waitScope) && !active.poll(waitScope) && sent == 2);
-  clock.advanceTo(start + 7 * kj::SECONDS);
-  const auto receiverExpired = expired.poll(waitScope);
-  const auto senderExpired = active.poll(waitScope);
-  KJ_REQUIRE(receiverExpired, "the receiving session expires five seconds after its last ping");
-  KJ_REQUIRE(senderExpired, "the outgoing session expires without an acknowledgement");
-  active.wait(waitScope);
-  KJ_REQUIRE(timedOut, "the outgoing session failed at its deadline");
-  KJ_REQUIRE(!unanswered.fulfiller->isWaiting(), "an expired session cancels its outstanding probe");
-  KJ_REQUIRE(kj::runCatchingExceptions([&]() { receiver.receivedPing(); }) != kj::none,
-      "a late ping cannot reopen a session");
+    if (stall) {
+      // The node's loop stopped running while a ping and its reply were in
+      // flight. They can be serviced on resume even though wall time passed.
+      auto queued = kj::evalLater([&]() {
+        receiver.receivedPing();
+        unanswered.fulfiller->fulfill();
+      }).eagerlyEvaluate(nullptr);
+      timer.advanceTo(start + 10 * kj::SECONDS);
+      queued.wait(waitScope);
+      waitScope.poll();
+      KJ_REQUIRE(!expired.poll(waitScope) && !inFlight.poll(waitScope));
+      lastAcknowledgement = 10 * kj::SECONDS;
+    }
+
+    const auto cutoff = lastAcknowledgement + PEER_KEEPALIVE_TIMEOUT;
+    advance(cutoff - kj::MILLISECONDS);
+    KJ_REQUIRE(!expired.poll(waitScope) && !inFlight.poll(waitScope));
+    advance(cutoff);
+    KJ_REQUIRE(expired.poll(waitScope), "the receiving session expires five seconds after the last ping");
+    KJ_REQUIRE(inFlight.poll(waitScope), "the outgoing session expires five seconds after the last acknowledgement");
+    inFlight.wait(waitScope);
+    KJ_REQUIRE(timedOut && !unanswered.fulfiller->isWaiting());
+    KJ_REQUIRE(kj::runCatchingExceptions([&]() { receiver.receivedPing(); }) != kj::none,
+        "a late ping cannot reopen a session");
+  }
 }
 
 void liveRequestLease() {
@@ -977,7 +1033,7 @@ int main(int argc, char* argv[]) {
   const std::string_view name(argv[1]);
   if (name == "native-config") nativeConfig();
   else if (name == "ingress-descriptor-plan") ingressDescriptorPlan();
-  else if (name == "peer-half-close") peerHalfClose();
+  else if (name == "peer-half-close") { peerHalfClose(); httpReadBeforeFin(); }
   else if (name == "peer-session-liveness") peerSessionLiveness();
   else if (name == "live-request-lease") liveRequestLease();
   else if (name == "tenant-execution") tenantExecution();

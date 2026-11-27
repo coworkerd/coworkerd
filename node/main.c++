@@ -232,6 +232,7 @@ enum class LeaseMode {
 };
 
 struct LeaseConfig {
+  static constexpr uint64_t ALARM_WALL_MS = 15 * 60 * 1000;
   LeaseMode mode;
   uint32_t defaultSubrequests;
   uint64_t ttlMs;
@@ -250,9 +251,7 @@ struct LeaseConfig {
     auto ttlMs = environmentUnsigned(
         "COWORKERD_LEASE_TTL_MS", 30'000, 86'400'000);
     KJ_REQUIRE(ttlMs > 0, "COWORKERD_LEASE_TTL_MS must be positive");
-    constexpr uint64_t ALARM_WALL_MS = 15 * 60 * 1000;
-    auto alarmWallMs = environmentUnsigned("COWORKERD_TEST_ALARM_WALL_MS", ALARM_WALL_MS, ALARM_WALL_MS);
-    KJ_REQUIRE(alarmWallMs > 0, "COWORKERD_TEST_ALARM_WALL_MS must be positive");
+    auto alarmWallMs = coworkerd::alarmWallOverrideForTest(ALARM_WALL_MS).value_or(ALARM_WALL_MS);
     if (std::getenv("COWORKERD_SUBREQUEST_GRANT") != nullptr) {
       std::cerr << "[server] COWORKERD_SUBREQUEST_GRANT is ignored: calls use the callee's own subrequest limit\n";
     }
@@ -3043,6 +3042,7 @@ private:
       std::string ingressServerId = {}, bool coldLoaded = false, const DurableTarget* durable = nullptr,
       const coworkerd::RootDispatch* root = nullptr) {
 
+    KJ_ON_SCOPE_FAILURE(leases.erase(invocationId));
     auto timing = slot ? slot->timing : nullptr;
     if (slot) slot->requestLease = requestLeaseFor(invocationId);
     if (timing) { timing->invocationId = invocationId; timing->treeId = treeId; timing->target = version->key(); }
@@ -3937,20 +3937,10 @@ private:
   }
 
   void addLease(std::string invocationId, InvocationLeaseState state) {
-    auto expiresAtMonotonicMs = state.expiresAtMonotonicMs;
-    auto requestLease = state.requestLease;
-    auto [_, inserted] = leases.emplace(invocationId, std::move(state));
+    auto [lease, inserted] = leases.emplace(invocationId, std::move(state));
     KJ_ASSERT(inserted, "duplicate invocation lease");
-    if (requestLease) {
-      leaseCleanupTasks.add(requestLease->whenClosed().then([this, id = std::move(invocationId)]() {
-        auto found = leases.find(id);
-        if (found != leases.end() && found->second.requestLease && !found->second.budgetHeld) {
-          leases.erase(found);
-          ++expiredLeases;
-        }
-      }));
-    } else {
-      leaseExpiries.push({expiresAtMonotonicMs, std::move(invocationId)});
+    if (!lease->second.requestLease) {
+      leaseExpiries.push({lease->second.expiresAtMonotonicMs, std::move(invocationId)});
     }
   }
 
@@ -3958,10 +3948,12 @@ private:
     auto lease = leases.find(invocationId);
     if (lease == leases.end()) return;
     lease->second.budgetHeld = false;
-    // The shared lease may still authorize calls during the HTTP drain.
-    if (!lease->second.held && !lease->second.live(monotonicTimeMs())) {
+    // The native event owns this budget through its drain. End its caller watch
+    // when the event releases it, even while the root and other calls stay live.
+    const bool expired = !lease->second.live(monotonicTimeMs());
+    if (!lease->second.held && (lease->second.requestLease || expired)) {
       leases.erase(lease);
-      ++expiredLeases;
+      if (expired) ++expiredLeases;
     }
   }
 
@@ -4014,7 +4006,6 @@ private:
   std::shared_ptr<int> executionLifetime = std::make_shared<int>(0);
   std::deque<std::shared_ptr<DebitRecord>> debits;
   std::map<std::string, InvocationLeaseState> leases;
-  kj::TaskSet leaseCleanupTasks{preparationErrors};
   std::priority_queue<
       LeaseExpiry,
       std::vector<LeaseExpiry>,
@@ -5359,8 +5350,8 @@ public:
   void setOwnerTailSupport(bool supported) { ownerTailSupport = supported; }
   bool supportsOwnerTail() const { return ownerTailSupport; }
 
-  void watchDisconnect(kj::Timer& timer, kj::Function<void()> observed) {
-    auto keepalive = coworkerd::runPeerKeepalive(timer, [this]() {
+  void watchDisconnect(coworkerd::PeerLivenessClock& clock, kj::Function<void()> observed) {
+    auto keepalive = coworkerd::runPeerKeepalive(clock, [this]() {
       return peer.keepAliveRequest().send().ignoreResult();
     });
     disconnectWatch = rpcSystem->onDisconnect().exclusiveJoin(kj::mv(keepalive)).catch_([this](kj::Exception&&) {
@@ -5547,6 +5538,7 @@ private:
 class PeerForwarder final {
 public:
   coworkerd::RpcMessageCounts& messageCounts() { return rpcMessages; }
+  coworkerd::PeerLivenessClock& livenessClock() { return peerClock; }
   std::string messageCountsJson() const {
     return "{\"sent\":" + std::to_string(rpcMessages.sent) + ",\"received\":" +
         std::to_string(rpcMessages.received) + "}";
@@ -6302,7 +6294,7 @@ private:
         found->second.connectingSettled = true;
         ++found->second.successfulConnections;
       }
-      connection->watchDisconnect(timer, [this, targetServerId]() {
+      connection->watchDisconnect(peerClock, [this, targetServerId]() {
         if (auto found = peerStates.find(targetServerId); found != peerStates.end()) ++found->second.disconnects;
       });
       return std::move(connection);
@@ -6392,6 +6384,7 @@ private:
   capnp::HttpOverCapnpFactory& factory;
   coworkerd::PeerAuth& peerAuth;
   coworkerd::RpcMessageCounts rpcMessages;
+  coworkerd::PeerLivenessClock peerClock{timer};
   coworkerd::RecoveryGate peerConnects{timer, 4};
   std::map<std::string, PeerState> peerStates;
   std::map<std::string, TailBatch> tailConnections;
@@ -7075,7 +7068,7 @@ public:
     accepted.addPtrPtr("X-Coworkerd-Tail-Owner", "1");
     accepted.addPtrPtr("X-Coworkerd-Peer-Protocol", "2");
     response.accept(200, "OK", accepted);
-    auto liveness = std::make_shared<coworkerd::PeerReceiveLiveness>(server.clock());
+    auto liveness = std::make_shared<coworkerd::PeerReceiveLiveness>(peerForwarder.livenessClock());
     coworkerd::CoarseTwoPartyServer rpcServer(rpc::PeerServer::Client(kj::heap<PeerBootstrap>(
         server, peerForwarder, durable, durableLog, factory, headerTable, liveness)));
     auto session = rpcServer.accept(connection, &peerForwarder.messageCounts()).exclusiveJoin(liveness->whenExpired());
@@ -10897,6 +10890,9 @@ int run(Launch launch) {
       "egress.defaultPolicy must be public or deny");
   coworkerd::EgressService::check(serverConfig.egress);
   auto leaseConfig = LeaseConfig::fromEnvironment(launch.experimentalNaiveLease);
+  if (leaseConfig.alarmWallMs < LeaseConfig::ALARM_WALL_MS) {
+    serverConfig.processPool.alarmWallMsForTest = leaseConfig.alarmWallMs;
+  }
   const auto configuration = configurationJson(launch, serverConfig, leaseConfig);
   std::cout << "[server] {\"event\":\"configuration\",\"version\":\"" << jsonEscape(COWORKERD_VERSION) << "\",\"form\":\""
             << launch.form << "\",\"configFile\":\"" << jsonEscape(launch.configFile.string()) << "\",\"tokenSource\":\""
@@ -11229,7 +11225,7 @@ int run(Launch launch) {
   SourceService source(server, *io.lowLevelProvider, timer, *headerTable);
   server.addStateSection("tenantLogPosts", [&source]() { return source.logJson(); });
   kj::HttpServer httpServer(timer, *headerTable, gateway,
-      {.callbacks = gateway, .cancelWebSocketHandshakeOnEof = true, .cancelHttpOnWriteDisconnect = true});
+      {.callbacks = gateway, .cancelHttpOnClientDisconnect = true});
   kj::HttpServer bindingServer(timer, *headerTable, bindingRpc);
   kj::HttpServer peerServer(timer, *headerTable, [&](kj::AsyncIoStream& connection) -> kj::Own<kj::HttpService> {
     return kj::heap<coworkerd::SqlHttpCancellation>(
