@@ -95,6 +95,10 @@ The default suite also runs `ingress-placement-live-saturation` with the pinned 
 test the production reader without overrides. It warms an isolate on the Worker home,
 runs one CPU-bound request there, and checks that a subsequent probe executes on a peer.
 
+The separate [hot Worker placement measurement](../../docs/hot-worker-placement.md) uses ordinary
+ingress near twice the measured single-isolate rate and compares another tenant's light-request p99
+with adjacent quiet windows. Its driver runs on demand on a quiet test machine.
+
 ### Threaded SQL deadline and disconnect
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matching Linux
