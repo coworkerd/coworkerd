@@ -113,4 +113,5 @@
 0183-bound-platform-sqlite-spill.patch
 0180-fix-database-admission-accounting.patch
 0184-charge-database-sqlite-heap-to-process.patch
+0122-order-threaded-wal-home-teardown.patch
 0109-deliver-threaded-websocket-bytes.patch

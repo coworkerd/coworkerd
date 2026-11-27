@@ -6,10 +6,10 @@ Subject: [PATCH] Read threaded Durable Object WebSocket frames as bytes
 Use typed metadata from the node invocation descriptor and read the fixed-length body directly into the hibernation event buffer. Preserve the existing Worker event types and output gate.
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index cee37c292d322dd58849260b7652968baa2c39c5..03c685ee1f06db8ff06615f23750e29c9785d84a 100644
+index 20f5e0299499088e0c7fcdfaa89a9e7ed3ce62d7..477cef832e7392b3c9c2135cf6a8230266e6314d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -4833,11 +4833,52 @@ class DurableAlarmHttp final: public kj::HttpService {
+@@ -4839,11 +4839,52 @@ class DurableAlarmHttp final: public kj::HttpService {
  };
  
  struct DurableSocketEvent {
@@ -62,7 +62,7 @@ index cee37c292d322dd58849260b7652968baa2c39c5..03c685ee1f06db8ff06615f23750e29c
  class DurableSocketHttp final: public kj::HttpService {
   public:
    DurableSocketHttp(kj::Own<WorkerInterface> worker, DurableSocketEvent event,
-@@ -4849,39 +4890,29 @@ class DurableSocketHttp final: public kj::HttpService {
+@@ -4855,39 +4896,29 @@ class DurableSocketHttp final: public kj::HttpService {
      KJ_REQUIRE(method == kj::HttpMethod::POST &&
          url == "http://coworkerd-node/__coworkerd/durable-socket", "invalid socket event");
      KJ_REQUIRE(worker.get() != nullptr, "one call per socket event");
@@ -119,7 +119,7 @@ index cee37c292d322dd58849260b7652968baa2c39c5..03c685ee1f06db8ff06615f23750e29c
      co_await event.actor->getOutputGate().wait(nullptr);
      response.send(204, "No Content", kj::HttpHeaders(headers), uint64_t{0});
    }
-@@ -7411,8 +7442,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -7417,8 +7448,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
        entry = kj::mv(opened.first);
        socketActor = kj::mv(opened.second);
      }
