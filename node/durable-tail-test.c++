@@ -76,7 +76,9 @@ struct DurableTailTest {
       for (const uint64_t e : {3,9}) {
         r=make(e,seq,seq%5==0?0:obj,shardEpoch,shard);
         if (e==9) {
-          log.records.emplace(seq,encodeLogRecord(r));log.rememberParsedRecord(r);
+          log.records.emplace(seq, std::make_shared<const std::string>(encodeLogRecord(r)));
+          log.appendedSeq = seq;
+          log.rememberParsedRecord(r);
           if (seq%7!=0) log.confirmed.insert(seq);
           if (seq%11==0) log.isolated.insert(seq);
           if (seq%7!=0 && seq%11!=0) remember(r);
