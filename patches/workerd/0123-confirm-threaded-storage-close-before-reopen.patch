@@ -1,11 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Fri, 27 Nov 2026 19:40:46 +0800
+Date: Sat, 28 Nov 2026 01:16:57 +0800
 Subject: [PATCH] Confirm threaded SQLite close before preparing a replacement
 
-Reserve the storage identity before the WAL scan and carry that reservation through the SQLite connection. On synchronous close, enqueue the existing CLOSED record and then release the reservation. A replacement tree waits for every connection of the previous tree, including retained facets. An unconfirmed close keeps the reservation until this child generation exits.
+Reserve the storage identity before the WAL scan and carry it through SQLite close. Queue CLOSED before releasing the reservation. A replacement tree waits for every connection in the previous tree, including retained facets.
 
-Cover retained connections, the CLOSED and OPEN wire order, an unrelated identity, canceled preparation, and a BUSY SQLite close with a controlled WAL peer.
+Keep the proof when reset has closed SQLite and failed to reopen it. A close that SQLite cannot confirm keeps that identity fenced for this generation and rejects waiting and new opens. Report the affected identities and tag the pre-execution refusal for the node.
+
+Exercise retained connections, the cross-thread CLOSED/OPEN order, abandoned reservations, WAL channel shutdown, reset failure, and a BUSY close with a controlled peer.
 
 diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
 index 2fc38aa5bf88950ac79e3219e81080855100461c..029547c394ad7ca3fae4f8617fef7345f926ba41 100644
@@ -25,10 +27,10 @@ index 2fc38aa5bf88950ac79e3219e81080855100461c..029547c394ad7ca3fae4f8617fef7345
  
  # The C++ side of the Rust server: compiles workers, starts requests, builds actors and their
 diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.c++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
-index 1035bb028f064145a8273f66632b43169847c8da..a3d033737109fbcbf234060326e9b20b1e2aed1c 100644
+index 1035bb028f064145a8273f66632b43169847c8da..7ed3e940c34e4a80dfbe99a7fd95d5d0166a6de7 100644
 --- a/src/workerd/server/factory/coworkerd-durable-test-storage.c++
 +++ b/src/workerd/server/factory/coworkerd-durable-test-storage.c++
-@@ -75,14 +75,27 @@ kj::Own<SqliteDatabase> DurableStorage::open(kj::StringPtr uniqueKey,
+@@ -75,14 +75,28 @@ kj::Own<SqliteDatabase> DurableStorage::open(kj::StringPtr uniqueKey,
  }
  
  kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
@@ -40,14 +42,15 @@ index 1035bb028f064145a8273f66632b43169847c8da..a3d033737109fbcbf234060326e9b20b
 +    DurableWalChannel& channel,
 +    DurableWalPosition position,
 +    uint64_t localOpenStartedNs,
-+    kj::Maybe<kj::Function<void()>> confirmClose) const {
++    kj::Maybe<kj::Function<void(SqliteDatabase::CloseOutcome)>> confirmClose) const {
 +  auto report = kj::heap<DurableLogShipper::DeferredClose>();
 +  auto& pending = *report;
 +  // Install the callback before setup can fail. When there is an OPEN on
 +  // the wire, enqueue its CLOSED before a waiter can enqueue the next OPEN.
-+  database.afterClose([report = kj::mv(report), confirm = kj::mv(confirmClose)]() mutable {
-+    report->send();
-+    KJ_IF_SOME(closed, confirm) closed();
++  database.afterClose([report = kj::mv(report), confirm = kj::mv(confirmClose)](
++                          SqliteDatabase::CloseOutcome outcome) mutable {
++    if (outcome == SqliteDatabase::CloseOutcome::CONFIRMED) report->send();
++    KJ_IF_SOME(closed, confirm) closed(outcome);
 +  });
    auto wal = databasePath(uniqueKey, name.storageId, name.facetId, "-wal"_kj);
    auto image = databasePath(uniqueKey, name.storageId, name.facetId);
@@ -59,7 +62,7 @@ index 1035bb028f064145a8273f66632b43169847c8da..a3d033737109fbcbf234060326e9b20b
    return shipper;
  }
  
-@@ -90,7 +103,8 @@ DurableStorage::WalImage DurableStorage::walImage(
+@@ -90,7 +104,8 @@ DurableStorage::WalImage DurableStorage::walImage(
      kj::StringPtr uniqueKey, kj::StringPtr storageId, uint facet) const {
    KJ_REQUIRE(uniqueKey.startsWith(ROOT_PREFIX) && isDigest(uniqueKey.slice(ROOT_PREFIX.size())) &&
            isDigest(storageId), "invalid durable storage identity");
@@ -70,7 +73,7 @@ index 1035bb028f064145a8273f66632b43169847c8da..a3d033737109fbcbf234060326e9b20b
  
  kj::Own<FacetTreeIndex> DurableStorage::openFacetIndex(
 diff --git a/src/workerd/server/factory/coworkerd-durable-test-storage.h b/src/workerd/server/factory/coworkerd-durable-test-storage.h
-index cf9f554ed3a6b79172e1bcba4cce594f718b1e13..68ebbfb99f10718a172d8765ff3fe77df37c0ee4 100644
+index cf9f554ed3a6b79172e1bcba4cce594f718b1e13..23f178ea1d3330f174d838f853b52026e6fec6e6 100644
 --- a/src/workerd/server/factory/coworkerd-durable-test-storage.h
 +++ b/src/workerd/server/factory/coworkerd-durable-test-storage.h
 @@ -33,11 +33,17 @@ class DurableStorage {
@@ -85,7 +88,7 @@ index cf9f554ed3a6b79172e1bcba4cce594f718b1e13..68ebbfb99f10718a172d8765ff3fe77d
 +      DurableWalChannel& channel,
 +      DurableWalPosition position,
 +      uint64_t localOpenStartedNs,
-+      kj::Maybe<kj::Function<void()>> confirmClose = kj::none) const;
++      kj::Maybe<kj::Function<void(SqliteDatabase::CloseOutcome)>> confirmClose = kj::none) const;
    struct WalImage {
      const kj::Directory& directory;
      kj::Path path;
@@ -94,7 +97,7 @@ index cf9f554ed3a6b79172e1bcba4cce594f718b1e13..68ebbfb99f10718a172d8765ff3fe77d
    WalImage walImage(kj::StringPtr uniqueKey, kj::StringPtr storageId, uint facet) const;
  
 diff --git a/src/workerd/server/factory/coworkerd-threaded-wal-test.c++ b/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
-index b573f48cebb25f2c31b94b3097b8e27c4743bb28..e6263f74397ccb7fd0e1038d4879f6e21e81f4b0 100644
+index b573f48cebb25f2c31b94b3097b8e27c4743bb28..086b81e1c700cc6101474baed0d00c81439b0073 100644
 --- a/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
 +++ b/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
 @@ -1,10 +1,12 @@
@@ -134,7 +137,7 @@ index b573f48cebb25f2c31b94b3097b8e27c4743bb28..e6263f74397ccb7fd0e1038d4879f6e2
      node = io.lowLevelProvider->wrapSocketFd(fds[1], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
    }
  
-@@ -227,6 +233,127 @@ struct HomeSession {
+@@ -227,6 +233,287 @@ struct HomeSession {
    }
  };
  
@@ -237,6 +240,8 @@ index b573f48cebb25f2c31b94b3097b8e27c4743bb28..e6263f74397ccb7fd0e1038d4879f6e2
 +KJ_TEST("a BUSY SQLite close cannot release threaded WAL preparation") {
 +  StorageSession test;
 +  auto old = test.open(*test.oldHome, test.link.wait(test.prepare(1, 0)), 0);
++  auto reopening = test.prepare(2, 0).eagerlyEvaluate(nullptr);
++  KJ_REQUIRE(!reopening.poll(test.link.io.waitScope));
 +  sqlite3_stmt* statement = nullptr;
 +  // This fixture bypasses the wrapper's SQL preparation only to keep one
 +  // untracked dependent handle. No SQL runs after the statement is prepared.
@@ -248,22 +253,180 @@ index b573f48cebb25f2c31b94b3097b8e27c4743bb28..e6263f74397ccb7fd0e1038d4879f6e2
 +    old.close();
 +  }
 +
-+  auto reopening = test.prepare(2, 0).eagerlyEvaluate(nullptr);
++  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
++      "did not confirm close in this generation", test.link.wait(kj::mv(reopening)));
++  KJ_EXPECT(test.log.unconfirmedCloseIdentities() == 1);
++  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
++      "did not confirm close in this generation", test.link.wait(test.prepare(2, 0)));
 +  auto neighbor = test.open(*test.nextHome,
 +      test.link.wait(test.prepare(3, 0, StorageSession::OTHER)), 0, StorageSession::OTHER);
-+  KJ_REQUIRE(!reopening.poll(test.link.io.waitScope),
-+      "a destroyed SQLite wrapper without close proof cannot authorize a scan");
 +  const auto finalized = sqlite3_finalize(std::exchange(statement, nullptr));
 +  KJ_REQUIRE(finalized == SQLITE_OK);
-+  test.link.wait(test.prepare(3, 1, StorageSession::OTHER));
-+  KJ_EXPECT(!reopening.poll(test.link.io.waitScope), "lazy close produced no synchronous proof");
++  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
++      "did not confirm close in this generation", test.link.wait(test.prepare(4, 0)));
++}
++
++KJ_TEST("a reset failure after SQLite closed still confirms final close") {
++  StorageSession test;
++  auto old = test.open(*test.oldHome, test.link.wait(test.prepare(1, 0)), 0);
++  auto reopen = test.prepare(2, 0).eagerlyEvaluate(nullptr);
++  auto id = old.shipper->getOpenId();
++  auto image = test.storage.walImage(StorageSession::NAMESPACE, StorageSession::ID, 0);
++  // Force the unlink in reset() to fail after the old SQLite handle closes.
++  image.directory.remove(
++      kj::Path({kj::str(StorageSession::NAMESPACE), kj::str(StorageSession::ID, ".sqlite")}));
++  KJ_EXPECT_THROW_RECOVERABLE_MESSAGE("path to remove doesn't exist", old.database->reset());
++  KJ_EXPECT(!reopen.poll(test.link.io.waitScope));
++  old.close();
++  test.link.receive(MSG_CLOSED, id);
++  auto next = test.open(*test.nextHome, test.link.wait(kj::mv(reopen)), 0);
++  KJ_EXPECT(test.log.unconfirmedCloseIdentities() == 0);
++}
++
++KJ_TEST("dropping a reserved WAL preparation allows the same identity to reopen") {
++  StorageSession test;
++  {
++    auto abandoned = test.link.wait(test.prepare(1, 0));
++    abandoned.positionForOpen();
++  }
++  auto reopened = test.open(*test.nextHome, test.link.wait(test.prepare(2, 0)), 0);
++}
++
++KJ_TEST("stopping threaded WAL wakes preparations waiting for close") {
++  // The peer disconnect is reported on the WAL owner thread.
++  class ExpectedDisconnect final: public kj::ExceptionCallback {
++   public:
++    explicit ExpectedDisconnect(std::atomic<bool>& seen): seen(seen) {}
++
++    void logMessage(kj::LogSeverity severity, const char* file, int line, int depth,
++        kj::String&& message) override {
++      if (severity == kj::LogSeverity::ERROR && message.contains("threaded WAL channel closed"_kj)) {
++        seen = true;
++        return;
++      }
++      ExceptionCallback::logMessage(severity, file, line, depth, kj::mv(message));
++    }
++
++    kj::Function<void(kj::Function<void()>)> getThreadInitializer() override {
++      return [next = ExceptionCallback::getThreadInitializer(), &seen = seen](
++                 kj::Function<void()> run) mutable {
++        next([&] {
++          ExpectedDisconnect expected(seen);
++          run();
++        });
++      };
++    }
++
++   private:
++    std::atomic<bool>& seen;
++  };
++  std::atomic<bool> sawDisconnect = false;
++  {
++    ExpectedDisconnect expected(sawDisconnect);
++    StorageSession test;
++    auto old = test.open(*test.oldHome, test.link.wait(test.prepare(1, 0)), 0);
++    auto reopening = test.prepare(2, 0).eagerlyEvaluate(nullptr);
++    KJ_EXPECT(!reopening.poll(test.link.io.waitScope));
++    test.link.node = nullptr;
++    KJ_EXPECT_THROW_RECOVERABLE_MESSAGE(
++        "replicator is not reachable", test.link.wait(kj::mv(reopening)));
++  }
++  KJ_EXPECT(sawDisconnect.load());
++}
++
++class BeforeClosedChannel final: public DurableWalChannel {
++ public:
++  explicit BeforeClosedChannel(DurableWalChannel& inner): inner(inner) {}
++  kj::Maybe<kj::Function<void()>> beforeClosed;
++
++  bool enabled() const override {
++    return inner.enabled();
++  }
++  uint64_t nextRequest() override {
++    return inner.nextRequest();
++  }
++  uint64_t registerShipper(DurableLogShipper& shipper) override {
++    return inner.registerShipper(shipper);
++  }
++  void unregisterShipper(DurableLogShipper& shipper) override {
++    inner.unregisterShipper(shipper);
++  }
++  kj::Promise<void> waitForOpen(uint64_t id, kj::Timer& timer) override {
++    return inner.waitForOpen(id, timer);
++  }
++  void send(uint64_t id, kj::Array<kj::byte> message) override {
++    if (message[4] == MSG_CLOSED) {
++      KJ_IF_SOME(check, beforeClosed) check();
++    }
++    inner.send(id, kj::mv(message));
++  }
++  kj::Promise<void> sendFrames(DurableLogShipper& shipper,
++      kj::Array<kj::byte> message,
++      uint64_t request,
++      kj::Timer& timer) override {
++    return inner.sendFrames(shipper, kj::mv(message), request, timer);
++  }
++
++ private:
++  DurableWalChannel& inner;
++};
++
++KJ_TEST("threaded WAL queues CLOSED before waking a replacement on another home") {
++  StorageSession test;
++  BeforeClosedChannel closing(*test.oldHome);
++  auto old = test.open(closing, test.link.wait(test.prepare(1, 0)), 0);
++  const auto id = old.shipper->getOpenId();
++
++  struct Waiter {
++    const kj::Executor& executor;
++    kj::Timer& timer;
++    kj::Own<kj::PromiseFulfiller<void>> quit;
++    bool prepared = false;
++    kj::Promise<ThreadedWalLog::PreparedOpen> opening = nullptr;
++  };
++  auto started = kj::newPromiseAndCrossThreadFulfiller<Waiter*>();
++  kj::Thread home([&test, ready = kj::mv(started.fulfiller)]() mutable {
++    auto io = kj::setupAsyncIo();
++    auto stop = kj::newPromiseAndFulfiller<void>();
++    Waiter waiter{kj::getCurrentThreadExecutor(), io.provider->getTimer(), kj::mv(stop.fulfiller)};
++    waiter.opening = test.prepare(2, 0)
++                         .then([&waiter](auto prepared) {
++      waiter.prepared = true;
++      return prepared;
++    }).eagerlyEvaluate(nullptr);
++    KJ_EXPECT(!waiter.opening.poll(io.waitScope));
++    ready->fulfill(&waiter);
++    stop.promise.wait(io.waitScope);
++  });
++  auto& waiter = *test.link.wait(kj::mv(started.promise));
++  KJ_DEFER({
++    closing.beforeClosed = kj::none;
++    waiter.executor.executeSync([&] { waiter.quit->fulfill(); });
++  });
++  closing.beforeClosed = [&] {
++    // Run the other home's queued work while CLOSED is held before enqueue.
++    // An independent scan drains the scanner queue after any early wakeup.
++    const auto prepared = waiter.executor.executeSync([&]() -> kj::Promise<bool> {
++      co_await kj::evalLast([] {});
++      auto barrier = co_await waiter.timer.timeoutAfter(
++          kj::SECONDS, test.prepare(3, 0, StorageSession::OTHER));
++      co_await kj::evalLast([] {});
++      co_return waiter.prepared;
++    });
++    KJ_EXPECT(!prepared, "CLOSED must be queued before the replacement is prepared");
++  };
++  old.close();
++  auto prepared = waiter.executor.executeSync(
++      [&] { return waiter.timer.timeoutAfter(kj::SECONDS, kj::mv(waiter.opening)); });
++  test.link.receive(MSG_CLOSED, id);
++  auto reopened = test.open(*test.nextHome, prepared, 0);
 +}
 +
  struct TestRoot {
    kj::Own<kj::Directory> directory = kj::newInMemoryDirectory(kj::nullClock());
    SqliteDatabase::Vfs vfs{*directory};
 diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.c++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
-index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df7bc93ac9 100644
+index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..bce15faf84cba989edf7cd2ffd32cb673558fbe9 100644
 --- a/src/workerd/server/factory/coworkerd-threaded-wal.c++
 +++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
 @@ -1,16 +1,21 @@
@@ -290,7 +453,16 @@ index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df
  
  namespace workerd::server {
  namespace {
-@@ -111,12 +116,6 @@ struct Command {
+@@ -28,6 +33,8 @@ constexpr uint8_t ACK_DISCONNECTED = 254;
+ constexpr auto STORAGE_UNAVAILABLE =
+     "jsg.Error: Durable Object storage is unavailable: the node's replicator is not reachable "
+     "(STORAGE_UNAVAILABLE)"_kj;
++constexpr auto CLOSE_UNCONFIRMED =
++    "the previous SQLite connection did not confirm close in this generation"_kj;
+ 
+ // The producer transfers owned data and wakes the consumer without entering its
+ // loop. A queue has one consumer. Its mutex is released before any I/O or await.
+@@ -111,12 +118,6 @@ struct Command {
    std::shared_ptr<Inbox> inbox;
  };
  
@@ -303,7 +475,7 @@ index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df
  struct Shared {
    explicit Shared(kj::Duration confirmationTimeout): confirmationTimeout(confirmationTimeout) {}
  
-@@ -125,6 +124,8 @@ struct Shared {
+@@ -125,6 +126,8 @@ struct Shared {
      ready.store(false, std::memory_order_release);
      commands.close();
      stopSignal.close();
@@ -312,10 +484,18 @@ index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df
    }
  
    bool post(Command command, bool control) {
-@@ -137,12 +138,50 @@ struct Shared {
+@@ -137,12 +140,76 @@ struct Shared {
      return !stopped.load(std::memory_order_acquire) && ready.load(std::memory_order_acquire);
    }
  
++  void checkReservedOpen(const std::string& key) {
++    std::lock_guard lock(openMutex);
++    KJ_REQUIRE(negotiated(), STORAGE_UNAVAILABLE);
++    auto storage = openStorage.find(key);
++    KJ_ASSERT(storage != openStorage.end());
++    requireConfirmedClose(storage->second);
++  }
++
 +  bool reserveOpen(const std::string& key,
 +      uint64_t tree,
 +      uint facet,
@@ -323,6 +503,7 @@ index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df
 +    std::lock_guard lock(openMutex);
 +    KJ_REQUIRE(negotiated(), STORAGE_UNAVAILABLE);
 +    auto& storage = openStorage.try_emplace(key, tree).first->second;
++    requireConfirmedClose(storage);
 +    if (storage.tree == tree && storage.facets.insert(facet).second) return true;
 +    // Coalesced root requests and the facet startup each have one shared
 +    // preparation. Drop canceled waiters as later requests replace them.
@@ -331,13 +512,20 @@ index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df
 +    return false;
 +  }
 +
-+  void releaseOpen(const std::string& key, uint64_t tree, uint facet) {
++  void finishOpen(
++      const std::string& key, uint64_t tree, uint facet, SqliteDatabase::CloseOutcome outcome) {
 +    std::lock_guard lock(openMutex);
 +    auto storage = openStorage.find(key);
 +    KJ_ASSERT(storage != openStorage.end() && storage->second.tree == tree);
 +    KJ_ASSERT(storage->second.facets.erase(facet) == 1);
++    if (outcome == SqliteDatabase::CloseOutcome::UNCONFIRMED &&
++        !std::exchange(storage->second.closeUnconfirmed, true)) {
++      unconfirmedCloseIdentities.fetch_add(1, std::memory_order_relaxed);
++    }
 +    wakePreparations(storage->second);
-+    if (storage->second.facets.empty()) openStorage.erase(storage);
++    if (storage->second.facets.empty() && !storage->second.closeUnconfirmed) {
++      openStorage.erase(storage);
++    }
 +  }
 +
    const kj::Duration confirmationTimeout;
@@ -346,15 +534,25 @@ index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df
    std::atomic<uint64_t> nextId{0};
    std::atomic<bool> ready{false};
    std::atomic<bool> stopped{false};
++  std::atomic<uint64_t> unconfirmedCloseIdentities{0};
 +
 + private:
 +  struct OpenStorage {
 +    uint64_t tree;
++    bool closeUnconfirmed = false;
 +    std::set<uint> facets;
 +    std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<void>>> waiters;
 +  };
 +  std::mutex openMutex;
 +  std::map<std::string, OpenStorage> openStorage;
++
++  static void requireConfirmedClose(const OpenStorage& storage) {
++    if (storage.closeUnconfirmed) {
++      auto error = KJ_EXCEPTION(OVERLOADED, CLOSE_UNCONFIRMED);
++      error.setDetail(ThreadedWalLog::CLOSE_UNCONFIRMED_DETAIL, kj::heapArray<kj::byte>(0));
++      kj::throwRecoverableException(kj::mv(error));
++    }
++  }
 +
 +  static void wakePreparations(OpenStorage& storage) {
 +    for (auto& waiter: storage.waiters) waiter->fulfill();
@@ -363,7 +561,7 @@ index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df
  };
  
  class Session {
-@@ -407,7 +446,54 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+@@ -407,7 +474,57 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
  
  }  // namespace
  
@@ -382,28 +580,31 @@ index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df
 +        facet(facet) {}
 +
 +  ~OpenReservation() {
-+    // Once SQLite has opened, destroying the callback is insufficient proof.
-+    // A BUSY connection leaves its reservation in place for this generation.
-+    if (state == State::RESERVED) shared->releaseOpen(key, tree, facet);
++    // Dropping a preparation that never reached SQLite needs no close proof.
++    if (state == State::RESERVED) {
++      shared->finishOpen(key, tree, facet, SqliteDatabase::CloseOutcome::CONFIRMED);
++    }
 +  }
 +
-+  void closed() {
++  void closed(SqliteDatabase::CloseOutcome outcome) {
 +    KJ_ASSERT(state == State::OPENED);
 +    state = State::WAITING;
-+    shared->releaseOpen(key, tree, facet);
++    shared->finishOpen(key, tree, facet, outcome);
 +  }
 +};
 +
 +DurableWalPosition ThreadedWalLog::PreparedOpen::positionForOpen() const {
 +  KJ_REQUIRE(reservation->state == OpenReservation::State::RESERVED,
 +      "jsg.Error: Durable Object storage preparation was already used (STORAGE_UNAVAILABLE)");
++  reservation->shared->checkReservedOpen(reservation->key);
 +  return position;
 +}
 +
-+kj::Function<void()> ThreadedWalLog::PreparedOpen::trackClose() const {
++kj::Function<void(SqliteDatabase::CloseOutcome)> ThreadedWalLog::PreparedOpen::trackClose() const {
 +  KJ_ASSERT(reservation->state == OpenReservation::State::RESERVED);
 +  reservation->state = OpenReservation::State::OPENED;
-+  return [reservation = reservation] { reservation->closed(); };
++  return [reservation = reservation](
++             SqliteDatabase::CloseOutcome outcome) { reservation->closed(outcome); };
 +}
 +
  struct ThreadedWalLog::Impl {
@@ -418,7 +619,16 @@ index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df
    Impl(int fd, uint64_t generation, kj::Duration confirmationTimeout)
        : shared(std::make_shared<Shared>(confirmationTimeout)),
          owner([state = shared, descriptor = kj::AutoCloseFd(fd), generation]() mutable {
-@@ -459,12 +545,28 @@ kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
+@@ -454,17 +571,37 @@ bool ThreadedWalLog::ready() const { return impl->shared->negotiated(); }
+ 
+ kj::Duration ThreadedWalLog::confirmationTimeout() const { return impl->shared->confirmationTimeout; }
+ 
++uint64_t ThreadedWalLog::unconfirmedCloseIdentities() const {
++  return impl->shared->unconfirmedCloseIdentities.load(std::memory_order_relaxed);
++}
++
+ kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
+     kj::Function<void(uint64_t, CloseReason)> requestClose) {
    return kj::heap<Home>(impl->shared, kj::mv(requestClose), kj::systemPreciseMonotonicClock());
  }
  
@@ -452,7 +662,7 @@ index 349b0ffe358d031ec5b12afcb2d10bd9cc5f315a..d893f5e633260d5c3d9d43152360e0df
  
  }  // namespace workerd::server
 diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.h b/src/workerd/server/factory/coworkerd-threaded-wal.h
-index b92c0b7377793841495b7122b078c0f8a66218d0..d5cb85b841e5ef1ee1554d08b7c611ad90670b66 100644
+index b92c0b7377793841495b7122b078c0f8a66218d0..f2fe8312b10840d141b47ebe57df78f63a7b6af9 100644
 --- a/src/workerd/server/factory/coworkerd-threaded-wal.h
 +++ b/src/workerd/server/factory/coworkerd-threaded-wal.h
 @@ -2,11 +2,15 @@
@@ -471,8 +681,12 @@ index b92c0b7377793841495b7122b078c0f8a66218d0..d5cb85b841e5ef1ee1554d08b7c611ad
   public:
    ThreadedWalLog(int fd, uint64_t generation, kj::Duration confirmationTimeout);
    ~ThreadedWalLog() noexcept(false);
-@@ -16,7 +20,33 @@ class ThreadedWalLog {
+@@ -14,9 +18,37 @@ class ThreadedWalLog {
+ 
+   bool ready() const;
    kj::Duration confirmationTimeout() const;
++  uint64_t unconfirmedCloseIdentities() const;
++  static constexpr kj::Exception::DetailTypeId CLOSE_UNCONFIRMED_DETAIL = 0x997a5d73b0e11893ull;
    enum class CloseReason { DRAIN, CODE_UPDATED };
    kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t, CloseReason)> requestClose);
 -  kj::Promise<DurableWalPosition> prepareOpen(const kj::Directory& directory, kj::Path path);
@@ -484,7 +698,7 @@ index b92c0b7377793841495b7122b078c0f8a66218d0..d5cb85b841e5ef1ee1554d08b7c611ad
 +
 +    // Bind a successful SQLite open to this reservation. Only a confirmed
 +    // SQLite close can then release it for a later preparation.
-+    kj::Function<void()> trackClose() const;
++    kj::Function<void(SqliteDatabase::CloseOutcome)> trackClose() const;
 +
 +   private:
 +    friend class ThreadedWalLog;
@@ -562,10 +776,10 @@ index f49268a48222ee29dd41f0e5aab49b6d4b4169fb..8a906acb41176e4468eaf9fec3cbd015
    // ActorSqlite's commit callback: the frames of everything committed since the last one go to the replicator and
    // the promise resolves when it confirms them. It is rejected -- which breaks the output gate, so the object is
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436962af6ae 100644
+index 94edf00375b8b5ff1eec655e65199b07aeb880a1..64357521a0629f9245743c228a7db44d1b3496cb 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1986,8 +1986,9 @@ struct ThreadState {
+@@ -2002,8 +2002,9 @@ struct ThreadState {
    };
    std::optional<DurableLoad> durableLoad;
    struct WalPreparation {
@@ -577,7 +791,49 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
    };
    struct SocketAdoption {
      explicit SocketAdoption(kj::Promise<void> promise): ready(promise.fork()) {}
-@@ -6696,7 +6697,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -3807,13 +3808,16 @@ struct ThreadedServer {
+         ",\"resettingHomes\":" + std::to_string(resettingHomes) +
+         ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
+         ",\"sqlSpillBytes\":" + std::to_string(durableStorage->getSqlSpillBudget().getUsed()) +
+-        ",\"sqlSpillMaximum\":" + std::to_string(durableStorage->getSqlSpillBudget().getCapacity()) +
++        ",\"sqlSpillMaximum\":" +
++        std::to_string(durableStorage->getSqlSpillBudget().getCapacity()) +
+         ",\"workerThreads\":" + std::to_string(liveThreads.load()) +
+         ",\"waiting\":" + std::to_string(state.waiting) +
+         ",\"running\":" + std::to_string(state.active) +
+         ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
+         ",\"homeSessions\":" + std::to_string(durableHomeSessions.load()) +
+         ",\"pendingCommits\":" + std::to_string(durablePendingCommits.load()) +
++        ",\"unconfirmedCloseIdentities\":" +
++        std::to_string(durableLog ? durableLog->unconfirmedCloseIdentities() : 0) +
+         ",\"groupCreationRefusals\":" + std::to_string(sandboxRefusals.load()) +
+         ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
+         ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
+@@ -6721,6 +6725,23 @@ class DurableAlarmReporter final: public ActorSqlite::Hooks {
+   uint facet;
+ };
+ 
++kj::Exception tagWalOpenError(kj::Exception error) {
++  if (error.getDetail(server::ThreadedWalLog::CLOSE_UNCONFIRMED_DETAIL) != kj::none) {
++    return jsg::tagCoworkerdRpcError(kj::mv(error), "DO_UNAVAILABLE");
++  }
++  return error;
++}
++
++kj::Promise<server::ThreadedWalLog::PreparedOpen> prepareDurableWal(server::ThreadedWalLog &log,
++    server::DurableStorage::WalImage image,
++    uint64_t tree,
++    uint facet) {
++  return log.prepareOpen(image.directory, kj::mv(image.path), kj::mv(image.storageKey), tree, facet)
++      .catch_([](kj::Exception &&error) -> kj::Promise<server::ThreadedWalLog::PreparedOpen> {
++    return tagWalOpenError(kj::mv(error));
++  });
++}
++
+ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &tree,
+     Worker &worker,
+     Worker::Actor::Id id,
+@@ -6731,7 +6752,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      std::shared_ptr<DurableFacetReservation> reservation = nullptr,
      uint parentFacet = 0,
      kj::StringPtr facetName = ""_kj,
@@ -586,7 +842,7 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
      bool platformDatabase = false,
      uint64_t sqlWalFrameLimitBytes = 0);
  
-@@ -7072,14 +7073,15 @@ kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
+@@ -7107,14 +7128,14 @@ kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
        }
      }
    }
@@ -595,8 +851,7 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
    if (tree->state.wal) {
      auto wal = tree->storage().walImage(tree->uniqueKey, tree->storageId, facet);
 -    position = co_await tree->server.durableLog->prepareOpen(wal.directory, kj::mv(wal.path));
-+    prepared = co_await tree->server.durableLog->prepareOpen(
-+        wal.directory, kj::mv(wal.path), kj::mv(wal.storageKey), tree->tree, facet);
++    prepared = co_await prepareDurableWal(*tree->server.durableLog, kj::mv(wal), tree->tree, facet);
      KJ_REQUIRE(!stopped, "durable facet closed during WAL preparation");
    }
    actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker), kj::mv(id), className,
@@ -605,7 +860,7 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
    if (tree->state.wal) co_await tree->state.wal->waitForOpen(
        tree->shippers.at(facet)->getOpenId(), tree->state.io.provider->getTimer());
    KJ_REQUIRE(!stopped, "durable facet closed during startup");
-@@ -7129,7 +7131,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7164,7 +7185,7 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      std::shared_ptr<DurableFacetReservation> reservation,
      uint parentFacet,
      kj::StringPtr facetName,
@@ -614,7 +869,7 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
      bool platformDatabase,
      uint64_t sqlWalFrameLimitBytes) {
    auto hooks = kj::refcounted<DurableActorHooks>(tree, facet, depth);
-@@ -7137,9 +7139,9 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7172,9 +7193,9 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
    auto observer = kj::refcounted<DurableActorObserver>(tree, facet);
    auto *borrowedObserver = observer.get();
    if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
@@ -627,18 +882,24 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
                         SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
      const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
      const auto memoryLimit = sqlWalFrameLimitBytes != 0
-@@ -7153,13 +7155,23 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7188,13 +7209,29 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
        KJ_REQUIRE(slot != nullptr, "database storage opened without its isolate reservation");
        sqliteProcessBudget = slot->reservation;
      }
 +    KJ_ASSERT(tree->server.durableLog.get() == nullptr || prepared != kj::none,
 +        "persistent SQLite open without WAL preparation");
 +    server::DurableWalPosition position;
-+    KJ_IF_SOME(open, prepared) position = open.positionForOpen();
++    KJ_IF_SOME(open, prepared) {
++      try {
++        position = open.positionForOpen();
++      } catch (const kj::Exception &error) {
++        kj::throwRecoverableException(tagWalOpenError(error.clone()));
++      }
++    }
      auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet,
          sqlWalFrameLimitBytes, memoryLimit, std::move(sqliteProcessBudget));
      if (tree->state.wal) {
-+      kj::Maybe<kj::Function<void()>> confirmClose;
++      kj::Maybe<kj::Function<void(SqliteDatabase::CloseOutcome)>> confirmClose;
 +      KJ_IF_SOME(open, prepared) confirmClose = open.trackClose();
        auto shipper = tree->storage().ship(tree->uniqueKey,
 -          {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),
@@ -654,7 +915,7 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
        auto* current = shipper.get();
        KJ_REQUIRE(tree->shippers.emplace(facet, current).second, "durable facet is already open");
        shipper = kj::mv(shipper).attach(kj::defer([tree, facet] { tree->shippers.erase(facet); }));
-@@ -7203,18 +7215,17 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7238,18 +7275,17 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
    return {kj::mv(actor), borrowedHooks};
  }
  
@@ -666,10 +927,9 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
    auto preparation = slot.lock();
    if (!preparation) {
      auto wal = server.durableStorage->walImage(route.uniqueKey.c_str(), route.storageId.c_str(), 0);
--    preparation = std::make_shared<ThreadState::WalPreparation>(
+     preparation = std::make_shared<ThreadState::WalPreparation>(
 -        server.durableLog->prepareOpen(wal.directory, kj::mv(wal.path)));
-+    preparation = std::make_shared<ThreadState::WalPreparation>(server.durableLog->prepareOpen(
-+        wal.directory, kj::mv(wal.path), kj::mv(wal.storageKey), tree, 0));
++        prepareDurableWal(*server.durableLog, kj::mv(wal), tree, 0));
      slot = preparation;
    }
 -  KJ_DEFER(if (preparation.use_count() == 1) state.preparingWal.erase(tree));
@@ -678,7 +938,7 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
  }
  
  kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
-@@ -7284,9 +7295,14 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -7319,9 +7355,14 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
    KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
        "durable class missing from pinned Worker");
    auto found = state.durableRoots.find(ticket.tree);
@@ -695,7 +955,7 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
      found = state.durableRoots.find(ticket.tree);
    }
    if (found == state.durableRoots.end()) {
-@@ -7309,7 +7325,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -7344,7 +7385,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
      });
      auto actor = makeDurableActor(tree, *KJ_REQUIRE_NONNULL(slot->worker),
          Worker::Actor::Id(kj::mv(actorId)), route.open.className.c_str(), Frankenvalue(), 0, 0,
@@ -704,3 +964,144 @@ index 477cef832e7392b3c9c2135cf6a8230266e6314d..37d98b2806aa8a709928e6fe43ca7436
      found = state.durableRoots
                  .emplace(ticket.tree,
                      ThreadState::DurableRoot{
+diff --git a/src/workerd/util/sqlite.c++ b/src/workerd/util/sqlite.c++
+index 1b701cce83e50808bc5694e6880780f7f549647e..c3248ac983258d0ffa872f8d375cd45df6239059 100644
+--- a/src/workerd/util/sqlite.c++
++++ b/src/workerd/util/sqlite.c++
+@@ -840,6 +840,7 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
+   // sqlite3_close_v2 is safe to call on nullptr, so we should simply call this always, thus
+   // cleaning up a partial db even when SQLITE_CALL_NODB throws.
+   KJ_ON_SCOPE_FAILURE({
++    maybeDb = kj::none;
+     sqlite3_close_v2(db);
+     releaseProcessMemoryAfterClose();
+   });
+@@ -887,40 +888,33 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
+ }
+ 
+ SqliteDatabase::~SqliteDatabase() noexcept(false) {
+-  sqlite3* db = &KJ_UNWRAP_OR(maybeDb, return);
+-
+-  if (getWalTransactionLimit() != nullptr || processMemoryBudget != nullptr) {
+-    // Finalize tracked statements and close the handle while the VFS, its limit,
+-    // and the SQLite heap reservation are still live.
+-    close();
+-    KJ_IF_SOME(closed, afterCloseCallback) closed();
+-    return;
+-  }
+-
+-  auto memoryScope = enterMemoryScope();
+-
+-  sqlite3_progress_handler(db, 0, nullptr, nullptr);
+-  auto err = sqlite3_close(db);
+-  if (err == SQLITE_OK) {
+-    KJ_IF_SOME(closed, afterCloseCallback) closed();
+-    return;
+-  }
+-  if (err == SQLITE_BUSY) {
+-    KJ_LOG(ERROR, "sqlite database destroyed while dependent objects still exist");
+-    // SQLite actually provides a lazy-close API which we might as well use here instead of leaking
+-    // memory.
+-    err = sqlite3_close_v2(db);
++  // A failed reset can leave no handle after synchronously closing the old
++  // one. Still report that close after the shipper has been dropped.
++  auto outcome = CloseOutcome::CONFIRMED;
++  int err = SQLITE_OK;
++  KJ_IF_SOME(db, maybeDb) {
++    if (getWalTransactionLimit() != nullptr || processMemoryBudget != nullptr) {
++      // Finalize tracked statements while the VFS and its budgets are live.
++      close();
++    } else {
++      auto memoryScope = enterMemoryScope();
++      sqlite3_progress_handler(&db, 0, nullptr, nullptr);
++      err = sqlite3_close(&db);
++      if (err != SQLITE_OK) outcome = CloseOutcome::UNCONFIRMED;
++      if (err == SQLITE_BUSY) {
++        KJ_LOG(ERROR, "sqlite database destroyed while dependent objects still exist");
++        err = sqlite3_close_v2(&db);
++      }
++    }
+   }
+-
++  KJ_IF_SOME(callback, afterCloseCallback) callback(outcome);
+   KJ_DTOR_REQUIRE(err == SQLITE_OK, sqlite3_errstr(err));
+ }
+ 
+ SqliteDatabase::operator sqlite3*() {
+-  KJ_IF_SOME(db, maybeDb) {
+-    return &db;
+-  }
+   KJ_REQUIRE(!closed, "database has been closed");
+-  KJ_FAIL_ASSERT("previous reset() failed");
++  KJ_ASSERT(!resetFailed, "previous reset() failed");
++  return &KJ_ASSERT_NONNULL(maybeDb, "previous reset() failed");
+ }
+ 
+ SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
+@@ -948,13 +942,18 @@ SqliteDatabase::WalTransactionLimit* SqliteDatabase::getWalTransactionLimit() co
+ }
+ 
+ void SqliteDatabase::setWalHook(WalHook callback, void* context) {
++  // The shipper clears its hook even if reset() has already cleared the handle.
++  auto* db = callback == nullptr
++      ? maybeDb.map([](sqlite3& handle) { return &handle; }).orDefault(nullptr)
++      : static_cast<sqlite3*>(*this);
++  if (db == nullptr) return;
+   if (getWalTransactionLimit() == nullptr) {
+-    sqlite3_wal_hook(*this, callback, context);
++    sqlite3_wal_hook(db, callback, context);
+     return;
+   }
+   walHook = callback;
+   walHookContext = context;
+-  sqlite3_wal_hook(*this, [](void* arg, sqlite3* db, const char* schema, int frames) {
++  sqlite3_wal_hook(db, [](void* arg, sqlite3* db, const char* schema, int frames) {
+     auto& self = *static_cast<SqliteDatabase*>(arg);
+     self.getWalTransactionLimit()->noteCommit();
+     if (self.walHook != nullptr) return self.walHook(self.walHookContext, db, schema, frames);
+@@ -1535,7 +1534,8 @@ void SqliteDatabase::reset() {
+     vfs.directory.remove(path);
+   }
+ 
+-  KJ_ON_SCOPE_FAILURE(maybeDb = kj::none);
++  KJ_ON_SCOPE_FAILURE(resetFailed = true);
++  resetFailed = false;
+   init(kj::WriteMode::CREATE | kj::WriteMode::MODIFY);
+ 
+   KJ_IF_SOME(resetCb, afterResetCallback) {
+diff --git a/src/workerd/util/sqlite.h b/src/workerd/util/sqlite.h
+index 6fa1b5007bfe81dde001be983957445949b181d3..c2f5ba84ac493ace98494bae394ba6d87fa7abac 100644
+--- a/src/workerd/util/sqlite.h
++++ b/src/workerd/util/sqlite.h
+@@ -424,9 +424,10 @@ class SqliteDatabase {
+     afterResetCallback = kj::mv(callback);
+   }
+ 
+-  // On destruction, only a synchronous SQLite close proves that no deferred
+-  // handle can still touch the files.
+-  void afterClose(kj::Function<void()> callback) {
++  enum class CloseOutcome { CONFIRMED, UNCONFIRMED };
++  // Report the final close on destruction. A lazy close leaves dependent
++  // handles that may still touch the files.
++  void afterClose(kj::Function<void(CloseOutcome)> callback) {
+     afterCloseCallback = kj::mv(callback);
+   }
+ 
+@@ -485,6 +486,8 @@ class SqliteDatabase {
+ 
+   // Set by close(). Distinguishes the closed state from a failed reset() in error messages.
+   bool closed = false;
++  // A failed afterReset callback can leave a replacement handle to close.
++  bool resetFailed = false;
+ 
+   // Set while a query is compiling.
+   kj::Maybe<StaticRegulator> currentRegulator;
+@@ -511,7 +514,7 @@ class SqliteDatabase {
+   kj::Maybe<kj::Function<void(kj::StringPtr errorMessage, kj::Maybe<kj::Exception> maybeException)>>
+       onCriticalErrorCallback;
+   kj::Maybe<kj::Function<void(SqliteDatabase&)>> afterResetCallback;
+-  kj::Maybe<kj::Function<void()>> afterCloseCallback;
++  kj::Maybe<kj::Function<void(CloseOutcome)>> afterCloseCallback;
+   kj::Maybe<kj::String> errorContext;
+ 
+   kj::List<ResetListener, &ResetListener::link> resetListeners;

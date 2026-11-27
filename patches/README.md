@@ -61,8 +61,12 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   The actor index and WAL Home stay live through actor cleanup, shipper deregistration, and SQLite close.
   It changes only the threaded server and its tests.
   Patch 0123 reserves a durable storage identity before its WAL scan. A replacement tree waits for
-  the previous root and facets to confirm SQLite close. A BUSY close keeps that identity fenced in
-  the child, and the node's existing generation-exit check protects the next child.
+  the previous root and facets to confirm SQLite close. The SQLite wrapper reports final close even
+  when reset already closed the handle and failed to reopen it. When close remains unconfirmed,
+  further preparations for that identity return `DO_UNAVAILABLE` for this generation.
+  The private threaded start reply lets the node report a retryable refusal before event dispatch.
+  `durableAdmission.unconfirmedCloseIdentities` counts the affected identities, and the node's
+  existing generation-exit check protects the next child.
   Patch 0185 measures wall time under the isolate lock for threaded stateless Workers. The JSG lock
   notifies the existing isolate observer at acquire and release. The threaded lifecycle publishes
   a bounded sliding-window reading for each loaded isolate.

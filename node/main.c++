@@ -513,6 +513,8 @@ constexpr std::string_view TENANT_ADMISSION_LIMIT = "tenant-concurrency";
 constexpr std::string_view PROCESS_TENANT_LIMIT = "process-tenant-concurrency";
 constexpr const char* DURABLE_CAPACITY_REASON =
     "The durable process refused the call before it started. The operation did not execute and can be retried.";
+constexpr const char* DURABLE_CLOSE_UNCONFIRMED_REASON =
+    "The previous storage connection did not confirm close. The object is unavailable in this process generation.";
 constexpr const char* PROCESS_TENANT_REASON = "tenant execution concurrency limit reached in process";
 bool processTenantRefusal(const InvocationRejection& refusal) {
   return refusal.code == "OVERLOADED" && refusal.category == PROCESS_TENANT_LIMIT;
@@ -1757,6 +1759,14 @@ public:
     return {status, std::move(code), std::move(reason), memory.effectiveBand(),
         inFlightRoots + inFlightNested, root ? serverConfig.rootLimit : serverConfig.nestedLimit,
         std::min(serverConfig.rejectionAvoidMs, serverConfig.avoidMaxMs)};
+  }
+
+  InvocationRejection durableStartRefusal(coworkerd::PreExecutionRefusal reason) {
+    auto value = reason == coworkerd::PreExecutionRefusal::STORAGE_CLOSE_UNCONFIRMED
+        ? refusal("DO_UNAVAILABLE", DURABLE_CLOSE_UNCONFIRMED_REASON)
+        : refusal("OVERLOADED", DURABLE_CAPACITY_REASON);
+    value.notExecuted = value.retryable = true;
+    return value;
   }
 
   void observeRefusal(const InvocationRejection& refusal, const std::string& source = "localBinding") {
@@ -3026,8 +3036,8 @@ private:
     const bool threadedDurable = durable && process->threadedDurableRole();
     auto decision = [this, lifetime = std::weak_ptr<int>(executionLifetime), slotRef = std::weak_ptr<AdmissionSlot>(slot), version, process, invocationId, treeId = std::move(treeId),
                      ingress, peerIngress, deferredCpu, threadedDurable](bool executed) {
-      // Preserve durable accounting on a lost reply. Only the child's explicit capacity refusal cancels the charge.
-      if (threadedDurable) executed = !process->capacityRejected;
+      // Preserve durable accounting on a lost reply. Only the child's explicit pre-execution refusal cancels the charge.
+      if (threadedDurable) executed = process->preExecutionRefusal == coworkerd::PreExecutionRefusal::NONE;
       if (deferredCpu) deferredCpu(executed);
       if (lifetime.expired()) return;
       pendingDispatchDecisions.erase(invocationId);
@@ -3039,7 +3049,7 @@ private:
         process->snapshotAfterFailure();
         leases.erase(invocationId);
         const auto current = slotRef.lock();
-        const auto refusal = threadedDurable ? this->refusal("OVERLOADED", DURABLE_CAPACITY_REASON) :
+        const auto refusal = threadedDurable ? this->durableStartRefusal(process->preExecutionRefusal) :
             this->refusal(current && !current->rejectionCode.empty() ? current->rejectionCode : "CODE_UNAVAILABLE",
                 current && !current->rejectionReason.empty() ? current->rejectionReason : "Worker unavailable before execution", 503, ingress);
         if (!threadedDurable)
@@ -7627,11 +7637,11 @@ private:
       };
       if (slot->process->threadedDurableRole()) {
         // The child can confirm refusal in the raw admission reply or before issuing the event dispatcher.
-        if (co_await kj::mv(opened.capacityRejected)) {
+        const auto reason = co_await kj::mv(opened.preExecutionRefusal);
+        if (reason != coworkerd::PreExecutionRefusal::NONE) {
           slot->outcome = {};
           slot->decide(false);
-          auto refusal = server.refusal("OVERLOADED", DURABLE_CAPACITY_REASON);
-          refusal.notExecuted = refusal.retryable = true;
+          auto refusal = server.durableStartRefusal(reason);
           server.observeLocalRefusal(refusal, "durableObject");
           log(line, target, slot->process.get(), refusal.status, refusal.code, started);
           co_return Ran{std::nullopt, {rejectedDispatcher(factory, headerTable, refusal, deadline, target.isDatabase())}};
@@ -7665,7 +7675,8 @@ private:
   // line on the owner.
   void log(const Line& line, const DurableTarget& target, const coworkerd::ProcessCall* process, uint status, const std::string& code,
       double started) {
-    if (process != nullptr && !process->capacityRejected && !process->threadedDurableTestRole() && status >= 500)
+    if (process != nullptr && process->preExecutionRefusal == coworkerd::PreExecutionRefusal::NONE &&
+        !process->threadedDurableTestRole() && status >= 500)
       durableLog.objectFailed(target.namespaceId, target.objectId, target.shardEpoch, "request",
           code.empty() ? "HTTP " + std::to_string(status) : code);
     std::cout << std::setprecision(17) << "[do] {\"nodeId\":\"" << jsonEscape(server.placementConfig().serverId) << "\",\"workerId\":\""
