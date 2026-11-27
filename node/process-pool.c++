@@ -1,5 +1,6 @@
 #include "process-culprit.h"
 #include "process-pool.h"
+#include "node-cpu.h"
 #include "rpc-clock.h"
 #include "event-loop.h"
 #include "memory-events.h"
@@ -1126,6 +1127,7 @@ struct ProcessGeneration {
   bool oomSignalled = false;
   // Lifecycle snapshot shared memory.
   LifecycleView lifecycle;
+  std::map<std::string, double, std::less<>> saturatedPlans;  // plan revision to sampled monotonic time.
   // Tenant request contexts. workerd writes a `completed` row when a request's context
   // ends -- after its waitUntil work, whether or not it ran JavaScript, limits or not -- so
   // a dispatched invocation stays open until that row is read.
@@ -4112,18 +4114,28 @@ static std::string placementKey(const std::string& worker, bool quarantine) {
   const auto tenant = tenantOf(worker);
   return quarantine && !tenant.empty() ? tenant : worker;
 }
-std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
-  impl->refresh();
-  const auto quarantine = quarantined(worker);
+std::shared_ptr<ProcessGeneration> ProcessPool::ordinaryProcess(const std::string& worker, bool quarantine) const {
   std::vector<std::string> ids;
   for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current && s.current->pid > 0) ids.push_back(s.id);
   for (const auto& id : rendezvousOrder(placementKey(worker, quarantine), ids)) for (const auto& s : impl->slots) {
-    if (s.id == id && s.current && impl->admittedTenant(*s.current, worker)) {
-      if (quarantine) ++impl->quarantineDispatches;
-      return std::shared_ptr<ProcessCall>(new ProcessCall(s.current, s.current->tenantExecution ? tenantOf(worker) : std::string()));
-    }
+    if (s.id == id && s.current && impl->admittedTenant(*s.current, worker)) return s.current;
   }
   return {};
+}
+std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
+  impl->refresh();
+  const auto quarantine = quarantined(worker);
+  auto process = ordinaryProcess(worker, quarantine);
+  if (!process) return {};
+  if (quarantine) ++impl->quarantineDispatches;
+  return std::shared_ptr<ProcessCall>(new ProcessCall(process, process->tenantExecution ? tenantOf(worker) : std::string()));
+}
+bool ProcessPool::workerSaturated(const std::string& worker, std::string_view planRevision, double nowMs) const {
+  if (planRevision.empty()) return false;
+  const auto process = ordinaryProcess(worker, quarantined(worker));
+  if (!process) return false;
+  const auto sample = process->saturatedPlans.find(planRevision);
+  return sample != process->saturatedPlans.end() && sample->second <= nowMs && nowMs - sample->second <= 2500;
 }
 std::optional<std::pair<std::string, uint64_t>> ProcessPool::threadedGenerationHint(const std::string& worker) const {
   const auto quarantine = quarantined(worker);
@@ -4261,6 +4273,60 @@ std::vector<SecretDictionary::Residents> ProcessPool::residentPlans() const {
   });
   return result;
 }
+kj::Promise<void> ProcessPool::sampleWorkerSaturation() {
+  std::vector<std::string> snapshots;
+  std::vector<std::shared_ptr<ProcessGeneration>> generations;
+  for (const auto& slot : impl->slots) {
+    auto process = slot.current;
+    if (!process || !process->threaded || slot.durable || process->pid <= 0) continue;
+    auto snapshot = process->lifecycle.read();
+    if (snapshot.find("\"isolateBusy\":") == std::string::npos) {
+      process->saturatedPlans.clear();
+      continue;
+    }
+    snapshots.push_back(std::move(snapshot));
+    generations.push_back(std::move(process));
+  }
+  if (snapshots.empty()) co_return;
+  // Parse the existing publication on the background worker and leave a bounded lookup on admission.
+  auto pending = backgroundValue([snapshots = std::move(snapshots)] {
+    std::vector<std::map<std::string, double, std::less<>>> result;
+    for (const auto& snapshot : snapshots) {
+      auto& saturated = result.emplace_back();
+      // A replacement can share its predecessor's plan revision. Its latest instance owns the reading.
+      struct Reading { double instance, throughMs; bool busy; };
+      std::map<std::string, Reading> readings;
+      try {
+        capnp::MallocMessageBuilder message;
+        auto value = message.initRoot<capnp::JsonValue>();
+        capnp::JsonCodec().decodeRaw(kj::arrayPtr(snapshot.data(), snapshot.size()), value);
+        const auto residents = json::field(value, "residentWorkers");
+        if (!residents.isArray()) continue;
+        for (auto row : residents.getArray()) {
+          const auto plan = json::field(row, "planRevision");
+          const auto instance = json::field(row, "instance");
+          if (!plan.isString() || !instance.isNumber()) continue;
+          const auto busy = json::field(row, "isolateBusy");
+          const auto through = busy.isObject() ? json::field(busy, "throughMonotonicMs") : capnp::JsonValue::Reader();
+          const auto permille = busy.isObject() ? json::field(busy, "permille") : capnp::JsonValue::Reader();
+          const bool aboveThreshold = through.isNumber() && permille.isNumber() &&
+              permille.getNumber() >= WORKER_BUSY_PERMILLE && permille.getNumber() <= 1000;
+          const Reading reading{instance.getNumber(), aboveThreshold ? through.getNumber() : 0, aboveThreshold};
+          auto [previous, inserted] = readings.try_emplace(plan.getString().cStr(), reading);
+          if (!inserted && reading.instance > previous->second.instance) previous->second = reading;
+        }
+      } catch (const kj::Exception&) {
+        continue;
+      }
+      for (const auto& [plan, reading] : readings)
+        if (reading.busy) saturated.emplace(plan, reading.throughMs);
+    }
+    return result;
+  });
+  auto sampled = co_await kj::mv(pending);
+  for (size_t i = 0; i < generations.size(); ++i) generations[i]->saturatedPlans = std::move(sampled[i]);
+}
+
 OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor, const std::string& hash,
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
     bool threadedSql) {

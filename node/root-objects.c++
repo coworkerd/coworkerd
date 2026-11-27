@@ -105,6 +105,15 @@ std::string rootLoaderService(bool durable, const std::string& storageDirectory)
       json::quote(durable ? storageDirectory : "") + ")),\n";
 }
 
+std::string_view plainPlanFingerprint(std::string_view plan) {
+  constexpr std::string_view field = ",\"versionFingerprint\":\"";
+  if (const auto at = plan.rfind(field); at != std::string_view::npos) {
+    const auto begin = at + field.size();
+    return plan.substr(begin, plan.find('"', begin) - begin);
+  }
+  return {};
+}
+
 std::string plainEnvironmentRevision(const DeploymentState& catalog, const VersionDefinition& version) {
   std::ostringstream revisions;
   for (const auto& value : version.variables)

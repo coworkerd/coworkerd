@@ -267,6 +267,9 @@ struct RemoteInvocation {
   entrypoint @18 :Text;
   # Opaque native loopback props, including its capability table. Nodes only copy it.
   coworkerdProps @19 :AnyPointer;
+  # Set by dynamic ingress placement on its first pass. A peer may decline before execution
+  # on soft saturation. The ingress can then retry without this preference.
+  preferIdle @20 :Bool;
 }
 
 # A request to a Durable Object from the node where its caller runs to the node that owns the object's shard. The owner

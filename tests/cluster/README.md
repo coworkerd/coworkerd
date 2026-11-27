@@ -71,6 +71,12 @@ To enable placement on all nodes for a new fixture, pass
 including two requests forwarded to a peer. Later cases can choose their own placement settings
 and use the same response field to see where each request ran.
 
+Run `ingress-placement-saturation` and `ingress-placement-all-busy` through the same runner
+to test deterministic readings at the isolate and CPU thresholds. These cases check that an
+ordinary request skips busy nodes and executes once on the idle candidate, that a lost peer
+open stops placement, and that explicit soft refusals can be revisited. The all-busy case
+fills the three root slots with sleeping requests to verify the hard concurrency limit.
+
 ### Threaded SQL deadline and disconnect
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matching Linux

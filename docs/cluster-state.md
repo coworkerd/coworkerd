@@ -189,9 +189,26 @@ Stateless Service Binding subcalls first try the caller's node by default (`plac
 2. Otherwise the order is the home, then X, then the others by rank. Executing on X after the home refused keeps the call local: the overflow stays where it arrived, at no extra hop, and the Worker is warm there for the next request.
 3. Candidates that refused or could not be reached recently move behind the others for a short avoidance period, at most `placement.avoidMaxMs` (2 s), without being removed.
 4. A refusal before execution, or a connection that was never established, moves on to the next candidate; a load failure of the version itself (other than a package the node could not get), a load check that could not finish (`RESULT_UNCERTAIN`), the call's own lease running out (`410 LEASE_EXPIRED`: no candidate is avoided for it) and anything that happens after the call was sent end the decision.
-5. Each attempt uses one of `initialPlacementHops` (8). When every attempt failed, the call ends with `503 PLACEMENT_EXHAUSTED`, not executed, listing each candidate's refusal -- or with `503 LOAD_FAILED` when every attempt failed in its load check because the code package itself could not be loaded; the codes of other refusals reach the client only inside that list. A candidate that cannot fetch or verify the code refuses before that, with `VERSION_UNAVAILABLE`.
+5. The first pass tries up to `initialPlacementHops` (8) candidates. When every attempt failed, the call ends with `503 PLACEMENT_EXHAUSTED`, not executed, listing each candidate's refusal -- or with `503 LOAD_FAILED` when every attempt failed in its load check because the code package itself could not be loaded; the codes of other refusals reach the client only inside that list. A candidate that cannot fetch or verify the code refuses before that, with `VERSION_UNAVAILABLE`.
 
 With `ingressPlacement` off (it is on by default), and for a Worker with a static entry in `placements`, ingress requests execute where they arrive. A static entry also sends the Worker's Binding calls to its one node, without other candidates; it is an operations tool.
+
+**Stateless root saturation.** When dynamic ingress placement has more than one candidate to try,
+the first pass lets a node refuse a root before dispatch with `WORKER_SATURATED` or
+`NODE_CPU_SATURATED`. The Worker threshold is 900 permille of isolate lock hold time over the
+threaded kernel's last 3 s. The node uses a recent sample for the requested plan revision in the
+process generation that would serve it. A missing or stale sample supplies no saturation signal.
+The CPU threshold is 950 permille of the node's available CPU. On Linux this uses cgroup v2
+`cpu.stat` usage over approximately 3 s, bounded by CPU affinity and visible CPU quotas. A node
+without that reading can still use the isolate signal.
+
+Each soft refusal explicitly reports that the call has not been dispatched and can be retried.
+If the first pass finds no candidate that can serve, the ingress revisits each candidate that sent
+an explicit soft refusal, in the same order, with the saturation preference disabled. Each
+candidate gets at most one such retry. The original admission checks and deadline still apply.
+An uncertain outcome ends either pass. Soft refusals do not add node-wide avoidance. The
+`[attempt]` log records `saturationFallback` and the state endpoint counts saturation refusals
+by code and successful second-pass placements under the `saturationFallback` decision.
 
 **Admission limits apply before any wait.** A node refuses new tree roots once `placement.rootLimit` (128) calls are in flight and nested calls only at `placement.nestedLimit` (384) (`503 OVERLOADED`): under overload new trees are held off first, while trees already admitted can finish. The memory band ([process isolation](process-isolation.md)) adds to it: in yellow a node refuses forwarded roots and nested calls for versions cold on it, in red all of them (`LOAD_BAND_REJECTED`); a request executing where it arrived is never refused by the band. A refusal carries the reason, the node's band and load and a suggested avoidance time.
 

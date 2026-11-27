@@ -24,5 +24,7 @@ inline bool tenantExecutionLimited(uint32_t own, uint32_t activeTenants, uint32_
 uint32_t cpusWithinQuota(uint32_t affinity, std::filesystem::path directory,
     const std::filesystem::path& root);
 uint32_t availableProcessCpus();
+double availableProcessCpuCapacity();
+std::filesystem::path processCpuCgroup();
 
 }  // namespace coworkerd
