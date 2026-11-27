@@ -15,14 +15,16 @@ by `durableObjectBytes` (10 GiB by default).
 
 ### Threaded database capacity
 
-The threaded database test build keeps each open database on its own home. At the default
-home count, one durable process handled four busy databases at once. Two processes handled
-eight when the database keys were distributed across both. Each process receives a share
-of the node's memory budget, and a smaller resource budget can lower capacity.
+A Linux shard owner with [`durableObjects.threadedStorage`](install.md#durable-objects-and-local-storage)
+enabled serves both D1 bindings and HTTP SQL. Each open database has its own isolate copy and
+home. At the default home count, one durable process handled four busy databases at once.
+Two processes handled eight when the database keys were distributed across both. Each process
+receives a share of the node's memory budget, and a smaller resource budget can lower capacity.
 
 When a new database needs room, the process releases its least recently used eligible idle
 database. An active call, queued call, or pending storage confirmation keeps its database
 resident. A later call reopens the released database with its confirmed data.
+An eligible idle database also releases its copy about 10 seconds after its last request.
 An explicit admission refusal returns HTTP `503 OVERLOADED` with `dispatched: false`
 and `retryable: true`.
 [Admission measurements and commands](../database-home-benchmark.md#database-admission-at-the-ceiling)
@@ -195,8 +197,7 @@ last statement for the SQL interface. The ledger INSERT remains a separate array
 Migration files must not contain transaction-control statements (`BEGIN`, `COMMIT`, `SAVEPOINT`); trigger
 `BEGIN … END` bodies are supported. The full JSON-encoded request, including escapes and the ledger statement, must be
 at most **1 MiB** (1,048,576 bytes). An oversized file is rejected locally before its execution request is sent; split it into smaller files.
-One file consumes one database-object event. The node's default CPU configuration is 200 ms, but enforcement of that
-budget for this internal SQL event is **not verified** by this change; do not treat 200 ms as a verified migration limit.
+One file consumes one database-object event. A threaded owner applies one 30-second SQL deadline to the file.
 
 On a timeout or `503 RESULT_UNCERTAIN`, the CLI does **not resend the file**. It reads the ledger: if the filename is
 present it continues, otherwise it stops with instructions to run `apply` again. If the ledger read also fails it stops.
@@ -336,19 +337,41 @@ be used again in this release.
 
 ## 10. Failure and consistency
 
-Each database event has a cumulative native SQL CPU budget of 200 ms by default and an 800 ms active SQL wall-time fallback. A request, alarm, delivered WebSocket message, call into an RPC target handed out by the object, or message on an outbound WebSocket accepted by the object starts a fresh budget. Statements share that budget across awaits; uninterrupted synchronous execution does not replace it. Configure `processPool.sqlCpuLimitMs` and `processPool.sqlWallLimitMs` in the [node configuration](install.md). Each native compilation or row step is sampled randomly with probability 1/16. A sampled segment without a SQLite progress callback contributes its first 250 microseconds of CPU multiplied by 16, plus any excess at its actual value. Segments invoking the progress callback are measured directly.
+### SQL deadlines
 
-A statement that needs more than the budget cannot finish. Building an index on a large table, changing or inserting hundreds of thousands of rows in one statement, or a long analytical scan is refused with `SQL_LIMIT_EXCEEDED`, and how much work fits in the budget depends on the node's CPU. Split such work into statements that each do a bounded amount, in separate requests (rows by key range; create an index before loading a large table rather than after). On nodes where waiting neighbours are acceptable, for example a cluster with a single tenant, raise `processPool.sqlCpuLimitMs` and `processPool.sqlWallLimitMs`: while one statement runs, every other object in the same durable process waits. Keep both below `processPool.stuckTimeoutMs` (3000 ms by default), or the watchdog ends the process before the limit does.
+On a threaded owner, an HTTP SQL query or D1 query has a 30-second wall deadline, including
+placement, queueing, storage recovery and SQL work. A whole batch shares one deadline. A deadline
+returns HTTP `503 SQL_LIMIT_EXCEEDED` or D1 `D1_ERROR: SQL_LIMIT_EXCEEDED: …`. A full HTTP SQL
+disconnect also cancels the running statement. In either case, the transaction rolls back and the next
+query can use the same open database. WAL confirmation runs under its own timeout after SQL execution.
 
-Reaching a limit ends the current database object and returns `503 SQL_LIMIT_EXCEEDED`, naming the cause and configured limit. A D1 binding receives `D1_ERROR: SQL_LIMIT_EXCEEDED: …`. A batch, one ingest segment, or one migration file including its `d1_migrations` row fails as a whole even if the interrupted statement is a read. Earlier confirmed segments and files remain. Concurrent `STORAGE_UNAVAILABLE` and `RESULT_UNCERTAIN` retain their confirmation meaning and priority. Other database objects and the shared durable process remain available.
+On an upstream owner, each database event has a cumulative native SQL CPU budget of 200 ms by default
+and an 800 ms active SQL wall-time fallback. Statements in the event share that budget across awaits.
+Configure `processPool.sqlCpuLimitMs` and `processPool.sqlWallLimitMs` in the [node configuration](install.md).
+Each native compilation or row step is sampled randomly with probability 1/16. A sampled segment without
+a SQLite progress callback contributes its first 250 microseconds of CPU multiplied by 16, plus any
+excess at its actual value. Segments invoking the progress callback are measured directly.
+
+How much work fits in a budget depends on the node's CPU. Split large updates and scans into bounded
+requests, for example by key range. On an upstream owner, a running statement blocks the shared event
+loop. Keep any raised upstream SQL limits below `processPool.stuckTimeoutMs` (3000 ms by default).
+
+An upstream SQL limit ends the current database object and returns `503 SQL_LIMIT_EXCEEDED`, naming
+the cause and configured limit. A batch, one ingest segment, or one migration file including its
+`d1_migrations` row fails as a whole. Earlier confirmed segments and files remain. Concurrent
+`STORAGE_UNAVAILABLE` and `RESULT_UNCERTAIN` retain their confirmation meaning and priority.
 
 For a tenant's own `ctx.storage.sql`, an interrupted write rolls back the transaction even if caught. A read error escaping `transactionSync` rolls back; if caught, earlier complete statements may commit, while later SQL in the event is refused. See [Durable Objects](durable-objects.md). A smaller Worker CPU allowance does not replace the SQL budget inside a native statement. With a 50 ms Worker CPU allowance and the default 200 ms SQL budget, a long SQL test returned `503 CPU_LIMIT_EXCEEDED` after about 220 ms; the Worker allowance took effect when native execution returned.
 
-Interruption is cooperative. A single costly function or blocking I/O without SQLite progress callbacks can exceed the SQL limit. A sequence of callback-free segments each taking more than 250 microseconds is undercounted by the sampled estimate, increasingly so as the segments become more expensive. The process watchdog (3000 ms by default) remains the fallback.
+SQL interruption is cooperative. A costly function or blocking I/O without SQLite progress callbacks
+can exceed the SQL limit. On upstream owners, a sequence of callback-free segments each taking more
+than 250 microseconds is undercounted by the sampled estimate. The process watchdog is the fallback.
+
+### Storage and transaction limits
 
 Each SQL HTTP request is one event of the database object; statements in a batch share that event's limits. The same durability and estimated tenant storage quota apply as to other objects. A failed `exec()` keeps earlier successful lines; `batch()` rolls back on a statement failure. SQL errors use D1 error prefixes. HTTP SQL preserves the node's status and body, including `success:false` with status 200 and platform errors such as `STORAGE_UNAVAILABLE`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED`. It tries another member only when connection establishment failed or the node returned a refusal known to precede execution ([errors](errors.md), section 4). Losing the reply after connecting returns `503 RESULT_UNCERTAIN` without replaying the request. A confirmation failure can leave changes readable locally until the object is reopened and repaired: do not blindly repeat a non-idempotent statement. Simultaneous loss of the owner and all confirming peers may lose the unuploaded tail. Deletions and other transactions that do not grow the database remain permitted over a byte limit. No read replicas or Sessions API provide another consistency mode.
 
-On threaded database homes, currently enabled in the test executable, one transaction must fit in one
+On threaded database homes, one transaction must fit in one
 recoverable WAL record. With default node settings, the encoded record can hold 67,104,768 bytes.
 The frame budget reserves the record's identity fields, length fields, checksum and WAL generation
 header. Each SQLite frame counts its page and its 24-byte frame header. Lowering
@@ -375,13 +398,18 @@ current transaction. A D1 batch rejects with `D1_ERROR: SQL_SPILL_LIMIT_EXCEEDED
 all its writes. A failing `exec()` line keeps its earlier confirmed lines. The same open database
 can serve subsequent requests. The one-record transaction limit above also applies.
 
-Each threaded platform database in the test executable has a 32 MiB SQLite heap budget. It covers
+Each threaded platform database has a 32 MiB SQLite heap budget. It covers
 SQLite allocations for the open connection, including statements and page and sort buffers. Growing
 a buffer charges its increase in size. SQLite returns the charge for freed buffers. A statement that
 exceeds the budget returns HTTP `422 SQL_MEMORY_LIMIT_EXCEEDED` or `D1_ERROR: SQL_MEMORY_LIMIT_EXCEEDED: …`.
 The current transaction rolls back and the next query can use the same open connection.
 `batch()` rolls back all its statements, and `exec()` keeps its earlier confirmed lines.
 The SQL value size and reply size limits also apply.
+
+Open databases also charge their SQLite heap to the durable process's shared memory budget in
+1 MiB steps. If a transaction cannot obtain the next reservation, it rolls back and returns
+HTTP `503 OVERLOADED` or D1 `D1_ERROR: OVERLOADED: …`. Retry an atomic query or batch when capacity
+returns. For `exec()`, earlier confirmed lines remain committed.
 
 Database names follow `[a-z0-9][a-z0-9-]{0,62}`: hyphens and a leading digit are supported. A malformed entry in the deployment's database or namespace table is skipped independently; `deployment.invalidNamespaceEntryCount` at the node's state endpoint counts skipped entries.
 

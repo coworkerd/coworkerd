@@ -105,8 +105,8 @@ See the [original queue profiles](https://github.com/coworkerd/coworkerd/pull/43
 The cluster suite uses the compiled mailbox defaults. Its database test runs separate bursts of
 128 public HTTP SQL requests and 128
 Worker requests through a D1 binding from a peer of the database owner. Each request selects the
-same seeded row by primary key in one threaded database. The test uses the database placement
-executable and checks all results and the owner process generation.
+same seeded row by primary key in one threaded database. The test checks all results and the
+owner process generation.
 [Cluster test](../tests/cluster/README.md#threaded-sql-default-mailbox).
 
 The node's default root admission threshold of 128 counts both active roots and nested calls on
@@ -332,10 +332,10 @@ allocations. A SQL transaction that cannot get the next step rolls back and retu
 HTTP 422 `SQL_MEMORY_LIMIT_EXCEEDED`. Opening, recovery and maintenance account for their heap
 as well. SQLite returns whole steps as its live heap shrinks and releases the remaining step on close.
 
-The threaded mapping is enabled by the cluster test executable. Production activation
-depends on the database deadline, cancellation, WAL, temporary-file and SQLite memory
-bounds required in [#81](https://github.com/coworkerd/coworkerd/issues/81). The upstream
-backend continues to serve databases during this stage.
+A release node uses the threaded database mapping when it owns the shard and explicitly enables
+`durableObjects.threadedStorage`. An upstream owner serves its database through the runtime.
+[Release acceptance (#81)](https://github.com/coworkerd/coworkerd/issues/81) ·
+[Database guide](guide/databases.md#threaded-database-capacity)
 
 ### Databases
 
@@ -511,7 +511,7 @@ Preserve local filesystem bounds and declare
 any native operation without a proven interruption path a release blocker for that execution path.
 [Existing database API and error contract](guide/databases.md).
 
-The threaded object database test path starts one 30-second monotonic deadline at the HTTP SQL
+The threaded database path starts one 30-second monotonic deadline at the HTTP SQL
 handler or D1 binding dispatch. Nodes forward the time remaining. Time spent receiving the HTTP
 body, waiting for placement or storage recovery, preparing and stepping SQLite, and encoding
 results counts against the same deadline. Every statement in a batch sees that deadline. The
@@ -531,8 +531,7 @@ An expected SQLite interruption or a failed deadline or disconnect check before 
 the current transaction and removes its spilled WAL tail. A queued HTTP or D1 query can read the last
 confirmed rows on the same open database. Storage failures still follow the existing storage error
 handling. SQLite functions and file operations without progress callbacks remain release blockers
-wherever they can outlast the deadline. The database placement fixture selects this behavior in the
-test build.
+wherever they can outlast the deadline.
 
 ### Decisions taken in review
 

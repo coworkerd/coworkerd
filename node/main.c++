@@ -2509,7 +2509,7 @@ public:
     auto owner = desiredState.state().namespaceOwner(namespaceId);
     if (!owner) return std::nullopt;
     if (owner->isDatabase()) {
-      if (owner->active() && serverConfig.processPool.threadedDurableStorage && platformDefinitions.threadedDatabasesForTest)
+      if (owner->active() && serverConfig.processPool.threadedDurableStorage)
         owner->platformClass = coworkerd::PlatformClassRef{platformDefinitions.product.name, "SqlDatabase"};
     } else if (!owner->platformClass && !platformDefinitions.fixtureClasses.empty()) {
       owner->platformClass = platformDefinitions.fixtureClassFor(*owner);
@@ -7682,10 +7682,6 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   auto owner = server.namespaceOwner(alarm.namespaceId);
   KJ_REQUIRE(owner.has_value());
   const auto threaded = server.placementConfig().processPool.threadedDurableStorage;
-  if (threaded && owner->isDatabase() && !owner->platformClass) {
-    co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
-        "NOT_SUPPORTED: database objects do not run on the threaded durable host"};
-  }
   DurableDispatch::Request request;
   request.workerId = owner->isDatabase()
       ? owner->tenant + "/" + coworkerd::DATABASE_WORKER_NAME

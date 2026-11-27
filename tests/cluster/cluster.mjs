@@ -205,6 +205,7 @@ export class Cluster {
         volumes: [{ type: 'bind', source: config, target, read_only: true }, ...(this.nodeVolumes?.(node) ?? [])],
       };
       if (this.budgetLifetime) overrides[node].environment.COWORKERD_LEASE_TTL_MS = String(this.budgetLifetime.leaseMs);
+      // The database benchmark can run archived product binaries that require the placement fixture.
       if (this.databaseFixtureNodes.has(node)) {
         overrides[node].environment.COWORKERD_TEST_THREADED_DATABASES = '1';
         if (!this.databaseAlarmFixture) {
