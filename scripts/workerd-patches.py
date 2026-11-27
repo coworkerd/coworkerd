@@ -316,6 +316,8 @@ def allowed_path(name, path):
                           name == '0122-order-threaded-wal-home-teardown.patch' and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
+                          name == '0123-confirm-threaded-storage-close-before-reopen.patch' and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0130-ordinary-fatal-attribution.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',

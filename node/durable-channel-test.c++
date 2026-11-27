@@ -1802,6 +1802,18 @@ struct DurableLogChannelTest {
     clock.advanceTo(clock.now() + 10 * kj::MILLISECONDS);
     KJ_REQUIRE(lost.poll(io.waitScope) && !lost.wait(io.waitScope),
         "EOF without process exit is not proof of close");
+
+    // Model a ready image and replacement generation. Even then, EOF cannot
+    // authorize dispatch while the process pool still tracks the old owner.
+    object.state = DurableLog::ObjectState::LOCAL;
+    const int replacement = log.openChannel("d0-8", 8);
+    KJ_REQUIRE(replacement >= 0);
+    KJ_DEFER(::close(replacement));
+    log.onMessage(log.channels.at("d0-8"), hello(8));
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 8).code == "DO_UNAVAILABLE");
+    log.closeChannel("d0-7");  // Called by the process pool after reaping the generation.
+    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 8).ready,
+        "generation exit can release the old image without a CLOSED record");
   }
 
   // The restored holder's reseal picks and builds its segments as it did on the event loop, byte for byte. The

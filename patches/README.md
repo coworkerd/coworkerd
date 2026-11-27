@@ -60,6 +60,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0122 cancels home tasks, destroys resident roots, and cancels facet drains queued by those roots.
   The actor index and WAL Home stay live through actor cleanup, shipper deregistration, and SQLite close.
   It changes only the threaded server and its tests.
+  Patch 0123 reserves a durable storage identity before its WAL scan. A replacement tree waits for
+  the previous root and facets to confirm SQLite close. A BUSY close keeps that identity fenced in
+  the child, and the node's existing generation-exit check protects the next child.
   Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
   quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and

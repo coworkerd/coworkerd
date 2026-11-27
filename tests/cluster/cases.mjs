@@ -2587,6 +2587,17 @@ async function durableAdmissionRefusal(cluster) {
     assert.deepEqual(json(await write(), 200, `${label} retried once`), { count: index + 1, attempts: index + 1 });
   }
   assert.deepEqual(json(await read(objectOwner, target), 200, 'target after retries'), { count: 4, attempts: 4 });
+  await writeFile(advance, '360000');
+  await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
+  await eventually('the written object releases its resident root', async () => {
+    const idle = await durableGeneration(cluster, objectOwner);
+    assert.equal(idle.generation, initial.generation);
+    assert.equal(idle.lifecycle.durableAdmission.residentRoots, 0);
+  });
+  for (const reply of await Promise.all([read(objectOwner, target), read(objectOwner, target)])) {
+    assert.deepEqual(json(reply, 200, 'target after idle reopen'), { count: 4, attempts: 0 });
+  }
+  assert.equal((await durableGeneration(cluster, objectOwner)).pid, initial.pid);
 
   const sql = (sql, timeout = 10000) => request(cluster.urls.apiserver, `${db.path}/query`, {
     method: 'POST', token: tenant.token, body: { sql }, timeout,
