@@ -54,6 +54,12 @@ after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` eac
 did not start and that one retry applies it once. A Durable Object exception after writing and a SQL
 constraint failure retain their ordinary error results.
 
+### Single-node waiting-call baseline
+
+The [waiting-call baseline](../../docs/waiting-call-capacity.md) uses ingress placement and a fixed
+local upstream. It records overlapping two-second HTTP waits, completed replies, and per-process
+RSS, threads and descriptors before, during and after each batch.
+
 ### Stateless Worker ingress placement
 
 ```sh
