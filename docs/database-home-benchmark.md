@@ -507,17 +507,20 @@ node tests/cluster/run.mjs "$KERNEL_DIR" durable-threaded-database-admission-mix
 
 ## Reproduce
 
-Run from a checkout containing the benchmark. Make two checkouts at the exact daemon source commits above. On
-Linux, build the daemon and launcher targets in each checkout as described in [Contributing](../CONTRIBUTING.md).
+Use the archived driver to reproduce the original two builds. Make two checkouts at the exact daemon
+source commits above. On Linux, build the daemon and launcher targets in each checkout as described
+in [Contributing](../CONTRIBUTING.md).
 On a Mac, build those targets inside an ARM64 Linux container. Use a release build and verification inputs from
 each checkout. The benchmark uses the checked-in Docker Compose topology's single-node profile.
 
 ```sh
-# Run from the benchmark checkout. Set OBJECT and NATIVE to absolute paths.
+# Set OBJECT and NATIVE to absolute paths.
+git worktree add --detach ../database-benchmark-driver 6f0c75fa55447c1a519a45de4a6d4a018f24254b
+driver=$(cd ../database-benchmark-driver && pwd)
 for side in object native; do
   case "$side" in object) checkout="$OBJECT" ;; native) checkout="$NATIVE" ;; esac
   kernel=$(cd "$checkout" && python3 scripts/fetch-kernel.py)
-  COWORKERD_CLUSTER_BIN_DIR="$checkout/build" node tests/cluster/database-home-benchmark.mjs \
+  COWORKERD_CLUSTER_BIN_DIR="$checkout/build" node "$driver/tests/cluster/database-home-benchmark.mjs" \
     "$side" "$checkout" "$kernel" "$PWD/database-home-$side.jsonl"
 done
 ```

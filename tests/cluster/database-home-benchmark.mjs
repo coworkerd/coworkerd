@@ -59,7 +59,7 @@ const kernel = resolve(kernelArg);
 const output = resolve(outputArg);
 const binaries = resolve(process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(checkout, 'build'));
 // The test-only database mapping is part of the product checkout being measured.
-const BenchmarkCluster = idleWindow
+const BenchmarkCluster = idleWindow || threadedSqlThroughput
   ? (await import(pathToFileURL(join(checkout, 'tests/cluster/cluster.mjs')).href)).Cluster
   : Cluster;
 const settings = {
