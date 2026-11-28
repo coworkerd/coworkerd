@@ -84,6 +84,11 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0186 clears the window when stateless initialization completes, before the slot is published
   to request threads and the lifecycle sampler. It changes the threaded server, its test, and
   `src/workerd/threaded/isolate-busy.h`.
+  Patch 0200 charges ordinary calls against their process's memory and descriptor budgets while
+  they have a native call loop. It allocates the loop before acknowledging dispatch and releases
+  the charge after the connection and its background tasks settle. It adds a versioned ordinary
+  preface on the existing private socket with structured resource refusals. The patch changes the
+  threaded server, its private protocol header and its test.
   Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
   quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and
