@@ -197,8 +197,8 @@ struct EgressConfig {
   std::string defaultPolicy = "public";
   std::vector<uint16_t> publicPorts = {80, 443};
   uint32_t timeoutMs = 30000;
-  uint32_t concurrency = 32;
-  uint32_t requestsPerSecond = 100;
+  uint32_t concurrency = 0;
+  uint32_t requestsPerSecond = 0;
   uint32_t dnsCacheMs = 10000;
   std::string caFile;
   bool systemTrustStore = true;

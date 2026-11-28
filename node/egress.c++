@@ -602,8 +602,9 @@ struct EgressService::Impl {
   // ---- Limits ----
   std::string limit(Counts& counts, const TenantRules* rules) {
     const uint32_t concurrency = rules && rules->concurrency ? rules->concurrency : config.concurrency;
+    if (concurrency > 0 && counts.inFlight >= concurrency) return "concurrency-limit";
     const uint32_t perSecond = rules && rules->requestsPerSecond ? rules->requestsPerSecond : config.requestsPerSecond;
-    if (counts.inFlight >= concurrency) return "concurrency-limit";
+    if (perSecond == 0) return "";
     const double now = monotonicTimeMs();
     if (counts.tokens < 0) counts.tokens = perSecond;
     else counts.tokens = std::min<double>(perSecond, counts.tokens + (now - counts.refilledAtMs) * perSecond / 1000.0);

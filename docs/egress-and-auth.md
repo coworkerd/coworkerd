@@ -37,7 +37,10 @@ A tenant isolate's global outbound -- where its `fetch()` goes -- is an entry po
 
 ### Limits and metering
 
-- Per tenant and node: `egress.concurrency` requests in flight (32) and `egress.requestsPerSecond` (100, a token bucket); beyond them `EGRESS_DENIED: concurrency-limit` or `rate-limit`, without affecting other tenants. A request counts as in flight until its body or WebSocket session ends.
+- `egress.concurrency` limits requests in flight per tenant and node. A request counts as in flight until its body or WebSocket session ends.
+  `egress.requestsPerSecond` limits request starts per tenant and node with a token bucket. Both are off at their default of `0`.
+  A positive value enables that limit independently and exceeding it returns `EGRESS_DENIED: concurrency-limit` or `EGRESS_DENIED: rate-limit`.
+  In `egress.tenants[]`, a positive value overrides the corresponding node setting, while an omitted or zero value inherits it.
 - `egress.timeoutMs` (30 s) bounds resolution, connecting, TLS and the response headers together, and then each read of either body; WebSocket messages have no timeout.
 - The bytes of request and response bodies, and of WebSocket messages, count into the tenant's usage as egress bytes.
 - Every request has an `[egress]` line in the node's log -- tenant, Worker, host, port, address, result, rule, status, bytes, duration -- outside the tenant's log; refusals for concurrency and rate are logged at most once per second per tenant, while the counters miss none.
