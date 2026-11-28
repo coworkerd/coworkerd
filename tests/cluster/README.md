@@ -86,8 +86,8 @@ node tests/cluster/durable-idle-measure.mjs "$kernel" build/durable-residency.js
 The driver starts one durable process with the default home policy. It gives Workers of
 different tenants one object apiece, keeps each accepted object busy through a tracked
 background operation, and reads it periodically to check that its copy stays resident.
-It records the first pre-execution capacity refusal, the exhausted resource and the
-number of homes serving when it occurred.
+It records the admitted and refused counts in the first batch with a capacity refusal,
+the pre-execution refusal replies and the exhausted resource.
 
 ```sh
 node tests/cluster/durable-home-capacity-measure.mjs "$kernel" build/worker-homes.jsonl
@@ -239,8 +239,8 @@ displaced database and reads its previously confirmed row. It then holds all thr
 checks the capacity refusal and recovery. A test fixture holds the final reservation past the
 one-second deadline so the case also verifies that the refusal is counted and the home is reusable.
 
-`durable-threaded-database-admission-mixed` fills the four default homes and runs a serial SQL scan
-while tenant objects from six definitions compete for the released homes in the same process.
+`durable-threaded-database-admission-mixed` configures four homes and runs a serial SQL scan while
+tenant objects from six definitions compete for the released homes in the same process.
 
 `durable-threaded-database-placement` uses the release daemon on the threaded owner and the upstream
 database backend on the other nodes. It checks HTTP SQL and D1 in both directions, batch rollback, two
