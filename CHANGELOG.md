@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Behavior change.** Per-tenant outbound concurrency and rate limits are off by default. Set `egress.concurrency` to `32` and `egress.requestsPerSecond` to `100` to keep the previous defaults. Existing explicit settings keep their values.
+
 - **Diagnostic and profiling renames.** Update environment settings to use the new names. The old names are removed.
 
   | Old environment variable | New environment variable |

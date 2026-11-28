@@ -87,6 +87,9 @@ node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-capaci
 
 Use a new output path for each run. The fixture removes its disposable cluster and upstream.
 
+Run `node tests/cluster/run.mjs "$kernel" egress-limits` to check a private HTTP upstream under the
+default egress settings, a concurrency limit on its own and a request rate limit on its own.
+
 ### Stateless Worker ingress placement
 
 ```sh

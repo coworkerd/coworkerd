@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { cases, durableGatedCases, fatalAttribution, webSocketCases } from './cases.mjs';
 import { Cluster } from './cluster.mjs';
+import { configureEgressLimits, egressLimits } from './egress-limits.mjs';
 import { ingressPlacementDefault, ingressPlacementEnabled, ingressPlacementSaturation, ingressPlacementAllBusy,
   ingressPlacementLiveSaturation } from './ingress-placement.mjs';
 import { isolateBusy } from './isolate-busy.mjs';
@@ -101,6 +102,7 @@ function defaultSuites() {
         }) : undefined,
       },
     })),
+    { selected: [['egress-limits', egressLimits]], options: { configureNode: configureEgressLimits } },
     ...Object.entries(leaseCases).map(([name, test]) => ({
       selected: [[name, test]], options: {
         configureNode: requestLeaseNode,

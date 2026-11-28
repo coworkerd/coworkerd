@@ -527,8 +527,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   KJ_REQUIRE(e.mode == "on" || e.mode == "off", "egress.mode must be on or off", e.mode.c_str());
   KJ_REQUIRE(e.defaultPolicy == "public" || e.defaultPolicy == "deny", "egress.defaultPolicy must be public or deny",
       e.defaultPolicy.c_str());
-  KJ_REQUIRE(e.timeoutMs > 0 && e.concurrency > 0 && e.requestsPerSecond > 0,
-      "egress.timeoutMs, egress.concurrency and egress.requestsPerSecond must be positive");
+  KJ_REQUIRE(e.timeoutMs > 0, "egress.timeoutMs must be positive");
   // The peer listener's authentication.
   result.peerAuth = {root.getPeerAuth().getKeyFile().cStr(), root.getPeerAuth().getWindowMs()};
   KJ_REQUIRE(result.peerAuth.windowMs >= 1000 && result.peerAuth.windowMs <= 600000, "peerAuth.windowMs must be 1000 to 600000");

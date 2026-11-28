@@ -550,8 +550,9 @@ struct ServerConfig {
     # Each request: until the destination's response headers arrive, and then between two reads of either body.
     timeoutMs @3 :UInt32 = 30000;
     # Per tenant and node: requests in flight, and requests per second (a token bucket of that size).
-    concurrency @4 :UInt32 = 32;
-    requestsPerSecond @5 :UInt32 = 100;
+    # 0 disables the corresponding limit.
+    concurrency @4 :UInt32 = 0;
+    requestsPerSecond @5 :UInt32 = 0;
     # How long a resolved name is reused (the system resolver reports no TTL; this is the upper bound). 0: never.
     dnsCacheMs @6 :UInt32 = 10000;
     # PEM certificates trusted besides the system's (systemTrustStore) for HTTPS destinations.
