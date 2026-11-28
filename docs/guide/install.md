@@ -471,7 +471,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `management.token` | required | The management token (see section 8); the environment variable `COWORKERD_MANAGEMENT_TOKEN` takes precedence. A node without one refuses to start |
 | `management.allowWithoutToken` | `false` | `true` lets a development node start without a token: its management endpoints are then open to whoever reaches its ingress or peer port, and it warns at startup |
 | `processPool.count` | `1` | The number of ordinary workerd processes |
-| `processPool.ordinaryServer` | `threaded` | C++ backend for ordinary and quarantine processes: HTTP, JS RPC, outbound calls, logs, bindings, object stubs, CPU and memory limits, eviction and generation draining. `upstream` is refused for this setting. Durable processes use the Rust backend |
+| `processPool.ordinaryServer` | `threaded` | C++ backend for ordinary and quarantine processes: HTTP, JS RPC, outbound calls, logs, bindings, object stubs, CPU and memory limits, eviction and generation draining. `upstream` is refused for this setting. Durable processes also run on the threaded server |
 | `processPool.threadedExecutable` | `coworkerd-threaded` beside `workerdPath` | Executable used when the ordinary backend is `threaded`. Build it with `//src/workerd/threaded:coworkerd-threaded` in the matching workerd fork |
 | `processPool.threadedMemoryBytes` | `0` | Native process memory budget in bytes. `0` divides 80% of the node's actual memory budget among ordinary, quarantine and durable processes plus one replacement generation. An explicit value cannot exceed this share |
 | `processPool.threadedResidentLimit` | `1840` | Maximum resident Worker versions in a native process, from `1` to `1840` for this shared pointer-space build. Memory and address budgets can refuse earlier. Idle versions are evicted before a new version is admitted |
@@ -610,12 +610,11 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 
 ### Durable Objects and local storage
 
-`durableObjects.processes` defaults to `1` (`d0`), accepts `0`–`64`, and is independent of `processPool.count`. At `0` a node still receives and forwards object / database calls but acquires no shards. Its membership advertises that count. The durable settings below belong in the JSON configuration (`COWORKERD_CONFIG` uses that file directly).
+`durableObjects.processes` defaults to `1` (`d0`), accepts `0`–`64`, and is independent of `processPool.count`. At `0` a node still receives and forwards object / database calls but acquires no shards. Its membership advertises that count. Durable slots run the threaded server on Linux with object-store membership. The same server runs Worker object calls and [HTTP SQL and D1](databases.md#threaded-database-capacity) on the shard owner. The durable settings below belong in the JSON configuration (`COWORKERD_CONFIG` uses that file directly).
 
 | `durableObjects` key | Default | Meaning |
 | --- | --- | --- |
 | `processes` | `1` | Number of durable workerd slots, not per tenant |
-| `threadedStorage` | `false` | Experimental Linux opt-in with object-store membership. Serves Worker Durable Object HTTP requests and JavaScript RPC. When this node owns a database shard, it serves [HTTP SQL and D1](databases.md#threaded-database-capacity) on the threaded backend. Persistent facet cloning is refused as `NOT_SUPPORTED`. Keep the default upstream backend for product deployments. |
 | `peers` | `2` | Reachable peers that hold committed frames in memory; at most 8; fewer reachable peers reduce K; an empty selected list uses a local flush, but an entirely unreachable nonempty list waits / times out |
 | `confirmTimeoutMs` | `5000` | Confirmation deadline; range 100–29000 ms |
 | `recoverTimeoutMs` | `30000` | How long an object request waits for recovery; at least 1000 ms |
@@ -633,12 +632,11 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | `rebuildConcurrency` | `4` | Concurrent rebuilds doing work per node, range 1–64. Foreground and alarm recoveries share the slots. Collecting evidence or waiting for a holder releases the rebuild slot |
 | `alarmDiscoveryIntervalMs` | `60000` | How often a node with durable processes looks for shards of stopped members that have pending alarms (it also looks at each membership change); at least 200 |
 | `alarmTakeoverConcurrency` | `4` | Such shards a node takes over at once; range 1–4 |
-| `alarmFireConcurrency` | `2` | Dispatching or executing background alarms per upstream node; range 1–512. Queued cold rebuilds wait separately, and ordinary admission remains in force |
 | `versionDrainTimeoutMs` | `30000` | Time from the first refused request for the new definition to a targeted reset of the old threaded tree. The node can replace an unresponsive durable process after a further `confirmTimeoutMs` |
 | `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
 | `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
 
-See [threaded object admission](durable-objects.md#threaded-object-admission) for the experimental
+See [threaded object admission](durable-objects.md#threaded-object-admission) for the
 backend's per-object waiting limits.
 
 A single encoded WAL record is limited to `min(64 MiB, 256 MiB, peerBufferBytes, UInt32 message limit) - 4 KiB`

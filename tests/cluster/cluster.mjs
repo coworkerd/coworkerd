@@ -56,10 +56,10 @@ export async function eventually(description, probe, { timeout = 30000, interval
 
 export class Cluster {
   constructor(directory, kernel, signal, {
-    holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
+    holdPeerAcks = false, durableFixtureNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
     budgetLifetime, nodeEnvironment, nodeVolumes, nodeComposeResources, binariesDirectory, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
-    databaseFixtureNodes = [], databaseAlarmFixture = false, alarmWallMs, previousProduct, previousKernel,
+    databaseFixtureNodes = [], databaseAlarmFixture = false, alarmWallMs,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -81,7 +81,7 @@ export class Cluster {
     this.fatalControl = fatalTestBinary ? join(directory, 'fatal-control') : null;
     this.durableLifecycleGate = controlDurableLifecycle ? join(directory, 'durable-lifecycle') : null;
     this.recoveryRelayGate = delayRecoveryPeers ? join(directory, 'recovery-relay') : null;
-    this.threadedNodes = new Set(threadedNodes);
+    this.durableFixtureNodes = new Set(durableFixtureNodes);
     this.membership = membership;
     this.confirmTimeoutMs = confirmTimeoutMs;
     this.versionDrainTimeoutMs = versionDrainTimeoutMs;
@@ -98,8 +98,6 @@ export class Cluster {
     this.databaseFixtureNodes = new Set(databaseFixtureNodes);
     this.databaseAlarmFixture = databaseAlarmFixture;
     this.alarmWallMs = alarmWallMs;
-    this.previousProduct = previousProduct;
-    this.previousKernel = previousKernel;
   }
 
   async command(program, args, { cwd = this.directory, token, env, cleanup = false, timeout = 60000,
@@ -186,9 +184,9 @@ export class Cluster {
         ...(node === nodes[0] && this.webSocketsPerNode ? { ingress: { webSocketsPerNode: this.webSocketsPerNode } } : {}),
         ...(this.fatalControl ? { quarantineProcesses: 1 } : {}),
         membership: this.membership,
-        ...(this.threadedNodes.has(node) ? {
+        ...(this.durableFixtureNodes.has(node) ? {
           durableObjects: {
-            threadedStorage: true, checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs,
+            checkpointBytes: 65536, confirmTimeoutMs: this.confirmTimeoutMs,
             versionDrainTimeoutMs: this.versionDrainTimeoutMs,
           },
           rotation: { drainTimeoutMs: 3000, termGraceMs: 1000 },
@@ -225,21 +223,6 @@ export class Cluster {
         overrides[node].volumes.push({ type: 'bind', source: join(root, 'tests/cluster/database-alarm-fixture.js'),
           target, read_only: true });
       }
-      if (node === nodes[1] && this.previousProduct) {
-        for (const [file, source] of [
-          ['bin/coworkerd', join(this.previousProduct, 'build/coworkerd')],
-          ['runtime/runtime.js', join(this.previousProduct, 'runtime/runtime.js')],
-        ]) {
-          overrides[node].volumes.push({ type: 'bind', source, target: `/opt/coworkerd/${file}`, read_only: true });
-        }
-        if (this.previousKernel) {
-          for (const file of ['workerd', 'coworkerd-threaded', 'coworkerd-syscalls-startup.txt', 'coworkerd-syscalls-steady.txt']) {
-            const source = file.endsWith('.txt')
-              ? join(this.previousKernel, 'allowlist', file) : join(this.previousKernel, file);
-            overrides[node].volumes.push({ type: 'bind', source, target: `/opt/coworkerd/bin/${file}`, read_only: true });
-          }
-        }
-      }
       if (platformSource) {
         const directory = join(this.directory, `${node}-platform`);
         const target = '/tmp/coworkerd-platform-test';
@@ -251,7 +234,7 @@ export class Cluster {
         overrides[node].environment.COWORKERD_PLATFORM_FIXTURE = `${target}/config.json`;
         overrides[node].volumes.push({ type: 'bind', source: directory, target, read_only: true });
       }
-      if (this.durableLifecycleGate && this.threadedNodes.has(node)) {
+      if (this.durableLifecycleGate && this.durableFixtureNodes.has(node)) {
         const gate = '/tmp/cluster-test-durable-lifecycle';
         overrides[node].environment.COWORKERD_DO_TEST_LIFECYCLE_DIR = gate;
         overrides[node].volumes.push({ type: 'bind', source: this.durableLifecycleGate, target: gate, read_only: true });
@@ -259,7 +242,7 @@ export class Cluster {
       if (this.peerAckGate) {
         const gate = '/tmp/cluster-test-peer-acks';
         overrides[node].environment.COWORKERD_HOLD_PEER_ACK_FOR_TEST = `${gate}/hold`;
-        if (this.threadedNodes.has(node)) {
+        if (this.durableFixtureNodes.has(node)) {
           overrides[node].environment.COWORKERD_CUT_DURABLE_CHANNEL_FOR_TEST = `${gate}/loss-${node}`;
         }
         overrides[node].volumes.push({ type: 'bind', source: this.peerAckGate, target: gate, read_only: true });

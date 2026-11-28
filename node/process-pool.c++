@@ -1798,11 +1798,6 @@ public:
       KJ_REQUIRE(*count && end && !*end && parsed <= 256, "invalid quarantine process override");
       this->config.quarantineProcesses = static_cast<uint32_t>(parsed);
     }
-    if (auto* count = std::getenv("COWORKERD_DURABLE_PROCESSES")) {
-      char* end = nullptr; auto parsed = std::strtoull(count, &end, 10);
-      KJ_REQUIRE(*count && end && !*end && parsed <= 64, "invalid durable process override");
-      this->config.durableProcesses = static_cast<uint32_t>(parsed);
-    }
     for (const auto& setting : {std::pair{"COWORKERD_IDLE_EVICT_MS", &this->config.idleEvictMs},
                                std::pair{"COWORKERD_TENANT_IN_FLIGHT_LIMIT", &this->config.tenantInFlightLimit},
                                std::pair{"COWORKERD_THREADED_RESIDENT_LIMIT", &this->config.threadedResidentLimit},
@@ -2081,8 +2076,7 @@ public:
   // the spawn goes ahead and the launcher reports the pair it was given.
   bool launchReady(Slot& s) {
     if (!sandbox.active || !sandbox.syscalls.active) return true;
-    const auto& program = !s.durable
-        ? config.threadedExecutable : executable;
+    const auto& program = config.threadedExecutable;
     const auto signature = statSignature(program);
     if (!signature.valid || !programDigest(signature).empty()) { s.digestWaitSince = 0; return true; }
     hasher.request(program, signature);
@@ -2478,9 +2472,9 @@ public:
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
     p->durableTestStorage = s.durable && config.threadedDurableTestStorage;
-    p->threaded = !s.durable || config.threadedDurable();
+    p->threaded = true;
     if (!s.durable) p->tenantExecution = makeTenantExecutionState(config.tenantInFlightLimit);
-    const std::string executable = p->threaded ? config.threadedExecutable : this->executable;
+    const auto& executable = config.threadedExecutable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
     p->cpuUsage = cpuUsage;
     p->timer = &provider.getTimer();
@@ -2595,7 +2589,7 @@ public:
     auto closeDurableLog = kj::defer([&durableLogFd] { if (durableLogFd >= 0) ::close(durableLogFd); });
     if (p->durable && !p->durableTestStorage && durableChannelOpen) {
       durableLogFd = raised(durableChannelOpen(p->id + "-" + std::to_string(p->generation),
-          p->threaded ? p->generation : 0));
+          p->generation));
       if (durableLogFd >= 0) {
         inherit(actions, durableLogFd, DURABLE_LOG_FD);
       }
@@ -2727,11 +2721,10 @@ public:
     childEnv.push_back(nullptr);
     // workerd's command line; with the sandbox, the launcher's options before it (PROTOCOL.md), and the
     // launcher itself executed through the descriptor this Server pinned at startup.
-    std::vector<std::string> args = {executable, "serve", "--experimental", "--socket-fd", "rpc=" + std::to_string(LISTEN_FD), path};
-    if (p->threaded) args = {executable, std::to_string(LISTEN_FD), sourceAddress,
+    std::vector<std::string> args = {executable, std::to_string(LISTEN_FD), sourceAddress,
         p->id + ":" + std::to_string(p->generation), std::to_string(config.inFlightLimit)};
     if (p->durableTestStorage) args.push_back("--durable-test-storage");
-    else if (p->durable && p->threaded) args.push_back("--durable-storage");
+    else if (p->durable) args.push_back("--durable-storage");
     std::string file = executable;
     bool thpResetViaLauncher = false;
 #ifdef __linux__

@@ -76,8 +76,7 @@ still needs room under the tenant's `maxWorkerCpuMs`, which defaults to 30,000 m
 ### Per-object admission mailbox
 
 The threaded durable child keeps one FIFO of waiting events per root object tree, shared by the
-root and its facets for events admitted through the child. When the experimental
-`durableObjects.threadedStorage` backend is enabled, a tree can hold **512 waiting events**
+root and its facets for events admitted through the child. A tree can hold **512 waiting events**
 (`mailboxDepth`) and **2 MiB of declared waiting bytes** (`mailboxBytes`). Waiting events remain
 subject to their original request deadlines. Admission refuses an event when the count is already
 full or its addition would exceed the byte limit.
@@ -318,9 +317,7 @@ log, confirmation, takeover, alarm and idle-release paths remain the common path
 ### Database placement
 
 The owner can map a database namespace to the `SqlDatabase` export of `coworkerd:platform`.
-Both backends use the same SQL module and address the stored data by the same namespace,
-object ID and data epoch. On the threaded host the platform copy key also binds the validated
-namespace and object IDs. Two open databases therefore have separate isolate copies even
+The platform SQL copy key binds the validated namespace and object IDs. Two open databases therefore have separate isolate copies even
 when their tenant, package and limits match. The product definition enables the experimental
 SQLite methods used by the SQL class. Tenant Workers keep their existing compatibility flags.
 
@@ -332,8 +329,7 @@ allocations. A SQL transaction that cannot get the next step rolls back and retu
 HTTP 422 `SQL_MEMORY_LIMIT_EXCEEDED`. Opening, recovery and maintenance account for their heap
 as well. SQLite returns whole steps as its live heap shrinks and releases the remaining step on close.
 
-A release node uses the threaded database mapping when it owns the shard and explicitly enables
-`durableObjects.threadedStorage`. An upstream owner serves its database through the runtime.
+The shard owner runs the threaded platform database class.
 [Release acceptance (#81)](https://github.com/coworkerd/coworkerd/issues/81) ·
 [Database guide](guide/databases.md#threaded-database-capacity)
 

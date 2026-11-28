@@ -428,7 +428,6 @@ INSERT INTO books VALUES (1, 'One');
 }
 
 async function threadedDatabaseAlarm(cluster) {
-  const [threaded] = cluster.nodes;
   const tenant = await cluster.tenant('sql-alarm', { durableObjectNamespaces: 64 });
   const databases = new Map();
   let revision = 0;
@@ -437,10 +436,9 @@ async function threadedDatabaseAlarm(cluster) {
     const created = await cluster.api(path, { method: 'POST', token: tenant.token });
     revision = Math.max(revision, created.revision);
     const [owner] = shardOwnerOrder(cluster.nodes, created.database.namespaceId, 0);
-    const backend = owner === threaded ? 'threaded' : 'upstream';
-    if (!databases.has(backend)) databases.set(backend, { ...created.database, path, owner });
+    if (!databases.has(owner)) databases.set(owner, { ...created.database, path, owner });
   }
-  assert.equal(databases.size, 2, 'both backends have a database');
+  assert.equal(databases.size, 2, 'two nodes own different databases');
   await eventually('each peer has the database catalog and full durable membership', async () => {
     await Promise.all(cluster.nodes.map(async node => {
       const state = await cluster.state(node);
@@ -450,7 +448,7 @@ async function threadedDatabaseAlarm(cluster) {
     }));
   });
 
-  await Promise.all([...databases].map(async ([backend, db]) => {
+  await Promise.all([...databases.values()].map(async db => {
     const query = body => cluster.api(`${db.path}/query`, { method: 'POST', token: tenant.token, body });
     const alarm = async () => {
       const result = await query({ alarmForTest: true });
@@ -459,10 +457,9 @@ async function threadedDatabaseAlarm(cluster) {
     };
     const stats = async () => (await cluster.state(db.owner)).durableLog.alarms;
     const process = await durableGeneration(cluster, db.owner);
-    if (backend === 'threaded') assert.equal(process.lifecycle.durableServer, 'threaded');
+    assert.equal(process.lifecycle.durableServer, 'threaded');
     const before = await stats();
-    assert.equal(before.fireConcurrency === 0, backend === 'threaded',
-      `${backend} owner uses the expected alarm dispatcher`);
+    assert.equal(before.fireConcurrency, 0, 'the owner uses the native alarm dispatcher');
     assert.equal(before.scheduled, 0);
     const seed = await query([
       { sql: 'CREATE TABLE records (value TEXT PRIMARY KEY)' },
@@ -470,12 +467,12 @@ async function threadedDatabaseAlarm(cluster) {
     ]);
     assert.deepEqual(seed.map(result => result.success), [true, true]);
     const at = await alarm();
-    assert.ok(Number.isSafeInteger(at) && at > Date.now(), `${backend} database holds a pending alarm`);
-    await eventually(`${backend} owner observes the scheduled alarm`, async () => {
+    assert.ok(Number.isSafeInteger(at) && at > Date.now(), `${db.owner} database holds a pending alarm`);
+    await eventually(`${db.owner} owner observes the scheduled alarm`, async () => {
       const pending = (await stats()).next.find(entry => entry.namespaceId === db.namespaceId.slice(0, 12));
       assert.equal(pending?.atUnixMs, at);
     });
-    const cleared = await eventually(`${backend} owner settles the database alarm`, async () => {
+    const cleared = await eventually(`${db.owner} owner settles the database alarm`, async () => {
       const current = await stats();
       assert.equal(current.cleared, before.cleared + 1);
       assert.equal(current.scheduled, 0);
@@ -483,42 +480,34 @@ async function threadedDatabaseAlarm(cluster) {
       return current;
     });
     const attempts = cleared.dispatchAttempts - before.dispatchAttempts;
-    assert.ok(attempts >= 1, `${backend} dispatched the due alarm`);
-    assert.equal(cleared.retries, before.retries, `${backend} did not retry the alarm handler`);
-    assert.equal(cleared.fired - before.fired, backend === 'upstream' ? 1 : 0,
-      `${backend} uses its own missing-handler outcome`);
-    assert.equal(await alarm(), null, `${backend} cleared the alarm in storage`);
+    assert.ok(attempts >= 1, `${db.owner} dispatched the due alarm`);
+    assert.equal(cleared.retries, before.retries, `${db.owner} did not retry the alarm handler`);
+    assert.equal(cleared.fired, before.fired, 'an absent handler does not run');
+    assert.equal(await alarm(), null, `${db.owner} cleared the alarm in storage`);
 
     const rotation = await rotationRequest(cluster, db.owner, process.processId);
     await waitForDurableRotation(cluster, db.owner, process, rotation, 'drained');
     const read = await query({ sql: 'SELECT value FROM records' });
-    assert.deepEqual(read.results, [{ value: db.name }], `${backend} reopens with the saved row`);
-    assert.equal(await alarm(), null, `${backend} reopens with the alarm still cleared`);
+    assert.deepEqual(read.results, [{ value: db.name }], `${db.owner} reopens with the saved row`);
+    assert.equal(await alarm(), null, `${db.owner} reopens with the alarm still cleared`);
     // Let the scheduler pass the first alarm retry window with the database reopened.
     await delay(2500);
     const reopened = await stats();
     assert.equal(reopened.scheduled, 0);
-    assert.equal(reopened.dispatchAttempts, cleared.dispatchAttempts, `${backend} did not dispatch the alarm again`);
-    console.log(`Database alarm on ${db.owner} (${backend}): ${attempts} dispatch attempt(s), cleared and reopened with saved row`);
+    assert.equal(reopened.dispatchAttempts, cleared.dispatchAttempts, `${db.owner} did not dispatch the alarm again`);
+    console.log(`Database alarm on ${db.owner}: ${attempts} dispatch attempt(s), cleared and reopened with saved row`);
   }));
 }
 
 async function threadedDatabasePlacement(cluster) {
-  const [threaded, upstream] = cluster.nodes;
-  if (cluster.previousProduct) {
-    const digest = async node => (await cluster.compose(
-      ['exec', '-T', node, 'sha256sum', '/opt/coworkerd/bin/coworkerd'])).split(' ')[0];
-    const [current, previous] = await Promise.all([digest(threaded), digest(upstream)]);
-    assert.notEqual(current, previous, 'the compatibility test uses different node binaries');
-    console.log(`Database compatibility binaries (SHA-256): upstream=${previous}, threaded=${current}`);
-  }
+  const [threaded, secondOwner] = cluster.nodes;
   const tenant = await cluster.tenant('sql-placement', { durableObjectNamespaces: 128 });
-  const candidates = [threaded, upstream];
+  const candidates = [threaded, secondOwner];
   await waitForDurableMembership(cluster, candidates);
-  const counts = new Map([[threaded, 2], [upstream, 1]]);
+  const counts = new Map([[threaded, 2], [secondOwner, 1]]);
   const { databases, revision } = await createDatabaseHomes(cluster, tenant, counts, { candidates });
   const selected = [...databases.values()].flat();
-  const peerUrls = new Map(await Promise.all([threaded, upstream].map(async node => {
+  const peerUrls = new Map(await Promise.all([threaded, secondOwner].map(async node => {
     const address = await cluster.compose(['port', node, '8934']);
     assert.match(address, /^127\.0\.0\.1:\d+$/);
     return [node, `http://${address}`];
@@ -541,11 +530,11 @@ async function threadedDatabasePlacement(cluster) {
   };
   const process = await durableGeneration(cluster, threaded);
   assert.equal(process.lifecycle.durableServer, 'threaded');
-  assert.equal((await durableGeneration(cluster, upstream)).sandbox.durableServer, 'upstream');
+  assert.equal((await durableGeneration(cluster, secondOwner)).lifecycle.durableServer, 'threaded');
   assert.equal(process.lifecycle.durableAdmission.residentRoots, 0);
   assert.equal(process.lifecycle.durableAdmission.homes, 0);
   for (const db of selected) {
-    const ingress = db.owner === threaded ? upstream : threaded;
+    const ingress = db.owner === threaded ? secondOwner : threaded;
     await eventually(`${ingress} can query ${db.name} on ${db.owner}`, async () => {
       const result = await sqlAt(ingress, db, { sql: 'SELECT 1 AS ready' });
       assert.deepEqual(result.results, [{ ready: 1 }]);
@@ -563,7 +552,7 @@ async function threadedDatabasePlacement(cluster) {
     binding: `DB${index}`, database_name: db.name,
   })) } });
   for (const [index, db] of selected.entries()) {
-    const ingress = db.owner === threaded ? upstream : threaded;
+    const ingress = db.owner === threaded ? secondOwner : threaded;
     await eventually(`${ingress} can bind ${db.name} on ${db.owner}`, async () => {
       const response = await workerCall(cluster, ingress, tenant, `read?db=DB${index}`);
       assert.deepEqual(json(response, 200, `${ingress} D1 to ${db.name}`), [{ value: db.name }]);
@@ -585,8 +574,8 @@ async function threadedDatabasePlacement(cluster) {
   await eventually('both threaded database roots occupy distinct warm homes in the original process', assertWarmCopies);
   const epochs = new Map();
   for (const db of selected) {
-    const from = db.owner === threaded ? upstream : threaded;
-    const ownerProcess = db.owner === threaded ? process : await durableGeneration(cluster, upstream);
+    const from = db.owner === threaded ? secondOwner : threaded;
+    const ownerProcess = db.owner === threaded ? process : await durableGeneration(cluster, secondOwner);
     await eventually(`both requests reached the local SqlDatabase on ${db.owner}`, async () => {
       const calls = (await databaseDispatches(cluster, db, db.owner)).filter(row => row.route === 'received' && row.node === from);
       for (const caller of ['node', 'worker']) {
@@ -626,19 +615,19 @@ async function threadedDatabasePlacement(cluster) {
       }, { timeout: 100000, interval: 500 });
     }
   };
-  await takeOver(upstream, threaded);
-  await cluster.compose(['start', upstream]);
-  await cluster.refreshUrl(upstream);
-  await eventually('the upstream node rejoins before the threaded owner is killed', async () => {
-    await durableGeneration(cluster, upstream);
-    const state = await cluster.state(upstream);
+  await takeOver(secondOwner, threaded);
+  await cluster.compose(['start', secondOwner]);
+  await cluster.refreshUrl(secondOwner);
+  await eventually('the secondOwner node rejoins before the threaded owner is killed', async () => {
+    await durableGeneration(cluster, secondOwner);
+    const state = await cluster.state(secondOwner);
     assert.ok(Number(state.storage.appliedTenantsRevision) >= revision);
-    await Promise.all(cluster.nodes.filter(node => node !== upstream).map(async node => {
+    await Promise.all(cluster.nodes.filter(node => node !== secondOwner).map(async node => {
       const { membership } = await cluster.state(node);
-      assert.ok(membership.members.some(member => member.nodeId === upstream && member.durableProcesses > 0));
+      assert.ok(membership.members.some(member => member.nodeId === secondOwner && member.durableProcesses > 0));
     }));
   }, { timeout: 45000 });
-  await takeOver(threaded, upstream);
+  await takeOver(threaded, secondOwner);
 }
 
 // One leaf, page 1 and 252 overflow pages. Each overflow page holds 4092
@@ -1288,11 +1277,11 @@ async function threadedSqlProcessMemory(cluster) {
 }
 
 async function threadedDatabaseAccounting(cluster) {
-  const [threaded, upstream] = cluster.nodes;
+  const [threaded, secondOwner] = cluster.nodes;
   const tenant = await cluster.tenant('sql-accounting', { durableObjectNamespaces: 48 });
   const databaseWorker = `${tenant.name}/__databases`;
   const platformWorker = `${tenant.name}/:platform`;
-  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[upstream, 1], [threaded, 1]]));
+  const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[secondOwner, 1], [threaded, 1]]));
   await cluster.deploy(tenant, 'object', `
     import { DurableObject } from 'cloudflare:workers';
     export class Echo extends DurableObject {
@@ -1348,13 +1337,9 @@ async function threadedDatabaseAccounting(cluster) {
 
     await eventually(`native metering rows and tenant usage on ${node}`, async () => {
       const { processes, usage } = await cluster.state(node);
-      if (node === threaded) {
-        // The native host's completion rows carry the Worker and peak memory.
-        // The upstream database uses a static runtime class.
-        for (const worker of expected.values()) {
-          assert.ok(processes.workerMemoryStats.some(row => row.workerId === worker && row.peakUsedBytes > 0),
-            `native usage row for ${worker}`);
-        }
+      for (const worker of expected.values()) {
+        assert.ok(processes.workerMemoryStats.some(row => row.workerId === worker && row.peakUsedBytes > 0),
+          `native usage row for ${worker}`);
       }
       const requestCount = Object.values(usage.hours).reduce((count, hour) => count + (hour[tenant.name]?.requests ?? 0), 0);
       assert.ok(requestCount >= expected.size, `durable requests are counted for ${tenant.name}`);
@@ -1730,10 +1715,9 @@ async function d1InvocationBudgets(cluster) {
 
 const budgetLifetime = { tenant: 'budget-lifetime', leaseMs: 5_000 };
 
-async function invocationBudgetLifetime(cluster) {
+async function invocationBudgetLifetime(cluster, withD1) {
   const [node] = cluster.nodes;
   const tenant = await cluster.tenant(budgetLifetime.tenant);
-  const withD1 = cluster.threadedNodes.size === 0;
   if (withD1) {
     await cluster.api(tenant.path, { method: 'PATCH', body: { defaultLimits: { d1Queries: 1 } } });
     const { storage: { tenantsRevision } } = await cluster.api('/v1/status');
@@ -2349,8 +2333,8 @@ async function durableTakeover(cluster, platformTenant) {
   let gate;
   try {
     await warm.promise;
-    if (cluster.threadedNodes.size) {
-      assert.equal((await durableGeneration(cluster, original.nodeId)).lifecycle?.durableServer, 'threaded');
+    assert.equal((await durableGeneration(cluster, original.nodeId)).lifecycle?.durableServer, 'threaded');
+    if (cluster.peerAckGate) {
       gate = join(cluster.peerAckGate, 'hold');
       await writeFile(gate, '');
       await eventually('the surviving peers withhold positive confirmations during active writes', async () => {
@@ -3170,10 +3154,10 @@ async function waitForDurableRotation(cluster, node, before, requestId, drainOut
   }, { timeout: 45000 });
 }
 
-async function mixedDurableStorage(cluster) {
+async function durableRotationRecovery(cluster) {
   const [threaded, ingress, other] = cluster.nodes;
   const peers = [ingress, other];
-  const tenant = await cluster.tenant('mixed-durable-test');
+  const tenant = await cluster.tenant('durable-rotation-test');
   const worker = `
     import { DurableObject } from 'cloudflare:workers';
     export class Record extends DurableObject {
@@ -3252,7 +3236,7 @@ async function mixedDurableStorage(cluster) {
   const neighbor = await findObject('reader');
   const write = async (suffix, value, node = ingress) => json(await request(cluster.urls[node], target.path(suffix), {
     method: 'POST', body: value,
-  }), 200, 'mixed durable write');
+  }), 200, 'durable write');
   assert.equal(await write('', 'warm'), 'warm');
   assert.match((await write('/clone-facet', null)).error, /NOT_SUPPORTED/);
   const first = await eventually('separate definitions occupy two homes in the same threaded generation', async () => {
@@ -3269,7 +3253,7 @@ async function mixedDurableStorage(cluster) {
       assert.equal((await durableGeneration(cluster, threaded)).pid, first.pid);
     })) early.push(value);
   }
-  assert.deepEqual(early, [], 'threaded responses escaped while both upstream peers held acknowledgements');
+  assert.deepEqual(early, [], 'threaded responses escaped while both peers held acknowledgements');
   assert.equal((await target.read()).value, 'threaded-rpc');
   assert.equal(await write('/checkpoint', 'x'.repeat(65536)), 65536);
   const io = await eventually('the threaded SQLite open and checkpoint are measured', async () => {
@@ -3333,7 +3317,7 @@ async function mixedDurableStorage(cluster) {
   const drained = await cluster.compose(['ps', '-a', '-q', threaded]);
   assert.equal(await cluster.command('docker', ['inspect', '--format', '{{.State.ExitCode}}', drained]), '0',
     'the threaded node completed its drain before Compose stopped it');
-  const upstreamOwner = await eventually('an upstream owner recovers the threaded write and fires the due alarm', async () => {
+  const successor = await eventually('a new owner recovers the threaded write and fires the due alarm', async () => {
     const saved = await target.read();
     assert.equal(saved.value, confirmed);
     assert.equal(saved.fired, true);
@@ -3342,7 +3326,7 @@ async function mixedDurableStorage(cluster) {
     const logs = await cluster.compose(['logs', '--no-color', owner.nodeId]);
     assert.ok(logs.split('\n').some(line => line.includes('[do-log]') &&
       line.includes('"event":"alarm-fired"') && line.includes(`"objectId":"${target.id.slice(0, 12)}"`) &&
-      line.includes(`"atUnixMs":${at},`)), 'the new upstream owner dispatched this exact alarm');
+      line.includes(`"atUnixMs":${at},`)), 'the new owner dispatched this exact alarm');
     return owner;
   }, { timeout: 120000, interval: 1000 });
 
@@ -3350,22 +3334,22 @@ async function mixedDurableStorage(cluster) {
   await cluster.refreshUrl(threaded);
   await eventually('the restarted threaded node rejoins as a live peer', async () => {
     await durableGeneration(cluster, threaded);
-    const { membership } = await cluster.state(upstreamOwner.nodeId);
+    const { membership } = await cluster.state(successor.nodeId);
     assert.ok(membership.members.some(member => member.nodeId === threaded && member.durableProcesses > 0));
   }, { timeout: 45000 });
-  const secondPeer = peers.find(node => node !== upstreamOwner.nodeId);
-  const upstreamEarly = await heldPeerWrite(cluster, [threaded, secondPeer],
-    cluster.urls[upstreamOwner.nodeId] + target.path(''), 'upstream-write', async () => {});
-  assert.equal(upstreamEarly, false, 'upstream waits for the restarted threaded peer');
+  const secondPeer = peers.find(node => node !== successor.nodeId);
+  const earlyAfterTakeover = await heldPeerWrite(cluster, [threaded, secondPeer],
+    cluster.urls[successor.nodeId] + target.path(''), 'successor-write', async () => {});
+  assert.equal(earlyAfterTakeover, false, 'the successor waits for the restarted threaded peer');
   await cluster.compose(['stop', '--timeout', '45', secondPeer], { timeout: 70000 });
-  await cluster.compose(['kill', '-s', 'SIGKILL', upstreamOwner.nodeId]);
-  await eventually('the restarted threaded owner replays confirmed upstream history', async () => {
+  await cluster.compose(['kill', '-s', 'SIGKILL', successor.nodeId]);
+  await eventually('the restarted threaded owner replays confirmed successor history', async () => {
     const saved = await target.read(threaded);
-    assert.equal(saved.value, 'upstream-write');
+    assert.equal(saved.value, 'successor-write');
     assert.equal(saved.fired, true);
     const owner = await target.owner();
     assert.equal(owner.nodeId, threaded);
-    assert.ok(BigInt(owner.epoch) > BigInt(upstreamOwner.epoch));
+    assert.ok(BigInt(owner.epoch) > BigInt(successor.epoch));
   }, { timeout: 140000, interval: 1000 });
 }
 
@@ -4363,25 +4347,25 @@ export const cases = { deployment, 'sql-atomicity': sqlAtomicity,
 export const webSocketCases = { 'websocket-admission': webSocketAdmission };
 
 export const durableGatedCases = {
-  'invocation-budget-lifetime': { test: invocationBudgetLifetime, budgetLifetime },
+  'invocation-budget-lifetime': { test: cluster => invocationBudgetLifetime(cluster, true), budgetLifetime },
   'invocation-budget-threaded-background': {
-    test: invocationBudgetLifetime, budgetLifetime, nodes: ['node-1', 'node-2', 'node-3'],
+    test: cluster => invocationBudgetLifetime(cluster, false), budgetLifetime, nodes: ['node-1', 'node-2', 'node-3'],
   },
   'durable-peer-ack': { test: durablePeerAck },
   'durable-slow-holder': {
     test: durableSlowHolder, delayRecoveryPeers: true,
     membership: { ttlSeconds: 6, heartbeatIntervalMs: 1000, livenessGraceMs: 3000, listIntervalMs: 200 },
   },
-  'durable-threaded-mixed': { test: mixedDurableStorage, nodes: ['node-1'] },
+  'durable-threaded-rotation-recovery': { test: durableRotationRecovery, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-threaded-database-release': {
     test: threadedDatabaseRelease, nodes: ['node-1', 'node-2', 'node-3'], holdPeerAcks: false,
   },
   'durable-threaded-database-alarm': {
-    test: threadedDatabaseAlarm, nodes: ['node-1'],
+    test: threadedDatabaseAlarm, nodes: ['node-1', 'node-2', 'node-3'],
     databaseAlarmFixture: true, holdPeerAcks: false,
   },
   'durable-threaded-database-placement': {
-    test: threadedDatabasePlacement, nodes: ['node-1'],
+    test: threadedDatabasePlacement, nodes: ['node-1', 'node-2'],
     publishPeerPorts: true, controlDurableLifecycle: true, holdPeerAcks: false,
     // Keep a third node for ingress and leave exactly one eligible owner after either kill.
     configureNode: node => node === 'node-3' ? { durableObjects: { processes: 0 } } : {},
@@ -4404,7 +4388,7 @@ export const durableGatedCases = {
     test: durableAdmissionRefusal, nodes: ['node-1', 'node-2'],
     controlDurableLifecycle: true, confirmTimeoutMs: 25000,
     configureNode: node => node === 'node-1' ? ({
-      durableObjects: { threadedStorage: true, residentObjects: 1, confirmTimeoutMs: 25000 },
+      durableObjects: { residentObjects: 1, confirmTimeoutMs: 25000 },
     }) : ({}),
     nodeEnvironment: node => node === 'node-2' ? { COWORKERD_DO_TEST_MAILBOX_EVENTS: '1' } : {},
   },
@@ -4423,14 +4407,14 @@ export const durableGatedCases = {
     // Only the owner uses the small record cap. Its two peers need room to
     // hold the schema record and the boundary record together.
     configureNode: node => node === 'node-1' ? ({
-      durableObjects: { threadedStorage: true, peerBufferBytes: sqlWalPeerBufferBytes,
+      durableObjects: { peerBufferBytes: sqlWalPeerBufferBytes,
         checkpointBytes: 8 * 1024 * 1024 },
     }) : ({}),
   },
   'threaded-sql-memory-limit': {
     test: threadedSqlMemoryLimit, nodes: ['node-1'], holdPeerAcks: false,
     configureNode: node => node === 'node-1' ? ({
-      durableObjects: { threadedStorage: true, checkpointBytes: 65536 },
+      durableObjects: { checkpointBytes: 65536 },
     }) : ({}),
     nodeEnvironment: node => node === 'node-1' ? { COWORKERD_DO_TEST_SQL_MEMORY_BYTES: '1048576' } : {},
   },
@@ -4438,7 +4422,7 @@ export const durableGatedCases = {
     test: threadedSqlSpillLimit, nodes: ['node-1'], holdPeerAcks: false,
     configureNode: node => node === 'node-1' ? ({
       sandbox: { mode: 'off' },
-      durableObjects: { threadedStorage: true, sqlDatabaseSpillBytes, sqlProcessSpillBytes,
+      durableObjects: { sqlDatabaseSpillBytes, sqlProcessSpillBytes,
         checkpointBytes: 32 * 1024 * 1024 },
     }) : ({}),
   },
@@ -4447,13 +4431,13 @@ export const durableGatedCases = {
     singleNode: true, controlDurableLifecycle: true, holdPeerAcks: false,
     configureNode: () => ({
       processPool: { count: 1, inFlightLimit: 16, threadedMemoryBytes: 112 * 1024 ** 2 },
-      durableObjects: { threadedStorage: true, processes: 1, peers: 0 },
+      durableObjects: { processes: 1, peers: 0 },
     }),
   },
   'threaded-sql-cli-parity': {
     test: threadedSqlCliParity, nodes: ['node-1', 'node-2', 'node-3'],
     holdPeerAcks: false,
-    configureNode: () => ({ durableObjects: { threadedStorage: true, segmentIntervalMs: 1000 } }),
+    configureNode: () => ({ durableObjects: { segmentIntervalMs: 1000 } }),
   },
   'durable-threaded-takeover': { test: durableTakeover, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-platform-definition': {
@@ -4484,7 +4468,7 @@ export const durableGatedCases = {
   },
   'durable-threaded-socket-frame-budget': {
     test: threadedSocketFrameBudget, nodes: ['node-1'], singleNode: true, holdPeerAcks: false, controlDurableLifecycle: true,
-    configureNode: () => ({ durableObjects: { threadedStorage: true, peers: 0, socketFrameBytesPerNode: 8 } }),
+    configureNode: () => ({ durableObjects: { peers: 0, socketFrameBytesPerNode: 8 } }),
   },
   'durable-threaded-retirement': {
     test: threadedSocketRetirement, nodes: ['node-1', 'node-2', 'node-3'], controlDurableLifecycle: true,

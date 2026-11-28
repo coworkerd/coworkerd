@@ -485,9 +485,8 @@ void tenantLineTruncation() {
 void durableNotSent() {
   KJ_REQUIRE(std::string_view(durableNotSentCode(true)) == "SECRET_UNAVAILABLE");
   KJ_REQUIRE(std::string_view(durableNotSentCode(false)) == "DO_UNAVAILABLE");
-  KJ_REQUIRE(acceptsForwardedAlarm(true, 0));
-  KJ_REQUIRE(acceptsForwardedAlarm(false, 1));
-  KJ_REQUIRE(!acceptsForwardedAlarm(true, 1));
+  KJ_REQUIRE(acceptsForwardedAlarm(0));
+  KJ_REQUIRE(!acceptsForwardedAlarm(1));
 }
 
 // The process pool refreshes once per turn: the first call of a turn does the work, the later ones of that turn

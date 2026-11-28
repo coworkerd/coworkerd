@@ -75,13 +75,13 @@ async function fixture(side, binaries, volume, objects) {
   const trace = await mkdtemp('/dev/shm/coworkerd-log-io-');
   await chmod(trace, 0o777);
   const cluster = new Cluster(directory, resolve(kernel), undefined, {
-    singleNode: true, threadedNodes: ['node-1'], binariesDirectory: resolve(binaries),
+    singleNode: true, durableFixtureNodes: ['node-1'], binariesDirectory: resolve(binaries),
     configureNode: () => ({
       memoryBudgetBytes: 16 * 1024 ** 3,
       quarantineProcesses: 1,
       placement: { rootLimit: 512, nestedLimit: 1024 },
       processPool: { count: 1, inFlightLimit: 512, threadedMemoryBytes: 3 * 1024 ** 3 },
-      durableObjects: { processes: 1, threadedStorage: true, peers: 0, segmentBytes: 512 * 1024 ** 2,
+      durableObjects: { processes: 1, peers: 0, segmentBytes: 512 * 1024 ** 2,
         segmentIntervalMs: 3600000 },
     }),
     nodeEnvironment: () => ({

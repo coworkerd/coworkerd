@@ -1,6 +1,6 @@
 # Databases (D1's shape)
 
-> For release 0.5.6. A database is a Durable Object: it gets the same replication, the same rebuild
+> A database is a Durable Object: it gets the same replication, the same rebuild
 > after its owner changes and the same limits ([compatibility scope](compat.md), [durable objects](durable-objects.md)).
 > The API is D1's, so an application written for D1 runs unchanged within the subset below.
 
@@ -15,8 +15,7 @@ by `durableObjectBytes` (10 GiB by default).
 
 ### Threaded database capacity
 
-A Linux shard owner with [`durableObjects.threadedStorage`](install.md#durable-objects-and-local-storage)
-enabled serves both D1 bindings and HTTP SQL. Each open database has its own isolate copy and
+The shard owner serves both D1 bindings and HTTP SQL on the threaded server. Each open database has its own isolate copy and
 home. At the default home count, one durable process handled four busy databases at once.
 Two processes handled eight when the database keys were distributed across both. Each process
 receives a share of the node's memory budget, and a smaller resource budget can lower capacity.
