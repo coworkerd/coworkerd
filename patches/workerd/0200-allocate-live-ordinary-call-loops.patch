@@ -1,8 +1,10 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sat, 28 Nov 2026 14:31:39 +0800
+Date: Sat, 28 Nov 2026 14:43:41 +0800
 Subject: [PATCH] Allocate ordinary call loops only for live invocations
 
+Charge the resources through connection and background settlement.
+Report pre-dispatch resource refusals on the private native channel.
 
 diff --git a/src/workerd/threaded/protocol.h b/src/workerd/threaded/protocol.h
 index cf178aff6687e0b9ec73a5d7c87a2c04694d787b..b0c92d0359db02738c0d233e556f13231ba2a196 100644
@@ -49,7 +51,7 @@ index cf178aff6687e0b9ec73a5d7c87a2c04694d787b..b0c92d0359db02738c0d233e556f1323
  // covers empty console calls, whose native objects still occupy memory.
  struct InvocationLogBudget {
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 103aa3d4912434595e6fbdb5534c284d72c084eb..d9f894bd35c47c504746ef950ceec4f4d08d7bd7 100644
+index 103aa3d4912434595e6fbdb5534c284d72c084eb..9fc9c517834a710fca51d5c7fb834dc3a6df5c52 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -403,7 +403,7 @@ struct DatabaseAdmissionFixture {
@@ -61,7 +63,7 @@ index 103aa3d4912434595e6fbdb5534c284d72c084eb..d9f894bd35c47c504746ef950ceec4f4
        thread->homeId = id;
        thread->home.emplace();
        server.threads.push_back(std::move(thread));
-@@ -928,42 +928,149 @@ KJ_TEST("a startup entry opens the fatal scope of its Worker and closes it") {
+@@ -928,42 +928,158 @@ KJ_TEST("a startup entry opens the fatal scope of its Worker and closes it") {
    });
  }
  
@@ -98,8 +100,7 @@ index 103aa3d4912434595e6fbdb5534c284d72c084eb..d9f894bd35c47c504746ef950ceec4f4
 +  constexpr auto descriptors = threaded::ORDINARY_FDS_PER_CALL;
 +  auto makeServer = [](uint ceiling) {
 +    return std::make_unique<ThreadedServer>(ceiling, "", "", -1,
-+        kj::Own<const kj::Directory>(), kj::Own<server::ThreadedWalLog>(),
-+        &initializeV8(), kj::systemPreciseMonotonicClock(), 128 * descriptors);
++        kj::Own<const kj::Directory>(), kj::Own<server::ThreadedWalLog>(), &initializeV8());
 +  };
 +  auto low = makeServer(1);
 +  auto high = makeServer(threaded::ORDINARY_MAX_IN_FLIGHT);
@@ -123,6 +124,11 @@ index 103aa3d4912434595e6fbdb5534c284d72c084eb..d9f894bd35c47c504746ef950ceec4f4
 +  auto nested = budget.reserveOrdinaryCall(high->limit, 128 * descriptors, Lane::NESTED);
 +  KJ_REQUIRE(nested.has_value() && nested->resource == Resource::MEMORY);
 +  KJ_EXPECT(nested->budget == idle.memoryCeiling && nested->current == nested->budget);
++  {
++    ResourceReservation worker(high->resources, 128);
++    KJ_REQUIRE(worker.registerPreparation(), "a call at the limit can still prepare its Worker");
++    KJ_EXPECT(budget.memoryReserved.load() == budget.admissionMaximum);
++  }
 +  for (uint i = 0; i < 8; ++i) budget.releaseOrdinaryCall();
 +  KJ_REQUIRE(budget.change(nonCallCharge, 0, 0, 0));
 +  KJ_EXPECT(high->ordinaryAdmissionSample().memory == idle.memory);
@@ -171,8 +177,8 @@ index 103aa3d4912434595e6fbdb5534c284d72c084eb..d9f894bd35c47c504746ef950ceec4f4
 +
 +KJ_TEST("ordinary admission only acknowledges a call with a live native loop and returns its charge") {
 +  using Lane = threaded::OrdinaryLane;
-+  ThreadedServer server{1, "", "", -1, {}, {}, &initializeV8(),
-+    kj::systemPreciseMonotonicClock(), 128};
++  ThreadedServer server{1, "", "", -1, {}, {}, &initializeV8()};
++  server.ordinaryDescriptorBudget = 128;
 +  server.ready.store(true);
 +  const auto idle = server.ordinaryAdmissionSample().memory;
 +
@@ -198,6 +204,11 @@ index 103aa3d4912434595e6fbdb5534c284d72c084eb..d9f894bd35c47c504746ef950ceec4f4
 +    KJ_REQUIRE(recv(blocked[0], refusal.data(), refusal.size(), MSG_WAITALL) == refusal.size());
 +    KJ_EXPECT(refusal == expected);
 +  }
++
++  auto disconnected = ordinaryTestSocket();
++  disconnected[0] = nullptr;
++  server.acceptOrdinary(kj::mv(disconnected[1]), Lane::ROOT);
++  waitForOrdinaryCallRelease(server);
 +  KJ_EXPECT(server.liveThreads.load() == 0);
 +  KJ_EXPECT(server.ordinaryAdmissionSample().memory == idle);
 +  KJ_EXPECT(server.refusedOrdinaryCeiling.load() == 2);
@@ -205,8 +216,8 @@ index 103aa3d4912434595e6fbdb5534c284d72c084eb..d9f894bd35c47c504746ef950ceec4f4
 +
 +KJ_TEST("ordinary native loop descriptor exhaustion is a refusal before acknowledgement") {
 +  using Lane = threaded::OrdinaryLane;
-+  ThreadedServer server{8, "", "", -1, {}, {}, &initializeV8(),
-+    kj::systemPreciseMonotonicClock(), 256};
++  ThreadedServer server{8, "", "", -1, {}, {}, &initializeV8()};
++  server.ordinaryDescriptorBudget = 256;
 +  server.ready.store(true);
 +  auto call = ordinaryTestSocket();
 +  const auto idle = server.ordinaryAdmissionSample().memory;
@@ -245,7 +256,7 @@ index 103aa3d4912434595e6fbdb5534c284d72c084eb..d9f894bd35c47c504746ef950ceec4f4
  
  KJ_TEST("actual reservation arithmetic, both watermarks and RAII release") {
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094ebe4a8502e 100644
+index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..345607eecc2d940139881a9911d1b28a5c97f44e 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -91,7 +91,9 @@
@@ -450,7 +461,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
    const uint limit;
 -  static constexpr uint CONTROL_THREADS = 8;
 -  static constexpr int MAINTAIN = -3, STOP = -4, STOPPED = -5;
-+  const uint64_t ordinaryDescriptorBudget;
++  uint64_t ordinaryDescriptorBudget = 0;  // Set before ready is published.
 +  std::atomic<uint64_t> refusedOrdinaryMemory{0}, refusedOrdinaryDescriptors{0},
 +      refusedOrdinaryThreads{0}, refusedOrdinaryCeiling{0};
    std::shared_ptr<ResourceBudget> resources;
@@ -480,26 +491,15 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
        KJ_REQUIRE(wake >= 0);
      }
    };
-@@ -2832,7 +2843,8 @@ struct ThreadedServer {
-       kj::Own<const kj::Directory> durableDirectory = {},
-       kj::Own<server::ThreadedWalLog> durableLog = {},
-       jsg::V8System* existingV8 = nullptr,
--      const kj::MonotonicClock& isolateBusyClock = kj::systemPreciseMonotonicClock())
-+      const kj::MonotonicClock& isolateBusyClock = kj::systemPreciseMonotonicClock(),
-+      uint64_t ordinaryDescriptorBudget = 0)
-       : engine(existingV8 == nullptr ? std::make_unique<Engine>() : nullptr),
-         v8(existingV8 == nullptr ? engine->v8 : *existingV8),
-         isolateBusyClock(isolateBusyClock),
-@@ -2859,22 +2871,23 @@ struct ThreadedServer {
+@@ -2859,7 +2870,6 @@ struct ThreadedServer {
          durableCommitDelayMs(
              this->durableStorage && !this->durableLog
                  ? configuredCount("COWORKERD_DO_TEST_COMMIT_DELAY_MS", 0) : 0),
 -        pending(limit * 2),
          limit(limit),
-+        ordinaryDescriptorBudget(ordinaryDescriptorBudget),
          resources(std::make_shared<ResourceBudget>(
              configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) -
-                 (this->durableStorage
+@@ -2867,14 +2877,15 @@ struct ThreadedServer {
                          ? configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) / 8
                          : 0),
              configuredCount("COWORKERD_THREADED_RESIDENT_LIMIT", 1840),
@@ -517,7 +517,17 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
      if (this->durableStorage) {
        KJ_REQUIRE(durableCommitDelayMs <= 1000, "invalid durable test commit delay");
        const auto refuseGroup = configuredCount("COWORKERD_DO_TEST_REFUSE_GROUP", 0);
-@@ -3000,8 +3013,9 @@ struct ThreadedServer {
+@@ -2913,7 +2924,8 @@ struct ThreadedServer {
+     }
+   }
+ 
+-  void start() {
++  void start(uint64_t descriptorLimit) {
++    if (!durableStorage) ordinaryDescriptorBudget = descriptorLimit - threaded::ORDINARY_FD_HEADROOM;
+     managerWake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+     KJ_REQUIRE(managerWake >= 0);
+     registerRoleFatalHandler(durableAdmission.has_value(), &v8::V8::SetFatalErrorHandler);
+@@ -3000,8 +3012,9 @@ struct ThreadedServer {
        }
        json += "}";
      }
@@ -528,7 +538,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
          ",\"memoryMaximum\":" + std::to_string(resources->memoryMaximum) +
          ",\"admissionMaximum\":" + std::to_string(resources->admissionMaximum) +
          ",\"pressureTerminations\":" + std::to_string(resources->pressureTerminations.load()) +
-@@ -3014,7 +3028,8 @@ struct ThreadedServer {
+@@ -3014,7 +3027,8 @@ struct ThreadedServer {
          ",\"sandboxRefused\":" + std::to_string(sandboxRefusals.load()) +
          ",\"evicted\":" + std::to_string(resources->evictions.load()) +
          ",\"tenantRejected\":" + std::to_string(tenantBudget->rejected.load()) +
@@ -538,7 +548,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
      lifecycle.publish(json, active, background, unknown);
    }
  
-@@ -3188,12 +3203,6 @@ struct ThreadedServer {
+@@ -3188,12 +3202,6 @@ struct ThreadedServer {
        while (read(managerWake, &count, sizeof(count)) > 0) {}
      }
    }
@@ -551,7 +561,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
    // Called with durableRoutingMutex held. The home still rechecks all the
    // prerequisites locally before it fences admission to the selected tree.
    bool requestDatabaseRetirement(server::DurableAdmission::Time now, bool needsPreparationBudget) {
-@@ -3866,150 +3875,224 @@ struct ThreadedServer {
+@@ -3866,150 +3874,224 @@ struct ThreadedServer {
      }
    }
  
@@ -896,7 +906,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
        state.wal = durableLog->attachHome(
            [this, &state](uint64_t openId, server::ThreadedWalLog::CloseReason why) {
          for (auto& [id, root]: state.durableRoots) {
-@@ -4022,79 +4105,32 @@ struct ThreadedServer {
+@@ -4022,79 +4104,32 @@ struct ThreadedServer {
                  "DO_CODE_UPDATED"_kj);
              beginDurableReset(state, id, reason);
              root.stopFacets(&reason);
@@ -993,7 +1003,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
    }
  
    kj::Promise<kj::String> fetchSource(Json::Reader descriptor, ThreadState &state, Slot &slot) {
-@@ -7626,7 +7662,6 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
+@@ -7626,7 +7661,6 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
    bool tenantCapacity = false;
    kj::Maybe<kj::Exception> loadFailure;
    try {
@@ -1001,7 +1011,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
      tenant = server.admitTenant(input);
      slot = co_await server.getWorker(input, state, coldLoaded);
      preparation = server.prepareSlot(slot);
-@@ -7711,7 +7746,6 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
+@@ -7711,7 +7745,6 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
    std::shared_ptr<ResourcePreparation> preparation;
    std::shared_ptr<TenantPermit> tenant;
    try {
@@ -1009,7 +1019,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
      tenant = server.admitTenant(input);
      slot = co_await server.getWorker(input, state, coldLoaded);
      if (!trial) preparation = server.prepareSlot(slot);
-@@ -7858,6 +7892,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7858,6 +7891,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
    };
    struct Connection {
      std::string input, output;
@@ -1017,7 +1027,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
      size_t sent = 0;
      std::optional<Admission::Ticket> durableCredit;
      std::optional<DurableRoute> durableRoute;
-@@ -7876,6 +7911,12 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7876,6 +7910,12 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
      ::close(fd);
      connections.erase(found);
    };
@@ -1030,7 +1040,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
    for (;;) {
      if (!listening && nowNs() >= retryAt) {
        listening = add(listener);
-@@ -7939,23 +7980,40 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -7939,23 +7979,40 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
          }
          continue;
        }
@@ -1084,7 +1094,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
        if (connection.output.empty() && !close) {
          char bytes[2048];
          auto size = recv(fd, bytes, sizeof(bytes), MSG_DONTWAIT);
-@@ -8001,20 +8059,17 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -8001,20 +8058,17 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
          if (connection.input.find("\r\n\r\n") != std::string::npos) {
            auto body = server.identity;
            if (connection.input.starts_with("GET /__coworkerd/threaded ")) {
@@ -1109,7 +1119,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
                  ",\"threadGrowthFailures\":" + std::to_string(server.growthFailures.load()) +
                  ",\"acceptFailures\":" + std::to_string(server.acceptFailures.load()) +
                  ",\"subrequestsActive\":" + std::to_string(server.subrequestBudget.active.load()) +
-@@ -8026,6 +8081,10 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -8026,6 +8080,10 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                  ",\"logFlushFailures\":" + std::to_string(server.logFlushFailures.load()) +
                  ",\"logPeakQueuedBytes\":" + std::to_string(server.logPeakQueuedBytes.load()) + "}";
              if (server.durableAdmission) server.reportDurable(false, &body);
@@ -1120,7 +1130,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
            }
            const bool walReady = !server.durableLog || server.durableLog->ready();
            auto status = server.ready.load(std::memory_order_acquire) && walReady
-@@ -8040,7 +8099,8 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -8040,7 +8098,8 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
                "\r\nX-Coworkerd-Threaded-Protocol: 3" +
                (server.durableLog
                        ? "\r\nX-Coworkerd-Threaded-Role: durable\r\nX-Coworkerd-WAL-Protocol: 1"
@@ -1130,7 +1140,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
                "\r\nContent-Length: " + std::to_string(body.size()) +
                "\r\nConnection: close\r\n\r\n" + body;
          }
-@@ -8083,6 +8143,10 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+@@ -8083,6 +8142,10 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
  
  int main(int argc, char **argv) {
    using namespace workerd;
@@ -1141,7 +1151,7 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
    if (argc == 2 && strcmp(argv[1], "--sandbox-facts") == 0) {
      // The node's startup probe of this build: one [coworkerd-sandbox] row on stderr, with V8's mode
      // and this build's sandbox layout ("mode":"off" without the sandbox); exit 78 with the problem
-@@ -8106,7 +8170,8 @@ int main(int argc, char **argv) {
+@@ -8106,7 +8169,8 @@ int main(int argc, char **argv) {
    }
    char *end = nullptr;
    auto limit = strtoul(argv[4], &end, 10);
@@ -1151,24 +1161,22 @@ index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..8cdfbf519d14a57c06a240d10ec094eb
    if (disposable && getenv("COWORKERD_DO_WAL_FD") != nullptr) {
      fprintf(stderr, "durable test storage refuses a persistent durable log channel\n");
      return 78;
-@@ -8119,7 +8184,9 @@ int main(int argc, char **argv) {
+@@ -8119,7 +8183,8 @@ int main(int argc, char **argv) {
        return 78;
      }
    }
 -  if (!prepareDescriptors(limit)) return 78;
 +  const auto descriptorLimit = prepareDescriptors(disposable || persistent ? limit : 0);
 +  if (!descriptorLimit) return 78;
-+  const auto ordinaryDescriptorBudget = *descriptorLimit - threaded::ORDINARY_FD_HEADROOM;
    auto event = limitEventFd();
    if (event >= 0) {
      auto flags = fcntl(event, F_GETFL);
-@@ -8176,7 +8243,8 @@ int main(int argc, char **argv) {
-     } else if (disposable) {
+@@ -8177,7 +8242,7 @@ int main(int argc, char **argv) {
        directory = newDurableTestDirectory(listener);
      }
--    server = new ThreadedServer(limit, argv[2], argv[3], parent, kj::mv(directory), kj::mv(wal));
-+    server = new ThreadedServer(limit, argv[2], argv[3], parent, kj::mv(directory), kj::mv(wal),
-+        nullptr, kj::systemPreciseMonotonicClock(), ordinaryDescriptorBudget);
-     server->start();
+     server = new ThreadedServer(limit, argv[2], argv[3], parent, kj::mv(directory), kj::mv(wal));
+-    server->start();
++    server->start(*descriptorLimit);
    } catch (...) {
      fprintf(stderr,
+         "[threaded-start] "
