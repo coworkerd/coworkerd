@@ -156,6 +156,49 @@ export async function ingressPlacementAllBusy(cluster) {
   console.log('All-busy roots rotated on equal load, filled both slots per node, and respected hard admission');
 }
 
+export const placementStreamWorker = 'saturation-neighbor/idle-stream';
+
+export async function ingressPlacementUnrelatedStreams(cluster) {
+  const [home, ingress, peer] = cluster.nodes;
+  const { call } = await saturationWorker(cluster);
+  const streamCount = 24;
+  const tenant = await cluster.tenant('saturation-neighbor');
+  await cluster.deploy(tenant, 'idle-stream', `export default { fetch(request) {
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(request.cf.nodeId));
+        setTimeout(() => controller.close(), 20000);
+      },
+    }));
+  } };`);
+  const controller = new AbortController();
+  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]);
+  const readRoots = async () => (await cluster.state(peer)).placement.inFlight.roots;
+  try {
+    await Promise.all(Array.from({ length: streamCount }, async () => {
+      const response = await fetch(`${cluster.urls[peer]}/${placementStreamWorker}`, { signal });
+      assert.equal(response.status, 200);
+      const { value } = await response.body.getReader().read();
+      assert.equal(Buffer.from(value).toString(), peer);
+    }));
+    assert.equal(await readRoots(), streamCount);
+
+    for (const node of [home, ingress, peer]) {
+      const response = json(await call(), 200, 'all-busy fallback with unrelated idle streams');
+      assert.equal(response.nodeId, node, 'an unrelated stream does not add to the hot Worker count');
+      await eventually('the hot root released its slot and all idle streams remain', async () => {
+        assert.equal(await readRoots(), streamCount);
+        assert.equal((await cluster.state(home)).placement.inFlight.roots, 0);
+        assert.equal((await cluster.state(ingress)).placement.inFlight.roots, 0);
+      });
+    }
+  } finally {
+    controller.abort();
+  }
+  await eventually('idle stream aborts released all root slots', async () => assert.equal(await readRoots(), 0),
+    { timeout: 8000 });
+}
+
 export async function ingressPlacementLiveSaturation(cluster) {
   const [home] = cluster.nodes;
   const { workerId, call } = await saturationWorker(cluster, `export default { async fetch(request) {

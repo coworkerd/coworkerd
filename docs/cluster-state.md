@@ -209,8 +209,9 @@ every visible ancestor quota. A node without that reading can still use the isol
 Each soft refusal explicitly reports that the call has not been dispatched and can be retried.
 If the first pass finds no candidate that can serve, the ingress revisits each candidate that sent
 an explicit soft refusal, with the saturation preference disabled. Among candidates with the
-same health priority, it tries the fewest in-flight calls first, using the node-wide root and
-nested count reported in the refusal. Each ingress rotates ties across its fallback decisions.
+same health priority, it tries the fewest in-flight calls first. Worker saturation reports
+stateless roots and Binding calls for that Worker. CPU saturation and refusals from older peers
+that lack the Worker count use the node-wide count. Each ingress rotates ties across its fallback decisions.
 Nodes under avoidance go behind other candidates, and a draining or expired ingress tries itself
 last. Each candidate gets at most one such retry. The original admission checks and deadline still apply.
 An uncertain outcome ends either pass. Soft refusals do not add node-wide avoidance. The

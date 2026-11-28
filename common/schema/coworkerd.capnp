@@ -242,6 +242,11 @@ struct InvocationRejection {
   category @7 :Text;
   notExecuted @8 :Bool;
   retryable @9 :Bool;
+  # WORKER_SATURATED: other stateless calls for this Worker on the candidate.
+  workerLoad :union {
+    unreported @10 :Void;
+    inFlight @11 :UInt32;
+  }
 }
 
 struct RemoteInvocation {

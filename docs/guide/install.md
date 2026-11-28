@@ -521,7 +521,8 @@ With dynamic ingress placement, a candidate can decline a new stateless root at 
 time or 95% of available node CPU over about 3 s. The isolate reading requires a threaded kernel
 with busy-time reporting. Linux cgroup v2 CPU usage covers the node's own cgroup and its
 descendants. When the first pass finds no candidate, ingress can retry soft refusals, preferring
-fewer in-flight calls among equally healthy nodes. The usual limits still apply. [Cluster placement](../cluster-state.md#7-placement)
+fewer in-flight calls for that Worker among equally healthy nodes. For a CPU saturation refusal it
+uses the node-wide count. The usual limits still apply. [Cluster placement](../cluster-state.md#7-placement)
 
 The experimental `processPool.tenantInFlightLimit` is disabled by default (`0`). When omitted, it creates no tenant execution counters or waiters and imposes no per-tenant call limit. It is not recommended for use; CPU-share fairness remains under evaluation. Explicit nonzero settings retain the experimental borrowable limit and `tenantAdmissionWaitMs` wait setting for development only. Per-request CPU and memory limits, process memory admission, node watermarks, and total process safety limits still apply.
 

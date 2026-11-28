@@ -106,7 +106,9 @@ to test deterministic readings at the isolate and CPU thresholds. These cases ch
 ordinary request skips busy nodes and executes once on the idle candidate, that a lost peer
 open stops placement, and that explicit soft refusals can be revisited. The all-busy case
 checks tie rotation and even placement of sleeping roots, then verifies hard refusal when
-both slots on each node are full.
+both slots on each node are full. The `ingress-placement-unrelated-streams` case checks
+that a second tenant's 24 idle response streams do not steer the hot Worker's overflow
+away from their peer.
 
 The default suite also runs `ingress-placement-live-saturation` with the pinned kernel to
 test the production reader without overrides. It warms an isolate on the Worker home,
