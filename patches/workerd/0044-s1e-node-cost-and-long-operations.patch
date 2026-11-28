@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
 Date: Fri, 20 Nov 2026 12:00:00 +0800
-Subject: [PATCH] S1e: long operations take interrupts, the heap ceiling rises within the process budget
+Subject: [PATCH] Interrupt long operations and raise the heap ceiling within
+ the process budget
 
 
 diff --git a/build/deps/v8.MODULE.bazel b/build/deps/v8.MODULE.bazel
@@ -433,7 +434,7 @@ index 0000000000000000000000000000000000000000..d4eebf6929ff2130bd86debb30e41bad
 + 
 +       if (element == TheHole) {
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b72064375f630b2 100644
+index 0b8e25a22cc0e3d149406e745e7a665a10177da2..06311b5ac7f9554a7698fd576b1f98a05e49c693 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -164,6 +164,34 @@ KJ_TEST("tenant admission releases counts on errors and cancellation") {
@@ -441,7 +442,7 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
  }
  
 +// A console line past 4,096 bytes reaches the node cut, with its size, so that
-+// the node marks it truncated and counts it (b50 log-quota-isolation).
++// the node marks it truncated and counts it.
 +KJ_TEST("a console line past 4,096 bytes carries its size to the node") {
 +  auto longLine = consoleLogRow("log", kj::str(kj::repeat('x', 5000)));
 +  KJ_EXPECT(longLine.endsWith(",\"messageBytes\":5000}"), longLine.slice(longLine.size() - 40));
@@ -453,7 +454,7 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
 +// The maintenance pass formats every resident into its lifecycle row outside
 +// the registry lock; holding them meanwhile must not make an idle Worker look
 +// in use, or a load past the resident limit is refused instead of evicting
-+// one (r50's fill cells: about four loads in ten refused).
++// one. In the original saturation run, about four loads in ten were refused.
 +KJ_TEST("the maintenance pass's snapshot leaves an idle resident evictable") {
 +  std::map<std::string, std::shared_ptr<Slot>> registry;
 +  auto idle = std::make_shared<Slot>();
@@ -475,7 +476,7 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
    abandoned = nullptr;
    KJ_EXPECT(small.waiters.empty());
  
-+  // Without a per-tenant limit no per-tenant count is kept (v138 section 1).
++  // Without a per-tenant limit no per-tenant count is kept.
 +  SubrequestBudget unlimited(512, 0);
 +  auto calls = std::make_shared<uint32_t>(0);
 +  SubrequestPermit egress(unlimited, calls, "a", true);
@@ -523,10 +524,10 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
      "globalThis.kept = []; for (let i = 0; i < 1013; ++i) kept.push(new Array(16300).fill(1.5));"
      "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
  
-+// Long operations that check no interrupt while they allocate: after the
-+// near-heap-limit callback has raised the ceiling and requested the
-+// termination, they keep allocating until they meet the raised ceiling (v137
-+// §6.28-§6.29, v138 §4).
++// These long operations allocate without checking for interrupts. The
++// near-heap-limit callback raises the ceiling and requests termination.
++// Until the operation reaches an interrupt check, it can keep allocating
++// up to the raised ceiling.
 +// JSON.parse of 120 million empty objects (about 3.4 GB) from a 360 MB text.
 +constexpr kj::StringPtr JSON_OBJECTS =
 +    "globalThis.retained = JSON.parse('[' + '{},'.repeat(1.2e8) + '{}]'); retained.length"_kj;
@@ -534,9 +535,9 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
 +// while parsing, then a backing store V8 cannot allocate.
 +constexpr kj::StringPtr JSON_NUMBERS =
 +    "globalThis.retained = JSON.parse('[' + '1,'.repeat(2**27) + '1]'); retained.length"_kj;
-+// Straight-line code: no loop and no JavaScript call, so no interrupt check,
-+// six flattened 500 MB strings one after another (the shape of the §6.29
-+// verifier).
++// Straight-line code flattens six 500 MB strings in succession.
++// There is no loop or JavaScript call to provide an interrupt check
++// between allocations.
 +constexpr kj::StringPtr STRAIGHT_LINE =
 +    "const a = ' '.repeat(5e8); a.indexOf('z'); const b = a + '1'; b.indexOf('z');"
 +    "const c = b + '2'; c.indexOf('z'); const d = c + '3'; d.indexOf('z');"
@@ -549,7 +550,7 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
 +    "globalThis.retained = clone([0, 1, 2, 3].map(i => String.fromCharCode(256 + i).repeat(2**29 - 24)));"
 +    "retained.length"_kj;
 +// replaceAll with a string replacement: a new ConsString per match and no
-+// JavaScript call, 250 million matches (§8.2 of the v138 task).
++// JavaScript call, 250 million matches.
 +constexpr kj::StringPtr REPLACE_ALL =
 +    "const s = 'a'.repeat(2.5e8); s.indexOf('z'); globalThis.retained = s.replaceAll('a', 'b'); retained.length"_kj;
 +// String.prototype.split into 120 million three-character strings (about
@@ -576,14 +577,14 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
 +// without the limit the repeated key collapses into one property and the parse completes.
 +constexpr kj::StringPtr JSON_PROPERTIES_REVIVER =
 +    "globalThis.retained = JSON.parse('{' + '\"a\":1,'.repeat(2**24) + '\"a\":1}', (k, v) => v); 1"_kj;
-+// The verifier's sweep of V8 builtins (v138 §8.4), the shapes that ended the
-+// process on cwkd-p40: a sort of an array-like object or a string sized its
-+// work array by the length; a global replace with a function collected every
++// These V8 builtins previously caused fatal allocation failures. Sorting an
++// array-like object or a string sized the work array by input length. A
++// global replace with a function collected every
 +// match before the first call; a global atom match allocated one array for
 +// every match it counted.
 +constexpr kj::StringPtr SORT_STRING =
 +    "Array.prototype.sort.call('x'.repeat(2**28)); 1"_kj;
-+// The work array of such a sort grows as it collects (v138 §8.5): past 89,989,624 elements its next
++// The work array grows as the sort collects elements. Past 89,989,624 elements its next
 +// growth went beyond the largest FixedArray and ended the process for a tenant whose memory limit
 +// lets it get there; it stops at the largest now, and one element more throws a RangeError.
 +constexpr kj::StringPtr SORT_STRING_90M = "Array.prototype.sort.call('x'.repeat(9e7)); 1"_kj;
@@ -597,7 +598,7 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
 +    "globalThis.retained = 'x'.repeat(2**27 + 1).match(/x/g); retained.length"_kj;
 +// Loops that allocate nothing while they run: their interrupt checks are what
 +// lets a short CPU limit end the call (each takes about a second unchecked).
-+// The numbers' fast path: long decimals, about 2 s of parsing on cwkd-p40 after about 0.15 s of flattening the text.
++// On the numbers' fast path, long decimals took about 2 s to parse after about 0.15 s to flatten the text.
 +// Its CPU limit (500 ms, below) expires inside the number loop, so only that loop's check can end the call in time;
 +// with the 50 ms of the others the limit expired while the text was flattened and the first value's check ended it.
 +constexpr kj::StringPtr CPU_JSON_NUMBERS =
@@ -891,10 +892,10 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
 +  isolate->CancelTerminateExecution();
 +}
 +
-+// With a V8 sandbox per isolate group each isolate's heap has a pointer cage of its own: a raise
-+// reaches at most that cage less what V8 keeps in it, however much the process budget has left
-+// (v138 §8.1's interface with r50's S3a). A build with one shared cage bounds it by that cage's
-+// remainder over all isolates instead (the test above), and skips this one.
++// With a V8 sandbox per isolate group, each isolate's heap has its own pointer cage.
++// The cage space V8 leaves available bounds a raise even if the process budget has room.
++// With a shared cage, the space left by all isolates in that cage bounds the raise.
++// That build runs the test above and skips this case.
 +KJ_TEST("with a sandbox per isolate, a raised ceiling stays within the isolate's own cage") {
 +  initializeV8();
 +  if (!v8::IsolateGroup::CanCreateNewGroups()) return;
@@ -915,7 +916,7 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
 +  KJ_EXPECT(budget->lent.load() == 0);
 +}
 +
-+// Each long operation below ended the process before v138 (exit 74 at the
++// Each long operation below previously ended the process (exit 74 at the
 +// raised ceiling, or V8's fatal invalid size): the child must survive, its
 +// call end with the memory limit (or, where noted, a RangeError), and the
 +// neighbor keep answering and allocating.
@@ -978,7 +979,7 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
  
 +// A streamed body keeps the call's response open: the 30 seconds of waitUntil
 +// work start when it ends (or the client goes away), not when the handler
-+// returned (Cloudflare's Context page; v138 section 4).
++// returned (see Cloudflare's Context documentation).
 +KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handler returns") {
 +  initializeV8();
 +  kj::EventLoop loop;
@@ -1011,7 +1012,7 @@ index 9de66b6175aa362df34813d8a08887ce7fef0322..720fadf3d930014291f9f3562b720643
    kj::EventLoop loop;
    kj::WaitScope waitScope(loop);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 612036c54c1437e0981dc5da39318f7f9347f1f4..d8295d11e322c9dbe65627b31a6f7859f36edaa9 100644
+index 659800e70521be25956c74a7cd92e085168ec7e5..d863959e0b78449e4410f5a6b3d4059e4c6d1730 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -213,18 +213,26 @@ thread_local const char *currentOomReport = nullptr;
@@ -1100,8 +1101,8 @@ index 612036c54c1437e0981dc5da39318f7f9347f1f4..d8295d11e322c9dbe65627b31a6f7859
      if (currentCause) {
 @@ -803,19 +820,87 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {
      // large allocation can then meet the fixed ceiling with that object live
-     // (cwkd-p40: a 500 MB string, then a maximum string, ended the process,
-     // raw/s27-x500). Near the ceiling the isolate is over its limit: it is
+     // (a 500 MB string followed by a maximum-size string caused a fatal OOM).
+     // Near the ceiling, the isolate has exceeded its limit and is
 -    // terminated as such, and its ceiling is raised once by one maximum
 -    // object so that the allocation in progress finishes; its call ends with
 +    // terminated as such, and its ceiling is raised by one maximum object so
@@ -1127,8 +1128,8 @@ index 612036c54c1437e0981dc5da39318f7f9347f1f4..d8295d11e322c9dbe65627b31a6f7859
      }, this);
    }
 +  // The new ceiling. The heap can already be past the old one: young large
-+  // objects are promoted without a limit check (cwkd-p40, v138: a structured
-+  // clone of three maximum strings had 2.0 GiB live at a 1313 MiB ceiling, so
++  // objects are promoted without a limit check (a structured clone of three
++  // maximum strings had 2.0 GiB live at a 1313 MiB ceiling, so
 +  // raising the ceiling itself by one maximum object left no room for the
 +  // third and V8's OOM ended the process). So the room is counted from what is
 +  // in use. The first raise is one maximum object, whatever else is in use. A
@@ -1147,7 +1148,7 @@ index 612036c54c1437e0981dc5da39318f7f9347f1f4..d8295d11e322c9dbe65627b31a6f7859
 +    const uint64_t used = stats.total_heap_size();
 +    // With a V8 sandbox per isolate group the isolate's heap has a pointer cage of its own, which
 +    // bounds every raise whatever the process budget has left (with one shared cage its remainder
-+    // over all isolates does, below: v138 §8.1's interface with r50's S3a).
++    // over all isolates does, below).
 +    const uint64_t wanted = ownCageCeiling(kj::max(uint64_t(current), used) + MAX_SINGLE_HEAP_OBJECT);
 +    const bool first = ceilingRaised.load() == 0;
 +    if (!first && !reservation) return current;
@@ -1278,8 +1279,8 @@ index 612036c54c1437e0981dc5da39318f7f9347f1f4..d8295d11e322c9dbe65627b31a6f7859
 +    // CPU/heap limits and ends at the latest WAIT_UNTIL_LIMIT after the
 +    // response ended: as on Cloudflare, once the response is sent -- a
 +    // streamed body to its end -- or the client disconnected, not when the
-+    // handler returned the response (v138 section 4). KJ's timer does not
-+    // advance while JavaScript runs, so the deadline is taken from the
++    // handler returned the response. KJ's timer does not advance while
++    // JavaScript runs, so the deadline is taken from the
 +    // monotonic clock (or the timer, if that is ahead), not as a delay from the
 +    // timer's cached time.
      if (drainLimitDisabledForTest()) return kj::NEVER_DONE;
@@ -1309,7 +1310,7 @@ index 612036c54c1437e0981dc5da39318f7f9347f1f4..d8295d11e322c9dbe65627b31a6f7859
 +// One console line for the node's log post: at most LOG_MESSAGE_BYTES of the
 +// message, and when it was longer its size, so that the node marks the line
 +// truncated and counts it as it does for any line past its own limit (a cut
-+// here without the size reached the node as an ordinary line, v138).
++// here without the size reached the node as an ordinary line).
 +constexpr size_t LOG_MESSAGE_BYTES = 4096;
 +kj::String consoleLogRow(kj::StringPtr level, kj::StringPtr message) {
 +  capnp::MallocMessageBuilder arena;

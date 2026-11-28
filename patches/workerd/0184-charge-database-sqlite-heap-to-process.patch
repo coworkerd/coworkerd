@@ -75,7 +75,7 @@ index b03e958d5b8dd371d31e3d775374fef9691404b2..cf9f554ed3a6b79172e1bcba4cce594f
    kj::Own<DurableLogShipper> ship(kj::StringPtr uniqueKey,
        DurableObjectName name, SqliteDatabase& database, kj::Timer& timer,
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index d1164d9463d31ce41fce91019133458f2aac7308..4c793547cf799e161aabb914ec5d74ddb1a5b3c4 100644
+index cd5a863932ecc9e2deb20944ec2b2dd767d7d8e0..0109d84789a034c749aeac1ca63f340a4057923f 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -523,6 +523,171 @@ KJ_TEST("queueDurable holds the returned tree and preparation credits until a da
@@ -251,7 +251,7 @@ index d1164d9463d31ce41fce91019133458f2aac7308..4c793547cf799e161aabb914ec5d74dd
    int fds[2];
    KJ_SYSCALL(pipe(fds));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index f391261748c3f980c6ea8760d1a0b7b6492ee342..cee37c292d322dd58849260b7652968baa2c39c5 100644
+index 9ba5c7117849923c45eb81b6df7e605f1e438025..25fd66efc65cee23465622dbf3a001e267627bba 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -350,7 +350,7 @@ struct ResourceBudget {

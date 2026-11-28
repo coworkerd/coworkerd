@@ -4,7 +4,7 @@ Date: Fri, 6 Nov 2026 02:20:26 +0800
 Subject: [PATCH] Carry explicit Coworkerd creation identity through the worker
  loader
 
-Coworkerd 0.5.4 port: creation identity record (r13 rule 2)
+Coworkerd 0.5.4 port: explicit creation identity record
 
 The platform-only optional get() argument preserves existing two-argument calls and load(). Presence enables tenant accounting, explicit limits override process defaults, and workerId selects GC budgets. Generation remains reserved at zero.
 
@@ -185,7 +185,7 @@ index 351e17522c3945771debb3279b62bddf4e9c9c0b..df7613f27355db32f9ba561e595cdaaf
    static const int pid = getpid();
    return pid;
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
-index 10003e7818ffa0eb6183e7bc849b49b3753e1cf8..d81e4d1e938ae950894d4a3b173b056784269c59 100644
+index 4c215e270479eba77cbb10ae184fd031afa7cd98..2a80d5269766e9e95592e545a7a33cf9d7a5474f 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.h
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
 @@ -26,24 +26,19 @@
@@ -205,7 +205,7 @@ index 10003e7818ffa0eb6183e7bc849b49b3753e1cf8..d81e4d1e938ae950894d4a3b173b0567
 +  uint32_t memoryLimitMiB = 0;
  };
 -uint32_t cpuLimitFromEnvironment();
--// The limits one Worker names (Coworkerd v49), as the loader key the node's runtime bridge chose carries them:
+-// The node's runtime bridge carries the Worker's explicit limits in the loader key:
 -// the isolate name's last segment `limits=<cpuMs>:<memoryMiB>` (either may be 0: the process's value, which
 -// COWORKERD_CPU_LIMIT_MS and COWORKERD_MEMORY_LIMIT_MIB give, applies to it instead). Both are zero for any
 -// other name, so an isolate whose Worker names no limit behaves as before. An isolate's heap constraint is
@@ -269,9 +269,9 @@ index 10003e7818ffa0eb6183e7bc849b49b3753e1cf8..d81e4d1e938ae950894d4a3b173b0567
 +    if (!tenantWorker && gcSettings().staticHeapBytes) recordStaticHeapLimit(value, name);
    }
    bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
-   // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
+   // Report the execution identity so a fatal OOM can be attributed to the request.
 @@ -184,11 +178,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-   // keeps reporting who was executing.
+   // limit.
    bool memoryIdentityWanted() const { return memory != nullptr || memoryLimitFromEnvironment() != 0; }
    // The limits in force here, whichever named them: what the state endpoint shows as applied.
 -  CoworkerdNamedLimits applied() const {

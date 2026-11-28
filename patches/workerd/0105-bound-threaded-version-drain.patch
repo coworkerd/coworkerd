@@ -93,7 +93,7 @@ index 3a5c53e6a35fa5d7861b718b1c57526ccad5a3e5..cc9bd557f7fae59dd358a304e75404f9
  // An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
  // object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 5a5f2008d42ce911dffb5fb07e005034d9445e48..bfe8f8899f7f4f6f921e17380ec73208633ee2b5 100644
+index b92707ed332e51fafc58a7be1e285b87b06e98ef..e9a20aa5354213078405135ad18e9c03d2b4843d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1684,7 +1684,7 @@ struct ThreadState {
@@ -154,7 +154,7 @@ index 5a5f2008d42ce911dffb5fb07e005034d9445e48..bfe8f8899f7f4f6f921e17380ec73208
            break;
          }
        });
-@@ -5504,6 +5514,10 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
+@@ -5540,6 +5550,10 @@ class DurableActorHooks final: public Worker::Actor::Loopback,
  
    void stop() {
      const auto reason = KJ_EXCEPTION(DISCONNECTED, "Durable test tree was closed.");
@@ -165,7 +165,7 @@ index 5a5f2008d42ce911dffb5fb07e005034d9445e48..bfe8f8899f7f4f6f921e17380ec73208
      for (auto at = children.begin(); at != children.end();) {
        auto current = at++;
        current->second->stop(reason);
-@@ -5564,7 +5578,7 @@ bool LocalFacet::hasOrdinaryWebSocket() {
+@@ -5600,7 +5614,7 @@ bool LocalFacet::hasOrdinaryWebSocket() {
  void LocalFacet::stop(const kj::Exception &reason) {
    const auto wasStopped = std::exchange(stopped, true);
    KJ_IF_SOME(opened, actor) {
@@ -174,7 +174,7 @@ index 5a5f2008d42ce911dffb5fb07e005034d9445e48..bfe8f8899f7f4f6f921e17380ec73208
      if (!wasStopped) opened.value->abort(reason.clone());
      if (!busy()) {
        opened.value->shutdown(0);
-@@ -5748,17 +5762,22 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -5784,17 +5798,22 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
                      ThreadState::DurableRoot{
                        .actor = kj::mv(actor.value),
                        .idle = std::move(idle),

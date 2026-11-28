@@ -16,7 +16,7 @@ and the home are released, which also takes the event's waiter off the
 cold load.
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 4f06fd15bf7fc60cc0585756d14c51b5c34c25c9..8fcf4919b3a80ce41e1debf82afba5257bc23714 100644
+index 79fcb09415ddc39bc9b3471aacd7d2a3e615b049..7672e8467d181b227e61eed65fb0aba9856d7393 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2114,18 +2114,28 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {

@@ -6,7 +6,7 @@ Subject: [PATCH] Report a fatal V8 error from the current ordinary Worker
 
 
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index 339f03ed092c134624fd395bd30351a53d30e21d..9895fca5e4c88f0497c8c29affe024e3af51738b 100644
+index b4b6e84ed58e08683bc8028a3d6dfb47d4d063bd..812c608560acab803e82fca20e849b4649d3a4bb 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
 @@ -42,6 +42,19 @@ wd_cc_binary(
@@ -30,7 +30,7 @@ index 339f03ed092c134624fd395bd30351a53d30e21d..9895fca5e4c88f0497c8c29affe024e3
      src = "protocol.capnp",
      deps = [
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 720fadf3d930014291f9f3562b72064375f630b2..058a61eb4a36493f7649ba1d8cb770b3cb6c5661 100644
+index 06311b5ac7f9554a7698fd576b1f98a05e49c693..8c87fe20452d78f5fe645a82ffa8c5db075e4e80 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -39,6 +39,41 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
@@ -76,7 +76,7 @@ index 720fadf3d930014291f9f3562b72064375f630b2..058a61eb4a36493f7649ba1d8cb770b3
    DescriptorQueue queue(2);
    KJ_EXPECT(queue.pop() == -1 && queue.hasSpace());
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 8ecd35b80c662a03e9aa2851ec9f6a5103a3910a..321dcf9052c5abaef63307be61143f83a1019972 100644
+index 2c950cea0674a2e26d53d8b4ba59aeec7341776f..403311ff39b4ff0e2e11239e72e4cd45a2462714 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -40,6 +40,7 @@

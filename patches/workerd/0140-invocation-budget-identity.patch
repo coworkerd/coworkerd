@@ -216,10 +216,10 @@ index 95c10ef3d9f4b86624ca6ece8092109642823942..381c494e534a33541b82a209ef98ca7b
      fn for_props(
          &self,
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 7f355641445dd2329a222cf84eedeaf028c1b154..7b0c5b5aeeb1d1c2addfafb7f80ffc200452d05f 100644
+index 80b3af25846ee82b9ea3762f65c33a10f62b1c0f..8825de427f59958f998dd9015d73b9df4e4bb6b5 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -5147,9 +5147,12 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+@@ -5177,9 +5177,12 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
        root.setString(value);
        return encode(root.asReader());
      };
@@ -233,7 +233,7 @@ index 7f355641445dd2329a222cf84eedeaf028c1b154..7b0c5b5aeeb1d1c2addfafb7f80ffc20
          "}");
      return envelope(input(), "", false, kj::mv(object));
    }
-@@ -5173,7 +5176,8 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+@@ -5203,7 +5206,8 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
      if (channel < IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT) {
        auto identity =
            kj::str(server.egressToken.c_str(), " {\"workerId\":", encode(field(input(), "workerId")),

@@ -5,10 +5,10 @@ Subject: [PATCH] Retry transient errors on the durable budget release socket
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index a13cfcbf22db2f5c9ae47b3a15d7bda235afe636..2390fd4b3ac0415110b2f88c04bdcc96eb025268 100644
+index 4c1dff8a02cfc19ee6180b866878ab3c167d1b06..95f3aeaed3b0654eb7a459e61fb1e3557c330d4d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -2816,6 +2816,7 @@ struct ThreadedServer {
+@@ -2846,6 +2846,7 @@ struct ThreadedServer {
      size_t offset = 0;
      for (;;) {
        bool pending;
@@ -16,7 +16,7 @@ index a13cfcbf22db2f5c9ae47b3a15d7bda235afe636..2390fd4b3ac0415110b2f88c04bdcc96
        {
          std::lock_guard lock(budgetReleaseMutex);
          while (!budgetReleases.empty()) {
-@@ -2825,9 +2826,9 @@ struct ThreadedServer {
+@@ -2855,9 +2856,9 @@ struct ThreadedServer {
            if (written < 0 && errno == EINTR) continue;
            if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
            if (written <= 0) {
@@ -29,7 +29,7 @@ index a13cfcbf22db2f5c9ae47b3a15d7bda235afe636..2390fd4b3ac0415110b2f88c04bdcc96
            }
            offset += written;
            if (offset == sizeof(uint64_t)) {
-@@ -2837,15 +2838,18 @@ struct ThreadedServer {
+@@ -2867,15 +2868,18 @@ struct ThreadedServer {
          }
          pending = !budgetReleases.empty();
        }

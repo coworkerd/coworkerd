@@ -6,7 +6,7 @@ Subject: [PATCH] Finish leased HTTP response bodies before draining background
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index f66a5927e6e97b409c8a16df6a0e4380f8d6feb6..7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4 100644
+index ee8fa65c87e755d2278ac35579a5bcbecd65cc3b..2ba4df5bf20e719b7332d4d65768725e4050506e 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -7821,7 +7821,13 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,

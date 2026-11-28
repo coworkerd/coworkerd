@@ -508,7 +508,7 @@ index 3c607e13c0d2a8d9b2b00d00184f75343c627cb4..6e93811be013ce7e47bad601f67dc674
      auto sqlite = kj::heap<ActorSqlite>(kj::mv(db), outputGate, kj::mv(commit), *sqliteHooks);
      KJ_IF_SOME(root, rootHooks) {
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index 019b6299a951a6682023542d692199bcb828715c..339f03ed092c134624fd395bd30351a53d30e21d 100644
+index 520d11b2d816ac9a39b98dbc4daa6804655bc744..b4b6e84ed58e08683bc8028a3d6dfb47d4d063bd 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
 @@ -19,6 +19,8 @@ THREADED_DEPS = [
@@ -521,7 +521,7 @@ index 019b6299a951a6682023542d692199bcb828715c..339f03ed092c134624fd395bd30351a5
      "//src/workerd/util:entropy",
      "@capnp-cpp//src/capnp:capnp-rpc",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 13e9e75235a83db02b49284b62e57113c2abd864..7e2658178095d399d6f1712a2beb5242ae2aee69 100644
+index c1489be837b1402a1781c5d224bd2bf6b374832b..5b947f098a37e7aef0b9f384404005820a8dcee5 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -26,6 +26,7 @@

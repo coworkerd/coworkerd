@@ -712,7 +712,7 @@ index 9e1aa1f6ac4fe039908c6314aa19710eabbfeaa5..fb89a42906f85f898ea2e1785b22349f
  
    // Ends the --async-trace file. The factory is destroyed first, ending every context, so the exit
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
-index 00c12e4f371aaf239fcbe0e3279e03ac68e41225..6684c1ce0df5ae7ded16cebd3b2533f3ae71d4d4 100644
+index 6ef62d3b25063b740c3711295b971b4f8a631999..34134cfe01d841720dadf78dabdd91213756ca23 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.h
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
 @@ -5,6 +5,7 @@
@@ -803,7 +803,7 @@ index 5cffbbaa11a5f04bca8a15d1423ba92994eda843..539656f9d4b92f8a1a29ac3000065856
  
  void IsolateMemoryLimit::customize(v8::Isolate* value) {
 diff --git a/src/workerd/server/factory/coworkerd-memory-limit.h b/src/workerd/server/factory/coworkerd-memory-limit.h
-index 4862a5b05f5c49bab7dd7ea6e14dbb07bd0bd996..95a535be3d6d098e2d0b31738c25b2915c92e07c 100644
+index 4862a5b05f5c49bab7dd7ea6e14dbb07bd0bd996..042fe3a2dcaab0c0e14067d0dd36aee8d17a0e3b 100644
 --- a/src/workerd/server/factory/coworkerd-memory-limit.h
 +++ b/src/workerd/server/factory/coworkerd-memory-limit.h
 @@ -23,14 +23,22 @@ struct MemoryExecution {
@@ -824,7 +824,7 @@ index 4862a5b05f5c49bab7dd7ea6e14dbb07bd0bd996..95a535be3d6d098e2d0b31738c25b291
    void Free(void* address, size_t length) override;
 +  // sandboxMaxAllocationSize(): with a V8 sandbox per isolate group, no single buffer and no
 +  // resizable buffer's reservation beyond the group's pool (V8's default is 32 GiB, more than the
-+  // buffer half of an 8 GiB sandbox); the limit itself stays with allocate() (r50 §6.5 B2).
++  // buffer half of an 8 GiB sandbox); allocate() enforces the Worker's memory limit.
 +  size_t MaxAllocationSize() const override;
 +  v8::PageAllocator* GetPageAllocator() override;
    void customize(v8::Isolate* isolate);
@@ -840,7 +840,7 @@ index 4862a5b05f5c49bab7dd7ea6e14dbb07bd0bd996..95a535be3d6d098e2d0b31738c25b291
  };
 diff --git a/src/workerd/server/factory/coworkerd-sandbox-test.c++ b/src/workerd/server/factory/coworkerd-sandbox-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..a1e8b500578ac87ba1095b34c588b8f407f7fb42
+index 0000000000000000000000000000000000000000..7696e280c0cce216caed02e171eb4ef91eb1bc5d
 --- /dev/null
 +++ b/src/workerd/server/factory/coworkerd-sandbox-test.c++
 @@ -0,0 +1,372 @@
@@ -984,8 +984,8 @@ index 0000000000000000000000000000000000000000..a1e8b500578ac87ba1095b34c588b8f4
 +  KJ_EXPECT(group.SandboxContains(store->Data()));
 +  KJ_EXPECT(!other.SandboxContains(store->Data()));
 +  KJ_EXPECT(limit->bufferBytes.load() >= size_t(1) << 20);
-+  // V8's maximum is the group's pool, not the 64 MiB limit, which allocate() enforces itself
-+  // (r50 §6.5 B2).
++  // V8's maximum is the group's pool. The allocator enforces the 64 MiB
++  // Worker limit separately.
 +  KJ_EXPECT(limit->MaxAllocationSize() == SANDBOX_POOL_BYTES);
 +}
 +
@@ -1623,7 +1623,7 @@ index 0000000000000000000000000000000000000000..586fcef2b332b6ddd923d5c1c1779759
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/coworkerd-sandbox.h b/src/workerd/server/factory/coworkerd-sandbox.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..2b5bee3f673d3787475297412fa7a37d7532616e
+index 0000000000000000000000000000000000000000..d16520c564b4ebe175d1856917256918152bd437
 --- /dev/null
 +++ b/src/workerd/server/factory/coworkerd-sandbox.h
 @@ -0,0 +1,85 @@
@@ -1697,13 +1697,13 @@ index 0000000000000000000000000000000000000000..2b5bee3f673d3787475297412fa7a37d
 +// With a V8 sandbox per isolate group no buffer can be larger than the group's pool, so V8 refuses
 +// one above SANDBOX_POOL_BYTES before reserving anything; otherwise, and in a build without the
 +// sandbox, V8's own value. Never the Worker's memory limit: a buffer above it still reaches the
-+// allocator, which ends the execution with the limit's own cause (r50 §6.5 B2).
++// allocator, which ends the execution with the limit's own cause.
 +size_t sandboxMaxAllocationSize(size_t inner);
 +
 +// How many isolate groups this process can still create: creates them until tryNewIsolateGroup()
 +// refuses, then releases them. V8 places each sandbox at a random address, so the address space
 +// holds about three quarters of what its size divided by one reservation suggests (random
-+// sequential packing; 720 on a 47-bit user address space with 136 GiB reservations, cwkd-p40).
++// sequential packing; 720 on a 47-bit user address space with 136 GiB reservations).
 +// 0 in a build with one shared pointer-compression cage.
 +size_t measureGroupCapacity(size_t limit = 65536);
 +
@@ -1876,7 +1876,7 @@ index 09ee81ac34bb1845ee1087b82075f1f984da081b..3267a65fd3ea297c261d61c3c965c818
  
  }  // namespace workerd::server
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index 2cac73c8b6ef474222a22f760dac058fdd3d932a..a9ea7a312afd18d6ffb1307c2c8372e3c8e478b2 100644
+index 2cac73c8b6ef474222a22f760dac058fdd3d932a..091d21d5278f5c1e5e99068534d9b34c98eb4556 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
 @@ -12,6 +12,7 @@ THREADED_DEPS = [
@@ -1891,14 +1891,14 @@ index 2cac73c8b6ef474222a22f760dac058fdd3d932a..a9ea7a312afd18d6ffb1307c2c8372e3
  )
  
  kj_test(
-+    # About 20 s on cwkd-p40 (seven children that each make near-GiB allocations): over the 15 s
-+    # that .bazelrc gives a medium test.
++    # Seven child processes make near-GiB allocations. The test took about 20 s,
++    # exceeding the 15 s that .bazelrc gives a medium test.
 +    size = "large",
      src = "threaded-server-test.c++",
      malloc = "//src/workerd/server:malloc",
      target_compatible_with = ["@platforms//os:linux"],
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..9de66b6175aa362df34813d8a08887ce7fef0322 100644
+index f96289ea77076ad4904f0ccef152481600360264..0b8e25a22cc0e3d149406e745e7a665a10177da2 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -27,6 +27,17 @@ void initializeV8() {
@@ -1985,7 +1985,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..9de66b6175aa362df34813d8a08887ce
 +  KJ_EXPECT(limits.group.SandboxContains(store->Data()));
 +  KJ_EXPECT(!other.SandboxContains(store->Data()) || !v8::IsolateGroup::CanCreateNewGroups());
 +  // V8 refuses a buffer above the group's pool before reserving anything; the Worker's own limit
-+  // (32 MiB here) is not V8's maximum (r50 §6.5 B2: the next test).
++  // (32 MiB here) is enforced separately, as the next test shows.
 +  if (v8::IsolateGroup::CanCreateNewGroups()) {
 +    KJ_EXPECT(limits.memory->MaxAllocationSize() == server::SANDBOX_POOL_BYTES);
 +  } else {
@@ -1995,7 +1995,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..9de66b6175aa362df34813d8a08887ce
 +
 +KJ_TEST("one ArrayBuffer above the memory limit ends the execution as MEMORY_LIMIT_EXCEEDED") {
 +  // With or without the V8 sandbox: the buffer reaches the budget, which marks MEMORY and ends
-+  // the execution, never a RangeError the Worker could catch (r50 §6.5 B2).
++  // the execution, never a RangeError the Worker could catch.
 +  allocationComponent(
 +      "try { globalThis.retained = new ArrayBuffer(64 * 1024 * 1024); } catch (e) { globalThis.caught = e; }");
 +}
@@ -2003,7 +2003,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..9de66b6175aa362df34813d8a08887ce
 +KJ_TEST("a refused isolate group is retried, not kept as the Worker's failure") {
 +  // compile() throws capacityError() when tryNewIsolateGroup() refuses (no room in the address
 +  // space for another V8 sandbox). Kept in the slot, every request for that Worker answered 503
-+  // in this process until the slot idled out (r50 §6.5 B1).
++  // in this process until the slot idled out.
 +  kj::Maybe<kj::Exception> refused = capacityError();
 +  KJ_EXPECT(loadFailureRetryable(refused, true, false));
 +  KJ_EXPECT(isCapacityError(KJ_ASSERT_NONNULL(refused)));
@@ -2021,7 +2021,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..9de66b6175aa362df34813d8a08887ce
 +}
 +
 +KJ_TEST("a refused isolate group lowers the process's resident limit to its residents") {
-+  // r50 §6.5 B3: the next Worker then evicts an idle one instead of being refused again.
++  // The next Worker can then evict an idle one instead of being refused again.
 +  auto budget = std::make_shared<ResourceBudget>(1ull << 30, 1840, 1);
 +  std::vector<std::shared_ptr<ResourceReservation>> residents;
 +  for (int i = 0; i < 4; i++) {
@@ -2090,8 +2090,8 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..9de66b6175aa362df34813d8a08887ce
 +// Four isolates each finish an object of about 1 GiB at the same moment while a neighbor keeps
 +// answering. With a pointer cage (and a V8 sandbox) per isolate (--config=coworkerd-sandbox), each
 +// heap has its own 4 GiB, so the process survives. With one shared 4 GiB cage this ended the
-+// process with V8's fatal OOM (exit 74; the known failure until S3, v137 §6.24), which a build
-+// without per-isolate cages still reproduces: that branch keeps the old expectation.
++// process with V8's fatal OOM (exit 74). A build without per-isolate cages still reproduces
++// the failure, so that branch keeps the original expectation.
 +KJ_TEST("four simultaneous near-GiB heap objects preserve the process and a neighboring Worker") {
    auto child = runAllocationChild("4:string");
 +  if (v8::IsolateGroup::CanCreateNewGroups()) {
@@ -2134,7 +2134,7 @@ index 0e4813ffca23f7d0d02b193f904cc1dd01385fa2..9de66b6175aa362df34813d8a08887ce
    slot.limits = &isolateLimits;
    Measurement measurement;
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..612036c54c1437e0981dc5da39318f7f9347f1f4 100644
+index c11b10ad02470dc6e5347f89c5caceea0c696ce1..659800e70521be25956c74a7cd92e085168ec7e5 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -19,6 +19,7 @@
@@ -2166,7 +2166,7 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..612036c54c1437e0981dc5da39318f7f
 -  const uint32_t residentMaximum;
 +  // The node's per-process limit, and the one in force: the first time the address space has no
 +  // room for another isolate's V8 sandbox, the limit is lowered to the residents it does hold
-+  // (lowerResidentMaximum(), r50 §6.5 B3), so that the next Worker evicts an idle one instead of
++  // (lowerResidentMaximum()), so that the next Worker evicts an idle one instead of
 +  // being refused again.
 +  const uint32_t configuredResidentMaximum;
 +  std::atomic<uint32_t> residentMaximum;
@@ -2222,7 +2222,7 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..612036c54c1437e0981dc5da39318f7f
 +// the Worker again instead of receiving this failure: one before the source was fetched, a caller
 +// failure (DISCONNECTED), memory pressure at startup (which becomes capacityError()), and any
 +// capacity refusal -- in particular no room for another isolate's V8 sandbox. Kept, a refused
-+// group answered 503 for this Worker in this process until its slot idled out (r50 §6.5 B1).
++// group answered 503 for this Worker in this process until its slot idled out.
 +// A tenant's own failure (its script throws, a binding is invalid) stays the Worker's failure.
 +bool loadFailureRetryable(kj::Maybe<kj::Exception> &error, bool fetched, bool memoryPressure) {
 +  if (memoryPressure) error = capacityError();
@@ -2270,7 +2270,7 @@ index 9e5db7888f2b74e154bce23cdac7fc3b123e8520..612036c54c1437e0981dc5da39318f7f
 +  // With a V8 sandbox per isolate group, no single buffer and no resizable buffer's reservation
 +  // beyond the group's pool (V8's default is 32 GiB, more than the buffer half of an 8 GiB
 +  // sandbox). Not the Worker's limit: a buffer above it reaches reserve(), which marks MEMORY and
-+  // ends the execution (r50 §6.5 B2).
++  // ends the execution.
 +  size_t MaxAllocationSize() const override {
 +    return server::sandboxMaxAllocationSize(inner->MaxAllocationSize());
 +  }

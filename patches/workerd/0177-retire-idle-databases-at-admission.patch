@@ -237,7 +237,7 @@ index aa8797f2c2121581aaa333ad7074ba1559b4d10b..a5355ec578e469118e4a00056436a708
  
   private:
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 6a59b1cf0fef0ac7c019898dfef7da82bfd98b3b..f5029f64355bb091fee49f6d92ff9f3aae09d959 100644
+index b740b0793d39c2cac0f56f07dbc80c854d577ee4..911d664965f036c6f4a939e0e9d8d945a0710bff 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -108,6 +108,133 @@ KJ_TEST("an exclusive database copy keeps its isolate while the home has a reser
@@ -375,7 +375,7 @@ index 6a59b1cf0fef0ac7c019898dfef7da82bfd98b3b..f5029f64355bb091fee49f6d92ff9f3a
    int fds[2];
    KJ_SYSCALL(pipe(fds));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index fbae87c6f5f828f9f312a94b7f30ece160c927a8..f676810d53511142b686177f7362e90f848fc913 100644
+index df080f6e3c4d7bad1bdf7762191a2aae0c2c2722..f0c5b55dbf2ef834d4a03d73da036fd1f10d3420 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -299,9 +299,23 @@ kj::Exception limitException(LimitCause cause);

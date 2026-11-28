@@ -6,7 +6,7 @@ Subject: [PATCH] Release exclusive database copies when idle roots retire
 Refs coworkerd/coworkerd#81
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index d706e00f8c866295dbd39e4363610f498065df6c..80030cfedf17f7a22997283e166fa7ec7d26604d 100644
+index 80f7c463fbbeff2864d8763428e5673a4ddf46f8..630e865d7467270ed53feda54c153ec7bd9a50ec 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -84,6 +84,16 @@ KJ_TEST("platform databases require a copy pinned to the specific object") {
@@ -27,10 +27,10 @@ index d706e00f8c866295dbd39e4363610f498065df6c..80030cfedf17f7a22997283e166fa7ec
    int fds[2];
    KJ_SYSCALL(pipe(fds));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 593c2a0fdecf25d0d14d24b09a6f57417cb15ab2..2b77dfc427c8a370e76da497a6dfb020c3f8661d 100644
+index 4e15ba038621126344134a89d237cec03b8db71c..a4891131ed90379e6b79218c52ccfe090ae869be 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -2114,6 +2114,16 @@ bool productPlatformPlan(Json::Reader plan) {
+@@ -2121,6 +2121,16 @@ bool productPlatformPlan(Json::Reader plan) {
        name.isString() && name.getString() == "coworkerd:platform";
  }
  
@@ -47,7 +47,7 @@ index 593c2a0fdecf25d0d14d24b09a6f57417cb15ab2..2b77dfc427c8a370e76da497a6dfb020
  std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
      const server::DurableAdmission::Key *object = nullptr) {
    auto namedLimit = [&](kj::StringPtr name) -> uint32_t {
-@@ -2129,7 +2139,7 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
+@@ -2136,7 +2146,7 @@ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
        namedLimit("memoryLimitMiB"));
    if (object != nullptr) {
      auto exclusive = kj::str(identity, "\n", object->namespaceId.c_str(), "\n", object->objectId.c_str());
@@ -56,7 +56,7 @@ index 593c2a0fdecf25d0d14d24b09a6f57417cb15ab2..2b77dfc427c8a370e76da497a6dfb020
    }
    return "platform-v1:" + digest(identity.asBytes());
  }
-@@ -3266,8 +3276,11 @@ struct ThreadedServer {
+@@ -3287,8 +3297,11 @@ struct ThreadedServer {
            home.memory >= memory.maximum - memory.maximum / 10 || rejectedGrowth, reclaimed);
        const auto idleMs = configuredCount("COWORKERD_THREADED_IDLE_EVICT_MS", 300000);
        const auto lastUse = state.durableSlot->lastUseNs.load();

@@ -138,10 +138,10 @@ index 1ec43c46f76a3a595553b3f19fa99d810972dca9..21f3e6a6878c75062824ae8eee91c60c
    socketControl @1 () -> (control :ThreadedSocketControl);
  }
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda235afe636 100644
+index f337a66f47369cdab5e052fb7bb26d640bdda039..4c1dff8a02cfc19ee6180b866878ab3c167d1b06 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -79,6 +79,7 @@
+@@ -80,6 +80,7 @@
  #include <cstdio>
  #include <cstdlib>
  #include <cstring>
@@ -149,7 +149,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
  #include <functional>
  #include <limits>
  #include <map>
-@@ -2230,6 +2231,15 @@ class DescriptorQueue {
+@@ -2260,6 +2261,15 @@ class DescriptorQueue {
  };
  
  struct ThreadedServer;
@@ -165,7 +165,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
  
  // The server's maintenance entry: its pass runs inside the budget's maintenance
  // mark, so that a reclaim the pass itself triggers never waits for that pass.
-@@ -2256,7 +2266,7 @@ struct InvocationState: kj::Refcounted {
+@@ -2286,7 +2296,7 @@ struct InvocationState: kj::Refcounted {
  class Invocation final: public kj::HttpService {
   public:
    Invocation(ThreadedServer &server, ThreadState &state, kj::String descriptor, Frankenvalue props,
@@ -174,7 +174,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
        : server(server),
          state(state),
          descriptor(kj::mv(descriptor)),
-@@ -2273,14 +2283,14 @@ class Invocation final: public kj::HttpService {
+@@ -2303,14 +2313,14 @@ class Invocation final: public kj::HttpService {
    ThreadState &state;
    kj::String descriptor;
    Frankenvalue props;
@@ -191,7 +191,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
        : server(server),
          state(state),
          descriptor(kj::mv(descriptor)),
-@@ -2300,7 +2310,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
+@@ -2330,7 +2340,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
    ThreadState &state;
    kj::String descriptor;
    Frankenvalue props;
@@ -200,7 +200,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
    bool used = false;
  };
  
-@@ -2313,8 +2323,9 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2343,8 +2353,9 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
      auto params = context.getParams();
      KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
          "NOT_SUPPORTED: persistent objects and handoff");
@@ -212,7 +212,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
      return kj::READY_NOW;
    }
  
-@@ -2323,7 +2334,8 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2353,7 +2364,8 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
      used = true;
      auto params = context.getParams();
      context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
@@ -222,7 +222,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
      return kj::READY_NOW;
    }
  
-@@ -2370,7 +2382,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2400,7 +2412,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
    bool used = false;
  
    kj::Promise<rpc::EventDispatcher::Client> prepare(kj::String descriptor, Frankenvalue props,
@@ -231,7 +231,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
  };
  
  struct SubrequestBudget {
-@@ -2487,6 +2499,9 @@ struct ThreadedServer {
+@@ -2517,6 +2529,9 @@ struct ThreadedServer {
    };
    std::vector<std::unique_ptr<Thread>> threads;
    int managerWake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -241,7 +241,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
    std::atomic<bool> ready{false};
    std::atomic<uint32_t> liveThreads{0};
    std::atomic<uint64_t> growthFailures{0};
-@@ -2503,6 +2518,7 @@ struct ThreadedServer {
+@@ -2533,6 +2548,7 @@ struct ThreadedServer {
    ThreadedServer(uint limit,
        std::string sourceAddress,
        std::string identity,
@@ -249,7 +249,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
        kj::Own<const kj::Directory> durableDirectory = {},
        kj::Own<server::ThreadedWalLog> durableLog = {})
        : sourceAddress(std::move(sourceAddress)),
-@@ -2539,6 +2555,7 @@ struct ThreadedServer {
+@@ -2569,6 +2585,7 @@ struct ThreadedServer {
                                   : ResourceBudget::ReclaimMode::BACKGROUND)),
          tenantBudget(std::make_shared<TenantBudget>(
              configuredCount("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT", 0))),
@@ -257,7 +257,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
          subrequestBudget(limit, tenantBudget->limit) {
      KJ_REQUIRE(managerWake >= 0 && limit > 0 && limit <= 16384);
      if (this->durableStorage) {
-@@ -2781,6 +2798,58 @@ struct ThreadedServer {
+@@ -2811,6 +2828,58 @@ struct ThreadedServer {
      } while (n < 0 && errno == EINTR);
      KJ_REQUIRE(n == sizeof(one) || (n < 0 && errno == EAGAIN));
    }
@@ -316,7 +316,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
    bool enqueue(int fd) {
      if (!pending.push(fd)) return false;
      wake(managerWake);
-@@ -3254,7 +3323,7 @@ struct ThreadedServer {
+@@ -3284,7 +3353,7 @@ struct ThreadedServer {
      for (auto &item: threads)
        while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
      ready.store(true, std::memory_order_release);
@@ -325,7 +325,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
      int held = -1;
      auto nextMaintenance = nowNs();
      auto idleMs = configuredCount("COWORKERD_THREADED_THREAD_IDLE_MS", 60000);
-@@ -4018,6 +4087,10 @@ struct ThreadedServer {
+@@ -4048,6 +4117,10 @@ struct ThreadedServer {
    }
  };
  
@@ -336,7 +336,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
  struct DurableSocketStart {
    std::function<void()> opened;
    std::shared_ptr<server::DurableIdleLifecycle> idle;
-@@ -5059,7 +5132,7 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+@@ -5089,7 +5162,7 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
    ThreadState &state;
    ThreadedServer &server;
    std::shared_ptr<Slot> slot;
@@ -345,7 +345,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
    uint64_t sequence = 0;
    std::shared_ptr<uint32_t> subrequests = std::make_shared<uint32_t>(0);
    threaded::InvocationLogBudget logBudget;
-@@ -5597,7 +5670,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+@@ -5627,7 +5700,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
      std::shared_ptr<Slot> slot,
      Json::Reader input,
      kj::StringPtr raw,
@@ -354,7 +354,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
      Frankenvalue props,
      std::shared_ptr<ResourcePreparation> preparation,
      std::shared_ptr<TenantPermit> tenant,
-@@ -5626,8 +5699,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+@@ -5656,8 +5729,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
      entrypoint.assign(name.begin(), name.size());
    }
    auto channels = kj::rc<Channels>(state, server, slot, raw);
@@ -364,7 +364,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
    auto tracer = kj::rc<TenantTracer>(channels.addRef());
    auto identity = kj::str("\"workerId\":", encode(field(input, "workerId")),
        ",\"versionId\":", encode(field(input, "versionId")),
-@@ -5637,7 +5709,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+@@ -5667,7 +5739,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
      observer = kj::refcounted<DurableEventObserver>(
          std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
    }
@@ -373,7 +373,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
    auto limits =
        kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
    if (slot->resetDurableRoot) {
-@@ -6105,7 +6177,7 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
+@@ -6135,7 +6207,7 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
    void stop(const kj::Exception &reason);
    kj::Promise<kj::Rc<LocalFacet>> openSocketFacet(uint id, kj::StringPtr descriptor);
    kj::Promise<std::pair<kj::Own<WorkerInterface>, kj::Own<Worker::Actor>>> openSocket(
@@ -382,7 +382,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
  
   private:
    struct Invocation {
-@@ -6121,7 +6193,7 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
+@@ -6151,7 +6223,7 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
    kj::Promise<void> initialize(kj::String descriptor);
    kj::Promise<void> ensureStarted(kj::StringPtr descriptor);
    kj::Promise<kj::Own<WorkerInterface>> open(kj::String descriptor, kj::Own<Invocation> invocation,
@@ -391,7 +391,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
  
    std::shared_ptr<DurableTreeContext> tree;
    std::shared_ptr<DurableFacetReservation> reservation;
-@@ -6352,10 +6424,9 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
+@@ -6382,10 +6454,9 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
    auto &channels =
        KJ_ASSERT_NONNULL(dynamic_cast<Channels *>(&IoContext::current().getIoChannelFactory()));
    KJ_REQUIRE(tree->slot.lock() == channels.slot, "facet request must stay on the original home");
@@ -403,7 +403,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
  }
  
  kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
-@@ -6469,13 +6540,13 @@ kj::Promise<kj::Rc<LocalFacet>> LocalFacet::openSocketFacet(uint id, kj::StringP
+@@ -6499,13 +6570,13 @@ kj::Promise<kj::Rc<LocalFacet>> LocalFacet::openSocketFacet(uint id, kj::StringP
  }
  
  kj::Promise<std::pair<kj::Own<WorkerInterface>, kj::Own<Worker::Actor>>> LocalFacet::openSocket(
@@ -419,7 +419,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
    co_await ensureStarted(descriptor);
    auto slot = tree->slot.lock();
    KJ_REQUIRE(slot != nullptr, "durable test facet lost its isolate copy");
-@@ -6564,7 +6635,7 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
+@@ -6594,7 +6665,7 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
  }
  
  kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
@@ -428,7 +428,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
    KJ_REQUIRE(!used, "one event per durable connection");
    used = true;
    KJ_REQUIRE(!server.durableLog || server.durableLog->ready(), "durable WAL channel unavailable");
-@@ -6781,9 +6852,12 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
+@@ -6813,9 +6884,12 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
        "unsupported durable test event origin");
    try {
      KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
@@ -444,7 +444,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
      if (accepted->isWaiting()) accepted->fulfill();
    } catch (const kj::Exception &error) {
      reportDurableFailureForTest("event preparation", error);
-@@ -6795,9 +6869,13 @@ kj::Promise<void> DurableBootstrap::startNativeEvent(StartNativeEventContext con
+@@ -6827,9 +6901,13 @@ kj::Promise<void> DurableBootstrap::startNativeEvent(StartNativeEventContext con
    auto params = context.getParams();
    try {
      KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
@@ -460,7 +460,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
      if (accepted->isWaiting()) accepted->fulfill();
    } catch (const kj::Exception &error) {
      reportDurableFailureForTest("native event preparation", error);
-@@ -7337,6 +7415,8 @@ int main(int argc, char **argv) {
+@@ -7369,6 +7447,8 @@ int main(int argc, char **argv) {
    util::Autogate::initAutogateNamesForTest({}, util::IgnoreAllAutogatesEnv(true));
    setenv("COWORKERD_THREADED", "1", 1);
    const int listener = strtol(argv[1], nullptr, 10);
@@ -469,7 +469,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
    ThreadedServer *server;
    try {
      kj::Own<const kj::Directory> directory;
-@@ -7361,7 +7441,7 @@ int main(int argc, char **argv) {
+@@ -7393,7 +7473,7 @@ int main(int argc, char **argv) {
      } else if (disposable) {
        directory = newDurableTestDirectory(listener);
      }
@@ -478,7 +478,7 @@ index 39de789e08ca274a53e810cecc72267da806eaa7..a13cfcbf22db2f5c9ae47b3a15d7bda2
    } catch (...) {
      fprintf(stderr,
          "[threaded-start] "
-@@ -7369,7 +7449,6 @@ int main(int argc, char **argv) {
+@@ -7401,7 +7481,6 @@ int main(int argc, char **argv) {
          "initialization\"}\n");
      return 78;
    }

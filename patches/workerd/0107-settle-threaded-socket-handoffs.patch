@@ -191,7 +191,7 @@ index f766c33e12d6e21cf93b7b0ee0acd4bdc72584e3..01a63e71876e698ed3515bab81f9b711
  }
  
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 42f06038655a6558fdb839153970f66ab5e96796..8ecd35b80c662a03e9aa2851ec9f6a5103a3910a 100644
+index e93d49d15e94daec038fd187e3da38f6b9018347..2c950cea0674a2e26d53d8b4ba59aeec7341776f 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2835,8 +2835,10 @@ struct ThreadedServer {

@@ -48,7 +48,7 @@ index 0000000000000000000000000000000000000000..44e832b18d53934706ca234df0f04468
 +}  // namespace workerd::jsg
 diff --git a/src/workerd/jsg/coworkerd-rpc-code.h b/src/workerd/jsg/coworkerd-rpc-code.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..b82413c9bae32a96f505bdda2a7c5dec1cfb3d02
+index 0000000000000000000000000000000000000000..d5adf26b97917bf9e8da032345a5f0a8d732aa0e
 --- /dev/null
 +++ b/src/workerd/jsg/coworkerd-rpc-code.h
 @@ -0,0 +1,15 @@
@@ -58,7 +58,7 @@ index 0000000000000000000000000000000000000000..b82413c9bae32a96f505bdda2a7c5dec
 +#include <kj/string.h>
 +
 +namespace workerd::jsg {
-+// Assigned by the v76 RPC error-detail contract. Keep in sync with the node's
++// The platform RPC error-detail ID must match the node's declaration in
 +// common/rpc-error.h. The value is a platform code's bytes, without a trailing NUL.
 +inline constexpr kj::Exception::DetailTypeId COWORKERD_CODE_DETAIL_ID = 0xc6f4a09d8b3e2175ull;
 +

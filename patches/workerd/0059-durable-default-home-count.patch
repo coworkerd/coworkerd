@@ -5,7 +5,7 @@ Subject: [PATCH] Default disposable durable roles to four bounded home loops
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 2e189837085cb5bd0b11e466608c91f35cc72f88..6d048d142e4d10337366b55310ee5cb16c02d9b1 100644
+index 8ba7acd7ca1a5c16b3854cab51b03248710fc57d..8d998f1695d811e63a529509e698a497f170c5cd 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -5467,7 +5467,7 @@ int main(int argc, char **argv) {

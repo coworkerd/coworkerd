@@ -5,7 +5,7 @@ Subject: [PATCH] Use home-based memory reclaim for both durable roles
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index aac4f5f1c10fb441dbc13770e74cacae11dee568..fdb5c3a611a9598e5d03ea6d5382c5cbb301b35b 100644
+index 783682f2f46d53676e59d7e15ac17824bfe950fe..676a98140baa31985b705e304ba0303d2b5774a1 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2335,8 +2335,8 @@ struct ThreadedServer {

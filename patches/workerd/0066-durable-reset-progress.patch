@@ -98,7 +98,7 @@ index a8234f55d3ccffc92ea3b47140a3ebcbcabf7973..bd94eaee8d5529a64110b97f7a397ee2
    // Normal retirement checks the idle deadline as well as mailbox/active ownership.
    // Pressure retirement uses the unconditional overload above.
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 8fcf4919b3a80ce41e1debf82afba5257bc23714..cbba8f26f9874fb4c9804971a0b296634096085c 100644
+index 7672e8467d181b227e61eed65fb0aba9856d7393..c7b3b75f8af4d606b81885f11b4873cace7c1998 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1664,6 +1664,7 @@ struct ThreadState {

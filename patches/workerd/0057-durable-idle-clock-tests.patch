@@ -121,7 +121,7 @@ index 80a032cc5ca8ec28862b95cba4bd4ccf80cfa4c4..ca73e2819a552b2477b203663b66952e
  }  // namespace
  }  // namespace workerd::server
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index e36881dff4b5ac1ef5bb777fa7315c06da3e463e..44af36d96b36dd4c0c55e9e31a0938ef2d99d27a 100644
+index 7b3802a96aa12dad61fa43a98c50cccd79142ccc..f2c210af8dd745cc4010ede56c9f76b25196bf13 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2685,7 +2685,7 @@ struct ThreadedServer {

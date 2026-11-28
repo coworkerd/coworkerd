@@ -5,7 +5,7 @@ Subject: [PATCH] Bind durable RPC sessions to their prepared invocation
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index d7f8d488c31e675e91fcdd79191f7d697f88684e..13e9e75235a83db02b49284b62e57113c2abd864 100644
+index 29095c9e5525477e5fdb334421d0da46806ef338..c1489be837b1402a1781c5d224bd2bf6b374832b 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2161,7 +2161,7 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {

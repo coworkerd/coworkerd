@@ -527,7 +527,7 @@ index 0000000000000000000000000000000000000000..1c5ba1ca18fb5e73dd43aa588dae9a19
 +
 +}  // namespace workerd::server
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index a9ea7a312afd18d6ffb1307c2c8372e3c8e478b2..e05b8897dddcd81efa71ba4ab12de73a46168b7d 100644
+index 091d21d5278f5c1e5e99068534d9b34c98eb4556..90bdc2bda12ce7df8f34ee30e3097413ee72ca8c 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
 @@ -12,6 +12,9 @@ THREADED_DEPS = [
@@ -541,7 +541,7 @@ index a9ea7a312afd18d6ffb1307c2c8372e3c8e478b2..e05b8897dddcd81efa71ba4ab12de73a
      "//src/workerd/server/factory:coworkerd-steady",
      "//src/workerd/util:autogate",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 67de7fde2e8eeaf3e10d87812c43af64b1625fa8..4920d4b64b069bcf924a9ea8f1da5e0448354ea8 100644
+index 944a5e096500818290aa84f2e31251a0e52cc879..b25ac49de2737cc47e8b23a0489ce915ffb98684 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -19,6 +19,9 @@

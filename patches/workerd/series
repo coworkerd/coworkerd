@@ -128,3 +128,4 @@
 0166-gate-alarm-test-limit.patch
 0167-update-isolate-busy-test-invocation.patch
 0187-bound-object-sqlite-memory.patch
+0200-allocate-live-ordinary-call-loops.patch

@@ -6,7 +6,7 @@ Subject: [PATCH] Size the default object mailbox for ordinary request bursts
 Use the node process in-flight default as the waiting-event ceiling and allow an average of 4 KiB in declared bytes per slot. Keep charging the shared memory and descriptor budgets for each admitted event.
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index f676810d53511142b686177f7362e90f848fc913..cca899fe5587696686ccf4b5bb8f2b1b9ecebf00 100644
+index f0c5b55dbf2ef834d4a03d73da036fd1f10d3420..90a612ae94522ce41b0de834d1373fcd96266947 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2780,6 +2780,10 @@ struct ThreadedServer {

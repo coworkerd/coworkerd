@@ -358,7 +358,7 @@ index 44e832b18d53934706ca234df0f0446894dcc0cf..5ff8f521c1dea41ebaa0757876202bf6
  }
  }  // namespace workerd::jsg
 diff --git a/src/workerd/jsg/coworkerd-rpc-code.h b/src/workerd/jsg/coworkerd-rpc-code.h
-index b82413c9bae32a96f505bdda2a7c5dec1cfb3d02..2635c7767873b29a08dbd6d34bec93e128885125 100644
+index d5adf26b97917bf9e8da032345a5f0a8d732aa0e..6ea3459305c9398800fbbcf0eb99aa7cc6368b2d 100644
 --- a/src/workerd/jsg/coworkerd-rpc-code.h
 +++ b/src/workerd/jsg/coworkerd-rpc-code.h
 @@ -8,6 +8,9 @@ namespace workerd::jsg {
@@ -425,7 +425,7 @@ index 7ed3e940c34e4a80dfbe99a7fd95d5d0166a6de7..6ca675465a476625d2a1f0493df6eac0
  
  kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 103aa3d4912434595e6fbdb5534c284d72c084eb..3883832796e8dd4d29770ed24eea5fd7d7021841 100644
+index 16cb4cacbea377046bd0841c09ec8c452918a379..4936bd3cd1aae528a9b75f9ff2d86b33b940df00 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -4,6 +4,7 @@
@@ -592,7 +592,7 @@ index 103aa3d4912434595e6fbdb5534c284d72c084eb..3883832796e8dd4d29770ed24eea5fd7
    constexpr auto MiB = ResourceBudget::MiB;
    auto budget = std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..9cc7b531151fa8351e72e35ef5765822aeb2e116 100644
+index 2ba4df5bf20e719b7332d4d65768725e4050506e..b8a0f1113d451d491b830ceaf695711cb944ae32 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1978,6 +1978,7 @@ server::DurableIdleLifecycle::Time durableIdleNow() {

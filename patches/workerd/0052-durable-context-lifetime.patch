@@ -6,7 +6,7 @@ Subject: [PATCH] Keep durable request limits backed for the actor context
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 74ea0c08f960c089f6ffe0cc41cb090d8cf01951..236a078415595ef2de29e207e65c4cdfb8792d5f 100644
+index 683f511724360ad98bce65e7a6a35ab261f6a1b6..c28eadc92518af4be983a1345b359e4cda0dc842 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -4489,14 +4489,19 @@ PreparedInvocation prepareInvocation(ThreadState &state,

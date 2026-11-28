@@ -14,7 +14,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 ## How the series is maintained
 
 - **The fork.** The patched workerd is the fork [coworkerd/workerd](https://github.com/coworkerd/workerd): one branch
-  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261114.1`), which contains the ordered patch commits plus the v95 follow-up to 0010. Feature branches carry additions until they are merged into the tag branch.
+  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261114.1`), which contains the ordered patch
+  commits plus the architecture-specific steady filter allocation fix folded into 0010. Feature branches
+  carry additions until they are merged into the tag branch.
   `patches/workerd/` is exported from that branch so that every change to workerd can be reviewed here; a change to
   the branch and its exported copy go into the same change of this repository.
 - **Thin patches.** Changes normally stay in `src/workerd/server/` (`scripts/workerd-patches.py` checks it), with explicit
@@ -84,6 +86,11 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0186 clears the window when stateless initialization completes, before the slot is published
   to request threads and the lifecycle sampler. It changes the threaded server, its test, and
   `src/workerd/threaded/isolate-busy.h`.
+  Patch 0200 charges ordinary calls against their process's memory and descriptor budgets while
+  they have a native call loop. It allocates the loop before acknowledging dispatch and releases
+  the charge after the connection and its background tasks settle. It adds a versioned ordinary
+  preface on the existing private socket with structured resource refusals. The patch changes the
+  threaded server, its private protocol header and its test.
   Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
   quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and

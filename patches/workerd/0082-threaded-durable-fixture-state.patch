@@ -20,7 +20,7 @@ index b57824f563705e1ca1b22c89e3dec20ebd8be31d..7ffc9eb8f52a9e4866c067f43de1f576
          "//src/workerd/util:sqlite",
          "@capnp-cpp//src/kj",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 7e2658178095d399d6f1712a2beb5242ae2aee69..f4862ad2b84d719e0b8ee967ab4056d1ba66136a 100644
+index 5b947f098a37e7aef0b9f384404005820a8dcee5..bf42eaacc36675e9ba0556b0dae9b4d4ce8c7770 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2903,7 +2903,8 @@ struct ThreadedServer {

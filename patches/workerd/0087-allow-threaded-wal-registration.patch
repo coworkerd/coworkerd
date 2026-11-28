@@ -5,7 +5,7 @@ Subject: [PATCH] Allow the threaded server to register WAL homes and opens
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index f83692207df6c5d4eec23d89b64e44e4709f2f42..4c0767ce0456c37f8bff66e3529b437ebd8fdbec 100644
+index 85914267b49ab14ad12659688defcbca88929bc8..f7971f0aa4f350ab33b0b95b749c70f7d93746b6 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2225,7 +2225,7 @@ struct ThreadedServer {

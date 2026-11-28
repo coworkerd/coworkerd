@@ -5,7 +5,7 @@ Subject: [PATCH] Load product Durable Object packages on threaded homes
 
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 67eb486f1d73adba9a141bd82f17d3cdf8faffd1..aaf24cdd0d4e58fc2d959afd20e04b619cef87cb 100644
+index de82f7885126124a33dc9ef0f6b5ec649dc78c2f..ecef09c4462643c8fba4eb9b0732646b26a379a0 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -40,6 +40,31 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
@@ -41,7 +41,7 @@ index 67eb486f1d73adba9a141bd82f17d3cdf8faffd1..aaf24cdd0d4e58fc2d959afd20e04b61
    int fds[2];
    KJ_SYSCALL(pipe(fds));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 7f355641445dd2329a222cf84eedeaf028c1b154..178f4c0f1455ead73382f19fe5c5b5430fc7646c 100644
+index 48b5cd4ee530d752d540dc73aaf1b6d550cef58e..fa0700cf2f6f0c30d890c8c44b66c449d500886f 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -75,6 +75,7 @@

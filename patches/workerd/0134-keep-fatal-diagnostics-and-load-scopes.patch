@@ -7,7 +7,7 @@ Subject: [PATCH] Keep fatal diagnostics and scope attribution to every Worker
 V8's location, line and message follow the fatal record as a bounded hex-encoded row of their own. The whole load, each call's JavaScript entry, the native binding's RPC entry and the source JSON check carry a fatal scope; startup, logging and dynamic import entries take the enclosing scope, else the current I/O context's call when it runs the same Worker, else the Worker's load identity, and name nobody on another isolate. The process-wide handler is registered through a role helper that tests drive with a mock registrar; child-process tests reach the isolate's registered handler through V8's own API check. The test build can raise that check while a Worker loads. Includes the test build's api-check event.
 
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index 9895fca5e4c88f0497c8c29affe024e3af51738b..e05a3275d2077123fecb09891f9578d2708c66b4 100644
+index 812c608560acab803e82fca20e849b4649d3a4bb..49f75d0671f250e71e0bd9d0ac62376c316de4b0 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
 @@ -4,6 +4,7 @@ load("//:build/wd_cc_binary.bzl", "wd_cc_binary")
@@ -334,7 +334,7 @@ index 0000000000000000000000000000000000000000..3c3136e91cb1e507bb8d0de142046e60
 +
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 9af1fc6c304cc03fd5542d1dd988ecc6debe9845..7045a3fe12e0a36d6ce0c7cd987f346cf7b6f5a4 100644
+index 83aaf4050209fd2f5b61fd34fed03d66e83b05ba..3d79c5ae1bafd264da7dfd0b7abfb95c36e910ec 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -7,6 +7,7 @@
@@ -595,7 +595,7 @@ index 9af1fc6c304cc03fd5542d1dd988ecc6debe9845..7045a3fe12e0a36d6ce0c7cd987f346c
    // Without the fragmentation reserve this child ended with V8's fatal OOM
    // (exit 74) at 1150.5 MiB live in 1154.8 MiB of pages.
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 3b00db1f3dfa43bd162a7e759ca2b7d1a9b8e812..bb9a4c4516f0e1588d9a5273e25dbcc908bdb026 100644
+index 3aebe26776194f9447feb141df896cc3dabfa5be..fdccb01d1b7d3da65429ef3e782236a72e33773c 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2,6 +2,7 @@

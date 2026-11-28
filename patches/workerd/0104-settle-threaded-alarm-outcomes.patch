@@ -103,10 +103,10 @@ index 994481dbbc8bed5a33ced41e6bbf2ba198936305..0ded7f7d5cd041abcb349fdfa44f62c3
    kj::Promise<kj::String> getCurrentBookmark(SpanParent parentSpan) override;
    kj::Promise<void> waitForBookmark(kj::StringPtr bookmark, SpanParent parentSpan) override;
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 7db0275a1f06f14f4e6c447defb44688e24ce08e..154b5c8ea4b0858b6d97afbc3c519fcad6a5ef90 100644
+index 5a826bdb1b22df3cf62a3ae440a7f22fb9b9b64a..b92707ed332e51fafc58a7be1e285b87b06e98ef 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -3727,40 +3727,76 @@ struct DurableAlarmEvent {
+@@ -3887,40 +3887,76 @@ struct DurableAlarmEvent {
  // to the same URL uses its regular entrypoint.
  class DurableAlarmHttp final: public kj::HttpService {
   public:
