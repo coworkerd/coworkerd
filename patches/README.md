@@ -223,6 +223,9 @@ workerd tree, patch series, toolchain declarations and GitHub Actions run.
 The same-source comparison matched both executables and both syscall lists byte
 for byte on each architecture. GitHub run metadata and freshly sampled profiling
 evidence account for the differences in the archive checksums.
+Independent cold x86-64 builds of the same workerd tree have shown eight bytes of
+register-allocation variation in KJ's `readRequestHeaders()` and different GNU
+build IDs. [Prior pin comparison][kernel-pin-comparison]
 
 Archive builds run the instrumented `fatal-attribution` fixture. The required PR
 check runs all production cluster cases across four shards on the x86-64 archive
@@ -233,6 +236,7 @@ named by the PR's pin. For release verification, dispatch the archive build with
 [kernel-cold]: https://github.com/coworkerd/coworkerd/actions/runs/46100545409
 [kernel-warm]: https://github.com/coworkerd/coworkerd/actions/runs/46110659813
 [kernel-small-change]: https://github.com/coworkerd/coworkerd/actions/runs/46112230625
+[kernel-pin-comparison]: https://github.com/coworkerd/coworkerd/pull/144#issuecomment-7234726541
 
 ## Verifying a kernel pull request
 
