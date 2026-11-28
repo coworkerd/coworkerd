@@ -1,9 +1,9 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sat, 28 Nov 2026 11:29:41 +0800
+Date: Sat, 28 Nov 2026 11:39:57 +0800
 Subject: [PATCH] Reclaim memory after durable object retirement
 
-Collect deferred actor handles on the owning home after ordinary retirement, drain the home allocation cache, and let the durable pool manager return free allocator pages without holding a routing or isolate lock.
+Collect retired actor handles once the home drains. Return free allocator pages once the durable process drains.
 
 Team cow-a
 
@@ -27,14 +27,14 @@ index b2d1c524acd9ca2f1aaddbde51c2ebda230add16..5649a4bbc463a5fee35eefbf8c90bc47
  
  wd_cc_library(
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 37b1e2c9be4859eb2adafee54c865d433b527140..e463e8cc58ee51fbc0891cc0b8e80b2517959797 100644
+index 37b1e2c9be4859eb2adafee54c865d433b527140..7d9828f2380e1c717cc699922137463de9af6f5f 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -2535,6 +2535,113 @@ KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing th
+@@ -2535,6 +2535,125 @@ KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing th
    KJ_EXPECT(events.asPtr() == expected.asPtr());
  }
  
-+KJ_TEST("normal retirement collects actor handles while a neighbor and stored state survive") {
++KJ_TEST("normal retirement collects actor handles after live and queued work drains") {
 +  ThreadedServer server{
 +    1, "", "retirement:1", -1, kj::newInMemoryDirectory(kj::nullClock()), {}, &initializeV8()};
 +  kj::AutoCloseFd managerWake(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
@@ -121,31 +121,43 @@ index 37b1e2c9be4859eb2adafee54c865d433b527140..e463e8cc58ee51fbc0891cc0b8e80b25
 +    if (!keepEventActive) {
 +      KJ_REQUIRE(admission.complete(*ticket, 1));
 +    }
-+    return tree;
++    return std::pair{tree, *ticket};
 +  };
-+  auto oldTree = open("retired"_kj, retired, false);
-+  auto liveTree = open("neighbor"_kj, neighbor, true);
++  auto oldTree = open("retired"_kj, retired, false).first;
++  auto [liveTree, liveEvent] = open("neighbor"_kj, neighbor, true);
 +  server.retireIdleDurableRoots(state, now);
 +  KJ_EXPECT(server.durableIdleRetirements.load() == 1);
 +  KJ_EXPECT(!state.durableRoots.contains(oldTree->tree));
 +  KJ_EXPECT(state.durableRoots.contains(liveTree->tree));
-+  KJ_EXPECT(!retired.collected && !server.releaseDurableMemoryRequested.load());
 +
-+  server.retireIdleDurableRoots(state, now + std::chrono::seconds(2));
-+  KJ_EXPECT(retired.collected);
-+  KJ_EXPECT(server.releaseDurableMemoryRequested.load());
++  const auto later = now + std::chrono::seconds(2);
++  server.retireIdleDurableRoots(state, later);
++  KJ_EXPECT(!retired.collected && !server.releaseDurableMemoryRequested.load());
 +  KJ_EXPECT(!neighbor.collected && state.durableRoots.contains(liveTree->tree));
 +  KJ_EXPECT(server.durableAdmission->hasActiveEvent(liveTree->tree));
++
++  KJ_REQUIRE(server.durableAdmission->complete(liveEvent, 1));
++  DurableRoute newRoute{{"tenant", "queued"}, {1, 1, 1, 1, "definition", "Store"}, {}, {}, {}};
++  auto queued = server.queueDurable(newRoute, 0, now + std::chrono::seconds(5), now).ticket;
++  KJ_REQUIRE(queued.has_value());
++  server.retireIdleDurableRoots(state, later);
++  KJ_EXPECT(state.durableRoots.empty());
++  KJ_EXPECT(!retired.collected && !neighbor.collected);
++  KJ_EXPECT(!server.releaseDurableMemoryRequested.load());
++
++  server.finishDurable(*queued);
++  server.retireIdleDurableRoots(state, later);
++  KJ_EXPECT(retired.collected && neighbor.collected);
++  KJ_EXPECT(server.releaseDurableMemoryRequested.load());
 +  auto reopened = server.durableStorage->open(oldTree->uniqueKey, oldTree->storageId);
 +  KJ_EXPECT(reopened->run("SELECT value FROM saved").getInt(0) == 29);
-+  worker.runInLockScope(takeLock, [&](Worker::Lock&) { neighbor.weak.Reset(); });
 +}
 +
  KJ_TEST("a reclaim requested during maintenance never waits for that pass") {
    initializeV8();
    auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 1);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index cfe75f0372931bccee40b3b3e45a2c80df8eb321..8ae35ab93d7b4a95f09a3442c850ebe2e38a5884 100644
+index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff86122843e7c6f28 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -40,6 +40,9 @@
@@ -162,7 +174,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..8ae35ab93d7b4a95f09a3442c850ebe2
    };
    std::map<Worker::Actor *, uint64_t> durableActorTrees;
    std::map<uint64_t, DurableRoot> durableRoots;
-+  std::optional<server::DurableIdleLifecycle::Time> collectRetiredAt;
++  bool retiredActors = false;
    kj::TaskSet tasks{errors};
  
    ~ThreadState() noexcept(false) {
@@ -174,20 +186,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..8ae35ab93d7b4a95f09a3442c850ebe2
    std::atomic<bool> ready{false};
    std::atomic<uint32_t> liveThreads{0};
    std::atomic<uint64_t> growthFailures{0};
-@@ -2901,6 +2906,12 @@ struct ThreadedServer {
-     // With the V8 sandbox: a process whose sandbox is not secure never loads a Worker (exit 78).
-     server::requireSecureSandbox();
-     resources->reclaimWake = managerWake;
-+    if (durableAdmission) {
-+      // Durable homes request page release after collecting retired objects. Allow that release
-+      // to return free portions of huge pages without waiting for recent allocation peaks to age.
-+      tcmalloc::MallocExtension::SetSkipSubreleaseShortInterval(absl::ZeroDuration());
-+      tcmalloc::MallocExtension::SetSkipSubreleaseLongInterval(absl::ZeroDuration());
-+    }
-     server::coworkerdServing();
-     fprintf(stderr, "[threaded-start] {\"event\":\"steady-start\",\"threadLimit\":%u}\n", limit);
-     manager = std::thread([this]() { manage(); });
-@@ -3124,10 +3135,15 @@ struct ThreadedServer {
+@@ -3124,10 +3129,38 @@ struct ThreadedServer {
      budgetReleases.push_back(ticket);
      if (needsWake) wake(managerWake);
    }
@@ -199,6 +198,29 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..8ae35ab93d7b4a95f09a3442c850ebe2
 +    if (!releaseDurableMemoryRequested.exchange(true)) wake(managerWake);
 +  }
 +
++  void releaseIdleDurablePages() {
++    {
++      std::lock_guard lock(durableRoutingMutex);
++      if (durableAdmission->state().trees != 0) return;
++      if (!releaseDurableMemoryRequested.exchange(false)) return;
++    }
++    using Allocator = tcmalloc::MallocExtension;
++    const auto free = Allocator::GetNumericProperty("tcmalloc.pageheap_free_bytes").value_or(0);
++    if (free == 0) return;
++
++    // Honor TCMalloc's demand history during normal operation. The idle trim can return free
++    // portions of huge pages even when the allocation peak was recent.
++    const auto shortInterval = Allocator::GetSkipSubreleaseShortInterval();
++    const auto longInterval = Allocator::GetSkipSubreleaseLongInterval();
++    KJ_DEFER({
++      Allocator::SetSkipSubreleaseShortInterval(shortInterval);
++      Allocator::SetSkipSubreleaseLongInterval(longInterval);
++    });
++    Allocator::SetSkipSubreleaseShortInterval(absl::ZeroDuration());
++    Allocator::SetSkipSubreleaseLongInterval(absl::ZeroDuration());
++    Allocator::ReleaseMemoryToSystem(free);
++  }
++
 +  // The durable pool manager drains the budget mailbox and returns free allocator pages.
 +  // Neither operation holds a home, isolate, or routing lock.
 +  void manageDurable() {
@@ -207,19 +229,18 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..8ae35ab93d7b4a95f09a3442c850ebe2
      size_t offset = 0;
      for (;;) {
        bool pending;
-@@ -3153,6 +3169,11 @@ struct ThreadedServer {
+@@ -3153,6 +3186,10 @@ struct ThreadedServer {
          }
          pending = !budgetReleases.empty();
        }
-+      if (nowNs() >= nextRelease && releaseDurableMemoryRequested.exchange(false)) {
-+        const auto free = tcmalloc::MallocExtension::GetNumericProperty("tcmalloc.pageheap_free_bytes");
-+        if (free.value_or(0) > 0) tcmalloc::MallocExtension::ReleaseMemoryToSystem(*free);
++      if (nowNs() >= nextRelease && releaseDurableMemoryRequested.load()) {
++        releaseIdleDurablePages();
 +        nextRelease = nowNs() + MIN_RELEASE_INTERVAL_NS;
 +      }
        // Keep a partially sent ticket at the front until the parent receives it.
        if (retry) {
          (void)poll(nullptr, 0, 10);
-@@ -3160,8 +3181,9 @@ struct ThreadedServer {
+@@ -3160,8 +3197,9 @@ struct ThreadedServer {
        }
        pollfd waits[] = {{managerWake, POLLIN, 0}, {parent, short(pending ? POLLOUT : 0), 0}};
        int result;
@@ -230,7 +251,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..8ae35ab93d7b4a95f09a3442c850ebe2
        } while (result < 0 && errno == EINTR);
        if (result >= 0 && (waits[1].revents & POLLHUP)) return;
        if (result < 0 || (waits[1].revents & (POLLERR | POLLNVAL))) (void)poll(nullptr, 0, 10);
-@@ -3578,7 +3600,8 @@ struct ThreadedServer {
+@@ -3578,7 +3616,8 @@ struct ThreadedServer {
      return home.resident.empty();
    }
  
@@ -240,7 +261,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..8ae35ab93d7b4a95f09a3442c850ebe2
      const auto homeId = state.durableHome;
      const auto victim = [&]() -> std::optional<DatabaseRetirement> {
        std::lock_guard lock(durableRoutingMutex);
-@@ -3597,12 +3620,12 @@ struct ThreadedServer {
+@@ -3597,7 +3636,6 @@ struct ThreadedServer {
        }
      });
      if (!state.durableSlot) return;
@@ -248,53 +269,38 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..8ae35ab93d7b4a95f09a3442c850ebe2
      auto &memory = *state.durableSlot->limits->memory;
      const auto accounted = [&] { return memory.heap.load() + memory.external.load(); };
      const auto placementLimit = kj::min(durablePlacement.placementBytes, memory.maximum * 3 / 4);
-     const bool pressured = accounted() >= placementLimit;
-     bool reclaimed = false;
-+    bool idleRetirement = false;
-     for (auto it = state.durableRoots.begin(); it != state.durableRoots.end();) {
-       auto current = it++;
-       using Decision = server::DurableIdleLifecycle::Decision;
-@@ -3704,9 +3727,14 @@ struct ThreadedServer {
-           reclaimed = true;
-         } else {
-           durableIdleRetirements.fetch_add(1);
-+          idleRetirement = true;
+@@ -3707,6 +3745,9 @@ struct ThreadedServer {
          }
        }
        if (current->second.resetting && memory.durableProcessPressure.load()) reclaimed = true;
-+      if ((!explicitClose || root.idleClosing || admissionClosing) && !state.collectRetiredAt) {
-+        // Coalesce retirements, including those spread across several maintenance passes.
-+        state.collectRetiredAt = now + std::chrono::seconds(1);
++      if (!explicitClose || root.idleClosing || admissionClosing) {
++        state.retiredActors = true;
 +      }
        current->second.stopFacets(nullptr);
        actor.shutdown(0);
        state.durableRoots.erase(current);
-@@ -3716,7 +3744,10 @@ struct ThreadedServer {
+@@ -3716,7 +3757,14 @@ struct ThreadedServer {
            state.durableSlot->lastUseNs.store(nowNs());
        }
      }
 -    if (reclaimed) {
-+    bool releaseMemory = reclaimed || (idleRetirement && state.durableRoots.empty()) ||
-+        (state.collectRetiredAt && now >= *state.collectRetiredAt);
-+    if (releaseMemory) {
-+      state.collectRetiredAt.reset();
++    bool drained = false;
++    if (state.retiredActors && state.durableRoots.empty() && state.durableActorTrees.empty()) {
++      std::lock_guard lock(durableRoutingMutex);
++      // Reserved trees include starts still queued or preparing. The home owns the event loop,
++      // so no new JavaScript can enter before this maintenance turn ends.
++      drained = threads[homeId - 1]->home->reservedTrees == 0;
++    }
++    if (reclaimed || drained) {
        // Actor teardown outside the isolate lock defers JSG handle destruction.
        // Take the Worker lock to drop those roots before collecting their memory.
        auto &worker = *KJ_REQUIRE_NONNULL(state.durableSlot->worker);
-@@ -3767,6 +3798,8 @@ struct ThreadedServer {
-         }
-       }
-       state.durableSlot.reset();
-+      releaseMemory = true;
-+      state.collectRetiredAt.reset();
-       std::lock_guard lock(durableRoutingMutex);
-       auto &home = *threads[homeId - 1]->home;
-       home.memory = 0;
-@@ -3778,6 +3811,11 @@ struct ThreadedServer {
+@@ -3778,6 +3826,12 @@ struct ThreadedServer {
          durableIsolateResets.fetch_add(1);
        }
      }
-+    if (releaseMemory) {
++    if (drained || releaseCopy) {
++      state.retiredActors = false;
 +      // Return the freed allocations in this thread's cache before returning process pages.
 +      tcmalloc::MallocExtension::MarkThreadIdle();
 +      requestDurableMemoryRelease();
@@ -302,7 +308,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..8ae35ab93d7b4a95f09a3442c850ebe2
    }
  
    void trackDurableTurn(uint64_t homeId, bool entering, uint64_t memory = 0) {
-@@ -3874,7 +3912,7 @@ struct ThreadedServer {
+@@ -3874,7 +3928,7 @@ struct ThreadedServer {
      for (auto &item: threads)
        while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
      ready.store(true, std::memory_order_release);
