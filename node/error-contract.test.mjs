@@ -4,7 +4,6 @@ import test from 'node:test';
 
 const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
 const node = read('./main.c++');
-const runtime = read('../runtime/runtime.js');
 const placement = read('./placement-contract.h');
 const guide = read('../docs/guide/errors.md');
 
@@ -128,9 +127,6 @@ function workerResponses() {
     /refusal\(slot->preparationLimit \? "([A-Z_]+)" : "([A-Z_]+)", slot->preparationReason, slot->preparationLimit \? (\d{3}) : (\d{3})/);
   assert.equal(runtimeLimit, loadCode);
   assert.equal(limited, prepareStatus);
-  const [, platformLimited, platformUnavailable] = evidence(runtime,
-    /return Response\.json\(reply\.refusal, \{status:preparationLimit \? (\d{3}) : (\d{3})\}\)/);
-  assert.deepEqual([platformLimited, platformUnavailable], [limited, unavailableStatus]);
   evidence(confirm, /slot->decide\(false\);/);
   evidence(confirm, /if \(slot->preparationLimit\) refused\.category = "limit";/);
   const [, serialCode, serialStatus, serialCategory, dispatched, retryable] = evidence(node,

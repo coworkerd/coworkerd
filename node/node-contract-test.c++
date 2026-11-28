@@ -294,12 +294,15 @@ void nativeConfig() {
     KJ_REQUIRE(config->ingressKeepalive.idleSeconds == 30 && config->ingressKeepalive.intervalSeconds == 10 &&
         config->ingressKeepalive.probes == 3);
     KJ_REQUIRE(config->processPool.tenantAdmissionWaitMs == 1000);
-    KJ_REQUIRE(config->processPool.cpuLimitMs == 30000 && config->processPool.durableCpuLimitMs == 200);
+    KJ_REQUIRE(config->processPool.cpuLimitMs == 30000 && config->processPool.processCpuLimitMs(true) == 30000);
   }
   write(directory / "limits.json", "{\"cpuLimitMs\":200,\"memoryLimitMiB\":64}");
   const auto overridden = ServerConfig::load(directory / "limits.json");
-  KJ_REQUIRE(overridden.processPool.cpuLimitMs == 200 && overridden.processPool.durableCpuLimitMs == 200 &&
+  KJ_REQUIRE(overridden.processPool.cpuLimitMs == 200 && overridden.processPool.processCpuLimitMs(true) == 200 &&
       overridden.processPool.memoryLimitMiB == 64);
+  write(directory / "limits.json", R"({"cpuLimitMs":45000})");
+  const auto capped = ServerConfig::load(directory / "limits.json").processPool;
+  KJ_REQUIRE(capped.processCpuLimitMs(false) == 45000 && capped.processCpuLimitMs(true) == 30000);
   write(directory / "keepalive.json", R"({"ingress":{"tcpKeepalive":{"idleSeconds":2,"intervalSeconds":1,"probes":2}}})");
   const auto keepalive = ServerConfig::load(directory / "keepalive.json").ingressKeepalive;
   KJ_REQUIRE(keepalive.idleSeconds == 2 && keepalive.intervalSeconds == 1 && keepalive.probes == 2);

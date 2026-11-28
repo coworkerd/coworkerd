@@ -2,13 +2,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const [nodeBinary, workerd, runtime, kind = 'buffer'] = process.argv.slice(2);
+const [nodeBinary, threaded, kind = 'buffer'] = process.argv.slice(2);
 assert.ok(['buffer', 'heap'].includes(kind));
 assert.equal(process.platform, 'linux');
 const scratch = await mkdtemp(join(tmpdir(), 'cwkd-process-memory-'));
@@ -31,7 +31,7 @@ const port = await new Promise((resolve, reject) => {
     server.close(error => error ? reject(error) : resolve(value));
   });
 });
-const args = [manifestPath, workerd, `127.0.0.1:${port}`, '127.0.0.1:0', '127.0.0.1:0', configPath];
+const args = [manifestPath, threaded, `127.0.0.1:${port}`, '127.0.0.1:0', '127.0.0.1:0', configPath];
 
 async function state() {
   const response = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
@@ -99,8 +99,6 @@ async function successful(path, value) {
 try {
   const modules = join(fixture, 'workers', 'counter', 'v1');
   await mkdir(modules, {recursive: true});
-  await mkdir(join(fixture, 'runtime'));
-  await copyFile(runtime, join(fixture, 'runtime', 'runtime.js'));
   const source = `
     import { DurableObject } from "cloudflare:workers";
     let isolate;

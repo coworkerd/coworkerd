@@ -27,7 +27,7 @@ namespace coworkerd {
 // The shard of an object: the first 8 bytes of its id (64 hexadecimal digits) as a big-endian number, modulo the
 // namespace's shards -- the same on every node.
 uint32_t durableShardOf(const std::string& objectId, uint32_t shards);
-// The object id a namespace's idFromName(name) gives (runtime.js, __coworkerdNamespace): the SHA-256 of the
+// The object id a namespace's idFromName(name) gives: the SHA-256 of the
 // namespace id's 32 bytes followed by "name" and the name, as 64 hexadecimal digits.
 std::string durableObjectIdFromName(const std::string& namespaceId, const std::string& name);
 

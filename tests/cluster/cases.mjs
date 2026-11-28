@@ -249,6 +249,9 @@ async function threadedDatabaseRelease(cluster) {
   });
   assert.deepEqual(result.results, [{ ready: 1 }]);
   const owner = await databaseShardOwner(cluster, database);
+  await cluster.compose(['exec', '-T', owner, 'test', '!', '-e', '/opt/coworkerd/bin/workerd']);
+  const state = await cluster.state(owner);
+  assert.equal(state.processes.rotation.binary.path, '/opt/coworkerd/bin/coworkerd-threaded');
   const binary = createHash('sha256').update(await readFile(join(cluster.kernel, 'coworkerd-threaded'))).digest('hex');
   const process = await eventually('the owner runs the pinned threaded executable with default settings', async () => {
     const generation = await durableGeneration(cluster, owner);
@@ -464,7 +467,6 @@ async function threadedDatabaseAlarm(cluster) {
     const process = await durableGeneration(cluster, db.owner);
     assert.equal(process.lifecycle.durableServer, 'threaded');
     const before = await stats();
-    assert.equal(before.fireConcurrency, 0, 'the owner uses the native alarm dispatcher');
     assert.equal(before.scheduled, 0);
     const seed = await query([
       { sql: 'CREATE TABLE records (value TEXT PRIMARY KEY)' },

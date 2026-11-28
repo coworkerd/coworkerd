@@ -549,13 +549,6 @@ bool tenantLimitRefusal(const InvocationRejection& refusal) {
   return refusal.code == "OVERLOADED" && refusal.category == TENANT_ADMISSION_LIMIT;
 }
 
-bool pausedRefusal(const InvocationRejection& refusal) {
-  return refusal.status == 503 &&
-      ((refusal.code == "PROCESS_UNAVAILABLE" && refusal.category == "paused-ordinary") ||
-       (refusal.code == "QUARANTINE_UNAVAILABLE" && refusal.category == "paused-quarantine") ||
-       (refusal.code == "DO_UNAVAILABLE" && refusal.category == "paused-durable"));
-}
-
 // A load failure is the version's own and the same everywhere -- except a code package
 // this Server could not get or verify, which another Server (another cache) may have.
 using coworkerd::PACKAGE_UNAVAILABLE;
@@ -564,12 +557,6 @@ bool rerouteAfter(const InvocationRejection& refusal) {
     return refusal.status == 503 && refusal.notExecuted && refusal.retryable;
   return refusal.code != "PROCESS_MEMORY_PRESSURE" && coworkerd::placementRetryable(refusal.code, refusal.category);
 }
-
-uint64_t preparationLargeBudget(uint32_t heapMiB) {
-  const auto heap = std::clamp<uint64_t>(heapMiB ? heapMiB : 128, 1, 65536);
-  return std::max<uint64_t>(1, heap * 1024 * 1024 * 21 / 32 / 65536) * 65536;
-}
-constexpr uint64_t MAX_PACKAGE_PREPARATION_BYTES = 84ull * 1024 * 1024;  // 10 MiB code plus a 1 MiB descriptor.
 
 class ServerCore;
 struct AdmissionSlot {
@@ -584,7 +571,6 @@ struct AdmissionSlot {
   ServerCore* server = nullptr;
   bool root = false;
   // Every pre-dispatch recheck shares this slot and the call's one paused-wait budget.
-  double pausedWaitMs = 0;
   double processTenantWaitMs = 0;
   std::string ingressNodeId;
   // A request to a Durable Object (DurableDispatch): its response may become a WebSocket connection too, and its outcome
@@ -844,8 +830,8 @@ private:
 // =====================================================================================================================
 // JS RPC: a method call on a Service Binding or on a Durable Object stub (docs/compatibility.md, section 7), carried by
 // workerd's own `EventDispatcher.jsRpcSession` (src/workerd/io/worker-interface.capnp). The node routes capabilities
-// and nothing else: of a call it reads only the name of the method -- our envelope, which the runtime's shim put
-// there -- and copies the arguments, the caller's pusher and the answer from one message to the other, capabilities
+// and reads only the routing envelope that the threaded kernel puts in the first method name. It copies
+// the arguments, the caller's pusher and the answer from one message to the other, capabilities
 // inside them included. A tenant's arguments are therefore serialized in the calling isolate and decoded in the
 // target's, never here, and a capability the target returns reaches the caller as the target's own.
 //
@@ -854,12 +840,8 @@ private:
 // one `startEvent` carried), so the channel that carries our descriptor for a `fetch` carries nothing for a method
 // call. The name of the one method a session takes is the only text of our own on the way in.
 constexpr uint64_t JS_RPC_TARGET_TYPE_ID = 0xa1a96525142a9d98ull;
-// What one node names when it asks another's session for the target's entrypoint; the node that executes the call
-// puts its own descriptor in its place (RpcDescriptorTarget), so a descriptor never travels between nodes.
+// The method name that asks the dispatcher's top-level RPC target for its selected entrypoint or actor.
 constexpr kj::StringPtr JS_RPC_BIND_METHOD = "coworkerd-bind"_kj;
-// The property of the runtime's top-level RPC target that answers with a version's entrypoint or an object's facet
-// (runtime/runtime.js, __coworkerdRpcBind): the descriptor is the name of the property read from it.
-constexpr kj::StringPtr JS_RPC_RUNTIME_PROPERTY = "__coworkerdRpcBind"_kj;
 
 // One call's parameters copied into another request, except the method it names: a serialized JavaScript value is
 // copied as the pointer it is, so nothing of it is decoded here.
@@ -972,13 +954,11 @@ private:
   std::function<void(const std::string&)> failed;
 };
 
-// The top-level target of a session on the node that executes the call: the runtime's own target takes our
-// descriptor as the name of the property it answers with the version's entrypoint (or the object's facet), so the
-// tenant's method call is then delivered to that entrypoint by workerd's RPC itself.
+// The first call asks the selected event for the entrypoint or actor capability.
 class RpcDescriptorTarget final: public rpc::JsRpcTarget::Server {
 public:
-  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot, bool threaded)
-      : runtimeTarget(kj::mv(runtimeTarget)), descriptor(kj::mv(descriptor)), slot(std::move(slot)), threaded(threaded) {}
+  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, std::shared_ptr<AdmissionSlot> slot)
+      : runtimeTarget(kj::mv(runtimeTarget)), slot(std::move(slot)) {}
 
   DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
       capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
@@ -993,12 +973,7 @@ private:
     auto params = context.getParams().getAs<rpc::JsRpcTarget::CallParams>();
     auto request = runtimeTarget.typelessRequest(interfaceId, methodId, params.totalSize(), {});
     auto builder = request.initAs<rpc::JsRpcTarget::CallParams>();
-    if (threaded) builder.setMethodName(JS_RPC_BIND_METHOD);
-    else {
-      auto path = builder.initMethodPath(2);
-      path.set(0, JS_RPC_RUNTIME_PROPERTY);
-      path.set(1, descriptor);
-    }
+    builder.setMethodName(JS_RPC_BIND_METHOD);
     copyCallParams(params, builder);
     // The runtime answers with a capability, not by running a method: the property is read.
     builder.getOperation().setGetProperty();
@@ -1010,18 +985,14 @@ private:
   }
 
   capnp::Capability::Client runtimeTarget;
-  kj::String descriptor;
   std::shared_ptr<AdmissionSlot> slot;
-  bool threaded;
 };
 
-// A workerd event dispatcher of this node with the descriptor that opened it: `getHttpService` is the event as it
-// always was, and `jsRpcSession` is the same event as a JS RPC session, whose top-level target carries the
-// descriptor into the runtime.
+// Expose the native event as an HTTP service or as a JS RPC session.
 class RpcDescriptorDispatcher final: public rpc::EventDispatcher::Server {
 public:
-  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot, bool threaded)
-      : inner(kj::mv(inner)), descriptor(kj::mv(descriptor)), slot(std::move(slot)), threaded(threaded) {}
+  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, std::shared_ptr<AdmissionSlot> slot)
+      : inner(kj::mv(inner)), slot(std::move(slot)) {}
 
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     context.initResults(capnp::MessageSize{4, 1}).setHttp(inner.getHttpServiceRequest().send().getHttp());
@@ -1031,16 +1002,14 @@ public:
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
     auto opened = inner.jsRpcSessionRequest().send();
     auto results = context.initResults(capnp::MessageSize{4, 2});
-    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot, threaded));
+    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), slot));
     results.setSession(opened.getSession());
     return kj::READY_NOW;
   }
 
 private:
   rpc::EventDispatcher::Client inner;
-  kj::String descriptor;
   std::shared_ptr<AdmissionSlot> slot;
-  bool threaded;
 };
 
 class ServerCore final {
@@ -1609,7 +1578,7 @@ public:
   }
 
   // ---- A Worker's log lines: 256 KB an event ----
-  // workerd caps a request's trace at 256 KB, but gives a streaming tail every line (runtime.js, TenantLog); the node
+  // workerd sends the event's console lines to the node, which
   // keeps the cap, per event: a request, or a message of a WebSocket connection toward the Worker (nextLogEvent, from
   // the connection's relay). An object's events are the object's: workerd records an object's lines under its latest
   // request, whichever of its requests or connections wrote them, so a request to an object (startObjectLogEvent) and a
@@ -1830,7 +1799,6 @@ public:
   }
 
   void observeRefusal(const InvocationRejection& refusal, const std::string& source = "localBinding") {
-    if (pausedRefusal(refusal)) return;  // A scheduling hint, before the call's final outcome.
     ++placementRejections[refusal.code];
     if (refusal.code == "QUARANTINE_UNAVAILABLE") decision("quarantineUnavailable", source == "localIngress" || source == "peerIngress");
     ++placementRejectionReasons[cleanReason(refusal.reason)];
@@ -1838,7 +1806,6 @@ public:
   }
 
   void observeLocalRefusal(const InvocationRejection& refusal, const std::string& source) {
-    if (pausedRefusal(refusal)) return;
     observeCounter("refusal", source, refusal.code);
     std::cout << "[refusal-count] {\"nodeId\":\"" << serverConfig.serverId
               << "\",\"source\":\"" << source << "\",\"code\":\"" << refusal.code
@@ -1947,10 +1914,6 @@ public:
     }
     auto value = durable ? refusal("DO_UNAVAILABLE", "the durable process of this object (" +
         runtime.durableProcessFor(durable->key()) + ") is not ready", 503, root) : processRefusal({runtime.quarantined(worker)}, root);
-    if (!durable && serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker)) {
-      value.category = runtime.quarantined(worker) ? "paused-quarantine" : "paused-ordinary";
-      value.avoidMs = 0;
-    }
     if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
     return value;
   }
@@ -1975,7 +1938,6 @@ public:
     return runtime.workerSaturated(worker, coworkerd::plainPlanFingerprint(plan->second), now);
   }
 
-  uint32_t pausedAdmissionWaitMs() const { return serverConfig.processPool.pausedAdmissionWaitMs; }
   struct Admission {
     std::optional<InvocationRejection> refused;
     std::shared_ptr<AdmissionSlot> slot;
@@ -2033,38 +1995,7 @@ public:
       slot->processTenantWaitMs += monotonicTimeMs() - began;
       co_return Admission{std::nullopt, std::move(slot)};
     }
-    if (!wait || !pausedRefusal(*failure)) {
-      if (!wait && pausedRefusal(*failure)) co_return Admission{std::move(failure), {}};
-      co_return reject(std::move(*failure));
-    }
-    auto paused = runtime.pausedAdmission(worker, durable ? durable->key() : "");
-    if (!paused) co_return reject(std::move(*failure));
-    const auto kind = failure->category.substr(7);
-    const auto began = monotonicTimeMs();
-    if (!slot) slot = reserve(root, worker, durable);
-    const auto until = std::min(deadline, began + std::max(0.0, pausedAdmissionWaitMs() - slot->pausedWaitMs));
-    const auto id = beginAdmissionWait(kind);
-    std::string outcome = "canceled";
-    // Keep a reference even when the successful return moves the slot into its result.
-    auto waitingSlot = slot;
-    auto done = kj::defer([&] {
-      waitingSlot->pausedWaitMs += monotonicTimeMs() - began;
-      endAdmissionWait(kind, id, began, outcome);
-    });
-    while (true) {
-      // Admission rechecks every original guard while accounting for this request's own reserved slot.
-      auto current = check();
-      if (current && current->code == "LEASE_EXPIRED") {
-        outcome = "lease";
-        if (record) rejectExpiredLease("lease expired during paused admission");
-        co_return reject(std::move(*current));
-      }
-      if (!paused.alive()) { outcome = "killed"; co_return reject(std::move(*failure)); }
-      if (!current) { outcome = "resumed"; co_return Admission{std::nullopt, std::move(slot)}; }
-      if (!pausedRefusal(*current)) { outcome = "unavailable"; co_return reject(std::move(*current)); }
-      if (monotonicTimeMs() >= until) { outcome = "expired"; co_return reject(std::move(*failure)); }
-      co_await timer.afterDelay(static_cast<int64_t>(std::max(0.0, std::min(10.0, until - monotonicTimeMs())) * 1000) * kj::MICROSECONDS);
-    }
+    co_return reject(std::move(*failure));
   }
 
   uint64_t beginAdmissionWait(const std::string& kind) {
@@ -2089,19 +2020,15 @@ public:
   std::string pausedAdmissionJson() const {
     std::ostringstream out; out << std::setprecision(17) << '{';
     bool first = true;
-    for (const auto* kind : {"ordinary", "quarantine", "durable", "tenant-execution"}) {
+    for (const auto* kind : {"tenant-execution"}) {
       auto found = pausedAdmissionCounts.find(kind);
       const auto count = found == pausedAdmissionCounts.end() ? PausedAdmissionCounts{} : found->second;
       out << (first ? "" : ",") << '"' << kind << "\":{\"count\":" << count.count << ",\"active\":" << count.active
           << ",\"maxActive\":" << count.maxActive << ",\"totalWaitMs\":" << count.totalWaitMs << ",\"maxWaitMs\":" << count.maxWaitMs;
       first = false;
-      for (const auto* outcome : {"resumed", "expired", "killed", "lease", "unavailable", "canceled"}) {
+      for (const auto* outcome : {"resumed", "expired", "unavailable", "canceled", "full"}) {
         auto value = count.outcomes.find(outcome);
         out << ",\"" << outcome << "\":" << (value == count.outcomes.end() ? 0 : value->second);
-      }
-      if (std::string_view(kind) == "tenant-execution") {
-        const auto full = count.outcomes.find("full");
-        out << ",\"full\":" << (full == count.outcomes.end() ? 0 : full->second);
       }
       out << '}';
     }
@@ -2435,45 +2362,43 @@ public:
         shared->fulfiller->fulfill();
       }
     });
-    if (process->threadedServer()) {
-      if (auto found = threadedLoads.find(key); found != threadedLoads.end()) {
-        auto pending = found->second;
-        // The shared check owns its own process admission. A waiter keeps no
-        // extra process ticket, invocation number, or another caller's deadline.
-        process.reset();
-        bool expired = false;
-        try {
-          auto remaining = static_cast<int64_t>(std::max(0.0, deadline - monotonicTimeMs()) * 1000) * kj::MICROSECONDS;
-          co_await timer.timeoutAfter(remaining, pending->done.addBranch());
-          // A completed load can release hundreds of waiters. Let ready I/O
-          // and existing RPC continuations run before opening their calls.
-          co_await kj::yieldUntilWouldSleep();
-        } catch (const kj::Exception&) { expired = true; }
-        if (expired || monotonicTimeMs() >= deadline) {
-          LoadCheck result;
-          result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
-          co_return result;
-        }
-        if (pending->result) {
-          const auto& result = *pending->result;
-          if (!result.refusal) co_return LoadCheck{};
-          if (result.refusal->code != "LEASE_EXPIRED") {
-            LoadCheck failed;
-            failed.refusal = refusal(result.refusal->code, result.refusal->reason, result.refusal->status, root);
-            failed.refusal->category = result.refusal->category;
-            failed.refusal->notExecuted = result.refusal->notExecuted;
-            failed.refusal->retryable = result.refusal->retryable;
-            co_return failed;
-          }
-        }
-        // Cancellation or the initiating caller's deadline cannot poison a
-        // later caller's check. Select the current generation again.
-        co_return co_await loadCheck(std::move(version), std::move(entrypoint), deadline, root);
+    if (auto found = threadedLoads.find(key); found != threadedLoads.end()) {
+      auto pending = found->second;
+      // The shared check owns its own process admission. A waiter keeps no
+      // extra process ticket, invocation number, or another caller's deadline.
+      process.reset();
+      bool expired = false;
+      try {
+        auto remaining = static_cast<int64_t>(std::max(0.0, deadline - monotonicTimeMs()) * 1000) * kj::MICROSECONDS;
+        co_await timer.timeoutAfter(remaining, pending->done.addBranch());
+        // A completed load can release hundreds of waiters. Let ready I/O
+        // and existing RPC continuations run before opening their calls.
+        co_await kj::yieldUntilWouldSleep();
+      } catch (const kj::Exception&) { expired = true; }
+      if (expired || monotonicTimeMs() >= deadline) {
+        LoadCheck result;
+        result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
+        co_return result;
       }
-      auto signal = kj::newPromiseAndFulfiller<void>();
-      shared = std::make_shared<PendingThreadedLoad>(kj::mv(signal.promise), kj::mv(signal.fulfiller));
-      threadedLoads.emplace(key, shared);
+      if (pending->result) {
+        const auto& result = *pending->result;
+        if (!result.refusal) co_return LoadCheck{};
+        if (result.refusal->code != "LEASE_EXPIRED") {
+          LoadCheck failed;
+          failed.refusal = refusal(result.refusal->code, result.refusal->reason, result.refusal->status, root);
+          failed.refusal->category = result.refusal->category;
+          failed.refusal->notExecuted = result.refusal->notExecuted;
+          failed.refusal->retryable = result.refusal->retryable;
+          co_return failed;
+        }
+      }
+      // Cancellation or the initiating caller's deadline cannot poison a
+      // later caller's check. Select the current generation again.
+      co_return co_await loadCheck(std::move(version), std::move(entrypoint), deadline, root);
     }
+    auto signal = kj::newPromiseAndFulfiller<void>();
+    shared = std::make_shared<PendingThreadedLoad>(kj::mv(signal.promise), kj::mv(signal.fulfiller));
+    threadedLoads.emplace(key, shared);
     LoadCheck result;
     result.sequence = nextSequence++;
     const auto forInvocation = invocationId(result.sequence);
@@ -2769,7 +2694,7 @@ public:
             std::min(limits.cpuMs, 30000u), limits.memoryMiB, target.namespaceId, target.objectId,
             target.dataEpoch, target.alarmAtUnixMs, target.alarmFacetId, target.isDatabase())}
         : coworkerd::prepareRootDispatch(desiredState.state(), *version, limits.cpuMs, limits.memoryMiB,
-        target.namespaceId, target.objectId, target.dataEpoch, target.isDatabase(), target.alarmAtUnixMs,
+        target.namespaceId, target.objectId, target.dataEpoch, target.alarmAtUnixMs,
         target.alarmFacetId);
     if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
         "the Durable Object namespace is unavailable or being deleted"}};
@@ -3216,10 +3141,8 @@ private:
     auto opened = runtime.open(process, descriptor, version->definitionHash,
         slot ? slot->nativeProps : NativeProps(), kj::mv(token), threadedSql,
         durable == nullptr && slot ? slot->requestLease : nullptr);
-    // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
-    // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
-        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), kj::str(descriptor), slot, process->threadedServer()));
+        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), slot));
     pathMark(timing, "open-runtime-send");
     phaseTiming("open-runtime-send", started, process);
     opened.ready = kj::mv(opened.ready).then([started, process, timing] {
@@ -3748,7 +3671,6 @@ private:
       auto json = message.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().encode(descriptor, json);
       auto value = coworkerd::json::encodeCompact(json.asReader());
-      if (!process.threadedServer()) return value;
       value.pop_back();
       value += ",\"nativeNamespaces\":[";
       bool first = true;
@@ -3791,14 +3713,11 @@ private:
     auto holdSecrets = [&](const std::string& plan) {
       if (version.secrets.empty()) return;
       syncSecretDictionary();
-      std::string revision;
-      if (process.threadedServer()) {
-        revision = coworkerd::plainPlanFingerprint(plan);
-        if (revision.empty()) revision = version.definitionHash;
-      }
+      auto revision = coworkerd::plainPlanFingerprint(plan);
+      if (revision.empty()) revision = version.definitionHash;
       // Its values changed after the call was admitted and the region cannot take them: nothing is sent.
       if (!secretDictionary.sent(coworkerd::tenantOf(version.workerId), secretValues(version), process.processId,
-              process.generation, revision, process.threadedServer(), monotonicTimeMs(), expiresAtMonotonicMs))
+              process.generation, std::string(revision), true, monotonicTimeMs(), expiresAtMonotonicMs))
         throw ProcessUnavailable{false, "this node's secret dictionary cannot take this call's secret values now", true};
     };
     if (!version.secrets.empty()) {
@@ -3821,21 +3740,20 @@ private:
     descriptor.setDepth(depth);
     descriptor.setRequiresChildSequence(leaseConfig.naive());
     descriptor.setColdLoaded(coldLoaded);
-    // The limits this Worker names: the runtime bridge puts them in the loader key, so the version's
-    // isolate is created under them. A limit it does not name stays 0 here and the process's value applies
-    // (and the loader key of a Worker that names none has no limits segment).
+    // The threaded loader uses these limits when identifying and creating the isolate.
+    // A zero limit selects the process default.
     auto limits = namedLimits(version.workerId);
-    if (process.threadedDurableRole()) limits.cpuMs = std::min(limits.cpuMs, 30000u);
-    else if (process.threadedServer() && limits.cpuMs > 300000) limits.cpuMs = 300000;
+    if (process.threadedDurableRole()) {
+      limits.cpuMs = std::min(limits.cpuMs, coworkerd::ProcessPoolConfig::DURABLE_CPU_CEILING_MS);
+    }
+    else if (limits.cpuMs > 300000) limits.cpuMs = 300000;
     descriptor.setCpuLimitMs(limits.cpuMs);
     descriptor.setMemoryLimitMiB(limits.memoryMiB);
     if (trial) {
-      // A trial load gets no Binding: nothing it may run could call one. The load check is one. Its bridge checks the
-      // Durable Object classes the version declares among the exports.
+      // The threaded loader verifies the trial's declared Durable Object classes against the module exports.
       descriptor.setTrial(true);
       descriptor.setLoadCheck(loadCheck);
       if (!sourceInvocationId.empty()) descriptor.setSourceInvocationId(sourceInvocationId.c_str());
-      descriptor.initBindings(0);
       if (!version.declaredClasses.empty()) {
         auto classes = descriptor.initDurableObjectClasses(version.declaredClasses.size());
         for (size_t i = 0; i < version.declaredClasses.size(); ++i) classes.set(i, version.declaredClasses[i].c_str());
@@ -3849,54 +3767,12 @@ private:
       holdSecrets(plain.plan);
       return kj::str(plain.descriptor(std::move(encoded)).c_str());
     }
-    // The classes the version declares (its bridge exports each one for the objects' Hosts, whichever call loads the
-    // isolate first), and its Durable Object namespace Bindings, with this node's view of each class's namespace: a
-    // namespace that cannot be used has no id (its Binding refuses every call).
-    if (!version.declaredClasses.empty()) {
-      auto classes = descriptor.initDurableObjectClasses(version.declaredClasses.size());
-      for (size_t i = 0; i < version.declaredClasses.size(); ++i) classes.set(i, version.declaredClasses[i].c_str());
-    }
-    if (!version.durableObjects.empty()) {
-      auto namespaces = descriptor.initDurableObjects(version.durableObjects.size());
-      for (size_t i = 0; i < version.durableObjects.size(); ++i) {
-        const auto& binding = version.durableObjects[i];
-        namespaces[i].setName(binding.binding.c_str());
-        namespaces[i].setClassName(binding.className.c_str());
-        // A database Binding names one of the tenant's databases: its namespace is the database's, and the one
-        // object it holds is named "database" in it (the id is computed here, so the runtime needs no hash for it).
-        if (!binding.database.empty()) {
-          const auto* space = desiredState.state().database(coworkerd::tenantOf(version.workerId), binding.database);
-          const bool usable = space != nullptr && space->status == "active";
-          namespaces[i].setDatabase(binding.database.c_str());
-          namespaces[i].setNamespaceId(usable ? space->id.c_str() : "");
-          if (usable) {
-            namespaces[i].setObjectId(
-                coworkerd::durableObjectIdFromName(space->id, coworkerd::DATABASE_OBJECT_NAME).c_str());
-          }
-          continue;
-        }
-        const auto* space = desiredState.state().durableNamespace(version.workerId, binding.className);
-        namespaces[i].setNamespaceId(space && space->status == "active" ? space->id.c_str() : "");
-      }
-    }
     if (durable) {
-      // A request to an object: its Host runs the Worker's class with the version's variables, secrets and Durable Object
-      // Bindings; Service Bindings are not given to a class in this release.
       auto target = descriptor.initDurableObject();
       target.setNamespaceId(durable->namespaceId.c_str());
       target.setObjectId(durable->objectId.c_str());
       const auto& className = durable->platformClass ? durable->platformClass->name : durable->className;
-      target.setClassName(className.c_str());
-      target.setHops(durable->hops);
-      target.setShard(durable->shard);
-      target.setShardEpoch(durable->shardEpoch);
-      target.setDataEpoch(durable->dataEpoch);
       target.setDatabase(durable->database.c_str());
-      target.setAlarmAtUnixMs(durable->alarmAtUnixMs);
-      target.setAlarmRetryCount(durable->alarmRetryCount);
-      target.setAlarmFacetId(durable->alarmFacetId);
-      if (durable->alarmAtUnixMs) target.setAlarmWallMs(leaseConfig.alarmWallMs);
-      descriptor.initBindings(0);
       holdSecrets(root != nullptr ? root->plan : std::string());
       if (root != nullptr) {
         auto encoded = root->descriptor(encodeJson(descriptor.asReader()));
@@ -3955,25 +3831,6 @@ private:
     if (perCallForTest()) {
       const auto* worker = desiredState.state().worker(version.workerId);
       if (worker && worker->valid) bindingPins = worker->closure;
-    }
-    auto bindings = descriptor.initBindings(version.bindings.size());
-    for (size_t index = 0; index < version.bindings.size(); ++index) {
-      bindings[index].setName(version.bindings[index].name.c_str());
-      if (version.bindings[index].assets) {
-        // The ASSETS Binding: this version's own asset layer.
-        bindings[index].setAssets(true);
-        bindings[index].setWorkerId(version.workerId.c_str());
-        bindings[index].setVersionId(version.versionId.c_str());
-        bindings[index].setContentHash(version.contentHash.c_str());
-        bindings[index].setDefinitionHash(version.definitionHash.c_str());
-        continue;
-      }
-      bindings[index].setWorkerId(version.bindings[index].workerId.c_str());
-      const auto& target = bindingPins->at(version.bindings[index].workerId);
-      bindings[index].setVersionId(target.versionId.c_str());
-      bindings[index].setContentHash(target.contentHash.c_str());
-      bindings[index].setDefinitionHash(target.definitionHash.c_str());
-      bindings[index].setEntrypoint(version.bindings[index].entrypoint.c_str());
     }
     const coworkerd::VersionPins emptyPins;
     const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version,
@@ -4373,7 +4230,7 @@ rpc::EventDispatcher::Client makeRejectionDispatcher(
 rpc::EventDispatcher::Client makeD1BudgetRejection(
     capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, const char* code,
     const std::string& reason) {
-  // Native D1 clients read the error field. The legacy shim also uses the structured code and reason.
+  // D1 clients read the error field. Preserve code and reason for the HTTP response.
   const auto detail = jsonEscape(cleanReason(reason));
   const auto body = "{\"success\":false,\"code\":\"" + std::string(code) + "\",\"reason\":\"" + detail +
       "\",\"error\":\"" + code + ": " + detail + "\"}";
@@ -5197,7 +5054,7 @@ public:
       if (slot->process) slot->process->snapshotAfterFailure();
       if (tracked->hasStarted()) { slot->report(tracked->status(), limitCode()); throw; }
       failure = error.getDescription().cStr();
-      if (slot->process && slot->process->threadedServer()) platformCode = rpcFailureCode(error);
+      if (slot->process) platformCode = rpcFailureCode(error);
     }
     co_await refuse(*tracked, failure, platformCode);
   }
@@ -5237,7 +5094,7 @@ private:
     }
     KJ_IF_SOME(error, failed) {
       if (tracked->hasStarted()) kj::throwFatalException(kj::mv(error));
-      co_await refuse(*tracked, failure, slot->process && slot->process->threadedServer() ? rpcFailureCode(error) : "");
+      co_await refuse(*tracked, failure, slot->process ? rpcFailureCode(error) : "");
     }
   }
   // A failure before the response started: the code the call's limits or its process say.
@@ -5658,52 +5515,7 @@ public:
   }
 
   kj::Promise<InvocationAttempt> openStatic(std::string target, RemoteInvocationData invocation) {
-    auto result = co_await tryOpen(target, invocation);
-    co_return co_await waitRemote(target, std::move(invocation), std::move(result));
-  }
-
-  kj::Promise<InvocationAttempt> waitRemote(const std::string& target, RemoteInvocationData invocation, InvocationAttempt result) {
-    if (!result.failure || !pausedRefusal(*result.failure) || !server.pausedAdmissionWaitMs()) co_return result;
-    const auto original = *result.failure;
-    const auto deadline = invocation.expiresAtMonotonicMs;
-    auto guard = server.admission(invocation.workerId, invocation.definitionHash, invocation.ingressRoot,
-        deadline, false, false, nullptr, false, false, false);
-    if (guard) {
-      server.recordTenantLimitRefusal(invocation.workerId, invocation.ingressRoot, *guard);
-      co_return InvocationAttempt{nullptr, std::move(guard), true};
-    }
-    auto slot = server.reserve(invocation.ingressRoot, invocation.workerId);
-    const auto kind = original.category.substr(7);
-    const auto began = monotonicTimeMs();
-    const auto until = std::min(deadline, began + server.pausedAdmissionWaitMs());
-    const auto id = server.beginAdmissionWait(kind);
-    std::string outcome = "canceled";
-    auto done = kj::defer([&] { server.endAdmissionWait(kind, id, began, outcome); });
-    while (true) {
-      guard = server.admission(invocation.workerId, invocation.definitionHash, invocation.ingressRoot,
-          deadline, false, false, nullptr, true, false, false);
-      if (guard) {
-        server.recordTenantLimitRefusal(invocation.workerId, invocation.ingressRoot, *guard);
-        outcome = guard->code == "LEASE_EXPIRED" ? "lease" : "unavailable";
-        co_return InvocationAttempt{nullptr, std::move(guard), true};
-      }
-      if (monotonicTimeMs() >= until) {
-        outcome = "expired";
-        auto failure = original; failure.category.clear();
-        failure.avoidMs = std::min(server.placementConfig().rejectionAvoidMs, server.placementConfig().avoidMaxMs);
-        co_return InvocationAttempt{nullptr, std::move(failure), true};
-      }
-      co_await timer.afterDelay(static_cast<int64_t>(std::max(0.0, std::min(10.0, until - monotonicTimeMs())) * 1000) * kj::MICROSECONDS);
-      if (monotonicTimeMs() >= until) continue;
-      // Only explicit refusals permit another open; accepted or uncertain commits this attempt.
-      result = co_await tryOpen(target, invocation);
-      if (!result.failure) { outcome = "resumed"; co_return result; }
-      if (!pausedRefusal(*result.failure)) {
-        outcome = result.failure->code == "LEASE_EXPIRED" ? "lease" :
-            (result.failure->code == "PROCESS_UNAVAILABLE" || result.failure->code == "QUARANTINE_UNAVAILABLE") ? "killed" : "unavailable";
-        co_return result;
-      }
-    }
+    co_return co_await tryOpen(target, invocation);
   }
 
   // A Durable Object log stream to one peer: the member's current epoch is addressed, and the stream stays on that
@@ -6146,7 +5958,7 @@ public:
           allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint,
           allocation.nativeProps, preferIdle, allocation.requestLease};
     };
-    bool allPaused = true, allTenantLimited = true;
+    bool allTenantLimited = true;
     bool allNotExecuted = true;
     std::optional<InvocationRejection> tenantRefusal;
     size_t finalRefusals = 0;
@@ -6224,7 +6036,6 @@ public:
       } else {
         ++finalRefusals;
         allNotExecuted = allNotExecuted && refusal.notExecuted;
-        allPaused = allPaused && pausedRefusal(refusal);
         packagesUnavailable = packagesUnavailable && refusal.code == "LOAD_FAILED" &&
             refusal.category == PACKAGE_UNAVAILABLE;
         if (tenantLimitRefusal(refusal)) {
@@ -6241,26 +6052,6 @@ public:
         }
       }
       if (i + 1 < firstPassSize + saturated.size()) server.reroute(result.failure->code);
-    }
-    // Every candidate explicitly refused before execution because its eligible processes were paused.
-    // Only now may one candidate wait. The first pass, including immediate reroutes, stays unchanged.
-    if (allPaused && finalRefusals > 0 && finalRefusals == ordered.size() && server.pausedAdmissionWaitMs() &&
-        std::find(ordered.begin(), ordered.end(), config.serverId) != ordered.end()) {
-      const auto target = config.serverId;
-      auto result = co_await attemptHere(true, false);
-      allNotExecuted = allNotExecuted && result.failure && result.failure->notExecuted;
-      server.observeAttempt(target, allocation.ingressRoot, result.failure);
-      if (!result.failure) {
-        avoidance.erase(target);
-        if (forwarded) *forwarded = false;
-        if (placedOn) *placedOn = target;
-        server.decision("localPausedResumed", allocation.ingressRoot);
-        co_return std::move(result.dispatcher);
-      }
-      server.observeRefusal(*result.failure, allocation.ingressRoot ? "localIngress" : "localBinding");
-      if (result.failure->code == "LEASE_EXPIRED" || !result.retryable)
-        co_return rejectedDispatcher(factory, headerTable, *result.failure, allocation.expiresAtMonotonicMs);
-      failures += ",{\"nodeId\":\"" + target + "\",\"failure\":" + result.failure->json() + "}";
     }
     if (allTenantLimited && tenantRefusal)
       co_return rejectedDispatcher(factory, headerTable, *tenantRefusal, allocation.expiresAtMonotonicMs);
@@ -7505,7 +7296,7 @@ private:
 
 // A request to a Durable Object (docs/compatibility.md, section 7): from a stateless Worker's namespace Binding, or from
 // an object's. In this release the owner of every object is this node: the request runs on the object's durable process
-// (ProcessPool::selectDurable: d0, ... by the object's id), whose runtime gives it to the object's Host -- the active
+// (ProcessPool::selectDurable: d0, ... by the object's id), which dispatches it to the object's home -- the active
 // version of the Worker, its class declared and its namespace active. A durable process being replaced or restarted is
 // waited for, at most DURABLE_WAIT_MS within the request's lease. One [do] line per request, with its outcome.
 class DurableDispatch final {
@@ -7828,8 +7619,7 @@ private:
         target.dataEpoch, target.shardEpoch, target.shard};
     if (!disposable) slot->durableLog = &durableLog;
     slot->timing = request.timing;
-    // The durable host loads platform packages from its admitting daemon. The upstream database class
-    // comes from the static runtime.
+    // The admitting daemon serves platform packages directly to the durable kernel.
     if (!target.isDatabase() && !target.platformClass) {
       auto unavailable = co_await server.ensureCode(*version, deadline, true);
       if (!unavailable.empty()) {
@@ -8264,8 +8054,7 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
 
 class BindingBootstrap;
 
-// The node's end of a session its own runtime opened for a method call (runtime/runtime.js: the Binding shim's
-// rpcTarget). It carries no HTTP request; its one method call is the envelope.
+// The native kernel opens this session to ask the node for a binding target over RPC.
 class RpcSessionDispatcher final: public rpc::EventDispatcher::Server {
 public:
   RpcSessionDispatcher(BindingBootstrap& bootstrap, NativeProps props): bootstrap(bootstrap), nativeProps(std::move(props)) {}
@@ -8602,7 +8391,7 @@ public:
     const bool assetsCall = descriptor.getAssets();
     server.observeSequenceMapSize(descriptor.getSequenceMapSize());
     if (descriptor.hasDurableObject()) {
-      // A call to a Durable Object of the calling Worker (runtime.js, DurableNamespace): from a stateless Worker a Binding
+      // A call to a Durable Object of the calling Worker uses a namespace binding. From a stateless Worker a binding
       // call of its call tree, from an object (callerObjectId) a call of that object's.
       auto call = descriptor.getDurableObject();
       DurableDispatch::Request request;
@@ -9023,11 +8812,7 @@ public:
   }
 
 private:
-  // A Worker's console lines, from the runtime of one of this node's processes (runtime/runtime.js, TenantLog: the
-  // streaming tail workerd gives each Worker it loads, bound to that Worker's identity by the runtime; only the
-  // runtimes reach this socket), as they are written, with the invocation they belong to. They are kept as that
-  // Worker's lines (WorkerdOutput::appendTenantLines); what a line says never decides whose it is. An event's lines past
-  // 256 KB (ServerCore::chargeLogLine) and lines beyond what one append carries are cut and counted.
+  // The threaded kernel sends console lines with their Worker and invocation identity.
   static constexpr size_t MAX_LOG_POST_BYTES = 16 * 1024 * 1024, MAX_LOG_APPEND_BYTES = 2 * 1024 * 1024;
   static constexpr const char* LOG_EVENT_EXCEEDED = "Log size limit exceeded: more than 256 KB of lines in one event (a request, "
       "a request to a Durable Object, or a message of a WebSocket connection); the event's later lines are not kept";
@@ -9624,7 +9409,7 @@ private:
             std::string names;
             for (const auto& name : named) names += (names.empty() ? "" : ", ") + name;
             if (kind == "class" || kind == "object" ||
-                (process->threadedServer() && flag("nativeHttpValidated") &&
+                (flag("nativeHttpValidated") &&
                     flag("hasDefault") && flag("entrypointUsable"))) {
               verdict.message = "the default export serves fetch (" + kind + ")";
               // The isolate stays for the next call; the load check before it need not load again.
@@ -10419,13 +10204,13 @@ std::optional<std::pair<std::string, int>> liveStackSocket(const fs::path& stack
 
 // ---- How the Server starts ----
 // `coworkerd --config FILE` reads everything from one file with defaults; the
-// positional form (`<manifest> <workerd> <http> <binding-rpc> <source>
+// positional form (`<manifest> <coworkerd-threaded> <http> <binding-rpc> <source>
 // [server-config]`) works as well. Both resolve to a Launch.
 struct Launch {
   std::string form;              // "serve" or "positional"
   fs::path configFile;           // empty: the positional form without a configuration file
   fs::path stackDirectory, manifestPath;
-  std::string workerd, runtime, listenAddress;
+  std::string listenAddress;
   std::string ignoredBindingAddress, ignoredSourceAddress;  // positional, unused
   bool experimentalNaiveLease = false;
   ServerConfig config;
@@ -10437,7 +10222,7 @@ constexpr const char* USAGE =
     "       coworkerd check storage ENDPOINT BUCKET  (the object store's self-check)\n"
     "       coworkerd check host [MiB]  (fresh-memory first touches and virtio balloon features)\n"
     "       coworkerd --version\n"
-    "       coworkerd <manifest> <workerd> <http-address> <binding-rpc-address> <source-address> [server-config]"
+    "       coworkerd <manifest> <coworkerd-threaded> <http-address> <binding-rpc-address> <source-address> [server-config]"
     "  (the regressions' form)\n";
 
 Launch serveLaunch(const std::vector<std::string>& args, bool naive) {
@@ -10456,10 +10241,6 @@ Launch serveLaunch(const std::vector<std::string>& args, bool naive) {
   KJ_REQUIRE(c.serverIdGiven, "the configuration needs a nodeId");
   launch.stackDirectory = fs::absolute(c.stackDirectory.empty() ? "/var/lib/coworkerd" : c.stackDirectory).lexically_normal();
   launch.manifestPath = launch.stackDirectory / "workers" / "manifest.json";
-  const auto self = executableDirectory();
-  launch.workerd = fs::absolute(c.workerdPath.empty() ? self / "workerd" : fs::path(c.workerdPath)).lexically_normal().string();
-  launch.runtime = fs::absolute(c.runtimePath.empty() ? self / ".." / "runtime" / "runtime.js" : fs::path(c.runtimePath))
-      .lexically_normal().string();
   launch.listenAddress = c.listenAddress.empty() ? "0.0.0.0:8930" : c.listenAddress;
   if (c.peerListenAddress.empty()) c.peerListenAddress = "0.0.0.0:8934";
   KJ_REQUIRE(c.desiredState.backend == "objectStore" && !c.desiredState.objectStore.endpoint.empty(),
@@ -10484,18 +10265,19 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
   launch.form = "positional";
   launch.experimentalNaiveLease = naive;
   launch.manifestPath = args[0];
-  launch.workerd = fs::absolute(args[1]).string();
   launch.listenAddress = args[2];
   launch.ignoredBindingAddress = args[3];
   launch.ignoredSourceAddress = args[4];
   if (args.size() == 6) launch.configFile = args[5];
   launch.config = ServerConfig::load(launch.configFile);
+  if (launch.config.processPool.threadedExecutable.empty()) {
+    launch.config.processPool.threadedExecutable = args[1];
+  }
   coworkerd::checkNodeLeaseMargin(launch.config.membership);
   KJ_REQUIRE(!launch.config.servePathsGiven(),
-      "stackDirectory, workerdPath, runtimePath and listenAddress are for `serve`; the positional form takes them as arguments");
+      "stackDirectory and listenAddress are for `serve`; the positional form takes them as arguments");
   // <stack>/workers/manifest.json -> <stack>.
   launch.stackDirectory = fs::absolute(launch.manifestPath).parent_path().parent_path();
-  launch.runtime = (launch.stackDirectory / "runtime/runtime.js").string();
   if (launch.config.cacheFollowsStack) launch.config.desiredState.cache.directory = launch.stackDirectory / "cache";
   return launch;
 }
@@ -10521,14 +10303,12 @@ fs::path makeDurableTestStack(const fs::path& fixtureStack) {
 // the threaded binary's sandbox, this machine's memory protection keys, address space and
 // vm.max_map_count lower each process's resident limit (never the process count).
 // A plan that refuses ends the start.
-void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& workerdPath) {
+void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool) {
   if (const char* keys = std::getenv("COWORKERD_SANDBOX_PROTECTION_KEYS")) pool.protectionKeys = keys;
   KJ_REQUIRE(pool.protectionKeys == "auto" || pool.protectionKeys == "off" || pool.protectionKeys == "required",
       "sandbox.protectionKeys must be auto, off or required", pool.protectionKeys.c_str());
   if (pool.count + pool.quarantineProcesses + pool.durableProcesses == 0) return;
-  const auto threaded = pool.threadedExecutable.empty()
-      ? (fs::path(workerdPath).parent_path() / "coworkerd-threaded").string() : pool.threadedExecutable;
-  auto plan = coworkerd::planV8Sandbox(pool.protectionKeys, coworkerd::probeSandboxBuild(threaded),
+  auto plan = coworkerd::planV8Sandbox(pool.protectionKeys, coworkerd::probeSandboxBuild(pool.threadedExecutable),
       coworkerd::probeProtectionKeys(), coworkerd::probeMachine(), pool.threadedResidentLimit,
       pool.count + pool.durableProcesses);
   // Only for the fill-until-failure cell: a per-process limit above what the address space holds,
@@ -10558,11 +10338,12 @@ uint64_t nodeHardDescriptorLimit(rlim_t inherited) {
   return hard;
 }
 
-void applyProcessPoolEnvironment(ServerConfig& config, const std::string& workerdPath) {
+void applyProcessPoolEnvironment(ServerConfig& config) {
   auto& pool = config.processPool;
+  pool.threadedExecutable = fs::absolute(pool.threadedExecutable.empty()
+      ? executableDirectory() / "coworkerd-threaded" : fs::path(pool.threadedExecutable)).lexically_normal().string();
   const auto memoryBudgetBytes = config.memoryBudgetBytes;
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
-  pool.durableCpuLimitMs = 30000;
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
   pool.quarantineProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_QUARANTINE_PROCESSES", pool.quarantineProcesses, 256));
   pool.durableProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_DURABLE_PROCESSES", pool.durableProcesses, 64));
@@ -10579,7 +10360,7 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
   pool.threadedResidentLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_RESIDENT_LIMIT", pool.threadedResidentLimit, 1840));
   pool.threadedThreadIdleMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_THREAD_IDLE_MS", pool.threadedThreadIdleMs, UINT32_MAX));
   pool.threadedMemoryBytes = environmentUnsigned("COWORKERD_THREADED_MEMORY_BYTES", pool.threadedMemoryBytes, UINT64_MAX);
-  planOrdinarySandbox(pool, workerdPath);
+  planOrdinarySandbox(pool);
   const auto [nodeBytes, memorySource] = coworkerd::MemoryWatermark::nodeMemory(config.memoryBudgetBytes);
   const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
   const auto memoryShare = (nodeBytes - nodeBytes / 5) / generations;
@@ -10661,7 +10442,6 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
   }
   config.resolvePlacementLimits();
   for (auto [name, field] : {std::pair{"COWORKERD_IDLE_EVICT_MS", &pool.idleEvictMs},
-                             std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &pool.idleDestroyIntervalMs},
                              std::pair{"COWORKERD_ROTATION_DRAIN_TIMEOUT_MS", &pool.rotationDrainTimeoutMs},
                              std::pair{"COWORKERD_ROTATION_TERM_GRACE_MS", &pool.rotationTermGraceMs},
                              std::pair{"COWORKERD_ROTATION_BINARY_CHECK_MS", &pool.rotationBinaryCheckMs},
@@ -10683,14 +10463,6 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
     pool.rotationResidentBytesDefault = false;
     pool.rotationResidentBytesSource = "default: 70% of " + source + " (" + std::to_string(bytes) + " bytes)";
   }
-  for (auto [name, field] : {std::pair{"COWORKERD_GC_BUDGET_MS", &pool.gcBudgetMs},
-                             std::pair{"COWORKERD_GC_REFILL_MS_PER_S", &pool.gcRefillMsPerSecond},
-                             std::pair{"COWORKERD_GC_LONG_PAUSE_MS", &pool.gcLongPauseMs},
-                             std::pair{"COWORKERD_IDLE_GC_MS", &pool.gcIdleCollectAfterMs},
-                             std::pair{"COWORKERD_IDLE_GC_MIN_MIB", &pool.gcIdleCollectMinGrowthMiB},
-                             std::pair{"COWORKERD_GC_INITIAL_OLD_SPACE_MIB", &pool.gcInitialOldSpaceMiB},
-                             std::pair{"COWORKERD_STATIC_HEAP_MIB", &pool.gcRuntimeHeapMiB}})
-    *field = static_cast<uint32_t>(environmentUnsigned(name, *field, UINT32_MAX));
   if (const char* mode = std::getenv("COWORKERD_SANDBOX_MODE")) pool.sandboxMode = mode;
   if (const char* mode = std::getenv("COWORKERD_SANDBOX_SYSCALLS")) pool.syscallsMode = mode;
   if (const char* path = std::getenv("COWORKERD_SANDBOX_ALLOWLIST")) pool.allowlistPath = path;
@@ -10710,15 +10482,6 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
   // The steady-state table of the same build, beside it as well.
   if (pool.steadyAllowlistPath.empty()) pool.steadyAllowlistPath = (executableDirectory() / "coworkerd-syscalls-steady.txt").string();
   pool.validate();
-  if (pool.durableProcesses > 0) {
-    const auto preparationBudget = preparationLargeBudget(pool.gcRuntimeHeapMiB);
-    std::cout << "[server] {\"event\":\"preparation-memory\",\"runtimeHeapMiB\":" << pool.gcRuntimeHeapMiB
-              << ",\"largeBudgetBytes\":" << preparationBudget << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
-              << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << (preparationBudget >= MAX_PACKAGE_PREPARATION_BYTES ? "true" : "false");
-    if (preparationBudget < MAX_PACKAGE_PREPARATION_BYTES)
-      std::cout << ",\"warning\":\"COWORKERD_STATIC_HEAP_MIB cannot reserve a maximum 10 MiB package with a 1 MiB descriptor; larger packages fail LOAD_FAILED without retry; increase the runtime heap\"";
-    std::cout << '}' << std::endl;
-  }
 }
 
 // Budget the active and replacement generations, other ingress traffic, and the open WebSockets together.
@@ -10770,7 +10533,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       : std::getenv("AWS_ACCESS_KEY_ID") ? "environment" : "none";
   std::ostringstream out;
   out << std::setprecision(17) << "{\"nodeId\":" << q(c.serverId) << ",\"stackDirectory\":" << q(launch.stackDirectory.string())
-      << ",\"workerdPath\":" << q(launch.workerd) << ",\"runtimePath\":" << q(launch.runtime)
+      << ",\"threadedExecutable\":" << q(p.threadedExecutable)
       << ",\"listenAddress\":" << q(launch.listenAddress) << ",\"peerListenAddress\":" << q(c.peerListenAddress)
       << ",\"advertisedAddress\":" << q(m.advertisedAddress)
       << ",\"membership\":{\"backend\":" << q(m.backend) << ",\"ttlSeconds\":" << m.ttlSeconds
@@ -10789,22 +10552,14 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << "},\"hostCheck\":{\"intervalMs\":" << c.hostCheck.intervalMs << ",\"sampleMiB\":" << c.hostCheck.sampleMiB
       << "},\"processPool\":{\"count\":" << p.count << ",\"quarantineProcesses\":" << p.quarantineProcesses
       << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"durableInFlightLimit\":" << p.durableInFlightLimit()
-      << ",\"threadedMemoryBytes\":" << p.threadedMemoryBytes << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
+      << ",\"threadedMemoryBytes\":" << p.threadedMemoryBytes << ",\"probeIntervalMs\":" << p.probeIntervalMs
       << ",\"stuckTimeoutMs\":" << p.stuckTimeoutMs << ",\"restartBackoffMs\":" << p.restartBackoffMs << ",\"restartMaxMs\":" << p.restartMaxMs
-      << ",\"pausedAdmissionWaitMs\":" << p.pausedAdmissionWaitMs
-      << ",\"watchdog\":" << b(p.watchdog) << ",\"idleEvictMs\":" << p.idleEvictMs << ",\"idleDestroyIntervalMs\":" << p.idleDestroyIntervalMs
+      << ",\"watchdog\":" << b(p.watchdog) << ",\"idleEvictMs\":" << p.idleEvictMs
       << "},\"limits\":{\"cpuLimitMs\":" << p.cpuLimitMs << ",\"memoryLimitMiB\":" << p.memoryLimitMiB
       << "},\"rotation\":{\"drainTimeoutMs\":" << p.rotationDrainTimeoutMs << ",\"termGraceMs\":" << p.rotationTermGraceMs
       << ",\"binaryCheckMs\":" << p.rotationBinaryCheckMs << ",\"maxAgeMs\":" << p.rotationMaxAgeMs << ",\"maxRequests\":" << p.rotationMaxRequests
       << ",\"residentBytes\":" << p.rotationResidentBytes << ",\"residentBytesSource\":" << q(p.rotationResidentBytesSource)
       << ",\"retryMs\":" << p.rotationRetryMs
-      << "},\"gc\":{\"budgetMs\":" << p.gcBudgetMs << ",\"refillMsPerSecond\":" << p.gcRefillMsPerSecond
-      << ",\"longPauseMs\":" << p.gcLongPauseMs << ",\"idleCollectAfterMs\":" << p.gcIdleCollectAfterMs
-      << ",\"idleCollectMinGrowthMiB\":" << p.gcIdleCollectMinGrowthMiB << ",\"initialOldSpaceMiB\":" << p.gcInitialOldSpaceMiB
-      << ",\"runtimeHeapMiB\":" << p.gcRuntimeHeapMiB
-      << ",\"preparationLargeBudgetBytes\":" << preparationLargeBudget(p.gcRuntimeHeapMiB)
-      << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
-      << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << b(preparationLargeBudget(p.gcRuntimeHeapMiB) >= MAX_PACKAGE_PREPARATION_BYTES)
       << "},\"sandbox\":{\"mode\":" << q(p.sandboxMode) << ",\"launcherPath\":" << q(p.launcherPath)
       << ",\"protectionKeys\":" << q(p.protectionKeys)
       << ",\"v8Sandbox\":" << (p.sandboxPlanJson.empty() ? std::string("null") : p.sandboxPlanJson)
@@ -10929,15 +10684,13 @@ int run(Launch launch) {
   if (serverConfig.peerListenAddress.empty()) {
     serverConfig.peerListenAddress = "127.0.0.1:0";
   }
-  // Environment overrides of the runtime file, the memory watermark and the process pool,
+  // Environment overrides of the memory watermark and the process pool,
   // applied before anything starts so that the configuration printed is the one in effect.
-  const char* runtimeFile = std::getenv("COWORKERD_RUNTIME_FILE");
-  if (runtimeFile) launch.runtime = fs::absolute(runtimeFile).string();
   if (auto* enabled = std::getenv("COWORKERD_MEMORY_WATERMARK_ENABLED")) {
     KJ_REQUIRE(std::string(enabled) == "0" || std::string(enabled) == "1", "invalid memory watermark override");
     serverConfig.memoryWatermarkEnabled = std::string(enabled) == "1";
   }
-  applyProcessPoolEnvironment(serverConfig, launch.workerd);
+  applyProcessPoolEnvironment(serverConfig);
   applyNodeDescriptorLimit(serverConfig);
   // Outbound requests and the peer key, as the file says or these override; the rules are checked here.
   if (const char* mode = std::getenv("COWORKERD_EGRESS_MODE"); mode != nullptr && *mode) serverConfig.egress.mode = mode;
@@ -11031,7 +10784,7 @@ int run(Launch launch) {
             << "\",\"source\":\"" << jsonEscape(sourceSocketAddress) << "\",\"ignoredBindingAddress\":\""
             << jsonEscape(launch.ignoredBindingAddress) << "\",\"ignoredSourceAddress\":\"" << jsonEscape(launch.ignoredSourceAddress)
             << "\"}" << std::endl;
-  coworkerd::ProcessPool runtime(serverConfig.processPool, launch.workerd, launch.runtime,
+  coworkerd::ProcessPool runtime(serverConfig.processPool,
       stackDirectory.string(), bindingSocketAddress, sourceSocketAddress, *io.provider, io.unixEventPort,
       *headerTable, suspects);
   runtime.setHostCheckOomGuard([&hostCheck]() { return hostCheck.takeOomExposure(); });
@@ -11087,8 +10840,7 @@ int run(Launch launch) {
       server.placementConfig().durableLog,
       membership->view().backend == "objectStore" && runtime.durableProcesses() > 0,
       uint32_t(uint64_t(server.placementConfig().membership.ttlSeconds) * 1000 +
-          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs,
-      true},
+          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs},
       server.placementConfig().desiredState.objectStore, io.provider->getNetwork(), timer, *io.lowLevelProvider,
       membership->view(),
       {[&peerForwarder, &membership](std::string nodeId, uint64_t ownerEpoch, uint64_t firstSeq) {
@@ -11251,9 +11003,7 @@ int run(Launch launch) {
       server.webSockets().goAwayNamespaces(*pending);
       server.rootsMaintained(durableLog.drainThreadedNamespaces(*pending));
     }
-    return std::shared_ptr<const std::vector<std::string>>{};
-  },
-      [&server](const auto& ids) { server.rootsMaintained(ids); });
+  });
   server.addStateSection("webSockets", [&server]() { return server.webSockets().json(); });
   server.addStateSection("readiness", [&server, &runtime]() {
     return "{\"ready\":" + std::string(server.processesReady() && !server.draining() ? "true" : "false") + ",\"quarantine\":" +
@@ -11332,7 +11082,7 @@ int run(Launch launch) {
             << " peer-rpc=" << peerAddressText
             << " source=" << sourceSocketAddress
             << " egress=" << (egressOn ? "unix:" + egressSocket : std::string("off"))
-            << " workerd=" << launch.workerd << std::endl;
+            << " threadedExecutable=" << serverConfig.processPool.threadedExecutable << std::endl;
 
   httpServer.listenHttp(*httpListener).exclusiveJoin(drain.ingressClosed())
       .then([&httpListener]() -> kj::Promise<void> { httpListener = nullptr; return kj::NEVER_DONE; })
@@ -11388,9 +11138,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
   std::optional<Launch> launch;
   try {
     launch = serveLaunch(options, false);
-    const char* runtimeFile = std::getenv("COWORKERD_RUNTIME_FILE");
-    if (runtimeFile) launch->runtime = fs::absolute(runtimeFile).string();
-    applyProcessPoolEnvironment(launch->config, launch->workerd);
+    applyProcessPoolEnvironment(launch->config);
     applyNodeDescriptorLimit(launch->config);
     report("configuration", true, ",\"configFile\":\"" + jsonEscape(launch->configFile.string()) + "\",\"nodeId\":\"" +
         jsonEscape(launch->config.serverId) + "\",\"webSocketsPerNode\":" + std::to_string(launch->config.webSocketsPerNode));
@@ -11524,11 +11272,12 @@ int runSelfCheck(const std::vector<std::string>& args) {
         c.suspectProbation && c.processPool.quarantineProcesses > 0);
     c.processPool.heatIdleMs = c.idleMs;
     const auto run = directory / "run";
-    coworkerd::ProcessPool pool(c.processPool, launch->workerd, launch->runtime, directory.string(),
+    coworkerd::ProcessPool pool(c.processPool, directory.string(),
         "unix:" + (run / "binding.sock").string(), "unix:" + (run / "source.sock").string(), *io.provider, io.unixEventPort,
         *headerTable, suspects);
     report("sandbox", true, ",\"mode\":\"" + jsonEscape(c.processPool.sandboxMode) + "\",\"syscalls\":\"" +
-        jsonEscape(c.processPool.syscallsMode) + "\",\"workerd\":\"" + jsonEscape(launch->workerd) + "\"");
+        jsonEscape(c.processPool.syscallsMode) + "\",\"threadedExecutable\":\"" +
+        jsonEscape(c.processPool.threadedExecutable) + "\"");
   } catch (const kj::Exception& error) {
     report("sandbox", false, ",\"mode\":\"" + jsonEscape(c.processPool.sandboxMode) + "\",\"reason\":\"" +
         jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");

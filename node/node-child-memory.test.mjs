@@ -2,13 +2,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const [nodeBinary, workerd, runtime] = process.argv.slice(2);
+const [nodeBinary, threaded] = process.argv.slice(2);
 assert.equal(process.platform, 'linux');
 const reservePort = () => new Promise((resolve, reject) => {
   const socket = createServer();
@@ -30,8 +30,6 @@ for (const [label, options, override, expected] of cases) {
   let child, closed, exited = false, diagnostic = '';
   try {
     await mkdir(join(stack, 'workers'));
-    await mkdir(join(stack, 'runtime'));
-    await copyFile(runtime, join(stack, 'runtime/runtime.js'));
     const manifest = join(stack, 'workers/manifest.json');
     const workerId = 'memory-component';
     const source = 'export default { fetch(){ return new Response("ready") } };';
@@ -46,7 +44,7 @@ for (const [label, options, override, expected] of cases) {
     await writeFile(config, JSON.stringify({ nodeId: 'memory-component', processPool: { count: 1 },
       quarantineProcesses: 0, sandbox: { mode: 'off', syscalls: { mode: 'off' } }, management: { allowWithoutToken: true }, memoryWatermarkEnabled: false,
       peerListenAddress: '127.0.0.1:0', ...options }));
-    child = spawn(nodeBinary, [manifest, workerd, `127.0.0.1:${port}`, '127.0.0.1:0', '127.0.0.1:0', config],
+    child = spawn(nodeBinary, [manifest, threaded, `127.0.0.1:${port}`, '127.0.0.1:0', '127.0.0.1:0', config],
       { env: { ...environment, ...override }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stderr.on('data', chunk => diagnostic = (diagnostic + chunk.toString()).slice(-3000));
     child.stdout.resume();

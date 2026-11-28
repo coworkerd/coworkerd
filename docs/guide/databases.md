@@ -347,12 +347,14 @@ query can use the same open database. WAL confirmation runs under its own timeou
 Each ingest segment and migration file uses its own transaction. If a deadline expires, earlier confirmed
 segments or files remain. Concurrent `STORAGE_UNAVAILABLE` and `RESULT_UNCERTAIN` retain their
 confirmation meaning. Split work that can exceed the deadline into smaller key ranges or transactions.
+SQLite checks for interruption as it runs. A costly function or blocking I/O without progress callbacks
+can run beyond the deadline.
 
 ### Storage and transaction limits
 
 Each SQL HTTP request is one event of the database object; statements in a batch share that event's limits. The same durability and estimated tenant storage quota apply as to other objects. A failed `exec()` keeps earlier successful lines; `batch()` rolls back on a statement failure. SQL errors use D1 error prefixes. HTTP SQL preserves the node's status and body, including `success:false` with status 200 and platform errors such as `STORAGE_UNAVAILABLE`, `DO_OBJECT_TOO_LARGE` and `QUOTA_EXCEEDED`. It tries another member only when connection establishment failed or the node returned a refusal known to precede execution ([errors](errors.md), section 4). Losing the reply after connecting returns `503 RESULT_UNCERTAIN` without replaying the request. A confirmation failure can leave changes readable locally until the object is reopened and repaired: do not blindly repeat a non-idempotent statement. Simultaneous loss of the owner and all confirming peers may lose the unuploaded tail. Deletions and other transactions that do not grow the database remain permitted over a byte limit. No read replicas or Sessions API provide another consistency mode.
 
-On threaded database homes, one transaction must fit in one
+One database transaction must fit in one
 recoverable WAL record. With default node settings, the encoded record can hold 67,104,768 bytes.
 The frame budget reserves the record's identity fields, length fields, checksum and WAL generation
 header. Each SQLite frame counts its page and its 24-byte frame header. Lowering

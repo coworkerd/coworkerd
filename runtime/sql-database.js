@@ -1,7 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
 
-export const DO_ALARM_HEADER = "x-coworkerd-do-alarm";
-
 // The platform's own SQL Worker class: a tenant's database is one object of it (docs/compatibility.md, section 7).
 // It answers the protocol workerd's own D1 wrapper speaks -- POST /query and /execute with {sql, params} or an array
 // of them and a resultsFormat, answered with {success, meta, results} -- so the same statements reach it from a
@@ -10,13 +8,6 @@ export const DO_ALARM_HEADER = "x-coworkerd-do-alarm";
 export class SqlDatabase extends DurableObject {
   static MAX_RESULT_BYTES = 7340032;
   async fetch(request) {
-    // The node's own alarm request: a database has no alarm handler, so the alarm goes rather than being retried.
-    const scheduled = request.headers.get(DO_ALARM_HEADER);
-    if (scheduled !== null) {
-      const held = await this.ctx.storage.getAlarm();
-      if (held !== null && held !== undefined) await this.ctx.storage.deleteAlarm();
-      return Response.json({ outcome: "fired", atUnixMs: 0, reason: "a database has no alarm() handler" });
-    }
     const { pathname, searchParams } = new URL(request.url);
     const query = pathname === "/query", execute = pathname === "/execute";
     if (request.method !== "POST" || (!query && !execute)) {
@@ -32,16 +23,14 @@ export class SqlDatabase extends DurableObject {
     const resultsFormat = asked === "ROWS_AND_COLUMNS" ? "ROWS_AND_COLUMNS" : asked === "NONE" ? "NONE" : "ARRAY_OF_OBJECTS";
     const encoder = new TextEncoder();
     const budget = { bytes: Array.isArray(body) ? 2 : 0, size: text => encoder.encode(text).byteLength };
-    const deadline = this.constructor.wallDeadline;
     // Pending storage work can outlive an event, including implicit writes
     // from native alarm cleanup. Drain it before a threaded SQL transaction.
-    if (deadline) await this.ctx.storage.sync();
+    await this.ctx.storage.sync();
     const unprocessable = code => code === "SQL_TRANSACTION_TOO_LARGE" || code === "SQL_MEMORY_LIMIT_EXCEEDED";
     const failure = error => {
       if (error?.code === "SQL_CLIENT_DISCONNECTED") throw error;
       const message = String(error instanceof Error ? error.message : error);
       if (error?.code === "SQL_LIMIT_EXCEEDED") {
-        if (!deadline) this.ctx.storage.sql.abortExecutionLimit();
         return { success: false, error: message, code: error.code, reason: message };
       }
       if (unprocessable(error?.code) || error?.code === "SQL_SPILL_LIMIT_EXCEEDED" ||
@@ -66,11 +55,11 @@ export class SqlDatabase extends DurableObject {
     };
     const one = (statement) => {
       try {
-        return deadline ? this.ctx.storage.transactionSync(() => {
+        return this.ctx.storage.transactionSync(() => {
           const answer = this.runStatement(statement, resultsFormat, budget);
           this.checkDeadline();
           return answer;
-        }) : this.runStatement(statement, resultsFormat, budget);
+        });
       } catch (error) {
         return failure(error);
       }
@@ -78,11 +67,8 @@ export class SqlDatabase extends DurableObject {
     if (!Array.isArray(body)) {
       try {
         if (query && body && Object.hasOwn(body, "ingest")) return this.runIngest(body, budget);
-        if (query || deadline) {
-          return this.ctx.storage.transactionSync(() =>
-            this.resultResponse(this.runStatement(body, resultsFormat, budget), budget));
-        }
-        return this.resultResponse(one(body), budget);
+        return this.ctx.storage.transactionSync(() =>
+          this.resultResponse(this.runStatement(body, resultsFormat, budget), budget));
       } catch (error) { return fail(error); }
     }
     if (query) {
@@ -104,14 +90,14 @@ export class SqlDatabase extends DurableObject {
       const answer = one(statement);
       answers.push(answer);
       if (!answer.success) break;
-      if (deadline) await this.ctx.storage.sync();
+      await this.ctx.storage.sync();
     }
     try { return this.resultResponse(answers, budget, failureStatus(answers.at(-1))); }
     catch (error) { return fail(error, true); }
   }
 
   checkDeadline() {
-    if (this.constructor.wallDeadline) this.ctx.storage.sql.checkExecutionDeadline();
+    this.ctx.storage.sql.checkExecutionDeadline();
   }
 
   resultTooLarge() {

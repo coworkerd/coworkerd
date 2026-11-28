@@ -780,7 +780,7 @@ kj::Promise<bool> DatabaseReplay::finishAsync() {
 namespace {
 // Messages from a durable process (patches/workerd 0013, coworkerd-wal-shipper.h).
 constexpr uint8_t FROM_HELLO = 1, FROM_FRAMES = 2, FROM_OPEN = 3, FROM_CHECKPOINT = 4, FROM_RESET = 5,
-                  FROM_DELETED = 6, FROM_CLOSED = 7, FROM_GAVE_UP = 8, FROM_ALARM = 9, FROM_RESIDENCY = 10,
+                  FROM_DELETED = 6, FROM_CLOSED = 7, FROM_GAVE_UP = 8, FROM_ALARM = 9,
                   FROM_ACTOR_RESET = 11;
 // Messages to one.
 constexpr uint8_t TO_ACK = 1, TO_SEALED = 2, TO_BREAK = 3, TO_CHECKPOINT = 4, TO_READY = 5, TO_CLOSE = 6,
@@ -791,7 +791,7 @@ constexpr uint8_t ACK_OK = 0, ACK_UNAVAILABLE = 1, ACK_TOO_LARGE = 3, ACK_QUOTA 
 
 // Cloudflare's alarm retries: the first two seconds later, doubling, a quarter of jitter; six counted tries, and
 // past them the delay doubles to about seventeen minutes (src/workerd/server/alarm-scheduler.h).
-constexpr uint32_t ALARM_RETRY_START_SECONDS = 2, ALARM_RETRY_MAX_TRIES = 6, ALARM_RETRY_BACKOFF_MAX = 9;
+constexpr uint32_t ALARM_RETRY_START_SECONDS = 2, ALARM_RETRY_MAX_TRIES = 6;
 // The facet tree index workerd keeps beside an object's databases (src/workerd/server/facet-tree-index.h): an
 // 8 byte magic number, then one entry per facet -- its parent (2 bytes), the length of its name (2) and the name.
 constexpr uint64_t FACET_INDEX_MAGIC = 0xc4cdce5bc5b0ef57ull;
@@ -1996,6 +1996,7 @@ kj::Promise<void> DurableLog::stop(double deadlineMonotonicMs) {
 // ---- The channel to a durable process ----
 
 int DurableLog::openChannel(const std::string& processId, uint64_t threadedGeneration) {
+  KJ_REQUIRE(threadedGeneration > 0, "the WAL channel requires a process generation");
   if (!enabled()) return -1;
   int fds[2];
   if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
@@ -2036,7 +2037,7 @@ void DurableLog::closeChannel(const std::string& processId) {
 
 bool DurableLog::drainChannel(const std::string& processId) {
   const auto found = channels.find(processId);
-  if (found == channels.end() || found->second.threadedGeneration == 0) return true;
+  if (found == channels.end()) return true;
   auto& channel = found->second;
   if (!channel.open) return false;
   channel.draining = true;
@@ -2138,13 +2139,9 @@ void DurableLog::sendToOpenChannels(uint8_t type, const std::string& key, const 
   for (auto& [id, channel] : channels) {
     std::string message;
     putU8(message, type);
-    if (channel.threadedGeneration != 0) {
-      auto open = channel.openFacets.find(key);
-      if (open == channel.openFacets.end()) continue;
-      putU64(message, open->second.id);
-    } else {
-      putText(message, key);
-    }
+    auto open = channel.openFacets.find(key);
+    if (open == channel.openFacets.end()) continue;
+    putU64(message, open->second.id);
     message += payload;
     sendToChannel(channel, std::move(message));
   }
@@ -2154,32 +2151,29 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
   Reader in{message};
   const auto type = in.u8();
   uint64_t openId = 0;
-  if (channel.threadedGeneration != 0 && type != FROM_HELLO) {
+  if (type != FROM_HELLO) {
     KJ_REQUIRE(channel.pid != 0, "threaded WAL message before readiness");
     openId = in.u64();
     KJ_REQUIRE(in.ok && openId != 0, "missing threaded WAL open ID");
   }
   auto isCurrentOpen = [&](std::string_view key) {
-    if (openId == 0) return true;
     const auto registration = channel.openFacets.find(key);
     return registration != channel.openFacets.end() && registration->second.id == openId;
   };
   switch (type) {
     case FROM_HELLO: {
       const auto pid = in.u32();
-      if (channel.threadedGeneration != 0) {
-        in.u64();  // child's monotonic time
-        const auto revision = in.u32();
-        const auto generation = in.u64();
-        KJ_REQUIRE(channel.pid == 0 && pid != 0 && in.ok && in.at == message.size() &&
-            revision == THREADED_WAL_REVISION && generation == channel.threadedGeneration,
-            "threaded WAL readiness mismatch", revision, generation);
-        std::string ready;
-        putU8(ready, TO_READY);
-        putU32(ready, THREADED_WAL_REVISION);
-        putU64(ready, generation);
-        sendToChannel(channel, std::move(ready));
-      }
+      in.u64();  // child's monotonic time
+      const auto revision = in.u32();
+      const auto generation = in.u64();
+      KJ_REQUIRE(channel.pid == 0 && pid != 0 && in.ok && in.at == message.size() &&
+          revision == THREADED_WAL_REVISION && generation == channel.threadedGeneration,
+          "threaded WAL readiness mismatch", revision, generation);
+      std::string ready;
+      putU8(ready, TO_READY);
+      putU32(ready, THREADED_WAL_REVISION);
+      putU64(ready, generation);
+      sendToChannel(channel, std::move(ready));
       channel.pid = pid;
       log("process-attached", "\"processId\":" + quote(channel.processId) + ",\"pid\":" + std::to_string(channel.pid));
       return;
@@ -2233,27 +2227,16 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       const auto walBytes = in.u64();
       const auto databaseBytes = in.u64();
       if (!in.ok) return;
-      if (openId != 0 && message.size() - in.at >= 16) {
+      if (message.size() - in.at >= 16) {
         in.u64();  // child's monotonic time
         const auto localOpenNs = in.u64();
         ++threadedHomeOpenSamples;
         threadedHomeOpenMaxNs = std::max(threadedHomeOpenMaxNs, localOpenNs);
       }
       auto* object = objectOf(objectName);
-      if (openId != 0) {
-        KJ_REQUIRE(object != nullptr && object->dispatchedChannel == channel.processId &&
-            storageId == object->storageId && key == objectName + "/" + std::to_string(facetId) &&
-            !channel.openFacets.contains(key), "threaded WAL open does not match dispatch");
-      }
-      if (object == nullptr) {
-        log("open-unknown", "\"object\":" + quote(objectName) + ",\"facet\":" + std::to_string(facetId));
-        return;
-      }
-      if (storageId != object->storageId) {
-        tellBreak(key, "Durable Object storage is unavailable: storage identity mismatch (STORAGE_UNAVAILABLE)");
-        log("open-refused", "\"object\":" + quote(objectName) + ",\"reason\":\"storage identity mismatch\"");
-        return;
-      }
+      KJ_REQUIRE(object != nullptr && object->dispatchedChannel == channel.processId &&
+          storageId == object->storageId && key == objectName + "/" + std::to_string(facetId) &&
+          !channel.openFacets.contains(key), "threaded WAL open does not match dispatch");
       log("root-storage-verified", "\"namespaceId\":" + quote(object->namespaceId) +
             ",\"objectId\":" + quote(object->objectId) + ",\"dataEpoch\":\"" + std::to_string(object->dataEpoch) +
             "\",\"uniqueKey\":" + quote(object->uniqueKey) + ",\"storageId\":" + quote(object->storageId) +
@@ -2296,22 +2279,20 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
           markRepair(*object, reason);
         }
       }
-      if (openId != 0) {
-        const bool fenced = (hooks.namespaceActive && !hooks.namespaceActive(object->namespaceId)) ||
-            (facetId == 0 && object->definitionDrainDeadline != kj::none);
-        const bool authorized = object->state == ObjectState::LOCAL && !fenced && !epochChanging;
-        std::string opened;
-        putU8(opened, TO_OPENED);
-        putU64(opened, openId);
-        putU8(opened, authorized ? ACK_OK : ACK_UNAVAILABLE);
-        sendToChannel(channel, std::move(opened));
-        if (fenced && facetId == 0) {
-          if (const auto deadline = object->definitionDrainDeadline;
-              deadline != kj::none && timer.now() >= KJ_ASSERT_NONNULL(deadline)) {
-            askCodeUpdateClose(channel, channel.openFacets.at(key), *object);
-          } else {
-            askClose(channel, openId);
-          }
+      const bool fenced = (hooks.namespaceActive && !hooks.namespaceActive(object->namespaceId)) ||
+          (facetId == 0 && object->definitionDrainDeadline != kj::none);
+      const bool authorized = object->state == ObjectState::LOCAL && !fenced && !epochChanging;
+      std::string opened;
+      putU8(opened, TO_OPENED);
+      putU64(opened, openId);
+      putU8(opened, authorized ? ACK_OK : ACK_UNAVAILABLE);
+      sendToChannel(channel, std::move(opened));
+      if (fenced && facetId == 0) {
+        if (const auto deadline = object->definitionDrainDeadline;
+            deadline != kj::none && timer.now() >= KJ_ASSERT_NONNULL(deadline)) {
+          askCodeUpdateClose(channel, channel.openFacets.at(key), *object);
+        } else {
+          askClose(channel, openId);
         }
       }
       return;
@@ -2326,7 +2307,7 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       in.u32();  // of those, confirmed
       const auto databaseBytes = in.u64();
       if (!in.ok) return;
-      if (openId != 0 && message.size() - in.at >= 18) {
+      if (message.size() - in.at >= 18) {
         in.u64();  // checkpoint start
         const auto tookNs = in.u64();
         in.text();  // checkpoint reason
@@ -2413,7 +2394,7 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       if (type == FROM_CLOSED) {
         in.u64();  // when the process closed it, by its monotonic clock
         const auto databaseBytes = in.u64();
-        if (openId != 0 && (!in.ok || in.at != message.size())) return;
+        if (!in.ok || in.at != message.size()) return;
         auto* object = objectOf(objectName);
         if (object == nullptr) return;
         const auto association = channel.openFacets.find(key);
@@ -2439,14 +2420,12 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
       }
       auto* object = objectOf(objectName);
       if (object == nullptr) return;
-      if (openId != 0) {
-        const auto prefix = objectName + "/";
-        auto sender = channel.openFacets.lower_bound(prefix);
-        for (; sender != channel.openFacets.end() && sender->first.starts_with(prefix); ++sender) {
-          if (sender->second.id == openId) break;
-        }
-        if (sender == channel.openFacets.end() || !sender->first.starts_with(prefix)) return;
+      const auto prefix = objectName + "/";
+      auto sender = channel.openFacets.lower_bound(prefix);
+      for (; sender != channel.openFacets.end() && sender->first.starts_with(prefix); ++sender) {
+        if (sender->second.id == openId) break;
       }
+      if (sender == channel.openFacets.end() || !sender->first.starts_with(prefix)) return;
       LogRecord record;
       record.kind = LogRecordKind::DELETED;
       record.objectName = objectName;
@@ -2468,25 +2447,12 @@ void DurableLog::onMessage(Channel& channel, std::string_view message) {
     case FROM_ACTOR_RESET: {
       const auto objectName = in.text();
       const auto code = in.text();
-      if (!in.ok || in.at != message.size() || openId == 0 ||
+      if (!in.ok || in.at != message.size() ||
           !isCurrentOpen(objectName + "/0")) return;
       const auto* object = objectOf(objectName);
       if (object == nullptr || object->dispatchedChannel != channel.processId || !actorResetHook) return;
       actorResetHook({object->namespaceId, object->objectId, object->tenant, object->dataEpoch,
           object->shardEpoch, object->shard}, code);
-      return;
-    }
-    case FROM_RESIDENCY: {
-      auto& entry = residency[channel.processId];
-      entry.resident = in.u64();
-      entry.limit = in.u64();
-      entry.evicted = in.u64();
-      entry.woken = in.u64();
-      entry.wakes = in.u64();
-      entry.wakeUsTotal = in.u64();
-      entry.wakeUsMax = in.u64();
-      if (!in.ok) return;
-      entry.atMs = monotonicTimeMs();
       return;
     }
     case FROM_GAVE_UP: {
@@ -2955,7 +2921,7 @@ kj::Promise<void> DurableLog::peerLoop() {
           log("channel-test-trigger-read-failed", "\"reason\":" + quote(readError.getDescription().cStr()));
         }
         auto found = channels.find(processId);
-        if (found != channels.end() && found->second.threadedGeneration != 0 && found->second.open) {
+        if (found != channels.end() && found->second.open) {
           auto& channel = found->second;
           channel.reader = nullptr;
           channelEnded(channel, "fixture cut the durable channel");
@@ -4784,7 +4750,7 @@ DurableLog::ObjectReady DurableLog::checkObjectDispatch(
   const auto target = processId + "-" + std::to_string(generation);
   const auto selectedChannel = channels.find(target);
   if (selectedChannel == channels.end() || !selectedChannel->second.open ||
-      (selectedChannel->second.threadedGeneration != 0 && selectedChannel->second.pid == 0)) {
+      selectedChannel->second.pid == 0) {
     ObjectReady result{false, 503, "STORAGE_UNAVAILABLE", "the selected durable generation has no replication channel"};
     result.channelMissing = true;
     return result;
@@ -4792,7 +4758,7 @@ DurableLog::ObjectReady DurableLog::checkObjectDispatch(
   if (selectedChannel->second.draining)
     return {false, 503, "DO_UNAVAILABLE", "the selected durable generation is draining"};
   for (const auto& [id, channel] : channels) {
-    if (id == target || (!channel.open && channel.threadedGeneration == 0)) continue;
+    if (id == target) continue;
     if (object->dispatchedChannel == id)
       return {false, 503, "DO_UNAVAILABLE", "another durable generation still holds the object"};
     if (channel.open && channelHasOpenObject(channel, *object))
@@ -4833,7 +4799,6 @@ std::vector<std::string> DurableLog::drainThreadedNamespaces(const std::vector<s
     auto prefix = ns + "/";
     bool open = false;
     for (auto& [id, channel] : channels) {
-      if (channel.threadedGeneration == 0) continue;
       if (!channel.open) {
         open = true;
         continue;
@@ -5259,7 +5224,7 @@ kj::Promise<bool> DurableLog::closeThreadedObject(const std::string& objectName)
   if (object == nullptr || object->state != ObjectState::REBUILDING) co_return false;
   const auto processId = object->dispatchedChannel;
   auto channel = channels.find(processId);
-  if (channel == channels.end() || !channel->second.open || channel->second.threadedGeneration == 0) co_return false;
+  if (channel == channels.end() || !channel->second.open) co_return false;
   const auto root = channel->second.openFacets.find(objectName + "/0");
   if (root == channel->second.openFacets.end()) co_return false;
   const auto expected = object->rebuildGeneration;
@@ -5322,7 +5287,7 @@ kj::Promise<void> DurableLog::rebuildAttempt(std::string objectName, std::string
     isolateObjectPending(*object, "pending records cannot outlive the image used by recovery");
     KJ_REQUIRE(!recoveryWriteFailed, "pending exclusions could not be made durable");
     const auto dispatched = channels.find(object->dispatchedChannel);
-    const bool threadedChannelLost = dispatched != channels.end() && dispatched->second.threadedGeneration != 0 &&
+    const bool threadedChannelLost = dispatched != channels.end() &&
         !dispatched->second.open;
     const bool closeLive = threadedChannelLost || hasLiveOpenFacets(*object) ||
         (hasLiveDispatch(*object) && object->dispatchPending) || hasLiveHolders(*object);
@@ -6925,14 +6890,12 @@ void DurableLog::alarmReported(const std::string& objectName, uint32_t facetId, 
   state.fromHint = false;
   if (fresh) {
     ++alarmsSet;
-    if (settings.threadedAlarmEvents && previous && previous != atUnixMs) {
+    if (previous && previous != atUnixMs) {
       state.fireToken = 0;
       state.firing = false;
       state.rebuildWaiting = false;
     }
     state.retries = 0;
-    state.countedRetries = 0;
-    state.backoff = 0;
     state.clearing = false;
     state.notBeforeMs = 0;
     log("alarm-set", "\"object\":" + quote(object->objectName) + ",\"facet\":" + std::to_string(facetId) +
@@ -6969,9 +6932,7 @@ DurableLog::AlarmDispatchLease::AlarmDispatchLease(DurableLog& owner, std::strin
     : owner(owner), key(std::move(key)), process(std::move(process)), token(token), cold(cold), probes(std::move(probes)) {
   ++owner.activeAlarmFires;owner.peakAlarmFires = std::max(owner.peakAlarmFires, owner.activeAlarmFires);
   if (cold) ++owner.activeAlarmPreparations;
-  if (owner.settings.threadedAlarmEvents) {
-    KJ_ASSERT(owner.activeThreadedAlarms.insert(this->key).second);
-  }
+  KJ_ASSERT(owner.activeThreadedAlarms.insert(this->key).second);
   auto& count = owner.alarmProcessFires[this->process];++count.first;count.second = std::max(count.second, count.first);
 }
 double DurableLog::alarmMonotonicMs() const {
@@ -6986,7 +6947,7 @@ DurableLog::AlarmDispatchLease::~AlarmDispatchLease() noexcept(false) {
   AlarmCpuScope measured(owner);--owner.activeAlarmFires;
   if (cold) --owner.activeAlarmPreparations;
   --owner.alarmProcessFires.at(process).first;
-  if (owner.settings.threadedAlarmEvents) owner.activeThreadedAlarms.erase(key);
+  owner.activeThreadedAlarms.erase(key);
   const auto now = owner.alarmMonotonicMs();
   // This lease exists before evalLater: even a dispatch that never starts or loses its entry releases its probe.
   for (const auto& probe: probes) {
@@ -7000,7 +6961,7 @@ DurableLog::AlarmDispatchLease::~AlarmDispatchLease() noexcept(false) {
   if (alarm != owner.alarms.end() && alarm->second.fireToken == token && alarm->second.firing) {
     alarm->second.firing = false;alarm->second.notBeforeMs = std::max(alarm->second.notBeforeMs, now + 1000);
     owner.indexAlarm(key, alarm->second);
-  } else if (alarm != owner.alarms.end() && owner.settings.threadedAlarmEvents) {
+  } else if (alarm != owner.alarms.end()) {
     owner.indexAlarm(key, alarm->second);
   }
   owner.wakeAlarmPreparations();owner.scheduleAlarmPump();
@@ -7165,10 +7126,7 @@ void DurableLog::pumpAlarmFires() {
       if (!gate.open) break; // Only one bucket can offer the next probe.
     }
   }
-  const auto fireRoom = [this] {
-    return settings.threadedAlarmEvents || activeAlarmFires < settings.config.alarmFireConcurrency;
-  };
-  for (unsigned n = 0;n < 8 && fireRoom();++n) {
+  for (unsigned n = 0;n < 8;++n) {
     const bool coldRoom = activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT;
     auto preparation = alarmPreparationQueue.end();
     if (coldRoom && !alarmPreparationQueue.empty()) {
@@ -7218,13 +7176,13 @@ void DurableLog::pumpAlarmFires() {
       return fireAlarm(key, token).attach(kj::mv(lease));
     }));
   }
-  if (!alarmActiveNamespaces.empty() || (fireRoom() && (!alarmReadyTenants.empty() ||
-      (!alarmPreparationQueue.empty() && activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT)))) scheduleAlarmPump();
+  if (!alarmActiveNamespaces.empty() || !alarmReadyTenants.empty() ||
+      (!alarmPreparationQueue.empty() && activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT)) scheduleAlarmPump();
   double next = 0;auto deadline = [&next](double at) { if (!next || at < next) next = at; };
   if (!alarmRetryDeadlines.empty()) deadline(alarmRetryDeadlines.begin()->first);
   if (!alarmNamespaceDeadlines.empty()) deadline(std::max(alarmNamespaceDeadlines.begin()->first, alarmNamespaceBatchAt));
   for (const auto& [key, gate]: alarmCapacityGates) if (!gate.open && !gate.probing && !gate.blocked.empty()) deadline(gate.next);
-  if (next) armAlarmTimer(!fireRoom() && next <= now ? now + 200 : next);
+  if (next) armAlarmTimer(next);
 }
 
 bool DurableLog::alarmFireIsCurrent(const DurableAlarm& alarm) const {
@@ -7258,7 +7216,7 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
   DurableAlarm ask{found->second.namespaceId, found->second.objectId, found->second.tenant, found->second.shard,
       found->second.facetId, found->second.dataEpoch, found->second.shardEpoch, found->second.atUnixMs,
       found->second.retries, token,
-      settings.threadedAlarmEvents && found->second.clearing};
+      found->second.clearing};
   const auto started = alarmMonotonicMs();
   AlarmResult result;
   try {
@@ -7292,8 +7250,6 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
   if (gone) {
     // Its schedule is gone (the object reported the clearing, or the shard left this node): the hint goes with it.
     log(result.outcome == AlarmOutcome::FIRED ? "alarm-fired" : "alarm-done", fields + ",\"scheduled\":false");
-    if (result.outcome == AlarmOutcome::FIRED && !settings.threadedAlarmEvents)
-      writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId, ask.shardEpoch, ask.tenant);
     co_return;
   }
   auto& state = again->second;
@@ -7309,29 +7265,17 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
   switch (result.outcome) {
     case AlarmOutcome::FIRED: {
       log("alarm-fired", fields + ",\"retries\":" + std::to_string(state.retries));
-      // The handler cleared the object's own alarm, and the report of that clears the schedule. A report that did
-      // not come (the object went away with the answer in flight) leaves this entry behind, so it goes now; the
-      // object's database is still the truth and reports again at its next open.
-      if (settings.threadedAlarmEvents) {
-        // The WAL channel reports the committed schedule independently of the reply.
-        state.retries = 0;
-        state.countedRetries = 0;
-        state.backoff = 0;
-        state.clearing = false;
-        state.notBeforeMs = alarmMonotonicMs() + 1000;
-      } else if (state.atUnixMs == ask.atUnixMs) {
-        eraseAlarm(key);
-        writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId, ask.shardEpoch, ask.tenant);
-      }
+      // The WAL channel reports the committed schedule independently of the reply.
+      state.retries = 0;
+      state.clearing = false;
+      state.notBeforeMs = alarmMonotonicMs() + 1000;
       co_return;
     }
     case AlarmOutcome::NOT_DUE: {
       log("alarm-not-due", fields + ",\"holds\":" + std::to_string(result.atUnixMs));
-      if (settings.threadedAlarmEvents) {
-        if (auto* object = objectOf(durableHostName(ask.namespaceId, ask.objectId, ask.dataEpoch))) {
-          alarmReported(object->objectName, ask.facetId, result.atUnixMs);
-          co_return;
-        }
+      if (auto* object = objectOf(durableHostName(ask.namespaceId, ask.objectId, ask.dataEpoch))) {
+        alarmReported(object->objectName, ask.facetId, result.atUnixMs);
+        co_return;
       }
       state.fromHint = false;
       if (result.atUnixMs == 0) {
@@ -7341,8 +7285,6 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
         state.atUnixMs = result.atUnixMs;
         state.dueObserved = false;
         state.retries = 0;
-        state.countedRetries = 0;
-        state.backoff = 0;
         state.clearing = false;
         state.notBeforeMs = 0;
         writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, result.atUnixMs, ask.facetId, ask.shardEpoch, ask.tenant);
@@ -7351,21 +7293,13 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
     }
     case AlarmOutcome::FAILED: {
       ++state.retries;
-      if (settings.threadedAlarmEvents && state.retries > ALARM_RETRY_MAX_TRIES) {
+      if (state.retries > ALARM_RETRY_MAX_TRIES) {
         state.clearing = true;
         log("alarm-retry-exhausted", fields);
         co_return;  // The next validated dispatch conditionally clears the stored time.
       }
       ++alarmRetries;
-      if (state.countedRetries < ALARM_RETRY_MAX_TRIES) {
-        ++state.countedRetries;
-      } else {
-        state.backoff = std::min<uint32_t>(state.backoff + 1, ALARM_RETRY_BACKOFF_MAX);
-      }
-      const uint32_t steps = state.countedRetries >= ALARM_RETRY_MAX_TRIES
-          ? ALARM_RETRY_MAX_TRIES - 1 + state.backoff
-          : state.retries - 1;
-      const uint64_t seconds = uint64_t(ALARM_RETRY_START_SECONDS) << std::min<uint32_t>(steps, ALARM_RETRY_BACKOFF_MAX);
+      const uint64_t seconds = uint64_t(ALARM_RETRY_START_SECONDS) << (state.retries - 1);
       // A quarter of jitter, so the retries of many objects do not land together.
       const auto jitter = seconds * 1000 / 4;
       const uint64_t delay = seconds * 1000 - jitter / 2 + (jitter ? (randomBelow(jitter)) : 0);
@@ -7836,8 +7770,7 @@ void DurableLog::shardGone(const std::string& namespaceId, uint32_t shard, const
   }
   uint32_t droppedAlarms = 0;
   for (auto it = alarms.begin(); it != alarms.end();) {
-    if (it->second.namespaceId == namespaceId && it->second.shard == shard &&
-        (settings.threadedAlarmEvents || !it->second.firing)) {
+    if (it->second.namespaceId == namespaceId && it->second.shard == shard) {
       unindexAlarm(it->first, it->second);
       it = alarms.erase(it);
       ++droppedAlarms;
@@ -8544,18 +8477,6 @@ std::string DurableLog::json() const {
         << (channel.open ? "true" : "false") << ",\"messages\":" << channel.messages << ",\"frames\":"
         << channel.frames << ",\"bytes\":\"" << channel.bytes << "\"}";
   }
-  // The resident objects of each durable process, as it reports them, and the alarms this node has to fire.
-  out << "],\"resident\":[";
-  first = true;
-  for (const auto& [processId, entry] : residency) {
-    if (!first) out << ",";
-    first = false;
-    out << "{\"processId\":" << quote(processId) << ",\"objects\":" << entry.resident << ",\"limit\":"
-        << entry.limit << ",\"evicted\":" << entry.evicted << ",\"woken\":" << entry.woken
-        << ",\"wakeMsTotal\":" << double(entry.wakeUsTotal) / 1000.0 << ",\"wakeMsMax\":"
-        << double(entry.wakeUsMax) / 1000.0 << ",\"wakeMsMean\":"
-        << (entry.wakes ? double(entry.wakeUsTotal) / double(entry.wakes) / 1000.0 : 0.0) << "}";
-  }
   out << "],\"recovery\":{\"bounded\":" << tailRecoveryBounded << ",\"ownerSilent\":" << ownerSilentRecoveries
       << ",\"scheduler\":" << recoverySchedulerJson(now)
       << ",\"cutsHeldOwnerLive\":" << cutsHeldOwnerLive << ",\"cutsHeldOwnerUnknown\":" << cutsHeldOwnerUnknown
@@ -8573,7 +8494,7 @@ std::string DurableLog::json() const {
       << ",\"recordLimitRefusals\":" << recordLimitRefusals
       << ",\"objectFailures\":" << objectFailures << "},\"alarms\":{\"scheduled\":" << alarms.size() << ",\"set\":" << alarmsSet << ",\"cleared\":"
       << alarmsCleared << ",\"fired\":" << alarmsFired << ",\"failed\":" << alarmFailures << ",\"retries\":"
-      << alarmRetries << ",\"fireConcurrency\":" << (settings.threadedAlarmEvents ? 0 : settings.config.alarmFireConcurrency)
+      << alarmRetries
       << ",\"inFlight\":" << activeAlarmFires << ",\"peakInFlight\":" << peakAlarmFires
       << ",\"capacityDeferred\":" << alarmDeferred << ",\"inactiveDropped\":" << alarmInactive
       << ",\"dispatchAttempts\":" << alarmAttempts << ",\"schedulingThreadCpuNs\":" << alarmPumpCpuNs
@@ -8667,7 +8588,6 @@ std::string DurableLog::json() const {
       << settings.config.snapshotBytes << "\",\"objectBytes\":\"" << settings.config.objectBytes
       << "\",\"checkpointBytes\":\"" << settings.config.checkpointBytes << "\",\"recoverParallelism\":"
       << settings.config.recoverParallelism << ",\"rebuildConcurrency\":" << settings.config.rebuildConcurrency
-      << ",\"alarmFireConcurrency\":" << settings.config.alarmFireConcurrency
       << ",\"residentObjects\":" << settings.config.residentObjects
       << ",\"usagePublishMs\":" << settings.config.usagePublishMs << "}}";
   return out.str();
@@ -8728,7 +8648,6 @@ std::string DurableLog::memoryJson() const {
   out.count("snapshotFacets", snapshotFacets);  // Latest snapshot's facets, replaced by the next snapshot.
   out.count("objectAlarms", objectAlarms);  // Per facet's latest reported alarm; removed with facet/object.
   out.count("alarms", alarms.size());  // Removed when cleared/fired or ownership is lost; one per scheduled facet.
-  out.count("residency", residency.size());  // One latest report per durable process channel.
   uint64_t inboxBytes = 0, queued = 0, queuedBytes = 0;
   for (const auto& [id, c] : channels) inboxBytes += c.inbox.size();
   for (const auto& [id, peer] : peers) { queued += peer.queue.size(); queuedBytes += peer.queuedBytes; }

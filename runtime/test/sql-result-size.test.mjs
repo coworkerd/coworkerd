@@ -9,6 +9,7 @@ const classSource = source.replace(/^import .*;$/m, '').replace(/^export /gm, ''
 function fixture() {
   const db = new DatabaseSync(':memory:');
   const sqlite = {
+    checkExecutionDeadline() {},
     get databaseSize() { return db.prepare('PRAGMA page_count').get().page_count * 4096; },
     prepare(text) {
       return (...params) => {
@@ -22,7 +23,7 @@ function fixture() {
       };
     },
   };
-  const storage = { sql: sqlite, transactionSync(fn) {
+  const storage = { sql: sqlite, async sync() {}, transactionSync(fn) {
     db.exec('SAVEPOINT batch');
     try { const result = fn(); db.exec('RELEASE batch'); return result; }
     catch (error) { db.exec('ROLLBACK TO batch; RELEASE batch'); throw error; }
@@ -81,7 +82,7 @@ test('oversized INSERT RETURNING rolls back and the same database remains usable
 
 test('after overflow the cursor is exhausted without encoding subsequent rows',async()=>{
  let drained=0,encodedAfter=false;
- const sqlite={databaseSize:0,prepare(sql){return()=>({columnNames:['v'],rowsRead:4,rowsWritten:0,raw:function*(){
+ const sqlite={databaseSize:0,checkExecutionDeadline(){},prepare(sql){return()=>({columnNames:['v'],rowsRead:4,rowsWritten:0,raw:function*(){
   if(sql.includes('total_changes()')){yield[0,0];return}
   if(sql==='oversized'){
    drained++;yield['x'.repeat(MAX)];
@@ -89,7 +90,7 @@ test('after overflow the cursor is exhausted without encoding subsequent rows',a
   }else yield[1];
  }})}};
  const C=vm.runInNewContext(classSource+'; SqlDatabase',{DurableObject:class{constructor(ctx){this.ctx=ctx}},ArrayBuffer,Uint8Array,Request,Response,URL,TextEncoder});
- const worker=new C({storage:{sql:sqlite,transactionSync:fn=>fn()}});
+ const worker=new C({storage:{sql:sqlite,async sync(){},transactionSync:fn=>fn()}});
  const request=sql=>new Request('http://sql/query',{method:'POST',body:JSON.stringify({sql})});
  const response=await worker.fetch(request('oversized')),answer=await response.json();
  assert.equal(response.status,200);assert.match(answer.error,/D1_RESULT_TOO_LARGE/);assert.equal(drained,4);assert.equal(encodedAfter,false);
