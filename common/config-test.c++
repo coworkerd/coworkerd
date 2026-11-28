@@ -63,6 +63,50 @@ void idleConfiguration(Fixture& fixture) {
   }
 }
 
+void admissionConfiguration(Fixture& fixture) {
+  struct Case {
+    const char* json;
+    uint32_t roots, nested, ordinary, durable;
+  };
+  constexpr Case cases[] = {
+    {R"({})", 7168, 8192, 8192, 512},
+    {R"({"placement":{"rootLimit":64}})", 64, 8192, 8192, 512},
+    {R"({"placement":{"nestedLimit":256}})", 224, 256, 8192, 512},
+    {R"({"placement":{"rootLimit":64,"nestedLimit":256}})", 64, 256, 8192, 512},
+    {R"({"processPool":{"inFlightLimit":400}})", 350, 400, 400, 400},
+    {R"({"processPool":{"inFlightLimit":400},"placement":{"rootLimit":64}})", 64, 400, 400, 400},
+    {R"({"processPool":{"inFlightLimit":400},"placement":{"nestedLimit":800}})", 350, 800, 400, 400},
+    {R"({"processPool":{"inFlightLimit":400},"placement":{"rootLimit":500,"nestedLimit":800}})", 500, 800, 400, 400},
+    {R"({"processPool":{"count":2,"inFlightLimit":400}})", 700, 800, 400, 400},
+    {R"({"processPool":{"ordinaryInFlightLimit":300}})", 262, 300, 300, 512},
+    {R"({"processPool":{"ordinaryInFlightLimit":20000,"inFlightLimit":400}})", 17500, 20000, 20000, 400},
+  };
+  for (const auto& row : cases) {
+    auto config = fixture.load(row.json);
+    config.resolveCallAdmission(8192);
+    KJ_REQUIRE(config.rootLimit == row.roots && config.nestedLimit == row.nested, row.json, config.rootLimit, config.nestedLimit);
+    KJ_REQUIRE(config.processPool.inFlightLimit == row.ordinary && config.processPool.durableInFlightLimit() == row.durable,
+        row.json, config.processPool.inFlightLimit, config.processPool.durableInFlightLimit());
+  }
+
+  auto legacy = fixture.load("{}");
+  legacy.resolveCallAdmission(0);
+  KJ_REQUIRE(legacy.rootLimit == 128 && legacy.nestedLimit == 384 && legacy.processPool.inFlightLimit == 512);
+  for (const auto& [json, diagnostic] : std::array{
+      std::pair{R"({"placement":{"rootLimit":10,"nestedLimit":10,"equalLimitsForTest":true}})", "nestedLimit"},
+      std::pair{R"({"processPool":{"inFlightLimit":100},"placement":{"rootLimit":100}})", "nestedLimit"},
+      std::pair{R"({"processPool":{"inFlightLimit":100},"placement":{"tenantNestedLimit":101}})", "per-tenant placement"},
+      std::pair{R"({"processPool":{"inFlightLimit":100},"placement":{"tenantRootLimit":89}})", "per-tenant placement"},
+      std::pair{R"({"placement":{"rootLimit":0}})", "rootLimit"}}) {
+    std::string refused;
+    try {
+      auto config = fixture.load(json);
+      config.resolveCallAdmission(8192);
+    } catch (const kj::Exception& error) { refused = error.getDescription().cStr(); }
+    KJ_REQUIRE(refused.find(diagnostic) != std::string::npos, json, refused.c_str());
+  }
+}
+
 void memoryConfiguration(Fixture& fixture) {
   const auto config = fixture.load(R"({"memoryWatermarkEnabled":true,"memoryBudgetBytes":2147483648,"processPool":{"count":4}})");
   KJ_REQUIRE(config.memoryWatermarkEnabled && config.memoryBudgetBytes == 2147483648ULL && config.processPool.count == 4,
@@ -172,6 +216,7 @@ int main(int argc, char** argv) {
     Fixture fixture;
     const std::string_view label = argv[1];
     if (label == "idle") idleConfiguration(fixture);
+    else if (label == "admission") admissionConfiguration(fixture);
     else if (label == "memory") memoryConfiguration(fixture);
     else if (label == "tenant-borrow") tenantBorrowConfiguration(fixture);
     else if (label == "websocket") webSocketConfiguration(fixture);

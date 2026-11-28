@@ -1,4 +1,5 @@
 #include "config.h"
+#include "call-admission.h"
 #include "coworkerd.capnp.h"
 #include "json.h"
 #include "support.h"
@@ -65,13 +66,43 @@ void DurableLogConfig::validate() const {
       "durableObjects.uploadRetryMaxMs is at least uploadRetryMs");
 }
 
+void ServerConfig::validatePlacementLimits() const {
+  KJ_REQUIRE(rootLimit > 0 && nestedLimit > rootLimit, "placement.nestedLimit must exceed placement.rootLimit",
+      rootLimit, nestedLimit);
+  KJ_REQUIRE(tenantRootLimit <= rootLimit && tenantNestedLimit <= nestedLimit,
+      "per-tenant placement limits must not exceed their effective node-wide limits",
+      tenantRootLimit, rootLimit, tenantNestedLimit, nestedLimit);
+}
+
+void ServerConfig::resolveCallAdmission(uint32_t ordinaryDefault) {
+  auto& pool = processPool;
+  pool.demandDrivenCalls = ordinaryDefault != 0;
+  if (pool.demandDrivenCalls) {
+    pool.inFlightLimit = pool.ordinaryInFlightLimit.value_or(pool.sharedInFlightLimit.value_or(ordinaryDefault));
+    // A single-slot explicit pool can still make a nested call on another role or node.
+    const auto automaticNested = std::max(2u, pool.inFlightLimit * std::max(1u, pool.count));
+    if (!nestedLimitGiven) nestedLimit = automaticNested;
+    if (!rootLimitGiven) {
+      const auto available = std::min(automaticNested, nestedLimit);
+      rootLimit = available - nestedCallReserve(available);
+    }
+  }
+  KJ_REQUIRE(pool.demandDrivenCalls || !pool.ordinaryInFlightLimit.has_value(),
+      "processPool.ordinaryInFlightLimit requires the demand-driven kernel");
+  validatePlacementLimits();
+}
+
 void ProcessPoolConfig::validate() const {
   KJ_REQUIRE((count > 0 || threadedDurableTestStorage) && count <= 256 && inFlightLimit > 0,
       "invalid process pool capacity");
   KJ_REQUIRE(ordinaryServer == "threaded",
       "processPool.ordinaryServer must be threaded; the ordinary upstream backend has been removed");
-  KJ_REQUIRE(ordinaryServer != "threaded" || inFlightLimit <= 16384,
-      "threaded process inFlightLimit must not exceed 16384");
+  KJ_REQUIRE(sharedInFlightLimit.value_or(1) > 0 && sharedInFlightLimit.value_or(1) <= 16384,
+      "explicit threaded process inFlightLimit must be between 1 and 16384");
+  KJ_REQUIRE(ordinaryInFlightLimit.value_or(1) > 0 && ordinaryInFlightLimit.value_or(1) <= MAX_ORDINARY_CALL_CEILING,
+      "processPool.ordinaryInFlightLimit must be between 1 and 1048576");
+  KJ_REQUIRE(inFlightLimit <= (demandDrivenCalls ? MAX_ORDINARY_CALL_CEILING : 16384u),
+      "effective threaded process inFlightLimit exceeds the kernel call ceiling");
   KJ_REQUIRE(tenantInFlightLimit <= 16384,
       "processPool.tenantInFlightLimit must be between 0 and 16384");
   KJ_REQUIRE(tenantAdmissionWaitMs <= 60000, "processPool.tenantAdmissionWaitMs is at most 60000");
@@ -199,6 +230,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   auto placement = root.getPlacement();
   result.rootLimit = placement.getRootLimit();
   result.nestedLimit = placement.getNestedLimit();
+  result.rootLimitGiven = given({"placement", "rootLimit"}).has_value();
+  result.nestedLimitGiven = given({"placement", "nestedLimit"}).has_value();
   result.tenantRootLimit = placement.getTenantRootLimit();
   result.tenantNestedLimit = placement.getTenantNestedLimit();
   result.tenantBorrowBelowPercent = placement.getTenantBorrowBelowPercent();
@@ -208,15 +241,14 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.rejectionAvoidMs = placement.getRejectionAvoidMs();
   result.connectBackoffMs = placement.getConnectBackoffMs();
   result.loadBandForTest = placement.getLoadBandForTest().cStr();
-  result.equalLimitsForTest = placement.getEqualLimitsForTest();
   result.subcalls = placement.getSubcalls().cStr();
   KJ_REQUIRE(result.subcalls == "home" || result.subcalls == "local",
       "placement.subcalls is \"home\" or \"local\"", result.subcalls.c_str());
-  KJ_REQUIRE(result.rootLimit > 0 &&
-      (result.nestedLimit > result.rootLimit ||
-       (result.equalLimitsForTest && result.nestedLimit == result.rootLimit)),
-      "nestedLimit must exceed rootLimit (equalLimitsForTest is only for the control)");
-  KJ_REQUIRE(result.tenantRootLimit <= result.rootLimit && result.tenantNestedLimit <= result.nestedLimit,
+  KJ_REQUIRE(!result.rootLimitGiven || result.rootLimit > 0, "placement.rootLimit must be positive");
+  KJ_REQUIRE(!result.nestedLimitGiven || result.nestedLimit > 1, "placement.nestedLimit must be at least 2");
+  if (result.rootLimitGiven && result.nestedLimitGiven) result.validatePlacementLimits();
+  KJ_REQUIRE((!result.rootLimitGiven || result.tenantRootLimit <= result.rootLimit) &&
+      (!result.nestedLimitGiven || result.tenantNestedLimit <= result.nestedLimit),
       "per-tenant placement limits must not exceed their node-wide limits");
   KJ_REQUIRE(result.tenantBorrowBelowPercent <= 100, "placement.tenantBorrowBelowPercent must be in [0, 100]");
   KJ_REQUIRE(result.idleMs > 0 && result.avoidMaxMs > 0 && result.connectBackoffMs > 0,
@@ -229,6 +261,9 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool = {pool.getCount(), pool.getInFlightLimit(), pool.getBasePort(),
     pool.getProbeIntervalMs(), pool.getProbeOverdueMs(), pool.getStuckTimeoutMs(),
     pool.getRestartBackoffMs(), pool.getRestartMaxMs(), pool.getWatchdog()};
+  if (given({"processPool", "inFlightLimit"})) result.processPool.sharedInFlightLimit = pool.getInFlightLimit();
+  if (given({"processPool", "ordinaryInFlightLimit"}))
+    result.processPool.ordinaryInFlightLimit = pool.getOrdinaryInFlightLimit();
   result.processPool.pausedAdmissionWaitMs = pool.getPausedAdmissionWaitMs();
   result.processPool.sqlCpuLimitMs = pool.getSqlCpuLimitMs();
   result.processPool.sqlWallLimitMs = pool.getSqlWallLimitMs();

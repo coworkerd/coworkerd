@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { Cluster, eventually } from './cluster.mjs';
+import { Cluster, eventually, request } from './cluster.mjs';
 
 const { positionals: [kernelDirectory, outputPath, ...extra], values: options } = parseArgs({
   allowPositionals: true,
@@ -15,17 +15,23 @@ const { positionals: [kernelDirectory, outputPath, ...extra], values: options } 
     'root-limit': { type: 'string' },
     'nested-limit': { type: 'string' },
     'process-limit': { type: 'string' },
+    'ordinary-limit': { type: 'string' },
     'ramp-ms': { type: 'string', default: '0' },
     'wait-ms': { type: 'string', default: '2000' },
     'node-memory-gib': { type: 'string', default: '16' },
     'node-tasks': { type: 'string', default: '40000' },
+    'node-cpus': { type: 'string' },
+    'node-descriptors': { type: 'string' },
+    'expect-first-resource': { type: 'boolean' },
+    'idle-worker-count': { type: 'string' },
     'expect-full': { type: 'boolean' },
   },
 });
 assert.ok(kernelDirectory && outputPath && !extra.length,
   'Usage: node tests/cluster/waiting-call-capacity.mjs <kernel-directory> <new-output.jsonl> ' +
   '[--batches 128,512,2000] [--root-limit N --nested-limit N] [--process-limit N] [--ramp-ms N] ' +
-  '[--wait-ms N] [--node-memory-gib N] [--node-tasks N] [--expect-full]');
+  '[--wait-ms N] [--node-memory-gib N] [--node-tasks N] [--node-cpus N] [--node-descriptors N] ' +
+  '[--expect-full | --expect-first-resource | --idle-worker-count N --ordinary-limit N]');
 const maxCalls = 12000;
 const plan = options.batches === undefined ? [8, 16, 24, 16, 24, 8, 24, 8, 16] :
   options.batches.split(',').map(value => integer(value, 1, maxCalls));
@@ -37,6 +43,15 @@ const expectFull = options['expect-full'] || options.batches === undefined;
 const rootLimit = optionalLimit('root-limit');
 const nestedLimit = optionalLimit('nested-limit');
 const processLimit = optionalLimit('process-limit');
+const ordinaryLimit = options['ordinary-limit'] === undefined ? undefined : integer(options['ordinary-limit'], 1, 1048576);
+const idleWorkerCount = options['idle-worker-count'] === undefined ? undefined : integer(options['idle-worker-count'], 1, 128);
+assert.ok(idleWorkerCount === undefined || (ordinaryLimit !== undefined && options.batches === undefined),
+  'the idle comparison needs an explicit ordinary ceiling and no batches');
+assert.ok(!options['expect-first-resource'] ||
+    (options.batches !== undefined && !expectFull && rootLimit === undefined && nestedLimit === undefined &&
+     processLimit === undefined && ordinaryLimit === undefined && idleWorkerCount === undefined),
+  'the first-resource check uses an explicit offer plan and default admission');
+
 assert.ok((rootLimit === undefined && nestedLimit === undefined) ||
   (rootLimit !== undefined && nestedLimit !== undefined && nestedLimit > rootLimit),
   'set both placement limits, with the nested limit greater than the root limit');
@@ -60,9 +75,14 @@ const controller = new AbortController();
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => controller.abort(new Error('Interrupted by ' + signal)));
 }
-const nodeMemory = integer(options['node-memory-gib'], 4, 20) + 'g';
+const nodeMemory = integer(options['node-memory-gib'], 2, 128) + 'g';
 const nodeResources = { mem_limit: nodeMemory, memswap_limit: nodeMemory,
-  pids_limit: integer(options['node-tasks'], 1000, 50000) };
+  pids_limit: integer(options['node-tasks'], 256, 250000) };
+if (options['node-cpus'] !== undefined) nodeResources.cpus = integer(options['node-cpus'], 1, 128);
+if (options['node-descriptors'] !== undefined) {
+  const hard = integer(options['node-descriptors'], 1024, 1048576);
+  nodeResources.ulimits = { nofile: { soft: Math.min(hard, 1024), hard } };
+}
 const peerResources = ['--memory', '768m', '--memory-swap', '768m', '--pids-limit', '128',
   '--ulimit', 'nofile=32768:32768', '--cpus', '2'];
 const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-waiting-calls-')), kernel, controller.signal, {
@@ -73,7 +93,8 @@ const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-waiting-call
     egress: { defaultPolicy: 'deny', clusterAddresses: ['apiserver:8940'],
       tenants: [{ tenant: 'waiting-capacity', allowInternal: ['waiting-origin:8080'] }] },
     ...(rootLimit !== undefined || nestedLimit !== undefined ? { placement: { rootLimit, nestedLimit } } : {}),
-    ...(processLimit !== undefined ? { processPool: { count: 1, inFlightLimit: processLimit } } : {}),
+    ...(processLimit !== undefined || ordinaryLimit !== undefined ?
+      { processPool: { count: 1, inFlightLimit: processLimit, ordinaryInFlightLimit: ordinaryLimit } } : {}),
   }),
 });
 const [node] = cluster.nodes;
@@ -147,7 +168,8 @@ function productProcesses(state) {
 
 function nodeReading(state) {
   return { inFlight: state.placement.inFlight, loadBand: state.placement.loadBand,
-    placementRejections: state.placement.rejections, egress: state.egress.tenants[tenantName],
+    placementRejections: state.placement.rejections, callResources: state.placement.callResources,
+    egress: state.egress.tenants[tenantName],
     processes: state.processes.entries.map(({ processId, processClass, generation, pid, inFlight }) =>
       ({ processId, processClass, generation, pid, inFlight })) };
 }
@@ -180,7 +202,10 @@ function summarize(calls, waits, waitMs) {
   const heldFullDelay = released.filter(call => call.releasedMs - call.enteredMs >= waitMs).length;
   const latencies = valid.map(call => call.finishedMs - call.sentMs).sort((a, b) => a - b);
   const percentile = p => latencies[Math.ceil(latencies.length * p) - 1] ?? null;
-  return { replies: valid.length, failureCounts: Object.fromEntries(failureCounts), entered: intervals.length, released: released.length,
+  const firstResource = calls.filter(call => call.result.resource)
+    .reduce((first, call) => first === null || call.finishedMs < first.finishedMs ? call : first, null);
+  return { replies: valid.length, failureCounts: Object.fromEntries(failureCounts), firstResource,
+    entered: intervals.length, released: released.length,
     heldFullDelay, peak, peakOverlapMs, p50Ms: percentile(.5), p99Ms: percentile(.99), maxMs: percentile(1),
     offerSpanMs: Math.max(...calls.map(call => call.sentMs)) - Math.min(...calls.map(call => call.sentMs)),
     upstreamEntrySpanMs: intervals.length ?
@@ -189,6 +214,44 @@ function summarize(calls, waits, waitMs) {
 
 async function capture(operation) {
   try { return await operation(); } catch (error) { return { error: error.message }; }
+}
+
+async function idleComparison() {
+  const readIdle = async () => {
+    const state = await cluster.state(node);
+    const ordinary = state.processes.entries.filter(entry => entry.processClass === 'ordinary');
+    assert.equal(ordinary.length, 1);
+    assert.equal(state.placement.inFlight.total, 0);
+    assert.equal(state.processes.configuration.ordinaryInFlightLimit, ordinaryLimit);
+    assert.equal(state.processes.configuration.demandDrivenCalls, true);
+    return { pool: state.processes.configuration, ordinary: ordinary[0],
+      ...await readProcesses(args => cluster.compose(['exec', '-T', node, ...args]), productProcesses(state)) };
+  };
+  const startup = await readIdle();
+  await delay(61000, undefined, { signal: controller.signal });
+  const settled = await readIdle();
+  assert.equal(startup.ordinary.generation, settled.ordinary.generation);
+  const tenant = await cluster.tenant(tenantName);
+  for (let index = 0; index < idleWorkerCount; ++index) {
+    // Warm earlier Workers as well so the residency check is independent of deployment time.
+    const name = 'idle-' + index;
+    await cluster.deploy(tenant, name, 'export default {fetch() { return new Response("idle worker ' + index + '"); }}');
+  }
+  for (let index = 0; index < idleWorkerCount; ++index) {
+    const reply = await request(cluster.urls[node], '/' + tenantName + '/idle-' + index);
+    assert.equal(reply.status, 200);
+    assert.equal(reply.text, 'idle worker ' + index);
+  }
+  const residents = await eventually('resident Worker set published', async () => {
+    const reading = await readIdle();
+    const workers = reading.ordinary.lifecycle?.residentWorkers
+      ?.filter(worker => worker.workerId?.startsWith(tenantName + '/idle-')) ?? [];
+    assert.equal(new Set(workers.map(worker => worker.workerId)).size, idleWorkerCount);
+    return reading;
+  });
+  await record({ type: 'idle-ceiling', ordinaryLimit, idleWorkerCount, startup, settled, residents });
+  console.log(JSON.stringify({ ordinaryLimit, idleWorkerCount,
+    startupMemory: startup.cgroup['memory.current'], settledMemory: settled.cgroup['memory.current'] }));
 }
 
 async function run() {
@@ -214,8 +277,10 @@ async function run() {
     publishedPin: { releaseTag: pins.releaseTag, sha256: pins.archives[kernelRecord.architecture] },
     linux: { architecture: engine.Architecture, release: engine.KernelVersion, cpus: engine.NCPU,
       memoryBytes: engine.MemTotal, os: engine.OperatingSystem, dockerVersion: engine.ServerVersion },
-    fixture: { peerImage, plan, rampMs, waitMs, recoveryMs, nodeResources, peerResources, rootLimit, nestedLimit, processLimit } });
+    fixture: { peerImage, plan, rampMs, waitMs, recoveryMs, nodeResources, peerResources,
+      rootLimit, nestedLimit, processLimit, ordinaryLimit, idleWorkerCount } });
   await cluster.start();
+  if (idleWorkerCount !== undefined) return idleComparison();
   for (const [role, name] of Object.entries(sides)) {
     await cluster.command('docker', ['run', '--detach', '--rm', '--name', name, '--network', cluster.project + '_backend',
       '--network-alias', role === 'upstream' ? 'waiting-origin' : 'waiting-client', ...peerResources,
@@ -334,6 +399,19 @@ async function run() {
     await record({ type: 'recovery', number, ...recovered });
     console.log(JSON.stringify({ offered, ...summary, recovered: !recovered.error }));
     assert.ok(!recovered.error, recovered.error);
+    if (options['expect-first-resource']) {
+      if (number < plan.length - 1) assert.equal(summary.replies, offered, 'sub-capacity batch refused');
+      else {
+        const first = summary.firstResource?.result;
+        assert.ok(first, 'the largest batch must produce a resource refusal');
+        assert.equal(first.code, 'OVERLOADED');
+        assert.match(first.resource.kind, /^(node|process)-(memory|tasks|descriptors)$/);
+        assert.ok(first.resource.limit > 0 && first.resource.current > 0 && first.inFlight > 0);
+        assert.equal(summary.failureCounts.OVERLOADED, offered - summary.replies, 'unexpected non-capacity failure');
+        const nodeFirst = after.product?.state?.callResources?.firstRefusal;
+        assert.equal(nodeFirst?.resource?.kind, first.resource.kind, 'first node and client resource disagree');
+      }
+    }
     if (expectFull) {
       assert.equal(summary.replies, offered);
       assert.equal(summary.heldFullDelay, offered);

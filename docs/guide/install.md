@@ -471,11 +471,13 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `management.token` | required | The management token (see section 8); the environment variable `COWORKERD_MANAGEMENT_TOKEN` takes precedence. A node without one refuses to start |
 | `management.allowWithoutToken` | `false` | `true` lets a development node start without a token: its management endpoints are then open to whoever reaches its ingress or peer port, and it warns at startup |
 | `processPool.count` | `1` | The number of ordinary workerd processes |
+| `processPool.inFlightLimit` | omitted | An explicit ceiling from 1 to 16,384 calls per ordinary, quarantine and durable process. When omitted, durable processes keep 512 and ordinary and quarantine processes derive their ceiling from the native process memory share |
+| `processPool.ordinaryInFlightLimit` | omitted | Optional ceiling from 1 to 1,048,576 calls per ordinary or quarantine process. Overrides the shared setting for those processes. Requires the demand-driven kernel |
 | `processPool.ordinaryServer` | `threaded` | C++ backend for ordinary and quarantine processes: HTTP, JS RPC, outbound calls, logs, bindings, object stubs, CPU and memory limits, eviction and generation draining. `upstream` is refused for this setting. Durable processes use the Rust backend |
 | `processPool.threadedExecutable` | `coworkerd-threaded` beside `workerdPath` | Executable used when the ordinary backend is `threaded`. Build it with `//src/workerd/threaded:coworkerd-threaded` in the matching workerd fork |
 | `processPool.threadedMemoryBytes` | `0` | Native process memory budget in bytes. `0` divides 80% of the node's actual memory budget among ordinary, quarantine and durable processes plus one replacement generation. An explicit value cannot exceed this share |
 | `processPool.threadedResidentLimit` | `1840` | Maximum resident Worker versions in a native process, from `1` to `1840` for this shared pointer-space build. Memory and address budgets can refuse earlier. Idle versions are evicted before a new version is admitted |
-| `processPool.threadedThreadIdleMs` | `60000` | Native call threads above the warm pool of 32 are released after this idle interval. `0` keeps them. The pool grows up to `inFlightLimit`; eight separate control loops maintain state and return pre-execution refusals |
+| `processPool.threadedThreadIdleMs` | `60000` | Native call threads above the warm pool of 32 are released after this idle interval. `0` keeps them. Live requests acquire call threads on demand within the process resource budget and ceiling |
 | `processPool.sqlCpuLimitMs` | `200` | Cumulative native SQL CPU per object event, shared by statements, batches and ingest segments. Short segments use a random sample estimate; long segments are measured. Integer from `1` to `60000` |
 | `processPool.sqlWallLimitMs` | `800` | Cumulative active SQL wall time as a fallback, excluding time outside SQL. Integer from `1` to `60000`. The 3000 ms process watchdog remains the fallback for operations without SQLite progress callbacks |
 | `processPool.pausedAdmissionWaitMs` | `1000` | Admission wait for a live paused process when no ready process or candidate node can take the call; bounded by the lease and concurrency limits. `0` disables it; must be less than `processPool.stuckTimeoutMs` |
@@ -551,23 +553,37 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 
 ### Waiting-call capacity
 
-The default placement thresholds are 128 calls in flight for new roots and 384 for nested calls.
-The default per-process limit is 512. In two batches of 2,000 ordinary calls with a two-second
-upstream wait, each batch completed 128 calls and refused 1,872 at the node's root threshold.
-With explicit experimental node and process limits on the same published ARM64 kernel,
-two batches completed all 2,000 calls. The full waits overlapped for 1.392 s and 1.524 s.
+On the demand-driven kernel, the node admits ordinary calls against its memory, task and
+descriptor budgets. An ordinary process also checks its own live resource budget before
+starting a call. In-flight calls acquire their memory charge, native thread and descriptors as
+they need them. A higher idle ceiling leaves the process budget available for Workers. The node
+and each ordinary process leave one eighth of the applicable resource allowance for nested
+work after new roots stop. The memory watermark still protects a node approaching its memory limit.
 
-A separate 12-second probe on the same eight-vCPU Linux VM and a 20 GiB node container completed
-11,250 calls with full overlap for 8.062 s. A larger batch briefly reached the configured
-11,400-call ceiling. Each wait added about one native thread, four daemon descriptors, five
-ordinary-process descriptors and 486 KiB of node cgroup memory at the 11,250-call sample.
-At startup the same node budget accepted 11,516 configured process slots and refused 11,517
-because the ordinary-process memory share could no longer fund an active Worker.
+| Scope | Ceiling and resource accounting |
+| --- | --- |
+| Node | `placement.rootLimit` and `placement.nestedLimit` count all root and nested calls on the node. An omitted nested ceiling is the ordinary process count times the effective ordinary ceiling, with a minimum of two. An omitted root ceiling leaves one eighth of that count for nested work and respects an explicit nested ceiling. An explicit root ceiling must be smaller than the effective nested ceiling. |
+| Ordinary or quarantine process | The automatic ceiling is twice the number of 256 KiB stacks that fit in the process memory share, bounded by the kernel's accepted range. Live resource checks come first in normal operation. Each extra ordinary process adds its own ceiling and shares the node's memory and descriptor budgets. The memory share may shrink as more ordinary, quarantine or durable processes are configured. |
+| Durable process | The default is 512 calls per process across its objects. `processPool.inFlightLimit` applies when explicitly configured. The per-object mailbox has its own limit. |
 
-The threaded kernel reserves memory for configured slots at startup. Reserving more slots
-reduces the memory available for Worker isolates even when the node is idle. The measured
-live-call cost and the startup reservation both enter capacity planning.
-[Readings, resource budgets and reproduction commands](../waiting-call-capacity.md)
+The daemon uses the node's descriptor hard limit after reserving for ingress WebSockets, other
+ingress traffic and process generations. It accounts up to four daemon descriptors per admitted
+call, as observed in [#149](../waiting-call-capacity.md#resource-cost). It also budgets one task
+per admitted ordinary call from the tightest startup task allowance, after reserving for the
+daemon and process generations. The kernel checks its actual resource allocation as the call
+starts. Startup and node state show the effective ceilings and the node's budget inputs.
+The per-tenant settings, if named, are checked against the effective placement ceilings.
+
+A resource refusal returns `503 OVERLOADED` before execution. The `resource` object names the
+scope and resource in `kind` and shows the `current` level and applicable `limit`. Memory is
+reported in bytes, other resources in counts. For a node resource, `capacity` includes the
+allowance for nested work. `placement.callResources.firstRefusal` records the first resource
+refusal since startup. Ordinary process lifecycle records show their live accounting in
+`ordinaryAdmission`. Placement can try another node after a confirmed refusal.
+
+An older kernel uses the earlier eager startup sizing and omitted ceilings of 128 roots,
+384 nested calls and 512 calls per process. [Historical measurements and reproduction](../waiting-call-capacity.md)
+
 
 ### Invocation budgets
 
@@ -590,7 +606,7 @@ A Durable Object's outgoing `fetch()` between incoming events has no invocation 
 
 ### Inbound HTTP capacity
 
-A connected Worker request holds a concurrent root slot on its execution node for the duration of the response, including idle streaming time. The node refuses new roots when its combined root and nested occupancy reaches `placement.rootLimit`. Set `placement.tenantRootLimit` to reserve room for other tenants. A new root that reaches either limit receives `503 OVERLOADED` before dispatch.
+A connected Worker request holds a concurrent root slot on its execution node for the duration of the response, including idle streaming time. New roots can receive `503 OVERLOADED` before dispatch when an admission resource or the combined occupancy reaches its root boundary. Set `placement.tenantRootLimit` to reserve room for other tenants.
 
 ### Inbound WebSocket capacity
 

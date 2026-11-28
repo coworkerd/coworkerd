@@ -301,6 +301,7 @@ public:
   bool threaded = false;
   bool threadedDurable = false;
   uint32_t threadedProtocol = 0;
+  bool demandDrivenCalls = false;
   kj::TaskSet* deferredDeletes = nullptr;
   std::shared_ptr<DurableBudgetRegistry> durableBudgets;
   kj::Timer* timer = nullptr;
@@ -317,7 +318,7 @@ public:
   }
   kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor,
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
-      std::function<void()> onDispatched, std::function<void(PreExecutionRefusal)> onRefused,
+      std::function<void()> onDispatched, std::function<void(PreExecutionRefusal, std::optional<CallResourceLevel>)> onRefused,
       kj::Own<kj::PromiseFulfiller<void>> ready, kj::Own<kj::PromiseFulfiller<PreExecutionRefusal>> refused,
       std::shared_ptr<ProcessCall> sqlCall, std::shared_ptr<RequestLease> lease,
       std::shared_ptr<const ProcessCall> call);
@@ -329,11 +330,11 @@ public:
   bool disconnected = false;
   OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps,
       kj::Maybe<capnp::Capability::Client> budgetLifetime, std::function<void()> onDispatched,
-      std::function<void(PreExecutionRefusal)> onRefused, std::shared_ptr<ProcessCall> sqlCall,
+      std::function<void(PreExecutionRefusal, std::optional<CallResourceLevel>)> onRefused, std::shared_ptr<ProcessCall> sqlCall,
       std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call) {
     if (threaded) {
       auto ready = kj::newPromiseAndFulfiller<void>();
-      auto refusal = threadedDurable ? kj::newPromiseAndFulfiller<PreExecutionRefusal>()
+      auto refusal = threadedDurable || demandDrivenCalls ? kj::newPromiseAndFulfiller<PreExecutionRefusal>()
           : kj::PromiseFulfillerPair<PreExecutionRefusal>{PreExecutionRefusal::NONE, {}};
       return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
           kj::mv(budgetLifetime), std::move(onDispatched), std::move(onRefused), kj::mv(ready.fulfiller),
@@ -393,7 +394,7 @@ private:
 
 kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor,
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
-    std::function<void()> onDispatched, std::function<void(PreExecutionRefusal)> onRefused,
+    std::function<void()> onDispatched, std::function<void(PreExecutionRefusal, std::optional<CallResourceLevel>)> onRefused,
     kj::Own<kj::PromiseFulfiller<void>> ready, kj::Own<kj::PromiseFulfiller<PreExecutionRefusal>> refused,
     std::shared_ptr<ProcessCall> sqlCall, std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call) {
   auto lifetime = shared_from_this();
@@ -417,7 +418,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       };
     }
     // No Cap'n Proto bytes may precede this raw routing prefix.
-    auto prefix = kj::str("T");
+    auto prefix = kj::str(demandDrivenCalls ? (call->root ? "Or" : "On") : "T");
     if (threadedDurable) {
       capnp::MallocMessageBuilder builder;
       capnp::JsonCodec codec;
@@ -431,8 +432,8 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
     KJ_REQUIRE(threadedProtocol == 3, "native invocation protocol 3 is required");
     auto retryDelay = 5 * kj::MILLISECONDS;
     const auto waitUntil = timer->now() + 5 * kj::SECONDS;
-    auto confirmRefusal = [&](PreExecutionRefusal reason) {
-      onRefused(reason);
+    auto confirmRefusal = [&](PreExecutionRefusal reason, std::optional<CallResourceLevel> resource = {}) {
+      onRefused(reason, resource);
       if (refused.get() != nullptr) refused->fulfill(kj::mv(reason));
     };
     for (;;) {
@@ -446,6 +447,15 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
       KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
       if (decision == 'R') {
+        if (demandDrivenCalls) {
+          std::array<char, 17> record;
+          const auto length = co_await connection->stream->tryRead(record.data(), record.size(), record.size());
+          KJ_REQUIRE(length == record.size(), "truncated native resource refusal");
+          const auto resource = parseOrdinaryResourceRefusal(record);
+          KJ_REQUIRE(resource.has_value(), "invalid native resource refusal");
+          confirmRefusal(PreExecutionRefusal::RESOURCE, resource);
+          kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, "native process refused a call resource; nothing executed"));
+        }
         confirmRefusal(PreExecutionRefusal::CAPACITY);
         kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, "native invocation queue is full; nothing executed"));
       }
@@ -472,6 +482,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       break;
     }
     onDispatched();
+    if (demandDrivenCalls) refused->fulfill(PreExecutionRefusal::NONE);
     if (!threadedDurable) ready->fulfill();
     connection->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*connection->stream);
     connection->bootstrap = connection->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
@@ -527,13 +538,16 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       else dispatcher = response.getDispatcher();
     }
     auto result = capnp::membrane(dispatcher, kj::refcounted<InvocationConnection>(connection));
-    if (refused.get() != nullptr) refused->fulfill(PreExecutionRefusal::NONE);
+    if (threadedDurable) refused->fulfill(PreExecutionRefusal::NONE);
     if (threadedDurable) ready->fulfill();
     cancelBudget.cancel();
     co_return result;
   } catch (const kj::Exception& error) {
-    if (refused.get() != nullptr && refused->isWaiting()) refused->fulfill(PreExecutionRefusal::NONE);
-    if (threadedDurable && ready->isWaiting()) ready->reject(error.clone());
+    if (refused.get() != nullptr && refused->isWaiting()) {
+      if (demandDrivenCalls) refused->reject(error.clone());
+      else refused->fulfill(PreExecutionRefusal::NONE);
+    }
+    if (ready->isWaiting()) ready->reject(error.clone());
     throw;
   }
 }
@@ -1071,6 +1085,7 @@ struct ProcessGeneration {
   bool threaded = false;
   bool durableTestStorage = false;
   uint32_t threadedProtocol = 0;
+  bool demandDrivenCalls = false;
   bool threadedCulpritHandled = false;
   bool quarantine = false, durable = false;
   std::shared_ptr<TenantCpu> cpuUsage;
@@ -2104,7 +2119,7 @@ public:
     std::vector<std::string> args = {sandbox.launcherPath, "--status-fd", std::to_string(LAUNCHER_STATUS_FD), "--program-fd",
         std::to_string(LAUNCHER_PROGRAM_FD), "--parent-pid", std::to_string(getpid()), "--root", sandbox.root,
         "--user", "--net", "--ipc", "--uts", "--drop-caps", "--no-new-privs", "--non-dumpable"};
-    if (!durable) {
+    if (!durable && !config.demandDrivenCalls) {
       args.push_back("--nofile");
       args.push_back(std::to_string(uint64_t(config.inFlightLimit) * 8 + 256));
     }
@@ -2495,7 +2510,7 @@ public:
     p->contextsVisible = !p->threaded;
     p->eventDigest = EVP_MD_CTX_new();
     KJ_REQUIRE(p->eventDigest && EVP_DigestInit_ex(p->eventDigest, EVP_sha256(), nullptr) == 1, "cannot hash the event channel");
-    const int listener = listenUnix(p->socketPath, config.inFlightLimit);
+    const int listener = listenUnix(p->socketPath, config.processInFlightLimit(p->durable));
     auto closeListener = kj::defer([listener] { ::close(listener); });
     const int lifecycle = p->lifecycle.create();
     auto closeLifecycle = kj::defer([lifecycle] { ::close(lifecycle); });
@@ -2729,7 +2744,7 @@ public:
     // launcher itself executed through the descriptor this Server pinned at startup.
     std::vector<std::string> args = {executable, "serve", "--experimental", "--socket-fd", "rpc=" + std::to_string(LISTEN_FD), path};
     if (p->threaded) args = {executable, std::to_string(LISTEN_FD), sourceAddress,
-        p->id + ":" + std::to_string(p->generation), std::to_string(config.inFlightLimit)};
+        p->id + ":" + std::to_string(p->generation), std::to_string(config.processInFlightLimit(p->durable))};
     if (p->durableTestStorage) args.push_back("--durable-test-storage");
     else if (p->durable && p->threaded) args.push_back("--durable-storage");
     std::string file = executable;
@@ -2927,12 +2942,17 @@ public:
           bool matchesProtocol = false;
           uint32_t roleHeaders = 0;
           uint32_t walHeaders = 0;
-          bool matchesRole = false, matchesWal = false;
+          uint32_t admissionHeaders = 0;
+          bool matchesRole = false, matchesWal = false, matchesAdmission = false;
           response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
             if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "3") matchesProtocol = true;
             if (strcasecmp(name.cStr(), "x-coworkerd-threaded-role") == 0) {
               ++roleHeaders;
               matchesRole = value == (p->durableTestStorage ? "durable-test" : "durable");
+            }
+            if (strcasecmp(name.cStr(), "x-coworkerd-ordinary-admission") == 0) {
+              ++admissionHeaders;
+              matchesAdmission = value == "1";
             }
             if (strcasecmp(name.cStr(), "x-coworkerd-wal-protocol") == 0) {
               ++walHeaders;
@@ -2947,6 +2967,10 @@ public:
               "native process role does not match the slot");
           KJ_REQUIRE(walNegotiated,
               "native process WAL protocol does not match the slot");
+          p->demandDrivenCalls = !p->durable && config.demandDrivenCalls;
+          if (p->demandDrivenCalls) {
+            KJ_REQUIRE(admissionHeaders == 1 && matchesAdmission, "native process demand-driven admission protocol is required");
+          }
           p->threadedProtocol = 3;
           p->contextsVisible = true;
         }
@@ -2969,6 +2993,7 @@ public:
           r->threadedDurable = p->durable;
           r->durableBudgets = p->durableBudgets;
           r->threadedProtocol = p->threadedProtocol;
+          r->demandDrivenCalls = p->demandDrivenCalls;
           r->deferredDeletes = &tasks;
           co_await r->fill();
         } else {
@@ -3407,9 +3432,12 @@ public:
       }
     });
   }
-  bool admitted(const ProcessGeneration& p) const {
+  bool readyForDispatch(const ProcessGeneration& p) const {
     return p.pid > 0 && p.state == "ready" && p.runtime && !p.runtime->disconnected &&
-        (!p.durableBudgets || p.durableBudgets->connected) && p.inFlight < config.inFlightLimit;
+        (!p.durableBudgets || p.durableBudgets->connected);
+  }
+  bool admitted(const ProcessGeneration& p) const {
+    return readyForDispatch(p) && p.inFlight < config.processInFlightLimit(p.durable);
   }
   bool admittedTenant(const ProcessGeneration& p, const std::string& worker) const {
     if (!admitted(p)) return false;
@@ -4013,7 +4041,7 @@ ProcessPool::PausedAdmission ProcessPool::pausedAdmission(const std::string& wor
     if (!p) continue;
     if (impl->admitted(*p)) return {};
     if (p->state == "paused" && p->pid > 0 && p->runtime && !p->runtime->disconnected &&
-        !p->closing && !p->retiring && p->inFlight < impl->config.inFlightLimit) result.processes.push_back(p);
+        !p->closing && !p->retiring && p->inFlight < impl->config.processInFlightLimit(p->durable)) result.processes.push_back(p);
   }
   return result;
 }
@@ -4164,6 +4192,21 @@ std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
   if (!process) return {};
   if (quarantine) ++impl->quarantineDispatches;
   return std::shared_ptr<ProcessCall>(new ProcessCall(process, process->tenantExecution ? tenantOf(worker) : std::string()));
+}
+std::optional<CallResourceLevel> ProcessPool::capacityRefusal(const std::string& worker, const std::string& objectKey) {
+  impl->refresh();
+  const auto quarantine = quarantined(worker);
+  const auto durableId = objectKey.empty() ? std::string() : impl->durableSlotFor(objectKey);
+  const auto limit = impl->config.processInFlightLimit(!objectKey.empty());
+  bool ready = false;
+  for (const auto& slot : impl->slots) {
+    if (objectKey.empty() ? slot.durable || slot.quarantine != quarantine : !slot.durable || slot.id != durableId) continue;
+    if (!slot.current || !impl->readyForDispatch(*slot.current)) continue;
+    if (slot.current->inFlight < limit) return std::nullopt;
+    ready = true;
+  }
+  if (!ready) return std::nullopt;
+  return CallResourceLevel{CallResource::ProcessCeiling, limit, limit, limit};
 }
 bool ProcessPool::workerSaturated(const std::string& worker, std::string_view planRevision, double nowMs) const {
   if (planRevision.empty()) return false;
@@ -4347,8 +4390,9 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
     p->openContexts[call->invocationId] = {call->workerId, call->versionId, 0, ticket};
   }
   // From this send onward, a lost connection or a dead child is never retried.
-  auto result = p->runtime->open(descriptor, std::move(nativeProps), kj::mv(budgetLifetime), [call] { call->dispatched = true; }, [call](PreExecutionRefusal reason) {
+  auto result = p->runtime->open(descriptor, std::move(nativeProps), kj::mv(budgetLifetime), [call] { call->dispatched = true; }, [call](PreExecutionRefusal reason, std::optional<CallResourceLevel> resource) {
     call->preExecutionRefusal = reason;
+    call->resourceRefusal = resource;
     if (reason == PreExecutionRefusal::CAPACITY && call->onCapacityRejected) call->onCapacityRejected();
   }, threadedSql ? call : nullptr, std::move(requestLease), call);
   result.ready = kj::mv(result.ready).exclusiveJoin(call->onExit()).catch_([call](kj::Exception&& error) -> kj::Promise<void> {
@@ -4402,7 +4446,10 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"idleDestroyIntervalMs\":" << impl->config.idleDestroyIntervalMs
       << ",\"quarantineProcesses\":" << impl->config.quarantineProcesses
       << ",\"durableProcesses\":" << impl->config.durableProcesses
-      << ",\"inFlightLimit\":" << impl->config.inFlightLimit << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
+      << ",\"inFlightLimit\":" << impl->config.inFlightLimit
+      << ",\"ordinaryInFlightLimit\":" << impl->config.inFlightLimit
+      << ",\"durableInFlightLimit\":" << impl->config.durableInFlightLimit()
+      << ",\"demandDrivenCalls\":" << (impl->config.demandDrivenCalls ? "true" : "false") << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
       << ",\"probeOverdueMs\":" << impl->config.probeOverdueMs << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
       << ",\"watchdog\":" << (impl->config.watchdog ? "true" : "false") << ",\"restartBackoffMs\":" << impl->config.restartBackoffMs
       << ",\"restartMaxMs\":" << impl->config.restartMaxMs

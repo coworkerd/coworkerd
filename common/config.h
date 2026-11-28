@@ -1,5 +1,7 @@
 #pragma once
 
+#include "call-admission.h"
+
 #include "object-store.h"
 #include "cpu-capacity.h"
 
@@ -18,7 +20,8 @@ namespace coworkerd {
 
 struct ProcessPoolConfig {
   uint32_t count = 1;
-  uint32_t inFlightLimit = 512;
+  static constexpr uint32_t LEGACY_IN_FLIGHT_LIMIT = 512;
+  uint32_t inFlightLimit = LEGACY_IN_FLIGHT_LIMIT;
   uint32_t basePort = 9000;  // ignored (workerd listens on an inherited Unix socket)
   uint32_t probeIntervalMs = 50;
   uint32_t probeOverdueMs = 400;
@@ -113,6 +116,12 @@ struct ProcessPoolConfig {
   // The largest Wasm memory the plan allows a process's isolates (0: no cap of the sandbox's).
   uint32_t sandboxWasmCapMiB = 0;
   std::string sandboxPlanJson, sandboxWarning;
+  std::optional<uint32_t> sharedInFlightLimit, ordinaryInFlightLimit;
+  bool demandDrivenCalls = false;
+  uint32_t processInFlightLimit(bool durable) const { return durable ? durableInFlightLimit() : inFlightLimit; }
+  uint32_t durableInFlightLimit() const {
+    return sharedInFlightLimit.value_or(demandDrivenCalls ? LEGACY_IN_FLIGHT_LIMIT : inFlightLimit);
+  }
   void validate() const;
 };
 
@@ -269,6 +278,13 @@ struct ServerConfig {
   int64_t clockOffsetMsForTest = 0;
   uint32_t rootLimit = 128;
   uint32_t nestedLimit = 384;
+  bool rootLimitGiven = false;
+  bool nestedLimitGiven = false;
+  void resolveCallAdmission(uint32_t ordinaryDefault);
+  void validatePlacementLimits() const;
+  CallResourceBudget callTasks{CallResource::NodeTasks, 0, 0, 1};
+  std::filesystem::path callTasksSource;
+  CallResourceBudget callDescriptors{CallResource::NodeDescriptors, 0, 0, 4};
   uint32_t tenantRootLimit = 0;
   uint32_t tenantNestedLimit = 0;
   uint32_t tenantBorrowBelowPercent = 0;
@@ -283,7 +299,6 @@ struct ServerConfig {
   bool memoryWatermarkEnabled = true;
   uint64_t memoryBudgetBytes = 0;
   HostCheckConfig hostCheck;
-  bool equalLimitsForTest = false;
   bool ingressPlacement = true;
   coworkerd::ProcessPoolConfig processPool;
   coworkerd::MembershipConfig membership;

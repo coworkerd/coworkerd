@@ -294,7 +294,12 @@ struct PlacementDefinition {
 
 using coworkerd::OpenEvent;
 // `reason`, when set, says why instead of "no ready ... process" (nothing was sent either way).
-struct ProcessUnavailable { bool quarantine = false; std::string reason; bool secretDictionary = false; };
+struct ProcessUnavailable {
+  bool quarantine = false;
+  std::string reason;
+  bool secretDictionary = false;
+  std::optional<coworkerd::CallResourceLevel> resource;
+};
 // A trial probe that was never sent (TrialService::probe()).
 constexpr kj::Exception::DetailTypeId TRIAL_NOT_SENT_DETAIL = 0x6f1c2e94a7d35b08ull;
 struct DurableDispatchRefused { coworkerd::DurableLog::ObjectReady result; };
@@ -515,6 +520,7 @@ struct InvocationRejection {
   std::string category;  // LOAD_FAILED: package-unavailable, evaluation, limit, secret-missing
   bool notExecuted = false, retryable = false;
   std::optional<uint32_t> workerInFlight;
+  std::optional<coworkerd::CallResourceLevel> resource;
 
   std::string json() const {
     std::ostringstream out;
@@ -522,6 +528,12 @@ struct InvocationRejection {
         << "\",\"loadBand\":\"" << loadBand << "\",\"inFlight\":" << inFlight
         << ",\"limit\":" << limit << ",\"avoidMs\":" << avoidMs << ",\"status\":" << status;
     if (!category.empty()) out << ",\"category\":\"" << jsonEscape(category) << "\"";
+    if (resource) {
+      out << ",\"resource\":{\"kind\":\"" << coworkerd::callResourceName(resource->resource)
+          << "\",\"current\":" << resource->current << ",\"limit\":" << resource->limit;
+      if (resource->capacity != 0) out << ",\"capacity\":" << resource->capacity;
+      out << '}';
+    }
     if (code == "LOAD_FAILED" && status == 409 && category == "limit")
       out << ",\"dispatched\":false,\"retryable\":false";
     else if (notExecuted) out << ",\"dispatched\":false,\"retryable\":" << (retryable ? "true" : "false");
@@ -628,11 +640,12 @@ struct LoadCheck {
 };
 
 struct PendingThreadedLoad {
-  PendingThreadedLoad(kj::Promise<void> signal, kj::Own<kj::PromiseFulfiller<void>> fulfiller)
-      : done(kj::mv(signal).fork()), fulfiller(kj::mv(fulfiller)) {}
+  PendingThreadedLoad(kj::Promise<void> signal, kj::Own<kj::PromiseFulfiller<void>> fulfiller, bool root)
+      : done(kj::mv(signal).fork()), fulfiller(kj::mv(fulfiller)), root(root) {}
   kj::ForkedPromise<void> done;
   kj::Own<kj::PromiseFulfiller<void>> fulfiller;
   std::optional<LoadCheck> result;
+  const bool root;
 };
 
 // The shared trial verdict and the cleaning of its message (trialClean,
@@ -1797,7 +1810,7 @@ public:
     auto started = monotonicTimeMs();
     auto call = runtime.select(worker);
     phaseTiming("process-selection", started);
-    if (!call) throw ProcessUnavailable{runtime.quarantined(worker)};
+    if (!call) throw ProcessUnavailable{runtime.quarantined(worker), {}, false, runtime.capacityRefusal(worker)};
     return call;
   }
 
@@ -1805,6 +1818,31 @@ public:
     return {status, std::move(code), std::move(reason), memory.effectiveBand(),
         inFlightRoots + inFlightNested, root ? serverConfig.rootLimit : serverConfig.nestedLimit,
         std::min(serverConfig.rejectionAvoidMs, serverConfig.avoidMaxMs)};
+  }
+
+  InvocationRejection resourceRefusal(coworkerd::CallResourceLevel resource, bool root) {
+    auto value = refusal("OVERLOADED", std::string(coworkerd::callResourceName(resource.resource)) +
+        " admission budget reached", 503, root);
+    value.resource = resource;
+    value.notExecuted = value.retryable = true;
+    return value;
+  }
+
+  kj::Promise<std::optional<InvocationRejection>> confirmOrdinaryAdmission(
+      OpenEvent& opened, const std::shared_ptr<AdmissionSlot>& slot) {
+    if (!serverConfig.processPool.demandDrivenCalls) co_return std::nullopt;
+    try {
+      const auto decision = co_await kj::mv(opened.preExecutionRefusal);
+      if (decision != coworkerd::PreExecutionRefusal::RESOURCE) co_return std::nullopt;
+    } catch (const kj::Exception&) {
+      co_return refusal("RESULT_UNCERTAIN", "native admission response is unavailable", 503, slot->root);
+    }
+    KJ_ASSERT(slot != nullptr && slot->process != nullptr && slot->process->resourceRefusal.has_value());
+    auto refused = resourceRefusal(*slot->process->resourceRefusal, slot->root);
+    slot->rejectionCode = refused.code;
+    slot->rejectionReason = refused.reason;
+    slot->decide(false);
+    co_return refused;
   }
 
   InvocationRejection durableStartRefusal(coworkerd::PreExecutionRefusal reason) {
@@ -1822,6 +1860,7 @@ public:
     ++placementRejections[refusal.code];
     if (refusal.code == "QUARANTINE_UNAVAILABLE") decision("quarantineUnavailable", source == "localIngress" || source == "peerIngress");
     ++placementRejectionReasons[cleanReason(refusal.reason)];
+    if (refusal.resource && firstCallResourceRefusal.empty()) firstCallResourceRefusal = refusal.json();
     observeLocalRefusal(refusal, source);
   }
 
@@ -1834,6 +1873,7 @@ public:
   }
 
   InvocationRejection processRefusal(const ProcessUnavailable& error, bool root = false) {
+    if (error.resource) return resourceRefusal(*error.resource, root);
     auto value = refusal(error.quarantine ? "QUARANTINE_UNAVAILABLE" : "PROCESS_UNAVAILABLE", !error.reason.empty() ? error.reason :
         error.quarantine ? "no ready quarantine process before dispatch" : "no ready workerd process before dispatch", 503, root);
     value.notExecuted = value.retryable = true;
@@ -1856,6 +1896,19 @@ public:
     if (initial == coworkerd::InitialPlacementAdmission::Expired) {
       if (record) rejectExpiredLease("lease expired before admission");
       return rejected("LEASE_EXPIRED", "lease expired before admission", 410);
+    }
+    auto rejectResource = [&](coworkerd::CallResourceLevel resource) {
+      auto value = resourceRefusal(resource, root);
+      if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
+      return value;
+    };
+    if (serverConfig.processPool.demandDrivenCalls) {
+      if (const auto memoryLimit = coworkerd::callResourceRefusal(memory.callMemoryBudget(), 0, root, false))
+        return rejectResource(*memoryLimit);
+      if (!durable) if (const auto tasks = coworkerd::callResourceRefusal(
+          serverConfig.callTasks, ordinaryInFlight, root, reserved)) return rejectResource(*tasks);
+      if (const auto descriptors = coworkerd::callResourceRefusal(serverConfig.callDescriptors,
+          inFlightRoots + inFlightNested, root, reserved)) return rejectResource(*descriptors);
     }
     if (initial == coworkerd::InitialPlacementAdmission::Saturated)
       return rejected("OVERLOADED", "concurrency limit reached");
@@ -1915,6 +1968,8 @@ public:
       if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
       return value;
     }
+    if (const auto capacity = runtime.capacityRefusal(worker, durable ? durable->key() : ""))
+      return rejectResource(*capacity);
     auto value = durable ? refusal("DO_UNAVAILABLE", "the durable process of this object (" +
         runtime.durableProcessFor(durable->key()) + ") is not ready", 503, root) : processRefusal({runtime.quarantined(worker)}, root);
     if (!(durable && serverConfig.processPool.threadedDurable()) &&
@@ -1926,8 +1981,13 @@ public:
     return value;
   }
 
-  void sampleNodeCpu() {
+  void sampleNodeResources() {
     if (!placementCpuFullForTest) nodeCpu.sample(monotonicTimeMs());
+    if (!serverConfig.callTasksSource.empty()) {
+      std::ifstream input(serverConfig.callTasksSource);
+      uint64_t current;
+      if (input >> current) observedCallTasks = current;
+    }
   }
 
   kj::Promise<void> sampleWorkerSaturation() {
@@ -2124,13 +2184,17 @@ public:
         if (tenant->second.empty()) tenantAdmissions.erase(tenant);
       }
       if (workerCount != statelessInFlight.end()) {
-        KJ_ASSERT(workerCount->second > 0, "Worker admission count underflow");
+        KJ_ASSERT(workerCount->second > 0 && ordinaryInFlight > 0, "Worker admission count underflow");
+        --ordinaryInFlight;
         if (--workerCount->second == 0) statelessInFlight.erase(workerCount);
       }
     });
     if (root) ++inFlightRoots; else ++inFlightNested;
     if (tenant != tenantAdmissions.end()) ++tenant->second.active(root);
-    if (workerCount != statelessInFlight.end()) ++workerCount->second;
+    if (workerCount != statelessInFlight.end()) {
+      ++workerCount->second;
+      ++ordinaryInFlight;
+    }
     slot->server = this;
     slot->root = root;
     return slot;
@@ -2222,6 +2286,10 @@ public:
     std::ostringstream out; out << std::setprecision(17) << "{\"inFlight\":{\"roots\":" << inFlightRoots
         << ",\"nested\":" << inFlightNested << ",\"total\":" << inFlightRoots + inFlightNested
         << "},\"rootLimit\":" << serverConfig.rootLimit << ",\"nestedLimit\":" << serverConfig.nestedLimit
+        << ",\"callResources\":{\"demandDriven\":" << (serverConfig.processPool.demandDrivenCalls ? "true" : "false")
+        << ",\"firstRefusal\":" << (firstCallResourceRefusal.empty() ? "null" : firstCallResourceRefusal)
+        << ",\"tasksObserved\":" << observedCallTasks << ",\"taskBudget\":" << serverConfig.callTasks.capacity
+        << ",\"descriptorBudget\":" << serverConfig.callDescriptors.capacity << "}"
         << ",\"tenantAdmission\":" << tenantAdmissionJson()
         << ",\"loadBand\":\"" << memory.effectiveBand() << "\",\"loadBandForTest\":\"" << serverConfig.loadBandForTest << "\",\"p\":" << serverConfig.homeProbability
         << ",\"idleMs\":" << serverConfig.idleMs << ",\"hotVersions\":[";
@@ -2329,6 +2397,7 @@ public:
   struct LoadProbe {
     std::string checkId, processId, report, failure, culprit, workerId;
     std::string notSent;  // why the probe was not sent (nothing reached the process)
+    std::optional<coworkerd::CallResourceLevel> resource;
     uint64_t generation = 0;
     bool timedOut = false, exited = false, cpuExceeded = false, memoryExceeded = false;
     double elapsedMs = 0;
@@ -2369,10 +2438,11 @@ public:
       KJ_REQUIRE(response.statusCode == 200, "the runtime answered the load check with an HTTP error", response.statusCode);
       probe.report = body.cStr();
     } catch (const kj::Exception& error) {
+      probe.resource = process->resourceRefusal;
       probe.failure = error.getDescription().cStr();
       probe.timedOut = monotonicTimeMs() >= deadline;
     }
-    if (!probe.failure.empty() && !probe.timedOut) {
+    if (!probe.failure.empty() && !probe.timedOut && !probe.resource) {
       // The connection to workerd failed: let the pool observe the exit (it reads the culprit then), bounded.
       std::string ended;
       try { co_await timer.timeoutAfter(1000 * kj::MILLISECONDS, process->onExit()); }
@@ -2433,12 +2503,14 @@ public:
         if (pending->result) {
           const auto& result = *pending->result;
           if (!result.refusal) co_return LoadCheck{};
-          if (result.refusal->code != "LEASE_EXPIRED") {
+          // The other lane may have a stricter resource boundary than this one.
+          if (result.refusal->code != "LEASE_EXPIRED" && (!result.refusal->resource || pending->root == root)) {
             LoadCheck failed;
             failed.refusal = refusal(result.refusal->code, result.refusal->reason, result.refusal->status, root);
             failed.refusal->category = result.refusal->category;
             failed.refusal->notExecuted = result.refusal->notExecuted;
             failed.refusal->retryable = result.refusal->retryable;
+            failed.refusal->resource = result.refusal->resource;
             co_return failed;
           }
         }
@@ -2447,7 +2519,7 @@ public:
         co_return co_await loadCheck(std::move(version), std::move(entrypoint), deadline, root);
       }
       auto signal = kj::newPromiseAndFulfiller<void>();
-      shared = std::make_shared<PendingThreadedLoad>(kj::mv(signal.promise), kj::mv(signal.fulfiller));
+      shared = std::make_shared<PendingThreadedLoad>(kj::mv(signal.promise), kj::mv(signal.fulfiller), root);
       threadedLoads.emplace(key, shared);
     }
     LoadCheck result;
@@ -2458,10 +2530,13 @@ public:
     bool coldLoad = false;
     LoadProbe probe;
     for (int attempt = 0;; ++attempt) {
+      process->root = root;
       probe = co_await loadProbe(*version, std::move(process), entrypoint, deadline, forInvocation);
       category.clear(); detail.clear(); message.clear(); coldLoad = false; result.refusal.reset();
       bool limitWithoutEvidence = false;
-      if (!probe.notSent.empty()) {
+      if (probe.resource) {
+        result.refusal = resourceRefusal(*probe.resource, root);
+      } else if (!probe.notSent.empty()) {
         result.refusal = processRefusal(ProcessUnavailable{false, probe.notSent}, root);
       } else if (probe.timedOut) {
         result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
@@ -3102,7 +3177,11 @@ private:
     pathMark(timing, "descriptor");
     process->workerId = version->workerId; process->versionId = version->versionId;
     process->invocationId = invocationId; process->treeId = treeId;
-    if (slot) { slot->process = process; slot->ingressNodeId = ingressServerId; }
+    if (slot) {
+      slot->process = process;
+      process->root = slot->root;
+      slot->ingressNodeId = ingressServerId;
+    }
     if (executions.size() == MAX_EXECUTION_RECORDS) {
       executions.pop_front();
       ++droppedExecutions;
@@ -3145,7 +3224,7 @@ private:
         const auto refusal = threadedDurable ? this->durableStartRefusal(process->preExecutionRefusal) :
             this->refusal(current && !current->rejectionCode.empty() ? current->rejectionCode : "CODE_UNAVAILABLE",
                 current && !current->rejectionReason.empty() ? current->rejectionReason : "Worker unavailable before execution", 503, ingress);
-        if (!threadedDurable)
+        if (!threadedDurable && !process->resourceRefusal)
           observeLocalRefusal(refusal, ingress ? (peerIngress ? "peerIngress" : "localIngress") : "localBinding");
         std::cout << "[execution-rejected] {\"invocationId\":\"" << invocationId
                   << "\",\"treeId\":\"" << treeId << "\",\"target\":\"" << version->key()
@@ -4090,6 +4169,9 @@ private:
   std::map<std::string, uint64_t> loadFailures, loadFailureDetails;
   uint32_t inFlightRoots = 0;
   uint32_t inFlightNested = 0;
+  uint32_t ordinaryInFlight = 0;
+  uint64_t observedCallTasks = 0;
+  std::string firstCallResourceRefusal;
   std::map<std::string, coworkerd::TenantAdmissionCounts, std::less<>> tenantAdmissions;
   std::map<std::string, uint32_t> statelessInFlight;
   struct PausedAdmissionCounts {
@@ -4419,13 +4501,25 @@ void writeRefusal(rpc::InvocationOpenResult::Builder result, const InvocationRej
   refusal.setNotExecuted(value.notExecuted); refusal.setRetryable(value.retryable);
   if (!value.category.empty()) refusal.setCategory(value.category.c_str());
   if (value.workerInFlight) refusal.getWorkerLoad().setInFlight(*value.workerInFlight);
+  if (value.resource) {
+    auto resource = refusal.initResource();
+    const auto name = coworkerd::callResourceName(value.resource->resource);
+    resource.setKind(kj::StringPtr(name.data(), name.size()));
+    resource.setCurrent(value.resource->current);
+    resource.setLimit(value.resource->limit);
+    resource.setCapacity(value.resource->capacity);
+  }
 }
 
 InvocationRejection readRefusal(rpc::InvocationRejection::Reader value) {
   auto workerLoad = value.getWorkerLoad();
-  return {value.getStatus(), value.getCode().cStr(), value.getReason().cStr(), value.getLoadBand().cStr(),
+  InvocationRejection result{value.getStatus(), value.getCode().cStr(), value.getReason().cStr(), value.getLoadBand().cStr(),
       value.getInFlight(), value.getLimit(), value.getAvoidMs(), value.getCategory().cStr(), value.getNotExecuted(),
       value.getRetryable(), workerLoad.isInFlight() ? std::optional(workerLoad.getInFlight()) : std::nullopt};
+  const auto resource = value.getResource();
+  if (const auto kind = coworkerd::parseCallResource(resource.getKind().cStr()))
+    result.resource = coworkerd::CallResourceLevel{*kind, resource.getCurrent(), resource.getLimit(), resource.getCapacity()};
+  return result;
 }
 
 // One relay of an inbound WebSocket connection (WebSocketRegistry): `outer` toward the client -- the client itself at the
@@ -6109,7 +6203,11 @@ public:
             co_return InvocationAttempt{nullptr, server.refusal("LEASE_EXPIRED", "lease expired before execution", 410), true};
           }
           try {
-            auto opened = server.executeAllocated(version, allocation.ingressRoot ? "ingress" : "binding", allocation, std::move(slot), check);
+            auto opened = server.executeAllocated(version, allocation.ingressRoot ? "ingress" : "binding", allocation, slot, check);
+            if (auto refusal = co_await server.confirmOrdinaryAdmission(opened, slot)) {
+              const bool retryable = refusal->notExecuted && refusal->retryable;
+              co_return InvocationAttempt{nullptr, std::move(refusal), retryable};
+            }
             // Dispatch is committed. Pipeline HTTP now; its wrapper reports uncertainty.
             result = {std::move(opened.dispatcher), std::nullopt, false};
           } catch (const ProcessUnavailable& error) {
@@ -6129,9 +6227,9 @@ public:
           allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint,
           allocation.nativeProps, preferIdle, allocation.requestLease};
     };
-    bool allPaused = true, allTenantLimited = true;
+    bool allPaused = true, allTenantLimited = true, allResourceLimited = true;
     bool allNotExecuted = true;
-    std::optional<InvocationRejection> tenantRefusal;
+    std::optional<InvocationRejection> tenantRefusal, resourceRefusal;
     size_t finalRefusals = 0;
     const auto firstPassSize = std::min<size_t>(ordered.size(), hops);
     std::vector<coworkerd::SaturatedPlacementCandidate> saturated;
@@ -6207,6 +6305,9 @@ public:
       } else {
         ++finalRefusals;
         allNotExecuted = allNotExecuted && refusal.notExecuted;
+        if (refusal.resource) {
+          if (!resourceRefusal) resourceRefusal = refusal;
+        } else allResourceLimited = false;
         allPaused = allPaused && pausedRefusal(refusal);
         packagesUnavailable = packagesUnavailable && refusal.code == "LOAD_FAILED" &&
             refusal.category == PACKAGE_UNAVAILABLE;
@@ -6248,7 +6349,8 @@ public:
     if (allTenantLimited && tenantRefusal)
       co_return rejectedDispatcher(factory, headerTable, *tenantRefusal, allocation.expiresAtMonotonicMs);
     failures += ']';
-    auto refusal = server.refusal("PLACEMENT_EXHAUSTED", coworkerd::placementExhaustionReason(hops), 503, allocation.ingressRoot);
+    auto refusal = allResourceLimited && resourceRefusal ? std::move(*resourceRefusal) :
+        server.refusal("PLACEMENT_EXHAUSTED", coworkerd::placementExhaustionReason(hops), 503, allocation.ingressRoot);
     // Preserve explicit pre-execution proof through placement aggregation. A failed
     // connection alone is insufficient evidence that another node did not execute.
     if (finalRefusals > 0 && allNotExecuted) refusal.notExecuted = refusal.retryable = true;
@@ -6725,13 +6827,22 @@ public:
     try {
       auto opened = server.openForwarded(std::move(version), invocation.treeId, invocation.parentInvocationId,
           invocation.depth, invocation.expiresAtMonotonicMs, invocation.callSequence,
-          invocation.orderSequence, invocation.pins, std::move(slot), invocation.ingressRoot, invocation.ingressServerId, check,
+          invocation.orderSequence, invocation.pins, slot, invocation.ingressRoot, invocation.ingressServerId, check,
           invocation.requestLease);
+      if (auto refusal = co_await server.confirmOrdinaryAdmission(opened, slot)) {
+        if (refusal->notExecuted) reject(*refusal);
+        else context.initResults().initResult().setAccepted(
+            rejectedDispatcher(factory, headerTable, *refusal, invocation.expiresAtMonotonicMs));
+        co_return;
+      }
       context.initResults().initResult().setAccepted(opened.dispatcher);
       // Acceptance commits dispatch; later failures travel through AdmissionHttpService.
       co_return;
     } catch (const ProcessUnavailable& error) {
       reject(server.processRefusal(error));
+    } catch (const kj::Exception& error) {
+      context.initResults().initResult().setAccepted(rejectedDispatcher(factory, headerTable,
+          server.refusal("RESULT_UNCERTAIN", error.getDescription().cStr()), invocation.expiresAtMonotonicMs));
     }
   }
 
@@ -7370,7 +7481,12 @@ public:
         server.observeStaticAttempt(targetServerId, refusal);
         co_return Dispatched{rejectedDispatcher(factory, headerTable, refusal, expiresAtMonotonicMs)};
       }
-      auto opened = server.executeAllocated(std::move(version), "binding", std::move(allocation), std::move(slot), check);
+      auto opened = server.executeAllocated(std::move(version), "binding", std::move(allocation), slot, check);
+      if (auto refusal = co_await server.confirmOrdinaryAdmission(opened, slot)) {
+        server.observeRefusal(*refusal, "localBinding");
+        server.observeStaticAttempt(targetServerId, refusal);
+        co_return Dispatched{rejectedDispatcher(factory, headerTable, *refusal, expiresAtMonotonicMs)};
+      }
       server.observeStaticAttempt(targetServerId, std::nullopt);
       pathMark(timing, "attempt-logs");
       co_return Dispatched{std::move(opened.dispatcher), std::move(opened.ready)};
@@ -10040,6 +10156,10 @@ private:
     auto opening = slot;
     auto opened = server.open(std::move(selected.version), "ingress", std::move(selected.pins), deadline,
         std::move(slot), check, requestLease);
+    if (auto refusal = co_await server.confirmOrdinaryAdmission(opened, opening)) {
+      server.observeRefusal(*refusal, "localIngress");
+      co_return co_await sendText(response, 503, "Service Unavailable", refusalBody(*refusal, deadline), "application/json");
+    }
     if (webSocket && opening->process) webSocket->treeId = opening->process->treeId;
     auto forwardedUrl = kj::str("http://", host.c_str(), url);
     auto forwardedHeaders = headers.clone();
@@ -10382,9 +10502,9 @@ kj::Promise<void> watchDurableEpoch(coworkerd::DurableLog& durableLog, coworkerd
   }
 }
 
-kj::Promise<void> sampleNodeCpu(ServerCore& server, kj::Timer& timer) {
+kj::Promise<void> sampleNodeResources(ServerCore& server, kj::Timer& timer) {
   while (true) {
-    server.sampleNodeCpu();
+    server.sampleNodeResources();
     co_await timer.afterDelay(1 * kj::SECONDS);
   }
 }
@@ -10545,11 +10665,11 @@ fs::path makeDurableTestStack(const fs::path& fixtureStack) {
 // the threaded binary's sandbox, this machine's memory protection keys, address space and
 // vm.max_map_count lower each process's resident limit (never the process count).
 // A plan that refuses ends the start.
-void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& workerdPath) {
+bool planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& workerdPath) {
   if (const char* keys = std::getenv("COWORKERD_SANDBOX_PROTECTION_KEYS")) pool.protectionKeys = keys;
   KJ_REQUIRE(pool.protectionKeys == "auto" || pool.protectionKeys == "off" || pool.protectionKeys == "required",
       "sandbox.protectionKeys must be auto, off or required", pool.protectionKeys.c_str());
-  if (pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurable()) return;
+  if (pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurable()) return false;
   const auto threaded = pool.threadedExecutable.empty()
       ? (fs::path(workerdPath).parent_path() / "coworkerd-threaded").string() : pool.threadedExecutable;
   auto plan = coworkerd::planV8Sandbox(pool.protectionKeys, coworkerd::probeSandboxBuild(threaded),
@@ -10568,10 +10688,12 @@ void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& 
   if (plan.perProcessLimit != 0) pool.sandboxResidentLimit = plan.perProcessLimit;
   // A Wasm memory reserves its maximum in the 4 GiB buffer half of the isolate's sandbox.
   if (plan.mode == "guard-regions") pool.sandboxWasmCapMiB = 1024;
+  return pool.count > 0 && coworkerd::probeDemandDrivenCalls(threaded);
 }
 
-void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t memoryBudgetBytes,
-    const std::string& workerdPath) {
+void applyProcessPoolEnvironment(ServerConfig& config, const std::string& workerdPath) {
+  auto& pool = config.processPool;
+  const auto memoryBudgetBytes = config.memoryBudgetBytes;
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
   if (std::getenv("COWORKERD_CPU_LIMIT_MS")) pool.durableCpuLimitMs = pool.cpuLimitMs;
   if (pool.threadedDurable()) pool.durableCpuLimitMs = 30000;
@@ -10586,7 +10708,7 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   pool.threadedResidentLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_RESIDENT_LIMIT", pool.threadedResidentLimit, 1840));
   pool.threadedThreadIdleMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_THREAD_IDLE_MS", pool.threadedThreadIdleMs, UINT32_MAX));
   pool.threadedMemoryBytes = environmentUnsigned("COWORKERD_THREADED_MEMORY_BYTES", pool.threadedMemoryBytes, UINT64_MAX);
-  planOrdinarySandbox(pool, workerdPath);
+  const bool demandDrivenCalls = planOrdinarySandbox(pool, workerdPath);
   const auto [nodeBytes, memorySource] = coworkerd::MemoryWatermark::nodeMemory(memoryBudgetBytes);
   const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
   const auto memoryShare = (nodeBytes - nodeBytes / 5) / generations;
@@ -10594,9 +10716,17 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   KJ_REQUIRE((pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurable()) ||
       (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
+  // Even if the process dedicated all of its memory to call threads, half of
+  // this ceiling would suffice. The resource budget, with live isolate use,
+  // is what normally refuses a call.
+  const auto ordinaryDefault = static_cast<uint32_t>(std::clamp<uint64_t>(
+      pool.threadedMemoryBytes / (coworkerd::CALL_THREAD_STACK_BYTES / 2),
+      coworkerd::ProcessPoolConfig::LEGACY_IN_FLIGHT_LIMIT, coworkerd::MAX_ORDINARY_CALL_CEILING));
+  config.resolveCallAdmission(demandDrivenCalls ? ordinaryDefault : 0);
   if (pool.count + pool.quarantineProcesses > 0) {
-    const auto threadsRequired = 32 + (uint64_t(pool.count) + pool.quarantineProcesses + 1) *
-        (uint64_t(pool.inFlightLimit) + 27) + uint64_t(pool.durableProcesses) * 8;
+    const auto ordinaryGenerations = uint64_t(pool.count) + pool.quarantineProcesses + 1;
+    const auto fixedThreads = 32 + ordinaryGenerations * 27 + uint64_t(pool.durableProcesses) * 8;
+    const auto threadsRequired = fixedThreads + (pool.demandDrivenCalls ? 0 : ordinaryGenerations * pool.inFlightLimit);
     uint64_t uidThreads = 0;
 #ifdef __linux__
     // RLIMIT_NPROC counts every existing thread of the real UID, including
@@ -10618,10 +10748,14 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
     KJ_REQUIRE(getrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot read thread configuration");
     KJ_REQUIRE(processLimit.rlim_max == RLIM_INFINITY || processLimit.rlim_max >= uidRequired,
         "insufficient host thread hard limit", threadsRequired, uidThreads, processLimit.rlim_max);
-    if (processLimit.rlim_cur < uidRequired) {
-      processLimit.rlim_cur = uidRequired;
-      KJ_REQUIRE(setrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot set thread soft limit", uidRequired);
+    // Demand-driven threads consume the OS limit when admitted, so they need the inherited hard limit.
+    const auto softLimit = pool.demandDrivenCalls ? processLimit.rlim_max : static_cast<rlim_t>(uidRequired);
+    if (processLimit.rlim_cur < softLimit) {
+      processLimit.rlim_cur = softLimit;
+      KJ_REQUIRE(setrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot set thread soft limit", softLimit);
     }
+    if (pool.demandDrivenCalls && processLimit.rlim_max != RLIM_INFINITY)
+      config.callTasks = {coworkerd::CallResource::NodeTasks, uidRequired, uint64_t(processLimit.rlim_max), 1};
 #ifdef __linux__
     auto cgroup = fs::path("/sys/fs/cgroup");
     std::ifstream membership("/proc/self/cgroup"); std::string member;
@@ -10634,13 +10768,22 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
       std::string maximum; uint64_t current = 0;
       if (maximumFile >> maximum && maximum != "max" && currentFile >> current) {
         uint64_t bound = 0; auto parsed = std::from_chars(maximum.data(), maximum.data()+maximum.size(), bound);
-        KJ_REQUIRE(parsed.ec == std::errc() && current <= bound && threadsRequired <= bound-current,
+        KJ_REQUIRE(parsed.ec == std::errc() && parsed.ptr == maximum.data()+maximum.size() &&
+            current <= bound && threadsRequired <= bound-current,
             "insufficient cgroup thread headroom", threadsRequired, current, bound);
+        if (pool.demandDrivenCalls && (config.callTasks.capacity == 0 ||
+            bound - current - threadsRequired < config.callTasks.capacity - config.callTasks.baseline)) {
+          config.callTasks = {coworkerd::CallResource::NodeTasks, current + threadsRequired, bound, 1};
+          config.callTasksSource = directory / "pids.current";
+        }
       }
     }
 #endif
-    const auto minimumMemory = (64ull << 20) + (uint64_t(pool.inFlightLimit) + 16) * (256ull << 10) + (2ull << 20);
-    KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, std::max<uint64_t>(8ull << 20, uint64_t(pool.inFlightLimit) << 20)) > minimumMemory,
+    const auto eagerSlots = pool.demandDrivenCalls ? 0 : pool.inFlightLimit;
+    const auto minimumMemory = (70ull << 20) + uint64_t(eagerSlots) * coworkerd::CALL_THREAD_STACK_BYTES;
+    const auto recoveryMemory = std::min<uint64_t>(pool.threadedMemoryBytes / 10,
+        std::max<uint64_t>(8ull << 20, uint64_t(eagerSlots) << 20));
+    KJ_REQUIRE(pool.threadedMemoryBytes - recoveryMemory > minimumMemory,
         "native process memory budget leaves no active Worker", minimumMemory, pool.threadedMemoryBytes);
   }
   for (auto [name, field] : {std::pair{"COWORKERD_IDLE_EVICT_MS", &pool.idleEvictMs},
@@ -10706,10 +10849,11 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
 
 // Budget the active and replacement generations, other ingress traffic, and the open WebSockets together.
 void applyNodeDescriptorLimit(ServerConfig& config) {
-  const auto& pool = config.processPool;
+  auto& pool = config.processPool;
   const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
-  const auto childRequired = uint64_t(pool.inFlightLimit) * 8 + 256;
-  const auto nodeRequired = 256 + generations * (uint64_t(pool.inFlightLimit) * 4 + 128);
+  const auto eagerSlots = pool.demandDrivenCalls ? 0 : pool.inFlightLimit;
+  const auto childRequired = uint64_t(eagerSlots) * 8 + 256;
+  const auto nodeRequired = 256 + generations * (uint64_t(eagerSlots) * 4 + 128);
   const auto poolDescriptors = std::max(childRequired, nodeRequired);
   rlimit limits;
   KJ_SYSCALL(getrlimit(RLIMIT_NOFILE, &limits));
@@ -10727,11 +10871,17 @@ void applyNodeDescriptorLimit(ServerConfig& config) {
   KJ_REQUIRE(plan.webSockets > 0, "insufficient host descriptor hard limit for the node and one ingress WebSocket",
       "required", poolDescriptors + coworkerd::OTHER_INGRESS_DESCRIPTORS + coworkerd::DESCRIPTORS_PER_WEBSOCKET,
       "hard limit", hard);
-  if (soft < plan.softLimit) {
-    limits.rlim_cur = static_cast<rlim_t>(plan.softLimit);
-    KJ_SYSCALL(setrlimit(RLIMIT_NOFILE, &limits), "cannot set node descriptor soft limit", plan.softLimit);
+  const auto targetSoft = pool.demandDrivenCalls && hard != UINT64_MAX ? hard : plan.softLimit;
+  if (soft < targetSoft) {
+    limits.rlim_cur = static_cast<rlim_t>(targetSoft);
+    KJ_SYSCALL(setrlimit(RLIMIT_NOFILE, &limits), "cannot set node descriptor soft limit", targetSoft);
   }
   config.webSocketsPerNode = plan.webSockets;
+  if (pool.demandDrivenCalls) {
+    config.callDescriptors.capacity = hard == UINT64_MAX ? 0 : hard;
+    config.callDescriptors.baseline = nodeRequired + coworkerd::OTHER_INGRESS_DESCRIPTORS +
+        uint64_t(plan.webSockets) * coworkerd::DESCRIPTORS_PER_WEBSOCKET;
+  }
   if (plan.webSockets < plan.requested) {
     std::cout << "[server] {\"event\":\"warning\",\"subject\":\"ingress-websocket-capacity\",\"requested\":" << plan.requested
               << ",\"effective\":" << plan.webSockets << ",\"hardDescriptorLimit\":" << hard
@@ -10779,7 +10929,9 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"prefetchConcurrency\":" << d.cache.prefetchConcurrency
       << "},\"hostCheck\":{\"intervalMs\":" << c.hostCheck.intervalMs << ",\"sampleMiB\":" << c.hostCheck.sampleMiB
       << "},\"processPool\":{\"count\":" << p.count << ",\"quarantineProcesses\":" << p.quarantineProcesses
-      << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
+      << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"ordinaryInFlightLimit\":" << p.inFlightLimit
+      << ",\"durableInFlightLimit\":" << p.durableInFlightLimit()
+      << ",\"demandDrivenCalls\":" << b(p.demandDrivenCalls) << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
       << ",\"stuckTimeoutMs\":" << p.stuckTimeoutMs << ",\"restartBackoffMs\":" << p.restartBackoffMs << ",\"restartMaxMs\":" << p.restartMaxMs
       << ",\"pausedAdmissionWaitMs\":" << p.pausedAdmissionWaitMs
       << ",\"watchdog\":" << b(p.watchdog) << ",\"idleEvictMs\":" << p.idleEvictMs << ",\"idleDestroyIntervalMs\":" << p.idleDestroyIntervalMs
@@ -10801,6 +10953,8 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"syscalls\":{\"mode\":" << q(p.syscallsMode) << ",\"allowlistPath\":" << q(p.allowlistPath)
       << ",\"steady\":{\"mode\":" << q(p.steadySyscallsMode) << ",\"allowlistPath\":" << q(p.steadyAllowlistPath) << "}}"
       << "},\"placement\":{\"ingressPlacement\":" << b(c.ingressPlacement) << ",\"rootLimit\":" << c.rootLimit << ",\"nestedLimit\":" << c.nestedLimit
+      << ",\"nodeTaskBudget\":" << c.callTasks.capacity << ",\"nodeTaskReserve\":" << c.callTasks.baseline
+      << ",\"nodeDescriptorBudget\":" << c.callDescriptors.capacity << ",\"nodeDescriptorReserve\":" << c.callDescriptors.baseline
       << ",\"tenantRootLimit\":" << c.tenantRootLimit << ",\"tenantNestedLimit\":" << c.tenantNestedLimit
       << ",\"tenantBorrowBelowPercent\":" << c.tenantBorrowBelowPercent
       << ",\"subcalls\":" << q(c.subcalls)
@@ -10833,7 +10987,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"clusterAddresses\":" << c.egress.clusterAddresses.size() << ",\"tenants\":" << c.egress.tenants.size()
       << "},\"peerAuth\":{\"keyFile\":" << q(c.peerAuth.keyFile) << ",\"windowMs\":" << c.peerAuth.windowMs
       << "},\"forTest\":{\"clockOffsetMs\":" << c.clockOffsetMsForTest << ",\"disableAlreadyPlaced\":" << b(c.disableAlreadyPlacedForTest)
-      << ",\"loadBand\":" << q(c.loadBandForTest) << ",\"equalLimits\":" << b(c.equalLimitsForTest)
+      << ",\"loadBand\":" << q(c.loadBandForTest)
       << ",\"versionResolution\":" << q(d.versionResolutionForTest) << ",\"deploymentApplyDelayMs\":" << d.deploymentApplyDelayMsForTest
       << ",\"drainAnnounceDelayMs\":" << c.drainAnnounceDelayMsForTest << "}}";
   return out.str();
@@ -10927,7 +11081,7 @@ int run(Launch launch) {
     KJ_REQUIRE(std::string(enabled) == "0" || std::string(enabled) == "1", "invalid memory watermark override");
     serverConfig.memoryWatermarkEnabled = std::string(enabled) == "1";
   }
-  applyProcessPoolEnvironment(serverConfig.processPool, serverConfig.memoryBudgetBytes, launch.workerd);
+  applyProcessPoolEnvironment(serverConfig, launch.workerd);
   applyNodeDescriptorLimit(serverConfig);
   // Outbound requests and the peer key, as the file says or these override; the rules are checked here.
   if (const char* mode = std::getenv("COWORKERD_EGRESS_MODE"); mode != nullptr && *mode) serverConfig.egress.mode = mode;
@@ -11339,7 +11493,7 @@ int run(Launch launch) {
       .exclusiveJoin(suspects.run())
       .exclusiveJoin(tenantUsage.run())
       .exclusiveJoin(runLeaseReaper(server, timer))
-      .exclusiveJoin(sampleNodeCpu(server, timer))
+      .exclusiveJoin(sampleNodeResources(server, timer))
       .exclusiveJoin(sampleWorkerSaturation(server, timer))
       .exclusiveJoin(runLogClock(timer))
       .exclusiveJoin(membership->run())
@@ -11382,7 +11536,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
     launch = serveLaunch(options, false);
     const char* runtimeFile = std::getenv("COWORKERD_RUNTIME_FILE");
     if (runtimeFile) launch->runtime = fs::absolute(runtimeFile).string();
-    applyProcessPoolEnvironment(launch->config.processPool, launch->config.memoryBudgetBytes, launch->workerd);
+    applyProcessPoolEnvironment(launch->config, launch->workerd);
     applyNodeDescriptorLimit(launch->config);
     report("configuration", true, ",\"configFile\":\"" + jsonEscape(launch->configFile.string()) + "\",\"nodeId\":\"" +
         jsonEscape(launch->config.serverId) + "\",\"webSocketsPerNode\":" + std::to_string(launch->config.webSocketsPerNode));

@@ -184,6 +184,13 @@ void MemoryWatermark::noteDaemonAppend() {
 }
 void MemoryWatermark::setTestBand(const std::string& value) { impl->testBand = number(value); impl->publish(); }
 std::string MemoryWatermark::effectiveBand() const { return BANDS[impl->effective()]; }
+CallResourceBudget MemoryWatermark::callMemoryBudget() const {
+  // Reuse the working-set sample and the red band's recovery margin. The kernel
+  // accounts the call's own process memory before it acknowledges dispatch.
+  const auto& sample = *impl;
+  const auto operatingBudget = sample.enabled ? sample.budget - sample.budget / 10 : 0;
+  return {CallResource::NodeMemory, 0, operatingBudget, 1, sample.workingSet};
+}
 int MemoryWatermark::channelDescriptor() const { return impl->channel; }
 std::string MemoryWatermark::json() const {
   const auto& s = *impl;

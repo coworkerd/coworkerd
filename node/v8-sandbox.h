@@ -94,6 +94,7 @@ std::string protectionKeysReason(const ProtectionKeyFacts& keys);
 
 // The probes.
 SandboxBuildFacts probeSandboxBuild(const std::string& threadedExecutable);
+bool probeDemandDrivenCalls(const std::string& threadedExecutable);
 SandboxBuildFacts parseSandboxFacts(const std::string& output, int exitStatus);
 ProtectionKeyFacts probeProtectionKeys();
 ProtectionKeyFacts parseCpuFlags(const std::string& cpuinfo);
