@@ -161,6 +161,8 @@ const config = {
   durableObjects: {
     processes: 1, threadedTestStorage: true, ...(measure || placement || queues || httpLifecycle || httpMemory ? { residentObjects: 0 } : {}),
   },
+  // Keep enough node slots for each Worker root and its overlapping durable calls.
+  ...(overlap ? { placement: { rootLimit: 128, nestedLimit: 384 } } : {}),
   processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: overlap ? 32 : 8,
     ...(queueLimit ? { threadedExecutable: descriptorLimitedThreaded } : {}) },
   quarantineProcesses: 0,

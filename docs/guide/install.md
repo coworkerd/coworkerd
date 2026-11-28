@@ -471,6 +471,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `management.token` | required | The management token (see section 8); the environment variable `COWORKERD_MANAGEMENT_TOKEN` takes precedence. A node without one refuses to start |
 | `management.allowWithoutToken` | `false` | `true` lets a development node start without a token: its management endpoints are then open to whoever reaches its ingress or peer port, and it warns at startup |
 | `processPool.count` | `1` | The number of ordinary workerd processes |
+| `processPool.inFlightLimit` | derived for ordinary and quarantine processes; 512 for durable processes | An explicit value sets the ceiling on each process. See [waiting-call capacity](#waiting-call-capacity). |
 | `processPool.ordinaryServer` | `threaded` | C++ backend for ordinary and quarantine processes: HTTP, JS RPC, outbound calls, logs, bindings, object stubs, CPU and memory limits, eviction and generation draining. `upstream` is refused for this setting. Durable processes use the Rust backend |
 | `processPool.threadedExecutable` | `coworkerd-threaded` beside `workerdPath` | Executable used when the ordinary backend is `threaded`. Build it with `//src/workerd/threaded:coworkerd-threaded` in the matching workerd fork |
 | `processPool.threadedMemoryBytes` | `0` | Native process memory budget in bytes. `0` divides 80% of the node's actual memory budget among ordinary, quarantine and durable processes plus one replacement generation. An explicit value cannot exceed this share |
@@ -551,23 +552,19 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 
 ### Waiting-call capacity
 
-The default placement thresholds are 128 calls in flight for new roots and 384 for nested calls.
-The default per-process limit is 512. In two batches of 2,000 ordinary calls with a two-second
-upstream wait, each batch completed 128 calls and refused 1,872 at the node's root threshold.
-With explicit experimental node and process limits on the same published ARM64 kernel,
-two batches completed all 2,000 calls. The full waits overlapped for 1.392 s and 1.524 s.
+The node's call ceilings are an overload fuse, with new roots stopped before nested calls so
+that admitted trees can continue. An ordinary or quarantine process defaults to one slot
+per MiB of its assigned memory, between 512 and 16,384 before any task or descriptor reduction,
+and the node defaults to all ordinary slots for nested calls and three quarters for roots.
+A Worker that waits on an upstream for a long time can reach the fuse first on a small node, and
+operators can raise it by adding memory and OS capacity or explicitly setting
+`processPool.inFlightLimit` after checking the budgets.
 
-A separate 12-second probe on the same eight-vCPU Linux VM and a 20 GiB node container completed
-11,250 calls with full overlap for 8.062 s. A larger batch briefly reached the configured
-11,400-call ceiling. Each wait added about one native thread, four daemon descriptors, five
-ordinary-process descriptors and 486 KiB of node cgroup memory at the 11,250-call sample.
-At startup the same node budget accepted 11,516 configured process slots and refused 11,517
-because the ordinary-process memory share could no longer fund an active Worker.
+An explicit setting is taken as given. An omitted placement ceiling stays within the
+ordinary slots, and an omitted root ceiling leaves room below an explicit nested ceiling.
+A one-slot ordinary pool needs both placement limits set explicitly. Durable processes
+keep a default of 512 calls per process. [Historical readings and reproduction](../waiting-call-capacity.md)
 
-The threaded kernel reserves memory for configured slots at startup. Reserving more slots
-reduces the memory available for Worker isolates even when the node is idle. The measured
-live-call cost and the startup reservation both enter capacity planning.
-[Readings, resource budgets and reproduction commands](../waiting-call-capacity.md)
 
 ### Invocation budgets
 

@@ -113,6 +113,9 @@ struct ProcessPoolConfig {
   // The largest Wasm memory the plan allows a process's isolates (0: no cap of the sandbox's).
   uint32_t sandboxWasmCapMiB = 0;
   std::string sandboxPlanJson, sandboxWarning;
+  bool inFlightLimitGiven = false;
+  uint32_t durableInFlightLimit() const { return inFlightLimitGiven ? inFlightLimit : 512; }
+  uint32_t processInFlightLimit(bool durable) const { return durable ? durableInFlightLimit() : inFlightLimit; }
   void validate() const;
 };
 
@@ -269,6 +272,10 @@ struct ServerConfig {
   int64_t clockOffsetMsForTest = 0;
   uint32_t rootLimit = 128;
   uint32_t nestedLimit = 384;
+  bool rootLimitGiven = false;
+  bool nestedLimitGiven = false;
+  void resolvePlacementLimits();
+  void validatePlacementLimits() const;
   uint32_t tenantRootLimit = 0;
   uint32_t tenantNestedLimit = 0;
   uint32_t tenantBorrowBelowPercent = 0;
@@ -283,7 +290,6 @@ struct ServerConfig {
   bool memoryWatermarkEnabled = true;
   uint64_t memoryBudgetBytes = 0;
   HostCheckConfig hostCheck;
-  bool equalLimitsForTest = false;
   bool ingressPlacement = true;
   coworkerd::ProcessPoolConfig processPool;
   coworkerd::MembershipConfig membership;

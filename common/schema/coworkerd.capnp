@@ -856,7 +856,7 @@ struct PlacementConfig {
   rejectionAvoidMs @5 :UInt32 = 100;
   connectBackoffMs @6 :UInt32 = 100;
   loadBandForTest @7 :Text = "green";
-  equalLimitsForTest @8 :Bool = false;
+  equalLimitsForTest @8 :Bool = false;  # Deprecated; equality is always invalid.
   # Stateless Service Binding fetch and method calls try the caller's node first, then the ordinary warm/home policy.
   # Measurements found lower local p99 at both tested tenant counts and all three RTTs, at the cost of additional
   # svc replicas on caller nodes. Select "home" for memory-first deployments or large caller fan-out.

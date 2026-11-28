@@ -45,9 +45,9 @@ const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-hot-placemen
   singleNode,
   configureNode: () => ({
     ingressPlacement: !singleNode,
-    // This enables per-tenant slot accounting. The fixture sends only roots and the
-    // tenant ceiling for nested calls is the same as the node-wide nested ceiling.
-    placement: { homeProbability: 1, ...(longRun && { tenantNestedLimit: 384 }) },
+    // Keep the ceilings from the recorded comparison. The optional tenant ceiling
+    // enables slot accounting for the long run, whose traffic consists of roots.
+    placement: { rootLimit: 128, nestedLimit: 384, homeProbability: 1, ...(longRun && { tenantNestedLimit: 384 }) },
     ...(pinned && { placements: [{ workerId: hot, nodeId: home }] }),
   }),
 });

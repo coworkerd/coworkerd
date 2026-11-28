@@ -132,6 +132,7 @@ public:
   WorkerLimits effectiveLimits(const std::string& workerId, bool durable = false) const;
   bool hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const;
   std::shared_ptr<ProcessCall> select(const std::string& worker);
+  std::optional<uint32_t> fullProcessLimit(const std::string& worker, const std::string& objectKey = "");
   kj::Promise<void> sampleWorkerSaturation();
   bool workerSaturated(const std::string& worker, std::string_view planRevision, double nowMs) const;
   // Scheduling hint only: no refresh, process admission, or dispatch commitment.
