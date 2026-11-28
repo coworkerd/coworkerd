@@ -221,6 +221,12 @@ separate node admission budget. [Maintainer decision](https://github.com/coworke
 
 ### Threaded SQLite memory limit
 
+For an ordinary-object latency and CPU comparison, use
+`node tests/cluster/durable-object-sql-heap-measure.mjs "$baseline" "$candidate"`. The driver
+uses the same daemon build at 100 requests per second in alternating kernel order and records
+read and write latency, request counts and durable child CPU ticks. It verifies the actor
+instance and every increment acknowledged by the output gate.
+
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-memory-limit` with the matching Linux
 binaries. The threaded owner uses a 1 MiB SQLite heap budget. The case checks repeated queries
 below and above the budget, HTTP and D1 rollback, the confirmed `exec()` prefix, and recovery
@@ -562,6 +568,8 @@ get those files and the cluster runner's combined output in `cluster.log`.
 | `durable-platform-definition` | A separate node executable installs fixture definitions for two tenants. Ordinary bindings reach the shard owner's build across two builds. Copy tokens show warm reuse within a tenant and isolation across tenants. A platform object runs an alarm, reopens after idle release, and recovers every acknowledged SQL write after owner loss. |
 | `durable-threaded-fence` | A paused old owner has positive acknowledgements withheld until a live node acquires a higher shard epoch. Releasing the acknowledgements before the confirmation deadline must never return success to that old owner's write. The next owner still reads the earlier confirmed value. |
 | `durable-threaded-alarm-fence` | A nonretrying abort clears its schedule, and a constructor exception consumes retries with backoff. When both peers hold confirmations through shard takeover, the old owner's alarm clear cannot succeed or suppress the recovered alarm. The successor stops dispatching a previously confirmed clear, and replacing an inherited schedule prevents it from firing at the old time. |
+| `durable-threaded-object-sqlite-heap` | A 1 MiB fixture rolls back synchronous and asynchronous SQL transactions, including a caught refusal followed by a KV write. A single refused write preserves the object for a later write. A rollback of earlier writes or pending alarm changes fails the response and preserves confirmed storage. The fixture checks two idle trims on an open ordinary WebSocket, then opens objects one at a time to measure 256 simultaneously open connections. It checks idle and close credits and confirmation for an object with a retained cursor. |
+| `durable-threaded-object-sqlite-process-memory` | A live ArrayBuffer consumes shared process headroom. A larger SQL allocation rolls back with a retryable `OVERLOADED` exception and the original connection still serves a read. |
 | `durable-threaded-migration` | An open stream stays on its original version until the drain expires. A request still waiting for headers receives `DO_CODE_UPDATED` with an uncertain result and its confirmed write occurs once. The old RPC capability and WebSockets close, including a parked facet socket whose startup options are discarded across the definition change. The renamed class keeps its namespace, ID and confirmed storage and handles an alarm due during the drain. Class deletion removes the namespace from admission. |
 | `durable-threaded-hibernation` | Two root connections and a nested facet connection park together and answer ping and automatic replies with zero actor sessions. The facet parks again after a root-only residency, then receives its frames in order and reaches the original bindings. An HTTP reopen verifies constructor-visible socket state. The case also checks startup option limits, unforwarded upgrades, facet abort and deletion, and fencing after a shard takeover. |
 | `durable-threaded-socket-frame-budget` | With an eight-byte budget, a four-byte message uses all reserved bytes while its parked socket waits for adoption. A second socket receives `1013` and its object receives the close event. When adoption resumes, the first delivery returns the reservation and a subsequent binary message round-trips unchanged. |

@@ -45,6 +45,30 @@ A statement exceeding the budget throws `SQL_LIMIT_EXCEEDED`; later SQL in that 
 
 An uncaught read error normally returns 500; a reset after an interrupted write returns 503. User error text or a user-set `code` does not create the platform's database error code. A smaller tenant CPU allowance does not take effect inside a running native SQL statement. With a 50 ms tenant CPU allowance and the default 200 ms SQL budget, a long SQL test returned `503 CPU_LIMIT_EXCEEDED` after about 220 ms, once native execution returned. Interruption is cooperative: a costly function or blocking I/O without progress callbacks can run past the SQL limit. A sequence of callback-free segments each taking more than 250 microseconds is undercounted by the sampled estimate, increasingly so as the segments become more expensive. The process watchdog, normally 3000 ms, remains its fallback.
 
+On the experimental threaded backend, each SQLite connection has a 32 MiB heap budget for
+`ctx.storage.sql`. The budget covers SQLite's live allocations, including prepared statements, page caches and
+query working memory. Each facet uses its own connection. The durable process reserves the heap
+in 64 KiB steps alongside its other memory use. The connection retains one step across small
+drops while busy. After one second of inactivity, the home releases reclaimable page cache and
+excess reserved credit, including while an ordinary WebSocket stays open. Opening and internal
+maintenance are accounted for. Confirmed close returns the connection's remaining reservation.
+
+A statement that exceeds the connection heap limit throws `SQL_MEMORY_LIMIT_EXCEEDED`. A shared
+reservation refusal throws `OVERLOADED` with `dispatched: false` and `retryable: true` for
+the failed SQL operation. The active transaction rolls back. A refused explicit transaction
+cannot commit, even if the callback catches the error. If rollback affects earlier writes or a
+pending alarm change, responses waiting for storage confirmation fail with HTTP 503 and the
+object resets. The next call opens the last confirmed storage. If the statement opened its own
+implicit transaction or the rollback stays within an isolated explicit transaction, the same
+object can serve further statements. When shared headroom returns, retry the transaction.
+Side effects elsewhere in the handler may have run.
+
+Isolate copies and SQLite reservations share seven eighths of the configured
+`processPool.threadedMemoryBytes`. By default, the node derives that setting from its memory
+budget and process count. At 128 KiB per idle connection, 4,096 root objects reserve 512 MiB for SQLite. Isolate memory, additional connections and larger
+live heaps also draw from this budget. Current default placement holds up to 256 ordinary
+object trees per process.
+
 After a declared secret or binding changes, the object's next request selects the updated definition. On the experimental threaded host, this uses the same bounded drain as a code update. Other objects reopen on their own next requests. Stateless Workers keep their loaded values until their isolates are evicted.
 
 ## 2. Declare the namespace
