@@ -61,6 +61,10 @@ Run the capacity case explicitly on a Linux Docker host that can sustain 5,000 c
 execution node. It verifies both the forwarded and executing counts, then compares peer RPC messages per second
 and Linux main-thread CPU for each node before and during the held requests.
 
+## Expected failures with threaded durable storage
+
+The list is empty. The runner requires every case to pass.
+
 ### Threaded admission refusal
 
 `durable-threaded-admission-refusal` uses a single resident object slot on one owner and a one-event database
@@ -538,7 +542,7 @@ get those files and the cluster runner's combined output in `cluster.log`.
 | `process-replacement` | Killing an ordinary workerd process marks a tenant without evidence, leaves its slot unavailable, or prevents the replacement from serving the next Worker request. |
 | `fatal-attribution` (test kernel) | A confirmed fatal exit fails to route the tenant's next call to quarantine, a peer fails to apply the suspect mark, a repeat exit affects the ordinary process, an unrelated tenant fails to recover, shared-cage exhaustion marks the last allocator, an exit through V8's own API check or one during the load stays unattributed, or V8's diagnostic is missing. |
 | `log-quota` | A node keeps too many log lines per second, discards another tenant's lines, keeps an older line over the tenant's byte budget, or returns a shortened line without `truncated: true`. |
-| `durable-peer-ack` | An HTTP reply or a JS RPC result from a Durable Object escapes while both replication peers hold positive append acknowledgements, or the write fails to return and read back its value after those acknowledgements are released. The run also checks a separate object's read during the hold. |
+| `durable-peer-ack` | An HTTP reply and a JS RPC result wait while both replication peers hold positive append acknowledgements. After the acknowledgements are released, each write completes and reads back its value. A separate object serves reads during the hold. |
 | `durable-takeover` | After the owner is killed during concurrent writes, another live node must take ownership in a later epoch and recover every write for which the client received a complete success response. Writes without such a response may survive or be lost. The case detects premature acknowledgements that lead to lost writes in the run. It measures neither a recovery deadline nor survival after multiple node losses. |
 | `durable-slow-holder` | A TCP relay delays the previous holder's peer replies past the recovery deadline while the holder keeps its lease. The successor reports the waiting object and holder, then reads the confirmed value after the relay releases the replies. |
 | `durable-threaded-rotation-recovery` | HTTP and RPC replies on a threaded owner wait for peer acknowledgements while another home serves a read. Rotation waits for a gated write, and clean rotation, a cut WAL socket, and rotation of a stopped child must reopen confirmed data. A due alarm survives its owner's drain and fires on a successor. The restarted threaded node then confirms a write as a peer and recovers it in a later ownership epoch. |
