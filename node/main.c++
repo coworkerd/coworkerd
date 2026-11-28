@@ -10357,9 +10357,15 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   KJ_REQUIRE((pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurable()) ||
       (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
-  if (pool.count + pool.quarantineProcesses > 0) {
-    const auto threadsRequired = 32 + (uint64_t(pool.count) + pool.quarantineProcesses + 1) *
-        (uint64_t(pool.inFlightLimit) + 27) + uint64_t(pool.durableProcesses) * 8;
+  const bool ordinaryThreads = pool.count + pool.quarantineProcesses > 0;
+  if (ordinaryThreads || pool.threadedDurable()) {
+    const uint64_t durableGenerations = uint64_t(pool.durableProcesses) + 1;
+    const auto ordinaryRequired = ordinaryThreads
+        ? (uint64_t(pool.count) + pool.quarantineProcesses + 1) * (uint64_t(pool.inFlightLimit) + 27)
+        : 0;
+    // Leave control, V8, WAL and node tasks available while a generation rotates.
+    const auto threadsRequired = 32 + ordinaryRequired +
+        (pool.threadedDurable() ? durableGenerations * 32 : uint64_t(pool.durableProcesses) * 8);
     uint64_t uidThreads = 0;
 #ifdef __linux__
     // RLIMIT_NPROC counts every existing thread of the real UID, including
@@ -10386,6 +10392,24 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
       KJ_REQUIRE(setrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot set thread soft limit", uidRequired);
     }
 #ifdef __linux__
+    auto available = processLimit.rlim_cur == RLIM_INFINITY ? UINT64_MAX
+        : uint64_t(processLimit.rlim_cur) - uidThreads;
+    std::ifstream load("/proc/loadavg");
+    std::string ignored, taskCounts;
+    uint64_t systemTasks = 0, systemMaximum = 0, pidMaximum = 0;
+    if (load >> ignored >> ignored >> ignored >> taskCounts) {
+      const auto slash = taskCounts.find('/');
+      if (slash != std::string::npos) {
+        std::from_chars(taskCounts.data() + slash + 1, taskCounts.data() + taskCounts.size(),
+            systemTasks);
+      }
+    }
+    std::ifstream("/proc/sys/kernel/threads-max") >> systemMaximum;
+    std::ifstream("/proc/sys/kernel/pid_max") >> pidMaximum;
+    for (const auto maximum: {systemMaximum, pidMaximum}) {
+      if (maximum != 0) available = std::min(available, maximum - std::min(maximum, systemTasks));
+    }
+
     auto cgroup = fs::path("/sys/fs/cgroup");
     std::ifstream membership("/proc/self/cgroup"); std::string member;
     while (std::getline(membership, member)) if (member.starts_with("0::") && member.substr(3) != "/") {
@@ -10399,9 +10423,18 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
         uint64_t bound = 0; auto parsed = std::from_chars(maximum.data(), maximum.data()+maximum.size(), bound);
         KJ_REQUIRE(parsed.ec == std::errc() && current <= bound && threadsRequired <= bound-current,
             "insufficient cgroup thread headroom", threadsRequired, current, bound);
+        available = std::min(available, bound - current);
       }
     }
+    if (pool.threadedDurable()) {
+      KJ_REQUIRE(available != UINT64_MAX && available >= threadsRequired,
+          "cannot budget durable home threads", threadsRequired, available);
+      pool.durableHomeThreadBudget = uint32_t(std::min<uint64_t>(UINT32_MAX,
+          (available - threadsRequired) / durableGenerations));
+    }
 #endif
+  }
+  if (ordinaryThreads) {
     const auto minimumMemory = (64ull << 20) + (uint64_t(pool.inFlightLimit) + 16) * (256ull << 10) + (2ull << 20);
     KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, std::max<uint64_t>(8ull << 20, uint64_t(pool.inFlightLimit) << 20)) > minimumMemory,
         "native process memory budget leaves no active Worker", minimumMemory, pool.threadedMemoryBytes);

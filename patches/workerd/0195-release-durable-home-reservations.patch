@@ -1,0 +1,1049 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sat, 28 Nov 2026 14:47:36 +0800
+Subject: [PATCH] Return idle home resources and report admission pressure
+
+
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission-test.c++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+index 5f3a72c183dbfec158927be187c6bee3c802fcd6..524f034b7ec090c5816147d7f39562d03aca9764 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission-test.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission-test.c++
+@@ -392,14 +392,19 @@ KJ_TEST("each durable reservation ceiling refuses before publishing a new tree")
+   auto below = limits;
+   // The resident count is disabled. Cap capacity at one tree and event in each dimension in turn.
+   below.residentTarget = 0;
+-  for (auto dimension: {&Admission::Resources::threads, &Admission::Resources::descriptors,
+-         &Admission::Resources::memory, &Admission::Resources::addressSpace}) {
++  for (auto [dimension, reason]: {std::pair{&Admission::Resources::threads, "threads"},
++         std::pair{&Admission::Resources::descriptors, "descriptors"},
++         std::pair{&Admission::Resources::memory, "memory"},
++         std::pair{&Admission::Resources::addressSpace, "address-space"}}) {
+     below.capacity = limits.capacity;
+     below.capacity.*dimension = limits.tree.*dimension + limits.event.*dimension;
+     Admission table(below, 1);
+     const auto reservation = queued(table.queue(first, open, 0, deadline, now), true);
+     const auto before = table.state().reserved;
+-    KJ_EXPECT(table.queue(second, open, 0, deadline, now).status == Status::OVERLOADED);
++    const auto refused = table.queue(second, open, 0, deadline, now);
++    KJ_EXPECT(refused.status == Status::OVERLOADED);
++    KJ_REQUIRE(refused.refusal != nullptr);
++    KJ_EXPECT(std::string_view(refused.refusal) == reason);
+     KJ_EXPECT(table.state().trees == 1);
+     KJ_EXPECT((table.state().reserved == before));
+     KJ_EXPECT((table.failOpen(reservation.tree) == std::vector{reservation}));
+@@ -410,7 +415,10 @@ KJ_TEST("each durable reservation ceiling refuses before publishing a new tree")
+   below.residentTarget = 1;
+   Admission table(below, 1);
+   const auto reservation = queued(table.queue(first, open, 0, deadline, now), true);
+-  KJ_EXPECT(table.queue(second, open, 0, deadline, now).status == Status::OVERLOADED);
++  const auto refused = table.queue(second, open, 0, deadline, now);
++  KJ_EXPECT(refused.status == Status::OVERLOADED);
++  KJ_REQUIRE(refused.refusal != nullptr);
++  KJ_EXPECT(std::string_view(refused.refusal) == "resident-target");
+   KJ_EXPECT((table.failOpen(reservation.tree) == std::vector{reservation}));
+   queued(table.queue(second, open, 0, deadline, now), true);
+ }
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.c++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+index ef5e79a778a09c6a8aed17417d07b38943eb8082..0eb0d83747f2e22760038e43516cd64fbee227f6 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.c++
++++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
+@@ -13,14 +13,17 @@ namespace {
+ 
+ using Resources = DurableAdmission::Resources;
+ 
+-bool reserve(Resources& used, Resources limit, Resources amount) {
++const char* reservationRefusal(Resources used, Resources limit, Resources amount) {
+   // Compare against the remaining capacity to avoid overflow.
+-  if (amount.threads > limit.threads - used.threads ||
+-      amount.descriptors > limit.descriptors - used.descriptors ||
+-      amount.memory > limit.memory - used.memory ||
+-      amount.addressSpace > limit.addressSpace - used.addressSpace) {
+-    return false;
+-  }
++  if (amount.threads > limit.threads - used.threads) return "threads";
++  if (amount.descriptors > limit.descriptors - used.descriptors) return "descriptors";
++  if (amount.memory > limit.memory - used.memory) return "memory";
++  if (amount.addressSpace > limit.addressSpace - used.addressSpace) return "address-space";
++  return nullptr;
++}
++
++bool reserve(Resources& used, Resources limit, Resources amount) {
++  if (reservationRefusal(used, limit, amount)) return false;
+   used.threads += amount.threads;
+   used.descriptors += amount.descriptors;
+   used.memory += amount.memory;
+@@ -67,35 +70,42 @@ DurableAdmission::Result DurableAdmission::queue(
+     if (tree->closing) return {tree->idleClosing ? Status::RETIRING : Status::STALE};
+   }
+ 
+-  auto refuse = [&](bool newTreeCapacityRefused = false) -> Result {
++  auto refuse = [&](const char* reason, bool newTreeCapacityRefused = false) -> Result {
+     if (!(newTreeCapacityRefused && (database || deferNewTreeOverload))) recordOverload();
+-    return {.status = Status::OVERLOADED, .newTreeCapacityRefused = newTreeCapacityRefused};
++    return {.status = Status::OVERLOADED, .newTreeCapacityRefused = newTreeCapacityRefused,
++      .refusal = reason};
+   };
+   if (bytes > limits.mailboxBytes ||
+-      (tree != nullptr &&
+-          (tree->waiting >= limits.mailboxDepth ||
+-              bytes > limits.mailboxBytes - tree->waitingBytes))) {
+-    return refuse();
++      (tree != nullptr && bytes > limits.mailboxBytes - tree->waitingBytes)) {
++    return refuse("mailbox-bytes");
+   }
++  if (tree != nullptr && tree->waiting >= limits.mailboxDepth) return refuse("mailbox-events");
++
+   const bool newTree = tree == nullptr;
+   auto reserved = counters.reserved;
+-  if (!reserve(reserved, limits.capacity, limits.event) ||
+-      !reserve(reserved, limits.capacity, {.memory = bytes})) {
+-    // An ordinary tree cannot make up missing event credit. Keep the database
+-    // path's existing copy and event reservation recovery.
+-    return refuse(database && newTree);
++  // An ordinary tree cannot make up missing event credit. Keep the database
++  // path's existing copy and event reservation recovery.
++  if (auto reason = reservationRefusal(reserved, limits.capacity, limits.event)) {
++    return refuse(reason, database && newTree);
+   }
+-  if (newTree &&
+-      ((limits.residentTarget != 0 && counters.trees >= limits.residentTarget) ||
+-          !reserve(reserved, limits.capacity, limits.tree))) {
+-    return refuse(true);
++  KJ_ASSERT(reserve(reserved, limits.capacity, limits.event));
++  if (!reserve(reserved, limits.capacity, {.memory = bytes})) {
++    return refuse("memory", database && newTree);
++  }
++  if (newTree) {
++    if (limits.residentTarget != 0 && counters.trees >= limits.residentTarget) {
++      return refuse("resident-target", true);
++    }
++    if (auto reason = reservationRefusal(reserved, limits.capacity, limits.tree)) {
++      return refuse(reason, true);
++    }
++    KJ_ASSERT(reserve(reserved, limits.capacity, limits.tree));
+   }
+   if (newTree && !database && now < databaseTreePreferredUntil) {
+-    auto includingPreferredTree = reserved;
+-    if ((limits.residentTarget != 0 && counters.trees + 1 >= limits.residentTarget) ||
+-        !reserve(includingPreferredTree, limits.capacity, limits.tree)) {
+-      return refuse();
++    if (limits.residentTarget != 0 && counters.trees + 1 >= limits.residentTarget) {
++      return refuse("resident-target");
+     }
++    if (auto reason = reservationRefusal(reserved, limits.capacity, limits.tree)) return refuse(reason);
+   }
+ 
+   KJ_ASSERT(nextTree != 0 && nextEvent != 0);
+@@ -130,6 +140,10 @@ bool DurableAdmission::publishHome(uint64_t tree, uint64_t home) {
+   return true;
+ }
+ 
++const char* DurableAdmission::auxiliaryRefusal(Resources amount) const {
++  return reservationRefusal(counters.reserved, limits.capacity, amount);
++}
++
+ bool DurableAdmission::reserveAuxiliary(Resources amount) {
+   if (reserve(counters.reserved, limits.capacity, amount)) return true;
+   ++counters.overloads;
+diff --git a/src/workerd/server/factory/coworkerd-durable-admission.h b/src/workerd/server/factory/coworkerd-durable-admission.h
+index 45ecdee59454749c7769f32f4f3013ab76f1542c..f0cbac40fc84867decc7a1032a86643c606c836c 100644
+--- a/src/workerd/server/factory/coworkerd-durable-admission.h
++++ b/src/workerd/server/factory/coworkerd-durable-admission.h
+@@ -69,6 +69,7 @@ class DurableAdmission {
+     std::optional<Ticket> ticket = std::nullopt;
+     bool needsHome = false;
+     bool newTreeCapacityRefused = false;
++    const char* refusal = nullptr;
+   };
+ 
+   enum class Cancellation { GONE, RELEASED, SIGNAL_HOME };
+@@ -122,6 +123,7 @@ class DurableAdmission {
+   // The home failed to open. Releases all waiting credits without a close acknowledgement.
+   std::vector<Ticket> failOpen(uint64_t tree);
+   bool releaseUnassigned(uint64_t tree);
++  const char* auxiliaryRefusal(Resources amount) const;
+   bool reserveAuxiliary(Resources amount);
+   void releaseAuxiliary(Resources amount);
+ 
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index fba2eeba2865ac91be9f7f129762c2b9409bf7ea..643e81eea18b72b7a40fac2f7ed5c5dbe9aa6126 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -398,13 +398,13 @@ struct ObjectAdmissionFixture {
+       auto thread = std::make_unique<ThreadedServer::Thread>(false, false);
+       thread->homeId = id;
+       thread->home.emplace();
+-      server.threads.push_back(std::move(thread));
++      server.durableHomes.emplace(id, std::move(thread));
+     }
+     server.ready.store(true);
+   }
+ 
+   ~ObjectAdmissionFixture() {
+-    for (const auto& thread: server.threads) close(thread->wake);
++    for (const auto& [_, thread]: server.durableHomes) close(thread->wake);
+   }
+ 
+   static DurableRoute route(const char* object, const char* definition = nullptr) {
+@@ -425,7 +425,7 @@ struct ObjectAdmissionFixture {
+     KJ_REQUIRE(table.begin(*ticket, *home, route.key, route.open, now) ==
+         Admission::Delivery::ACCEPTED);
+     server.publishDurableRoot(*home, ticket->tree);
+-    server.threads[*home - 1]->home->warmDefinition = route.open.definition;
++    server.durableHomes.at(*home)->home->warmDefinition = route.open.definition;
+     return *ticket;
+   }
+ 
+@@ -503,6 +503,27 @@ KJ_TEST("an event on any selected home tree cancels the whole home retirement")
+   KJ_EXPECT(!test.server.fenceHome(picked, test.now));
+ }
+ 
++KJ_TEST("a fenced home stays selected while its trees finish closing") {
++  using Status = ObjectAdmissionFixture::Status;
++  ObjectAdmissionFixture test(0);
++  auto& server = test.server;
++  for (const auto* definition: {"oldest", "young", "youngest"}) {
++    test.finish(test.start(test.route(definition)), test.now);
++  }
++
++  const auto incoming = test.route("incoming");
++  KJ_REQUIRE(test.queue(incoming).status == Status::RETIRING);
++  KJ_REQUIRE(server.homeVictim.has_value());
++  const auto chosen = *server.homeVictim;
++  {
++    std::lock_guard lock(server.durableRoutingMutex);
++    KJ_REQUIRE(server.fenceHome(chosen, test.now));
++  }
++  server.expireDurableAdmissions(chosen.deadline);
++  KJ_EXPECT(server.queueDurable(incoming, 0, test.lease, chosen.deadline).status == Status::RETIRING);
++  KJ_EXPECT(server.homeVictim == chosen);
++}
++
+ KJ_TEST("ordinary admission selects the least recently used eligible tree across homes") {
+   ObjectAdmissionFixture test(3);
+   auto recent = test.start(test.route("recent"));
+@@ -634,7 +655,7 @@ KJ_TEST("ordinary retirement avoids a running home and looks elsewhere after it
+   test.finish(oldest, test.now - std::chrono::seconds(1));
+   test.finish(younger, test.now);
+   const auto request = test.route("incoming");
+-  auto& oldHome = *server.threads[0]->home;
++  auto& oldHome = *server.durableHomes.at(1)->home;
+   oldHome.load.begin(test.now);
+   KJ_EXPECT(test.queue(request).status == Status::RETIRING);
+   KJ_REQUIRE(server.objectVictim.has_value());
+@@ -647,7 +668,7 @@ KJ_TEST("ordinary retirement avoids a running home and looks elsewhere after it
+   KJ_EXPECT(server.queueDurable(request, 0, test.lease, deadline).status == Status::RETIRING);
+   KJ_REQUIRE(server.objectVictim.has_value());
+   KJ_EXPECT(server.objectVictim->tree == oldest.tree);
+-  KJ_EXPECT(server.threads[1]->home->admissionTurnDelayed);
++  KJ_EXPECT(server.durableHomes.at(2)->home->admissionTurnDelayed);
+   oldHome.load.end(deadline);
+ }
+ 
+@@ -661,7 +682,7 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
+   test.finish(other, test.now);
+   auto& server = test.server;
+   auto& table = *server.durableAdmission;
+-  for (auto& thread: server.threads) thread->home->walFull = true;
++  for (auto& [_, thread]: server.durableHomes) thread->home->walFull = true;
+ 
+   const auto incoming = test.route("incoming", "matching");
+   KJ_EXPECT(test.queue(incoming).status == Status::RETIRING);
+@@ -694,7 +715,7 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
+   // The real Home publishes walFull as soon as a slot comes back. Routing
+   // credit waits for the entire tree, while unrelated existing roots can run.
+   closing->shippers.erase(0);
+-  server.threads[picked.home - 1]->home->walFull = false;
++  server.durableHomes.at(picked.home)->home->walFull = false;
+   server.releaseClosedAdmissionTrees(state, picked.deadline);
+   server.expireDurableAdmissions(picked.deadline);
+   KJ_EXPECT(table.homeFor(picked.tree) == picked.home);
+@@ -726,7 +747,7 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
+   test.finish(next, test.now - std::chrono::seconds(1));
+   test.finish(firstNeighbor, test.now);
+   test.finish(nextNeighbor, test.now);
+-  for (auto& thread: server.threads) thread->home->walFull = true;
++  for (auto& [_, thread]: server.durableHomes) thread->home->walFull = true;
+ 
+   const auto incoming = test.route("incoming", "matching");
+   KJ_REQUIRE(test.queue(incoming).status == Status::RETIRING);
+@@ -760,7 +781,7 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
+     // The accept loop advances without any further pass by the first home.
+     server.expireDurableAdmissions(deadline);
+     KJ_EXPECT(!table.homeFor(stalled.tree));
+-    KJ_EXPECT(server.threads[stalled.home - 1]->home->walFull.load());
++    KJ_EXPECT(server.durableHomes.at(stalled.home)->home->walFull.load());
+     KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 1);
+     KJ_REQUIRE(server.queueDurable(incoming, 0, test.lease, deadline).status == Status::RETIRING);
+     KJ_REQUIRE(server.objectVictim.has_value());
+@@ -782,7 +803,7 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
+   {
+     std::lock_guard lock(server.durableRoutingMutex);
+     KJ_REQUIRE(server.stopObjectAdmissionVictim(nextVictim, deadline));
+-    server.threads[nextVictim.home - 1]->home->walFull = false;
++    server.durableHomes.at(nextVictim.home)->home->walFull = false;
+   }
+   server.waitForAdmissionWal(nextHome, nextVictim.tree,
+       std::make_shared<DurableTreeContext>(DurableTreeContext{
+@@ -830,7 +851,7 @@ struct DatabaseAdmissionFixture {
+       auto thread = std::make_unique<ThreadedServer::Thread>(false, false);
+       thread->homeId = id;
+       thread->home.emplace();
+-      server.threads.push_back(std::move(thread));
++      server.durableHomes.emplace(id, std::move(thread));
+     }
+     server.ready.store(true);
+     KJ_REQUIRE(held->registerPreparation());
+@@ -842,7 +863,7 @@ struct DatabaseAdmissionFixture {
+   }
+ 
+   ~DatabaseAdmissionFixture() {
+-    for (auto& thread: server.threads) close(thread->wake);
++    for (auto& [_, thread]: server.durableHomes) close(thread->wake);
+   }
+ 
+   static DurableRoute route(const char* object, bool database) {
+@@ -853,7 +874,7 @@ struct DatabaseAdmissionFixture {
+   }
+ 
+   ThreadedServer::Thread::DurableHome& home() {
+-    return *server.threads.front()->home;
++    return *server.durableHomes.at(1)->home;
+   }
+ 
+   Admission::Result queue(const DurableRoute& route, Admission::Time at) {
+@@ -869,7 +890,7 @@ struct DatabaseAdmissionFixture {
+     KJ_REQUIRE(table.begin(*ticket, *homeId, route.key, route.open, now) ==
+         Admission::Delivery::ACCEPTED);
+     KJ_REQUIRE(table.complete(*ticket, *homeId));
+-    auto& home = *server.threads[*homeId - 1]->home;
++    auto& home = *server.durableHomes.at(*homeId)->home;
+     home.resident.insert(ticket->tree);
+     home.warmDefinition = route.open.definition;
+     return ticket->tree;
+@@ -889,7 +910,7 @@ struct DatabaseAdmissionFixture {
+ KJ_TEST("durable placement skips a full WAL Home for fresh trees and keeps existing routes") {
+   DatabaseAdmissionFixture test;
+   auto& table = *test.server.durableAdmission;
+-  for (auto& thread: test.server.threads) thread->home->walFull = true;
++  for (auto& [_, thread]: test.server.durableHomes) thread->home->walFull = true;
+ 
+   auto existing = test.queue(test.victim, test.now).ticket;
+   KJ_REQUIRE(existing.has_value());
+@@ -899,7 +920,7 @@ KJ_TEST("durable placement skips a full WAL Home for fresh trees and keeps exist
+   KJ_EXPECT(refused.status == DatabaseAdmissionFixture::Admission::Status::OVERLOADED);
+   KJ_EXPECT(!refused.ticket.has_value());
+ 
+-  test.server.threads[1]->home->walFull = false;
++  test.server.durableHomes.at(2)->home->walFull = false;
+   auto replacement = test.queue(test.neighbor, test.now).ticket;
+   KJ_REQUIRE(replacement.has_value());
+   KJ_EXPECT(table.homeFor(replacement->tree) == 2u);
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index e2cd4e83e780820fba159f400e0a1b68974f9c37..f6cb643c0f82efd0fea0b431a5b6e9658caa2920 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2767,13 +2767,15 @@ struct ThreadedServer {
+   std::optional<ObjectRetirement> objectVictim;
+   std::optional<HomeRetirement> homeVictim;
+   const char* lastHomeRefusal = nullptr;
++  const char* lastDurableRefusal = nullptr;
+   uint64_t homeRefusals = 0, homeRetirements = 0;
+   uint64_t durableDescriptorBudget = 0;
+   static constexpr auto HOME_RESERVATION = server::DurableAdmission::Resources{
+-    .threads = 1, .descriptors = 5,
++    .threads = 1, .descriptors = 5, .memory = 256 << 10,
+   };
+-  static constexpr uint64_t HOME_NATIVE_BYTES = 256 << 10;
+   using DatabaseReplacement = std::shared_ptr<DatabasePreparationReplacement>;
++  DatabaseReplacement databaseRoutingReplacement;
++  server::DurableAdmission::Time databaseRoutingReplacementUntil{};
+   std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<DatabaseReplacement>>> databaseCapacityWaiters;
+   std::atomic<uint64_t> durableHomeSessions{0};
+   std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
+@@ -2798,6 +2800,7 @@ struct ThreadedServer {
+   std::vector<std::shared_ptr<Slot>> retiredSlots;
+   DescriptorQueue pending;
+   const uint limit, maxDurableHomes;
++  const uint32_t durableHomeThreadBudget;
+   static constexpr uint CONTROL_THREADS = 8;
+   static constexpr int MAINTAIN = -3, STOP = -4, STOPPED = -5;
+   std::shared_ptr<ResourceBudget> resources;
+@@ -2819,6 +2822,7 @@ struct ThreadedServer {
+       uint64_t memory = 0, heapBytes = 0, copyInstance = 0;
+       bool admissionTurnDelayed = false;
+       bool reclaiming = false;
++      bool stopping = false;
+       uint64_t activity = 0;
+       server::DurableAdmission::Time lastUse{};
+       std::shared_ptr<ResourceReservation> preparation;
+@@ -2843,6 +2847,9 @@ struct ThreadedServer {
+     }
+   };
+   std::vector<std::unique_ptr<Thread>> threads;
++  // Only accessed with durableRoutingMutex held. IDs are never reused.
++  std::map<uint64_t, std::unique_ptr<Thread>> durableHomes;
++  uint64_t nextDurableHome = 0;
+   int managerWake = -1;
+   const int parent;
+   std::mutex budgetReleaseMutex;
+@@ -2900,6 +2907,9 @@ struct ThreadedServer {
+         maxDurableHomes(this->durableStorage
+             ? uint(boundedDurableSetting("COWORKERD_DO_MAX_HOMES", 16384, 16384))
+             : 0),
++        durableHomeThreadBudget(this->durableStorage
++            ? uint32_t(kj::min<uint64_t>(configuredCount("COWORKERD_DO_HOME_THREADS", 0), UINT32_MAX))
++            : 0),
+         resources(std::make_shared<ResourceBudget>(
+             configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) -
+                 (this->durableStorage
+@@ -2939,7 +2949,7 @@ struct ThreadedServer {
+       constexpr uint64_t defaultMailboxBytes = uint64_t(defaultMailboxDepth) * 4096;
+       durableAdmission.emplace(
+           server::DurableAdmission::Limits{
+-            .capacity = {.threads = limit,
++            .capacity = {.threads = durableHomeThreadBudget,
+               .descriptors = durableDescriptorBudget,
+               .memory = configuredCount("COWORKERD_THREADED_MEMORY_BYTES", 2ull << 30) / 8},
+             .tree = {.descriptors = 4, .memory = 16 * 1024},
+@@ -3241,7 +3251,7 @@ struct ThreadedServer {
+     if (databaseVictim) {
+       if (!needsPreparationBudget) databaseVictim->preferDatabase = true;
+       if (needsPreparationBudget && !databaseVictim->preparationCeiling) {
+-        const auto reservation = threads[databaseVictim->home - 1]->home->databaseReservation.lock();
++        const auto reservation = durableHomes.at(databaseVictim->home)->home->databaseReservation.lock();
+         if (!reservation) return false;
+         databaseVictim->preparationCeiling = reservation->replacementCeiling();
+         if (!databaseVictim->preparationCeiling) return false;
+@@ -3250,7 +3260,7 @@ struct ThreadedServer {
+     }
+     const auto deadline = now + std::chrono::seconds(1);
+     std::shared_ptr<ResourceReservation> retiringReservation;
+-    for (const auto& thread: threads) {
++    for (const auto& [id, thread]: durableHomes) {
+       const auto& home = *thread->home;
+       if ((selectedHome && *selectedHome != thread->homeId) || home.reclaiming ||
+           (homeVictim && homeVictim->home == thread->homeId) || !home.databaseCanRetire || home.reservedTrees != 1 || home.resident.size() != 1 ||
+@@ -3263,8 +3273,7 @@ struct ThreadedServer {
+           (databaseVictim && home.databaseLastUse >= databaseVictim->lastUse)) continue;
+       auto reservation = home.databaseReservation.lock();
+       if (!reservation) continue;
+-      const auto preparationCeiling =
+-          needsPreparationBudget ? reservation->replacementCeiling() : std::nullopt;
++      const auto preparationCeiling = reservation->replacementCeiling();
+       if (needsPreparationBudget && !preparationCeiling) continue;
+       databaseVictim =
+           DatabaseRetirement{thread->homeId, tree, home.databaseLastUse, reservation->returned,
+@@ -3275,7 +3284,7 @@ struct ThreadedServer {
+     // Both routing and cold-load retirement leave the returned preparation
+     // credit for a database. Hold the reservation until the preference is set.
+     resources->preferDatabasePreparation(deadline + DATABASE_ADMISSION_GRACE);
+-    wake(threads[databaseVictim->home - 1]->wake);
++    wake(durableHomes.at(databaseVictim->home)->wake);
+     return true;
+   }
+ 
+@@ -3284,7 +3293,7 @@ struct ThreadedServer {
+       server::DurableAdmission::Time now) {
+     using Outcome = DatabaseRetirement::Outcome;
+     if (outcome == Outcome::PENDING) return;
+-    auto& home = *threads[databaseVictim->home - 1]->home;
++    auto& home = *durableHomes.at(databaseVictim->home)->home;
+     if (outcome == Outcome::RELEASED && databaseVictim->preferDatabase) {
+       // Leave time for the native preface retry, whose backoff is capped at 50 ms.
+       home.databasePreferredUntil = now + DATABASE_ADMISSION_GRACE;
+@@ -3311,6 +3320,10 @@ struct ThreadedServer {
+                 kj::min(*databaseVictim->preparationCeiling, returned.memoryBeforeRelease));
+       replacement = std::make_shared<DatabasePreparationReplacement>(ceiling);
+     }
++    if (replacement && databaseVictim->preferDatabase) {
++      databaseRoutingReplacement = replacement;
++      databaseRoutingReplacementUntil = now + DATABASE_ADMISSION_GRACE;
++    }
+     databaseVictim.reset();
+     for (const auto &waiter: databaseCapacityWaiters) {
+       if (waiter->isWaiting()) waiter->fulfill(DatabaseReplacement(replacement));
+@@ -3325,8 +3338,10 @@ struct ThreadedServer {
+     if (databaseVictim && now >= databaseVictim->deadline) {
+       finishDatabaseRetirement(databaseVictim->outcome(now, false, false), now);
+     }
+-    if (homeVictim && now >= homeVictim->deadline) {
+-      threads[homeVictim->home - 1]->home->admissionTurnDelayed = true;
++    reapDurableHomes();
++    if (homeVictim && now >= homeVictim->deadline &&
++        !durableHomes.at(homeVictim->home)->home->reclaiming) {
++      durableHomes.at(homeVictim->home)->home->admissionTurnDelayed = true;
+       homeVictim.reset();
+     }
+     if (objectVictim && now >= objectVictim->deadline) {
+@@ -3337,7 +3352,7 @@ struct ThreadedServer {
+         releaseDurableTree(objectVictim->tree, objectVictim->home, true);
+       } else {
+         // Do not choose the same home again until its loop shows progress.
+-        threads[objectVictim->home - 1]->home->admissionTurnDelayed = true;
++        durableHomes.at(objectVictim->home)->home->admissionTurnDelayed = true;
+         objectVictim.reset();
+       }
+     }
+@@ -3359,7 +3374,7 @@ struct ThreadedServer {
+ 
+   server::DurableCopyCandidate durableCopyCandidate(uint64_t id,
+       server::DurableAdmission::Time now) const {
+-    const auto& home = *threads[id - 1]->home;
++    const auto& home = *durableHomes.at(id)->home;
+     return {id, home.definition, home.reservedTrees, home.memory, home.load.busyFor(now),
+       home.pressure.accepting()};
+   }
+@@ -3369,17 +3384,16 @@ struct ThreadedServer {
+       server::DurableAdmission::Time now) const {
+     std::vector<server::DurableCopyCandidate> candidates;
+     uint64_t spare = 0;
+-    for (uint64_t id = 1; id <= threads.size(); ++id) {
+-      const auto& thread = *threads[id - 1];
+-      if (!thread.home || (databaseVictim && databaseVictim->home == id)) continue;
+-      const auto& home = *thread.home;
+-      if (home.reclaiming || home.walFull.load(std::memory_order_relaxed)) continue;
++    for (const auto& [id, thread]: durableHomes) {
++      if (databaseVictim && databaseVictim->home == id) continue;
++      const auto& home = *thread->home;
++      if (home.stopping || home.reclaiming || home.walFull.load(std::memory_order_relaxed)) continue;
+       if (!database && now < home.databasePreferredUntil) continue;
+       // New-root eligibility is checked here, including on the empty-home path.
+       // The empty copy owns its old isolate until the home releases it.
+       if (home.reservedTrees == 0 && !home.pressure.resetting() &&
+           (spare == 0 ||
+-              (home.definition.empty() && !threads[spare - 1]->home->definition.empty()))) {
++              (home.definition.empty() && !durableHomes.at(spare)->home->definition.empty()))) {
+         spare = id;
+       }
+       if (!home.definition.empty()) candidates.push_back(durableCopyCandidate(id, now));
+@@ -3395,8 +3409,7 @@ struct ThreadedServer {
+     if (objectVictim) return true;
+     const auto deadline = now + std::chrono::seconds(1);
+     bool selectedRunning = false;
+-    for (const auto& thread: threads) {
+-      const auto id = thread->homeId;
++    for (const auto& [id, thread]: durableHomes) {
+       const auto& home = *thread->home;
+       if (home.reclaiming || (homeVictim && homeVictim->home == id) ||
+           (matchingOnly && home.definition != route.open.definition) ||
+@@ -3423,7 +3436,7 @@ struct ThreadedServer {
+       }
+     }
+     if (!objectVictim) return false;
+-    wake(threads[objectVictim->home - 1]->wake);
++    wake(durableHomes.at(objectVictim->home)->wake);
+     return true;
+   }
+ 
+@@ -3431,7 +3444,7 @@ struct ThreadedServer {
+   // fences the set, since the router only has each loop's idle snapshot.
+   bool canReclaimHome(const Thread& thread) const {
+     const auto& home = *thread.home;
+-    if (home.definition.empty() || home.reclaiming || home.pressure.resetting() ||
++    if (home.definition.empty() || home.stopping || home.reclaiming || home.pressure.resetting() ||
+         home.admissionTurnDelayed || home.load.hasRunningTurn() ||
+         home.reservedTrees != home.resident.size()) return false;
+     const bool database = home.warmDefinition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
+@@ -3442,11 +3455,13 @@ struct ThreadedServer {
+     });
+   }
+ 
+-  bool requestHomeRetirement(server::DurableAdmission::Time now, bool database) {
+-    if (homeVictim || (database && databaseVictim)) return true;
++  bool requestHomeRetirement(server::DurableAdmission::Time now, bool database, bool needsCopyCredit) {
++    if (homeVictim || (database && databaseVictim) ||
++        std::ranges::any_of(durableHomes, [](const auto& entry) {
++      return entry.second->home->stopping;
++    })) return true;
+     Thread* oldest = nullptr;
+-    for (const auto& thread: threads) {
+-      const auto id = thread->homeId;
++    for (const auto& [id, thread]: durableHomes) {
+       if ((databaseVictim && databaseVictim->home == id) ||
+           (objectVictim && objectVictim->home == id) ||
+           now < thread->home->databasePreferredUntil || !canReclaimHome(*thread)) continue;
+@@ -3458,7 +3473,10 @@ struct ThreadedServer {
+     // Reuse the database replacement path when the oldest home is already a
+     // database. It preserves the preference given to the retiring copy's credit.
+     if (database && oldest->home->warmDefinition.starts_with(PLATFORM_DATABASE_COPY_PREFIX) &&
+-        requestDatabaseRetirement(now, false, oldest->homeId)) return true;
++        requestDatabaseRetirement(now, needsCopyCredit, oldest->homeId)) {
++      databaseVictim->preferDatabase = true;
++      return true;
++    }
+     homeVictim = HomeRetirement{oldest->homeId, oldest->home->activity,
+       now + std::chrono::seconds(1)};
+     wake(oldest->wake);
+@@ -3466,7 +3484,7 @@ struct ThreadedServer {
+   }
+ 
+   bool fenceHome(const HomeRetirement& selected, server::DurableAdmission::Time now) {
+-    auto& thread = *threads[selected.home - 1];
++    auto& thread = *durableHomes.at(selected.home);
+     auto& home = *thread.home;
+     if (homeVictim != selected || now >= selected.deadline ||
+         selected.activity != home.activity || !canReclaimHome(thread)) return false;
+@@ -3485,26 +3503,33 @@ struct ThreadedServer {
+     if (!assigned) {
+       assigned = findDurableHome(route, database, now);
+       const bool cold = !assigned ||
+-          (threads[*assigned - 1]->home->reservedTrees == 0 &&
+-              threads[*assigned - 1]->home->warmDefinition != route.open.definition);
++          (durableHomes.at(*assigned)->home->reservedTrees == 0 &&
++              durableHomes.at(*assigned)->home->warmDefinition != route.open.definition);
+       std::shared_ptr<ResourceReservation> preparation;
+       if (maxDurableHomes != 0 && cold) {
++        if (!assigned && !canStartDurableHome(refusal)) return false;
+         preparation = std::make_shared<ResourceReservation>(resources, 0, database);
+-        if (!preparation->registerPreparation(nullptr, &refusal)) return false;
++        if (!preparation->registerPreparation(nullptr, &refusal)) {
++          if (!database || !databaseRoutingReplacement ||
++              now >= databaseRoutingReplacementUntil ||
++              !preparation->registerPreparation(databaseRoutingReplacement.get(), &refusal)) {
++            return false;
++          }
++        }
+       }
+       if (!assigned) {
+         if (maxDurableHomes == 0) return false;
+         assigned = startDurableHome(refusal);
+         if (!assigned) return false;
+       }
+-      auto& home = *threads[*assigned - 1]->home;
++      auto& home = *durableHomes.at(*assigned)->home;
+       if (preparation) home.preparation = std::move(preparation);
+       home.definition = route.open.definition;
+       home.databasePreferredUntil = {};
+       KJ_ASSERT(durableAdmission->publishHome(ticket.tree, *assigned));
+       ++home.reservedTrees;
+     }
+-    auto& home = *threads[*assigned - 1]->home;
++    auto& home = *durableHomes.at(*assigned)->home;
+     if (home.pressure.resetting() || home.reclaiming) return false;
+     ++home.activity;
+     return true;
+@@ -3514,11 +3539,14 @@ struct ThreadedServer {
+       const DurableRoute &route, uint64_t bytes, server::DurableAdmission::Time deadline,
+       std::optional<server::DurableAdmission::Time> at = std::nullopt) {
+     using Admission = server::DurableAdmission;
+-    if (!ready.load(std::memory_order_acquire)) return {Admission::Status::OVERLOADED};
++    if (!ready.load(std::memory_order_acquire)) {
++      return {.status = Admission::Status::OVERLOADED, .refusal = "starting"};
++    }
+     const bool database = route.open.className == "SqlDatabase" &&
+         route.open.definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX);
+     std::lock_guard lock(durableRoutingMutex);
+     const auto now = at ? *at : Admission::Clock::now();
++    reapDurableHomes();
+     auto result = durableAdmission->queue(
+         route.key, route.open, bytes, deadline, now, database, true);
+     bool needsPlacement = false;
+@@ -3527,7 +3555,8 @@ struct ThreadedServer {
+       needsPlacement = result.needsHome;
+       KJ_ASSERT(durableAdmission->refuseWaiting(*result.ticket, !needsPlacement));
+       durableAdmission->releaseUnassigned(result.ticket->tree);
+-      result = {.status = Admission::Status::OVERLOADED, .newTreeCapacityRefused = result.needsHome};
++      result = {.status = Admission::Status::OVERLOADED, .newTreeCapacityRefused = result.needsHome,
++        .refusal = refusal != nullptr ? refusal : "home-placement"};
+     } else if (database && result.ticket && result.needsHome) {
+       durableAdmission->claimDatabaseTree();
+     }
+@@ -3536,8 +3565,9 @@ struct ThreadedServer {
+       const bool lackingHome = needsPlacement || !findDurableHome(route, database, now);
+       const bool retiringTree = database ? (!needsPlacement && requestDatabaseRetirement(now, false))
+           : requestObjectRetirement(route, now, lackingHome, needsPlacement);
+-      if (retiringTree || (lackingHome && requestHomeRetirement(now, database))) {
+-        return {Admission::Status::RETIRING};
++      const bool needsCopyCredit = refusal != nullptr && std::string_view(refusal).starts_with("copy-");
++      if (retiringTree || (lackingHome && requestHomeRetirement(now, database, needsCopyCredit))) {
++        return {.status = Admission::Status::RETIRING, .refusal = result.refusal};
+       }
+       if (refusal != nullptr) {
+         lastHomeRefusal = refusal;
+@@ -3545,6 +3575,7 @@ struct ThreadedServer {
+       }
+       durableAdmission->recordOverload();
+     }
++    if (result.status == Admission::Status::OVERLOADED) lastDurableRefusal = result.refusal;
+     return result;
+   }
+ 
+@@ -3558,7 +3589,7 @@ struct ThreadedServer {
+     if (deadline <= server::DurableAdmission::Clock::now()) return false;
+     auto assigned = durableAdmission->homeFor(ticket.tree);
+     if (!assigned) return false;
+-    auto &thread = *threads[*assigned - 1];
++    auto &thread = *durableHomes.at(*assigned);
+     if (thread.home->pressure.resetting()) return false;
+     thread.home->incoming.push_back({kj::AutoCloseFd(fd), std::move(route), ticket, deadline});
+     wake(thread.wake);
+@@ -3568,7 +3599,7 @@ struct ThreadedServer {
+   void publishDurableRoot(uint64_t homeId, uint64_t tree) {
+     std::lock_guard lock(durableRoutingMutex);
+     KJ_ASSERT(durableAdmission->homeFor(tree) == homeId);
+-    threads[homeId - 1]->home->resident.insert(tree);
++    durableHomes.at(homeId)->home->resident.insert(tree);
+   }
+ 
+   void markDurableSocket(ThreadState& state, server::DurableAdmission::Ticket ticket,
+@@ -3591,7 +3622,7 @@ struct ThreadedServer {
+       return false;
+     }
+     const auto finished = durableAdmission->complete(ticket, *assigned);
+-    auto &home = *threads[*assigned - 1]->home;
++    auto &home = *durableHomes.at(*assigned)->home;
+     if (home.resident.contains(ticket.tree)) {
+       if (finished) {
+         home.lastUse = kj::max(home.lastUse,
+@@ -3773,7 +3804,7 @@ struct ThreadedServer {
+         (!databaseVictim || databaseVictim->tree != tree ||
+             databaseVictim->deadline != selected->deadline ||
+             (at ? *at : server::DurableAdmission::Clock::now()) >= selected->deadline ||
+-            threads[homeId - 1]->home->databaseLastUse != selected->lastUse ||
++            durableHomes.at(homeId)->home->databaseLastUse != selected->lastUse ||
+             !durableAdmission->isIdleTree(tree, homeId))) {
+       return false;
+     }
+@@ -3786,7 +3817,7 @@ struct ThreadedServer {
+   bool stopObjectAdmissionVictim(const ObjectRetirement& selected,
+       server::DurableAdmission::Time now) {
+     if (objectVictim != selected || now >= selected.deadline) return false;
+-    const auto& idle = threads[selected.home - 1]->home->idleObjects;
++    const auto& idle = durableHomes.at(selected.home)->home->idleObjects;
+     const auto found = idle.find(selected.tree);
+     return found != idle.end() && found->second == selected.lastUse &&
+         durableAdmission->isIdleTree(selected.tree, selected.home) &&
+@@ -3804,14 +3835,17 @@ struct ThreadedServer {
+       durableAdmission->preferDatabaseTree(databaseVictim->deadline + DATABASE_ADMISSION_GRACE);
+       databaseVictim->treePreferred = true;
+     }
+-    auto &home = *threads[homeId - 1]->home;
++    auto &home = *durableHomes.at(homeId)->home;
+     home.resident.erase(tree);
+     home.idleObjects.erase(tree);
+     if (objectVictim && objectVictim->tree == tree) objectVictim.reset();
+     if (admissionClosing) durableAdmissionRetirements.fetch_add(1);
+     home.databaseCanRetire = false;
+     home.databaseLastUse = 0;
+-    if (--home.reservedTrees == 0) home.definition = home.warmDefinition;
++    if (--home.reservedTrees == 0) {
++      home.preparation.reset();
++      home.definition = home.warmDefinition;
++    }
+     return home.resident.empty();
+   }
+ 
+@@ -3855,7 +3889,7 @@ struct ThreadedServer {
+     const auto homeId = state.durableHome;
+     const auto [victim, selectedObject, homeWake] = [&] {
+       std::lock_guard lock(durableRoutingMutex);
+-      auto& thread = *threads[homeId - 1];
++      auto& thread = *durableHomes.at(homeId);
+       auto& home = *thread.home;
+       home.admissionTurnDelayed = false;
+       if (homeVictim && homeVictim->home == homeId && !home.reclaiming) {
+@@ -3891,15 +3925,7 @@ struct ThreadedServer {
+             victim->outcome(now, hasTree, hasTree && root->second.admissionClosing), now);
+       }
+     });
+-    if (!state.durableSlot) {
+-      std::lock_guard lock(durableRoutingMutex);
+-      auto& home = *threads[homeId - 1]->home;
+-      if (home.reclaiming) {
+-        home.reclaiming = false;
+-        if (homeVictim && homeVictim->home == homeId) homeVictim.reset();
+-      }
+-      return;
+-    }
++    if (!state.durableSlot) return;
+     const auto now = durableIdleNow();
+     auto &memory = *state.durableSlot->limits->memory;
+     const auto accounted = [&] { return memory.heap.load() + memory.external.load(); };
+@@ -4058,7 +4084,7 @@ struct ThreadedServer {
+     bool releaseCopy;
+     {
+       std::lock_guard lock(durableRoutingMutex);
+-      auto &home = *threads[homeId - 1]->home;
++      auto &home = *durableHomes.at(homeId)->home;
+       home.databaseCanRetire = databaseCanRetire;
+       home.idleObjects = std::move(idleObjects);
+       for (const auto& [_, lastUse]: home.idleObjects) home.lastUse = kj::max(home.lastUse, lastUse);
+@@ -4077,10 +4103,11 @@ struct ThreadedServer {
+       const auto lastUse = state.durableSlot->lastUseNs.load();
+       // An empty database copy still charges the process budget. Release it when its
+       // tree retires so a new database can open on an unused home.
+-      releaseCopy = shouldReleaseDurableCopy(home.reservedTrees, !state.durableRoots.empty(),
+-          state.durableSlot->planRevision,
+-          home.pressure.resetting() || (home.reclaiming && !closingForAdmission) ||
+-              (idleMs && nowNs() - lastUse >= idleMs * 1000000));
++      releaseCopy = state.admissionWalClosing.empty() &&
++          shouldReleaseDurableCopy(home.reservedTrees, !state.durableRoots.empty(),
++              state.durableSlot->planRevision,
++              home.pressure.resetting() || (home.reclaiming && !closingForAdmission) ||
++                  (idleMs && nowNs() - lastUse >= idleMs * 1000000));
+     }
+     if (pressureAction == server::DurablePressure::Action::RESET) {
+       for (auto &[tree, root]: state.durableRoots) {
+@@ -4104,16 +4131,11 @@ struct ThreadedServer {
+       }
+       state.durableSlot.reset();
+       std::lock_guard lock(durableRoutingMutex);
+-      auto &home = *threads[homeId - 1]->home;
++      auto &home = *durableHomes.at(homeId)->home;
+       home.memory = home.heapBytes = home.copyInstance = 0;
+       home.warmDefinition.clear();
+       home.databaseReservation.reset();
+       if (home.reservedTrees == 0) home.definition.clear();
+-      if (home.reclaiming) {
+-        home.reclaiming = false;
+-        ++homeRetirements;
+-        if (homeVictim && homeVictim->home == homeId) homeVictim.reset();
+-      }
+       if (home.pressure.resetting()) {
+         home.pressure.closed();
+         durableIsolateResets.fetch_add(1);
+@@ -4124,7 +4146,7 @@ struct ThreadedServer {
+   void trackDurableTurn(
+       uint64_t homeId, bool entering, uint64_t heapBytes = 0, uint64_t externalBytes = 0) {
+     std::lock_guard lock(durableRoutingMutex);
+-    auto &home = *threads[homeId - 1]->home;
++    auto &home = *durableHomes.at(homeId)->home;
+     const auto now = server::DurableHomeLoad::Clock::now();
+     if (entering) {
+       ++home.activity;
+@@ -4144,7 +4166,7 @@ struct ThreadedServer {
+     uint64_t maxHomeMemory = 0;
+     std::string copies;
+     if (ready.load(std::memory_order_acquire)) {
+-      for (const auto &thread: threads) {
++      for (const auto& [id, thread]: durableHomes) {
+         const auto &home = *thread->home;
+         homes += !home.definition.empty();
+         placementClosedHomes += !home.pressure.accepting();
+@@ -4153,7 +4175,7 @@ struct ThreadedServer {
+         resident += home.resident.size();
+         if (home.copyInstance != 0) {
+           if (!copies.empty()) copies += ',';
+-          copies += "{\"home\":" + std::to_string(thread->homeId) +
++          copies += "{\"home\":" + std::to_string(id) +
+               ",\"instance\":" + std::to_string(home.copyInstance) +
+               ",\"residentRoots\":" + std::to_string(home.resident.size()) +
+               ",\"heapBytes\":" + std::to_string(home.heapBytes) +
+@@ -4162,7 +4184,8 @@ struct ThreadedServer {
+         }
+       }
+     }
+-    const auto homeDescriptors = uint64_t(liveThreads.load()) * HOME_RESERVATION.descriptors;
++    const auto homeDescriptors = durableHomes.size() * HOME_RESERVATION.descriptors;
++    const auto homeMemory = durableHomes.size() * HOME_RESERVATION.memory;
+     auto row = ",\"durableAdmission\":{\"trees\":" + std::to_string(state.trees) +
+         ",\"residentRoots\":" + std::to_string(resident) + ",\"homes\":" + std::to_string(homes) +
+         ",\"placementClosedHomes\":" + std::to_string(placementClosedHomes) +
+@@ -4174,14 +4197,17 @@ struct ThreadedServer {
+         std::to_string(durableStorage->getSqlSpillBudget().getCapacity()) +
+         ",\"workerThreads\":" + std::to_string(liveThreads.load()) +
+         ",\"maxHomes\":" + std::to_string(maxDurableHomes) +
+-        ",\"homeThreadBudget\":" + std::to_string(limit) +
++        ",\"homeThreadBudget\":" + std::to_string(durableHomeThreadBudget) +
+         ",\"descriptorBudget\":" + std::to_string(durableDescriptorBudget) +
+         ",\"homeReservedDescriptors\":" + std::to_string(homeDescriptors) +
+-        ",\"homeReservedBytes\":" + std::to_string(uint64_t(liveThreads.load()) * HOME_NATIVE_BYTES) +
++        ",\"homeReservedBytes\":" + std::to_string(homeMemory) +
+         ",\"homeRetirements\":" + std::to_string(homeRetirements) +
+         ",\"homeRefusals\":" + std::to_string(homeRefusals) +
+         ",\"lastHomeRefusal\":" +
+         (lastHomeRefusal == nullptr ? std::string("null") : "\"" + std::string(lastHomeRefusal) + "\"") +
++        ",\"lastDurableRefusal\":" +
++        (lastDurableRefusal == nullptr ? std::string("null")
++                                      : "\"" + std::string(lastDurableRefusal) + "\"") +
+         ",\"waiting\":" + std::to_string(state.waiting) +
+         ",\"running\":" + std::to_string(state.active) +
+         ",\"waitingBytes\":" + std::to_string(state.waitingBytes) +
+@@ -4198,7 +4224,7 @@ struct ThreadedServer {
+         ",\"treeResets\":" + std::to_string(durableTreeResets.load()) +
+         ",\"isolateResets\":" + std::to_string(durableIsolateResets.load()) +
+         ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors - homeDescriptors) +
+-        ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
++        ",\"reservedBytes\":" + std::to_string(state.reserved.memory - homeMemory) +
+         ",\"sqliteHeapReservedBytes\":" + std::to_string(resources->sqliteMemoryReserved.load()) +
+         ",\"copyMemoryReservedBytes\":" + std::to_string(resources->memoryReserved.load()) +
+         ",\"copyMemoryMaximum\":" + std::to_string(resources->memoryMaximum) +
+@@ -4219,30 +4245,48 @@ struct ThreadedServer {
+     }
+   }
+ 
+-  // The router owns the growing home vector. A reserved loop can be reused
+-  // for another definition after its actor and isolate have left that loop.
+-  std::optional<uint64_t> startDurableHome(const char*& refusal) {
+-    if (threads.size() >= limit) {
++  // A stopped loop no longer owns SQLite, the isolate, or its event port.
++  // Reap on the router before returning the reservations to fresh placement.
++  void reapDurableHomes() {
++    for (auto it = durableHomes.begin(); it != durableHomes.end();) {
++      auto& [id, thread] = *it;
++      if (thread->descriptor.load(std::memory_order_acquire) != STOPPED) {
++        ++it;
++        continue;
++      }
++      thread->thread.join();
++      ::close(thread->wake);
++      durableAdmission->releaseAuxiliary(HOME_RESERVATION);
++      liveThreads.fetch_sub(1);
++      if (thread->home->reclaiming) ++homeRetirements;
++      if (homeVictim && homeVictim->home == id) homeVictim.reset();
++      it = durableHomes.erase(it);
++    }
++  }
++
++  bool canStartDurableHome(const char*& refusal) {
++    if (durableHomes.size() >= durableHomeThreadBudget) {
+       refusal = "home-threads";
+-      return std::nullopt;
++      return false;
+     }
+-    if (threads.size() >= maxDurableHomes) {
++    if (durableHomes.size() >= maxDurableHomes) {
+       refusal = "home-ceiling";
+-      return std::nullopt;
+-    }
+-    if (!durableAdmission->reserveAuxiliary(HOME_RESERVATION)) {
+-      refusal = "home-descriptors";
+-      return std::nullopt;
++      return false;
+     }
+-    if (!resources->change(0, HOME_NATIVE_BYTES, 0, 0, true)) {
+-      durableAdmission->releaseAuxiliary(HOME_RESERVATION);
+-      refusal = "home-memory";
+-      return std::nullopt;
++    if (const auto* reason = durableAdmission->auxiliaryRefusal(HOME_RESERVATION)) {
++      if (std::string_view(reason) == "descriptors") refusal = "home-descriptors";
++      else if (std::string_view(reason) == "memory") refusal = "home-memory";
++      else refusal = "home-threads";
++      return false;
+     }
++    return true;
++  }
++
++  std::optional<uint64_t> startDurableHome(const char*& refusal) {
++    KJ_ASSERT(durableAdmission->reserveAuxiliary(HOME_RESERVATION));
+     bool started = false;
+     KJ_DEFER(if (!started) {
+       durableAdmission->releaseAuxiliary(HOME_RESERVATION);
+-      (void)resources->change(HOME_NATIVE_BYTES, 0, 0, 0);
+       growthFailures.fetch_add(1);
+       refusal = "home-loop-start";
+     });
+@@ -4250,23 +4294,24 @@ struct ThreadedServer {
+       auto item = std::make_unique<Thread>(false, false);
+       kj::AutoCloseFd wakeFd(item->wake);
+       item->home.emplace();
+-      item->homeId = threads.size() + 1;
++      item->homeId = ++nextDurableHome;
+       auto* pointer = item.get();
+-      threads.push_back(std::move(item));
+-      KJ_DEFER(if (!started) threads.pop_back());
++      const auto id = pointer->homeId;
++      KJ_ASSERT(durableHomes.emplace(id, std::move(item)).second);
++      KJ_DEFER(if (!started) {
++        if (pointer->thread.joinable()) pointer->thread.join();
++        durableHomes.erase(id);
++      });
+       std::promise<bool> startup;
+       auto initialized = startup.get_future();
+       pointer->thread = std::thread([this, pointer, startup = std::move(startup)]() mutable {
+         runThread(*pointer, &startup);
+       });
+-      if (!initialized.get()) {
+-        pointer->thread.join();
+-        return std::nullopt;
+-      }
++      if (!initialized.get()) return std::nullopt;
+       started = true;
+       (void)wakeFd.release();
+       liveThreads.fetch_add(1);
+-      return pointer->homeId;
++      return id;
+     } catch (...) {
+       return std::nullopt;
+     }
+@@ -4449,7 +4494,18 @@ struct ThreadedServer {
+           state.tasks.add(startDurableSession(state, std::move(call)));
+         }
+         retireIdleDurableRoots(state);
++        std::lock_guard lock(durableRoutingMutex);
++        if (!state.durableSlot && !state.durableLoad && state.durableSessions.empty() &&
++            state.admissionWalClosing.empty() && thread.home->reservedTrees == 0 &&
++            !(databaseVictim && databaseVictim->home == thread.homeId)) {
++          thread.home->stopping = true;
++          break;
++        }
+       }
++      signal = nullptr;
++      storage.reset();
++      thread.descriptor.store(STOPPED, std::memory_order_release);
++      return;
+     }
+     runOrdinaryThread(thread, state);
+     storage.reset();
+@@ -4855,7 +4911,7 @@ struct ThreadedServer {
+     std::shared_ptr<ResourceReservation> reservation;
+     {
+       std::lock_guard lock(durableRoutingMutex);
+-      reservation = std::move(threads[state.durableHome - 1]->home->preparation);
++      reservation = std::move(durableHomes.at(state.durableHome)->home->preparation);
+     }
+     const bool registered = bool(reservation);
+     if (!registered) {
+@@ -4921,7 +4977,7 @@ struct ThreadedServer {
+     state.durableSlot.reset();
+     {
+       std::lock_guard lock(durableRoutingMutex);
+-      auto &home = *threads[state.durableHome - 1]->home;
++      auto &home = *durableHomes.at(state.durableHome)->home;
+       home.warmDefinition.clear();
+       home.memory = home.heapBytes = home.copyInstance = 0;
+       home.databaseReservation.reset();
+@@ -4953,7 +5009,7 @@ struct ThreadedServer {
+     state.durableSlot = loaded;
+     {
+       std::lock_guard lock(durableRoutingMutex);
+-      auto &home = *threads[state.durableHome - 1]->home;
++      auto &home = *durableHomes.at(state.durableHome)->home;
+       home.warmDefinition = loaded->planRevision;
+       home.copyInstance = loaded->instance;
+       if (loaded->reservation->returned) home.databaseReservation = loaded->reservation;
+@@ -8399,6 +8455,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+         if (!close && server.durableAdmission && connection.input.starts_with('D') &&
+             connection.input.ends_with('\n')) {
+           char receipt = 'S';
++          const char* refusal = nullptr;
+           auto error = kj::runCatchingExceptions([&] {
+             JsonDoc frame(kj::StringPtr(connection.input.c_str() + 1, connection.input.size() - 1));
+             auto input = frame.get();
+@@ -8410,6 +8467,7 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+             auto deadline = Admission::Time(std::chrono::duration_cast<Admission::Clock::duration>(
+                 std::chrono::nanoseconds(deadlineNs)));
+             auto result = server.queueDurable(route, durableNumber(input, "queuedBytes"), deadline);
++            refusal = result.refusal;
+             if (result.ticket) {
+               receipt = 'A';
+               connection.durableCredit = *result.ticket;
+@@ -8424,7 +8482,16 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
+               receipt = 'I';
+             }
+           });
+-          if (error != kj::none || send(fd, &receipt, 1, MSG_DONTWAIT | MSG_NOSIGNAL) != 1 ||
++          // The single-byte receipt remains first. A refused or retiring
++          // preface can carry a resource name before the socket closes.
++          char response[33] = {receipt};
++          size_t bytes = 1;
++          if (refusal != nullptr) {
++            const size_t length = std::min(strlen(refusal), sizeof(response) - 1);
++            memcpy(response + 1, refusal, length);
++            bytes += length;
++          }
++          if (error != kj::none || send(fd, response, bytes, MSG_DONTWAIT | MSG_NOSIGNAL) != ssize_t(bytes) ||
+               receipt != 'A') {
+             closeConnection(found);
+           }

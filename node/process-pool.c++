@@ -400,11 +400,14 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
     }
     // No Cap'n Proto bytes may precede this raw routing prefix.
     auto prefix = kj::str("T");
+    kj::String invocation;
     if (threadedDurable) {
       capnp::MallocMessageBuilder builder;
       capnp::JsonCodec codec;
       auto root = builder.initRoot<capnp::JsonValue>();
       codec.decodeRaw(descriptor.asArray(), root);
+      const auto id = json::field(root.asReader(), "invocationId");
+      if (id.isString()) invocation = kj::str(id.getString());
       const auto route = json::field(root.asReader(), "durableTestRoute");
       KJ_REQUIRE(route.isObject(), "missing durable test routing identity");
       prefix = kj::str("D", codec.encodeRaw(route), "\n");
@@ -421,6 +424,18 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       confirmRefusal(PreExecutionRefusal::CAPACITY);
       kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, message));
     };
+    auto recordAdmissionRefusal = [&](kj::StringPtr resource) {
+      fprintf(stderr, "[durable-admission] {\"invocationId\":\"%s\",\"resource\":\"%s\"}\n",
+          escape(invocation.cStr()).c_str(), resource.cStr());
+    };
+    auto readAdmissionResource = [&]() -> kj::Promise<kj::String> {
+      char resource[32];
+      const auto size = co_await connection->stream->tryRead(resource, sizeof(resource), sizeof(resource));
+      if (size == 0 || !std::all_of(resource, resource + size, [](char value) {
+        return (value >= 'a' && value <= 'z') || value == '-';
+      })) co_return kj::str("unspecified");
+      co_return kj::heapString(resource, size);
+    };
     for (;;) {
       if (idle.empty()) connection->stream = co_await address->connect();
       else { connection->stream = kj::mv(idle.back()); idle.pop_back(); }
@@ -432,6 +447,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
       KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
       if (decision == 'R') {
+        if (threadedDurable) recordAdmissionRefusal(co_await readAdmissionResource());
         refuseCapacity("native invocation queue is full; nothing executed");
       }
       if (threadedDurable && decision == 'E') {
@@ -445,10 +461,11 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       if (threadedDurable && decision == 'I') {
         // Idle trees may be closing to return a tree or an entire home.
         // Retry the preface so this invocation can enter after the close settles.
-        connection->stream = nullptr;
         if (timer->now() + retryDelay >= waitUntil) {
+          recordAdmissionRefusal(co_await readAdmissionResource());
           refuseCapacity("durable idle retirement did not settle; nothing executed");
         }
+        connection->stream = nullptr;
         co_await timer->afterDelay(retryDelay);
         retryDelay = kj::min(retryDelay * 2, 50 * kj::MILLISECONDS);
         continue;
@@ -483,8 +500,11 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
         co_return result.getDispatcher();
       } catch (const kj::Exception& error) {
         // Only the trusted start reply can establish that the event never ran.
-        if (error.getDetail(DURABLE_COPY_RESERVATION_REFUSED) != kj::none ||
-            error.getDetail(WAL_HOME_CAPACITY_REFUSED) != kj::none) {
+        if (error.getDetail(DURABLE_COPY_RESERVATION_REFUSED) != kj::none) {
+          recordAdmissionRefusal("copy-preparation");
+          confirmRefusal(PreExecutionRefusal::CAPACITY);
+        } else if (error.getDetail(WAL_HOME_CAPACITY_REFUSED) != kj::none) {
+          recordAdmissionRefusal("wal-home");
           confirmRefusal(PreExecutionRefusal::CAPACITY);
         } else if (error.getDetail(STORAGE_CLOSE_UNCONFIRMED) != kj::none) {
           confirmRefusal(PreExecutionRefusal::STORAGE_CLOSE_UNCONFIRMED);
@@ -2656,6 +2676,7 @@ public:
     }
     if (p->durable && p->threaded) {
       childEnvironment.push_back("COWORKERD_DO_MAX_HOMES=" + std::to_string(config.durableMaxHomes));
+      childEnvironment.push_back("COWORKERD_DO_HOME_THREADS=" + std::to_string(config.durableHomeThreadBudget));
       for (const auto* name : {"COWORKERD_DO_TEST_TREES_PER_COPY",
                "COWORKERD_DO_TEST_PLACEMENT_BYTES", "COWORKERD_DO_TEST_BUSY_MS",
                "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",
@@ -4381,6 +4402,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"idleDestroyIntervalMs\":" << impl->config.idleDestroyIntervalMs
       << ",\"quarantineProcesses\":" << impl->config.quarantineProcesses
       << ",\"durableProcesses\":" << impl->config.durableProcesses
+      << ",\"durableHomeThreadBudget\":" << impl->config.durableHomeThreadBudget
       << ",\"inFlightLimit\":" << impl->config.inFlightLimit << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
       << ",\"probeOverdueMs\":" << impl->config.probeOverdueMs << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
       << ",\"watchdog\":" << (impl->config.watchdog ? "true" : "false") << ",\"restartBackoffMs\":" << impl->config.restartBackoffMs

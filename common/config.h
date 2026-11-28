@@ -34,6 +34,8 @@ struct ProcessPoolConfig {
   // not replaced with age or with requests; a rotation of one drains it before its next generation starts.
   uint32_t durableProcesses = 1;
   uint32_t durableMaxHomes = 16384;
+  // Native tasks available per threaded durable generation after the node's startup budget.
+  uint32_t durableHomeThreadBudget = 0;
   uint32_t sqlCpuLimitMs = 200;
   uint32_t sqlWallLimitMs = 800;
   uint32_t idleEvictMs = 300000;

@@ -611,13 +611,15 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
 | `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
 
-A threaded durable process draws its home threads from the thread budget given by
-`processPool.inFlightLimit`. Each created home reserves one thread, five descriptors and
+The node budgets native threads using the host's task and PID limits and the cgroup's
+process limits. It subtracts existing tasks and the planned overhead of the node and its
+children, then divides the remaining thread headroom across the durable processes and one
+replacement generation. Each created home reserves one thread, five descriptors and
 256 KiB for its loop. A new isolate copy also reserves 2.5 MiB to begin loading, then charges
 the process for its allocated heap, SQLite and other tracked memory. A root reserves four
 descriptors and 16 KiB for routing. Objects of one Worker definition can share a copy.
-Each open database owns a copy and a home. Empty home threads can be reused after their trees
-retire. See [threaded object admission](durable-objects.md#threaded-object-admission) for
+Each open database owns a copy and a home. Once a home releases its last copy and its work
+has settled, its thread exits and returns its reservations. See [threaded object admission](durable-objects.md#threaded-object-admission) for
 per-object waiting limits.
 
 A single encoded WAL record is limited to `min(64 MiB, 256 MiB, peerBufferBytes, UInt32 message limit) - 4 KiB`

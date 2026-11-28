@@ -150,9 +150,9 @@ async function empty() {
 }
 
 function reservationReached(state, pinned) {
-  const resource = state.admission.lastHomeRefusal;
-  assert.match(resource, /^(copy-(memory|residents|address-space)|home-(threads|descriptors|memory))$/);
-  assert.ok(state.admission.homeRefusals > 0);
+  const resource = state.admission.lastDurableRefusal;
+  assert.match(resource, /^(copy-(memory|residents|address-space)|home-(threads|descriptors|memory)|threads|descriptors|memory|address-space)$/);
+  assert.ok(state.admission.overloaded > 0);
   assert.ok(pinned > 4);
   return resource;
 }
@@ -161,7 +161,7 @@ async function measureResidentCost(before, after, pinned) {
   const deltas = Object.fromEntries(['rssKiB', 'anonymousKiB', 'threads', 'descriptors']
     .map(key => [key, (after[key] - before[key]) / pinned]));
   await record('resident-cost', { pinned, deltas, ...after });
-  console.log(JSON.stringify({ size, mode, pinned, resource: after.admission.lastHomeRefusal, deltas }));
+  console.log(JSON.stringify({ size, mode, pinned, resource: after.admission.lastDurableRefusal, deltas }));
 }
 
 async function visitParticipants(tenants, action) {
