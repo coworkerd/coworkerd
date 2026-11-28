@@ -57,12 +57,14 @@ function source(className) {
 }
 
 function summary(rows) {
-  const successful = rows.filter(row => !row.error && !row.missed);
-  // Misses and errors occupy ranks above successful replies.
-  const times = successful.map(row => row.scheduledElapsedMs).toSorted((a, b) => a - b);
-  return { offers: rows.length, successes: times.length, misses: rows.filter(row => row.missed).length,
-    errors: rows.filter(row => row.error).length, p50Ms: times[Math.ceil(rows.length * 0.50) - 1] ?? null,
-    p99Ms: times[Math.ceil(rows.length * 0.99) - 1] ?? null };
+  const sent = rows.filter(row => !row.missed);
+  const misses = rows.length - sent.length;
+  // Skipped offers have no latency. Failures among sent probes occupy ranks above successful replies.
+  const times = sent.filter(row => !row.error).map(row => row.scheduledElapsedMs).toSorted((a, b) => a - b);
+  return { offers: rows.length, sent: sent.length, successes: times.length, misses,
+    skipRatio: rows.length ? misses / rows.length : null, errors: sent.length - times.length,
+    p50Ms: times[Math.ceil(sent.length * 0.50) - 1] ?? null,
+    p99Ms: times[Math.ceil(sent.length * 0.99) - 1] ?? null };
 }
 
 async function measure() {
@@ -239,7 +241,8 @@ async function measure() {
     const busy = counts('busy');
     const deltaMs = busy.p99Ms === null || quiet.p99Ms === null ? null : busy.p99Ms - quiet.p99Ms;
     return [role, { quiet, busy, deltaMs, pass: quiet.successes >= 1000 && busy.successes >= 1000 &&
-      deltaMs !== null && deltaMs <= 5 && busy.errors <= quiet.errors && busy.misses <= quiet.misses }];
+      deltaMs !== null && deltaMs <= 5 && quiet.errors === 0 && busy.errors === 0 &&
+      quiet.skipRatio < 0.01 && busy.skipRatio < 0.01 }];
   }));
   await record('gate-summary', { child: ready.child, load: await run('uptime', []), ...results });
   console.log(JSON.stringify(results, null, 2));
