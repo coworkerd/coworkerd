@@ -288,6 +288,55 @@ to accommodate all its invocation channels. It verifies the ingress and executio
 median Linux `smaps_rollup` RSS with 32 and 3,072 idle connections to the same Worker and reports the delta per
 added connection for the daemon and ordinary workerd process on each measured node.
 
+### Threaded WebSocket message memory
+
+Run the two fixed local checks on a Linux Docker engine with cgroup v2. The first measures a
+bounded workload and the second checks the default home mailbox's current behavior.
+
+```sh
+node tests/cluster/websocket-frame-memory.mjs "$kernel"
+node tests/cluster/websocket-frame-memory.mjs "$kernel" --default-mailbox
+```
+
+The measurement opens eight hibernatable connections from one tenant on `node-1`. The fixture
+sends one 512 KiB binary message per connection, two at a time, with a 2 MiB node reservation
+limit. A pong on each of the first two connections confirms that ingress processed the first
+fragment. The reservation remains zero at that point. The existing adoption gate then holds both
+complete messages with exactly 2 MiB reserved. When the gate opens, the handler acknowledges
+the length and selected bytes of each message. Each wave returns the reservation to zero. The
+node container has two CPUs, a 512 MiB memory limit and zero swap. It runs one ordinary and one
+durable workerd child, with 32 in-flight places and no quarantine children.
+
+RSS samples come from `smaps_rollup` for the same daemon and child PIDs throughout the run. The
+sampler sleeps 5 ms between readings in the delivery check. The gated intervals use the maximum
+of five samples each. The release interval ends with the last handler acknowledgement. Short
+handoff transients may fall between samples. The container's `memory.peak` includes its processes,
+file cache and other cgroup charges. It is measured separately from process RSS, which includes
+resident shared pages. The client, control plane, storage and other containers are outside these
+readings. The reservation accounts for message bytes after the managed relay receives them.
+
+Three fresh ARM64 Docker Desktop runs on an Apple M4 used Linux 6.12.76, the release daemon from
+`4b8aa8f` and the verified `ad2ece2dcdd8` kernel series. All values are MiB.
+
+| Run | Daemon, parked baseline | Daemon, first fragments | Daemon, reservation held | Daemon, gate release to acknowledgements | Daemon, drained | Daemon, sampled peak | Container peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 29.98 | 30.49 | 31.08 | 31.54 | 30.75 | 31.76 | 51.39 |
+| 2 | 30.00 | 30.56 | 31.20 | 31.46 | 30.77 | 31.90 | 52.48 |
+| 3 | 29.97 | 30.48 | 31.11 | 31.20 | 30.71 | 32.04 | 51.00 |
+
+The ordinary child peaked at 55.55–56.73 MiB and the durable child at 54.29–54.41 MiB. All
+24 messages were acknowledged with no refusal, process change or cgroup OOM kill. The independent
+`durable-threaded-socket-frame-budget` case checks code 1013 and credit return at an eight-byte limit.
+
+With the default 128 MiB node reservation and default home mailbox, a single 3 MiB message reached
+home admission and was refused with `1013 Durable Object socket wake refused`. The durable child's
+overload counter increased by one, the node frame-budget refusal count stayed at zero, and the
+reservation returned to zero. Daemon RSS went from 29.84 to 32.42 MiB and the container peaked at
+53.13 MiB. A separate 32 MiB pilot through the Worker's forwarded upgrade hit a Cap’n Proto traversal
+limit in ordinary workerd before the managed handoff. These observations cover the fixed local
+workloads above. Maximum-size delivery with default settings remains an acceptance item for
+[#61](https://github.com/coworkerd/coworkerd/issues/61).
+
 The [database home benchmark](../../docs/database-home-benchmark.md) compares the published Object and native
 kernels through stateless Worker bindings. Its driver starts a single-node cluster for each side and records
 latency, throughput, CPU time, live database counts and idle memory.
