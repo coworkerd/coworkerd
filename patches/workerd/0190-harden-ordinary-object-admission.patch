@@ -33,7 +33,7 @@ index 6cc516e758c936cb2288d8ba35f9f641255f668e..f6b336c58ab8e4addc9f913d92b66133
   private:
    static constexpr int64_t BUCKETS = 16;
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index c3274da44dbfbf698f1d648f7ed1a9c611204c3a..22b210683c9230fc21f3d7580ba8b60c20d0a547 100644
+index 00c34cb80ddf59dc496d47840270269bba4ab351..db7c942b163e89a619fd798be2007f94291ac48f 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -380,11 +380,14 @@ struct ObjectAdmissionFixture {
@@ -175,7 +175,7 @@ index c3274da44dbfbf698f1d648f7ed1a9c611204c3a..22b210683c9230fc21f3d7580ba8b60c
  struct DatabaseAdmissionFixture {
    using Admission = server::DurableAdmission;
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f5527706e 100644
+index e52e7ddf9fb113812d9d7f2fbaf9b2df4383c031..a73f4eaac43d38de4704320c6c3e75f1eb7537cc 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -92,6 +92,7 @@
@@ -203,8 +203,8 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
 +      bool admissionTurnDelayed = false;
        server::DurableHomeLoad load{std::chrono::seconds(4)};
        server::DurablePressure pressure;
-       std::vector<DurableIncoming> incoming;
-@@ -2824,7 +2827,8 @@ struct ThreadedServer {
+       std::atomic<bool> walFull{false};
+@@ -2825,7 +2828,8 @@ struct ThreadedServer {
        kj::Own<const kj::Directory> durableDirectory = {},
        kj::Own<server::ThreadedWalLog> durableLog = {},
        jsg::V8System* existingV8 = nullptr,
@@ -214,7 +214,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
        : engine(existingV8 == nullptr ? std::make_unique<Engine>() : nullptr),
          v8(existingV8 == nullptr ? engine->v8 : *existingV8),
          isolateBusyClock(isolateBusyClock),
-@@ -2836,7 +2840,7 @@ struct ThreadedServer {
+@@ -2837,7 +2841,7 @@ struct ThreadedServer {
                      configuredCount("COWORKERD_DO_SQL_PROCESS_SPILL_BYTES", 0))
                  : nullptr),
          durableLog(kj::mv(durableLog)),
@@ -223,7 +223,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
            .treesPerCopy = this->durableStorage
                ? uint32_t(boundedDurableSetting("COWORKERD_DO_TEST_TREES_PER_COPY", 1024, 65536))
                : 0,
-@@ -2847,7 +2851,7 @@ struct ThreadedServer {
+@@ -2848,7 +2852,7 @@ struct ThreadedServer {
                ? std::chrono::milliseconds(
                      boundedDurableSetting("COWORKERD_DO_TEST_BUSY_MS", 3000, 4000))
                : std::chrono::milliseconds(0),
@@ -232,7 +232,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
          durableCommitDelayMs(
              this->durableStorage && !this->durableLog
                  ? configuredCount("COWORKERD_DO_TEST_COMMIT_DELAY_MS", 0) : 0),
-@@ -3275,7 +3279,11 @@ struct ThreadedServer {
+@@ -3276,7 +3280,11 @@ struct ThreadedServer {
      if (databaseVictim && now >= databaseVictim->deadline) {
        finishDatabaseRetirement(databaseVictim->outcome(now, false, false), now);
      }
@@ -245,15 +245,15 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
      return durableAdmission->expire(now);
    }
  
-@@ -3309,6 +3317,7 @@ struct ThreadedServer {
-       if (!thread.home || (databaseVictim && databaseVictim->home == id)) continue;
+@@ -3311,6 +3319,7 @@ struct ThreadedServer {
        const auto& home = *thread.home;
+       if (home.walFull.load(std::memory_order_relaxed)) continue;
        if (!database && now < home.databasePreferredUntil) continue;
 +      // New-root eligibility is checked here, including on the empty-home path.
        // The empty copy owns its old isolate until the home releases it.
        if (home.reservedTrees == 0 && !home.pressure.resetting() &&
            (spare == 0 ||
-@@ -3327,25 +3336,29 @@ struct ThreadedServer {
+@@ -3329,25 +3338,29 @@ struct ThreadedServer {
        bool needsPlacement) {
      if (objectVictim) return true;
      const auto deadline = now + std::chrono::seconds(1);
@@ -286,7 +286,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
          }
        }
      }
-@@ -3570,6 +3583,7 @@ struct ThreadedServer {
+@@ -3572,6 +3585,7 @@ struct ThreadedServer {
      auto root = state.durableRoots.find(tree);
      if (root == state.durableRoots.end() || root->second.resetting) return;
      root->second.resetting = true;
@@ -294,7 +294,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
      {
        std::lock_guard lock(durableRoutingMutex);
        KJ_ASSERT(durableAdmission->beginReset(tree, state.durableHome));
-@@ -3663,6 +3677,7 @@ struct ThreadedServer {
+@@ -3665,6 +3679,7 @@ struct ThreadedServer {
      const auto homeId = state.durableHome;
      const auto [victim, selectedObject] = [&] {
        std::lock_guard lock(durableRoutingMutex);
@@ -302,7 +302,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
        return std::pair(databaseVictim && databaseVictim->home == homeId ? databaseVictim : std::nullopt,
            objectVictim && objectVictim->home == homeId ? objectVictim : std::nullopt);
      }();
-@@ -3838,7 +3853,8 @@ struct ThreadedServer {
+@@ -3840,7 +3855,8 @@ struct ThreadedServer {
        auto &home = *threads[homeId - 1]->home;
        home.databaseCanRetire = databaseCanRetire;
        home.idleObjects = std::move(idleObjects);
@@ -312,7 +312,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
        const bool rejectedGrowth =
            memory.cause->load() == LimitCause::MEMORY || memory.durableProcessPressure.load();
        pressureAction = home.pressure.sample(home.memory >= placementLimit || rejectedGrowth,
-@@ -3874,7 +3890,7 @@ struct ThreadedServer {
+@@ -3876,7 +3892,7 @@ struct ThreadedServer {
        state.durableSlot.reset();
        std::lock_guard lock(durableRoutingMutex);
        auto &home = *threads[homeId - 1]->home;
@@ -321,7 +321,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
        home.warmDefinition.clear();
        home.databaseReservation.reset();
        if (home.reservedTrees == 0) home.definition.clear();
-@@ -3885,7 +3901,8 @@ struct ThreadedServer {
+@@ -3887,7 +3903,8 @@ struct ThreadedServer {
      }
    }
  
@@ -331,7 +331,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
      std::lock_guard lock(durableRoutingMutex);
      auto &home = *threads[homeId - 1]->home;
      const auto now = server::DurableHomeLoad::Clock::now();
-@@ -3893,7 +3910,8 @@ struct ThreadedServer {
+@@ -3895,7 +3912,8 @@ struct ThreadedServer {
        home.load.begin(now);
      } else {
        home.load.end(now);
@@ -341,7 +341,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
      }
    }
  
-@@ -3902,6 +3920,7 @@ struct ThreadedServer {
+@@ -3904,6 +3922,7 @@ struct ThreadedServer {
      const auto state = durableAdmission->state();
      size_t resident = 0, homes = 0, placementClosedHomes = 0, resettingHomes = 0;
      uint64_t maxHomeMemory = 0;
@@ -349,7 +349,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
      if (ready.load(std::memory_order_acquire)) {
        for (const auto &thread: threads) {
          const auto &home = *thread->home;
-@@ -3910,6 +3929,15 @@ struct ThreadedServer {
+@@ -3912,6 +3931,15 @@ struct ThreadedServer {
          resettingHomes += home.pressure.resetting();
          maxHomeMemory = kj::max(maxHomeMemory, home.memory);
          resident += home.resident.size();
@@ -365,7 +365,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
        }
      }
      auto row = ",\"durableAdmission\":{\"trees\":" + std::to_string(state.trees) +
-@@ -3917,6 +3945,7 @@ struct ThreadedServer {
+@@ -3919,6 +3947,7 @@ struct ThreadedServer {
          ",\"placementClosedHomes\":" + std::to_string(placementClosedHomes) +
          ",\"resettingHomes\":" + std::to_string(resettingHomes) +
          ",\"maxHomeMemoryBytes\":" + std::to_string(maxHomeMemory) +
@@ -373,7 +373,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
          ",\"sqlSpillBytes\":" + std::to_string(durableStorage->getSqlSpillBudget().getUsed()) +
          ",\"sqlSpillMaximum\":" +
          std::to_string(durableStorage->getSqlSpillBudget().getCapacity()) +
-@@ -3933,6 +3962,7 @@ struct ThreadedServer {
+@@ -3935,6 +3964,7 @@ struct ThreadedServer {
          ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
          ",\"admissionRetirements\":" + std::to_string(durableAdmissionRetirements.load()) +
          ",\"actorResets\":" + std::to_string(durableActorResets.load()) +
@@ -381,7 +381,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
          ",\"isolateResets\":" + std::to_string(durableIsolateResets.load()) +
          ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
          ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
-@@ -4529,7 +4559,7 @@ struct ThreadedServer {
+@@ -4531,7 +4561,7 @@ struct ThreadedServer {
      slot->isolateLabel = "coworkerd-durable:" + std::to_string(slot->instance);
      slot->homeTurn = [this, homeId = state.durableHome, loaded = slot.get()](bool entering) {
        const auto &memory = *loaded->limits->memory;
@@ -390,7 +390,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
      };
      slot->resetDurableRoot = [this, &state](Worker::Actor &actor) {
        auto at = state.durableActorTrees.find(&actor);
-@@ -4551,10 +4581,9 @@ struct ThreadedServer {
+@@ -4553,10 +4583,9 @@ struct ThreadedServer {
      {
        trackDurableTurn(state.durableHome, true);
        KJ_DEFER({
@@ -404,7 +404,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
        });
        slot->worker = compile(*slot, input, source);
      }
-@@ -4575,6 +4604,7 @@ struct ThreadedServer {
+@@ -4577,6 +4606,7 @@ struct ThreadedServer {
        std::lock_guard lock(durableRoutingMutex);
        auto &home = *threads[state.durableHome - 1]->home;
        home.warmDefinition.clear();
@@ -412,7 +412,7 @@ index b25f631a36628f70a9002204ab67b648ef9bf997..3d21d5bcdbbeb14cced1c893dc64de4f
        home.databaseReservation.reset();
      }
      if (!state.durableLoad) {
-@@ -4606,6 +4636,7 @@ struct ThreadedServer {
+@@ -4608,6 +4638,7 @@ struct ThreadedServer {
        std::lock_guard lock(durableRoutingMutex);
        auto &home = *threads[state.durableHome - 1]->home;
        home.warmDefinition = loaded->planRevision;

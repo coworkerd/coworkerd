@@ -202,8 +202,9 @@ When a working set exceeds the available places, objects can retire and reopen r
 Retirement follows the existing facet and WebSocket hibernation rules. Queued calls, active
 events, tracked pending work and unfinished handoffs keep their tree in place. When no
 eligible tree can make room, the call receives `OVERLOADED` with `dispatched: false` and
-`retryable: true`. Per-copy placement, memory and descriptor limits also apply. With the
-upstream backend, active trees can temporarily exceed the resident target.
+`retryable: true`. If the node's five-second retirement retry window runs out, it returns
+the same capacity refusal. Per-copy placement, memory and descriptor limits also apply.
+With the upstream backend, active trees can temporarily exceed the resident target.
 
 An ordinary class exception leaves the instance available; fetch returns `500 EXECUTION_FAILED` with its message. CPU or memory termination invalidates the version's isolate in that durable process: all its objects there are constructed again on their next event, recovering storage subject to the limitations in section 7. A durable slot does not move a suspect tenant into quarantine.
 

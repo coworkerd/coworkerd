@@ -417,6 +417,10 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       onRefused(reason);
       if (refused.get() != nullptr) refused->fulfill(kj::mv(reason));
     };
+    auto refuseCapacity = [&](kj::StringPtr message) {
+      confirmRefusal(PreExecutionRefusal::CAPACITY);
+      kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, message));
+    };
     for (;;) {
       if (idle.empty()) connection->stream = co_await address->connect();
       else { connection->stream = kj::mv(idle.back()); idle.pop_back(); }
@@ -428,8 +432,7 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
       auto acknowledged = co_await connection->stream->tryRead(&decision, 1, 1);
       KJ_REQUIRE(acknowledged == 1, "native admission connection closed before dispatch");
       if (decision == 'R') {
-        confirmRefusal(PreExecutionRefusal::CAPACITY);
-        kj::throwRecoverableException(KJ_EXCEPTION(OVERLOADED, "native invocation queue is full; nothing executed"));
+        refuseCapacity("native invocation queue is full; nothing executed");
       }
       if (threadedDurable && decision == 'E') {
         kj::throwRecoverableException(tagRpcError(
@@ -443,9 +446,9 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
         // The previous idle tree is closing before execution begins. Retry
         // the preface so this invocation can enter after the close settles.
         connection->stream = nullptr;
-        if (timer->now() + retryDelay >= waitUntil)
-          kj::throwRecoverableException(tagRpcError(
-              KJ_EXCEPTION(OVERLOADED, "durable idle retirement did not settle"), "DO_UNAVAILABLE"));
+        if (timer->now() + retryDelay >= waitUntil) {
+          refuseCapacity("durable idle retirement did not settle; nothing executed");
+        }
         co_await timer->afterDelay(retryDelay);
         retryDelay = kj::min(retryDelay * 2, 50 * kj::MILLISECONDS);
         continue;
