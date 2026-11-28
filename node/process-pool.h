@@ -22,12 +22,12 @@
 
 namespace coworkerd {
 
-enum class PreExecutionRefusal { NONE, CAPACITY, STORAGE_CLOSE_UNCONFIRMED };
+enum class PreExecutionRefusal { NONE, CAPACITY, STORAGE_CLOSE_UNCONFIRMED, RESOURCE };
 
 struct OpenEvent {
   v1::rpc::EventDispatcher::Client dispatcher;
   kj::Promise<void> ready;
-  // The threaded durable child can confirm a refusal before issuing the event dispatcher.
+  // A negotiated ordinary child or a threaded durable child can confirm a refusal before dispatch.
   kj::Promise<PreExecutionRefusal> preExecutionRefusal = PreExecutionRefusal::NONE;
 };
 
@@ -59,6 +59,8 @@ public:
   uint64_t startedAtUnixMs = 0;
   bool dispatched = false;
   PreExecutionRefusal preExecutionRefusal = PreExecutionRefusal::NONE;
+  std::optional<CallResourceLevel> resourceRefusal;
+  bool root = true;
   bool upgradedToWebSocket = false;
   std::function<void()> onCapacityRejected;
 private:
@@ -132,6 +134,7 @@ public:
   WorkerLimits effectiveLimits(const std::string& workerId, bool durable = false) const;
   bool hot(const std::string& worker, const std::string& hash, uint32_t idleMs) const;
   std::shared_ptr<ProcessCall> select(const std::string& worker);
+  std::optional<CallResourceLevel> capacityRefusal(const std::string& worker, const std::string& objectKey = "");
   kj::Promise<void> sampleWorkerSaturation();
   bool workerSaturated(const std::string& worker, std::string_view planRevision, double nowMs) const;
   // Scheduling hint only: no refresh, process admission, or dispatch commitment.

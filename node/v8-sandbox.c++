@@ -109,30 +109,32 @@ SandboxBuildFacts parseSandboxFacts(const std::string& output, int exitStatus) {
   return facts;
 }
 
-SandboxBuildFacts probeSandboxBuild(const std::string& threadedExecutable) {
-  std::string program = threadedExecutable, option = "--sandbox-facts";
+namespace {
+struct ThreadedProbe {
+  std::string output, error;
+  int status = 1;
+};
+
+ThreadedProbe probeThreaded(const std::string& threadedExecutable, std::string option, int outputFd) {
+  std::string program = threadedExecutable;
   char* argv[] = {program.data(), option.data(), nullptr};
   int pipeFds[2];
   if (const int error = openProbePipe(pipeFds); error != 0) {
-    SandboxBuildFacts facts;
-    facts.probeError = std::string("pipe: ") + std::strerror(error);
-    return facts;
+    return {{}, std::string("pipe: ") + std::strerror(error)};
   }
   posix_spawn_file_actions_t actions;
   pid_t pid = -1;
   int spawned = posix_spawn_file_actions_init(&actions);
   if (spawned == 0) {
-    spawned = posix_spawn_file_actions_adddup2(&actions, pipeFds[1], STDERR_FILENO);
-    if (spawned == 0) spawned = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    spawned = posix_spawn_file_actions_adddup2(&actions, pipeFds[1], outputFd);
+    if (spawned == 0) spawned = posix_spawn_file_actions_addopen(&actions, outputFd == STDOUT_FILENO ? STDERR_FILENO : STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
     if (spawned == 0) spawned = posix_spawn(&pid, program.c_str(), &actions, nullptr, argv, environ);
     posix_spawn_file_actions_destroy(&actions);
   }
   close(pipeFds[1]);
   if (spawned != 0) {
     close(pipeFds[0]);
-    SandboxBuildFacts facts;
-    facts.probeError = "cannot run " + threadedExecutable + ": " + std::strerror(spawned);
-    return facts;
+    return {{}, "cannot run " + threadedExecutable + ": " + std::strerror(spawned)};
   }
   // The probe only starts V8 and answers; 30 s is far beyond it.
   std::string output;
@@ -156,11 +158,23 @@ SandboxBuildFacts probeSandboxBuild(const std::string& threadedExecutable) {
   int status = 0;
   while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
   if (timedOut) {
-    SandboxBuildFacts facts;
-    facts.probeError = "the sandbox probe of " + threadedExecutable + " did not answer within 30 s";
-    return facts;
+    return {{}, "the probe of " + threadedExecutable + " did not answer within 30 s"};
   }
-  return parseSandboxFacts(output, WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+  return {std::move(output), {}, WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status)};
+}
+}  // namespace
+
+SandboxBuildFacts probeSandboxBuild(const std::string& threadedExecutable) {
+  const auto probe = probeThreaded(threadedExecutable, "--sandbox-facts", STDERR_FILENO);
+  if (probe.error.empty()) return parseSandboxFacts(probe.output, probe.status);
+  SandboxBuildFacts facts;
+  facts.probeError = probe.error;
+  return facts;
+}
+
+bool probeDemandDrivenCalls(const std::string& threadedExecutable) {
+  const auto probe = probeThreaded(threadedExecutable, "--ordinary-admission-version", STDOUT_FILENO);
+  return probe.status == 0 && probe.output == "1\n";
 }
 
 ProtectionKeyFacts parseCpuFlags(const std::string& cpuinfo) {

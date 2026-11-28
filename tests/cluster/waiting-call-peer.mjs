@@ -27,7 +27,9 @@ function invoke(id) {
           let body;
           try { body = JSON.parse(text); } catch { body = {}; }
           resolve({ status: response.statusCode, nodeId: body.nodeId, upstream: body.upstream,
-            code: body.error?.code ?? body.code, reason: body.error?.reason ?? body.reason });
+            code: body.error?.code ?? body.code, reason: body.error?.reason ?? body.reason,
+            resource: body.resource, inFlight: body.inFlight, attempts: body.attempts,
+            dispatched: body.dispatched, retryable: body.retryable });
         });
       });
     request.on('error', reject);

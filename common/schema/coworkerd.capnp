@@ -264,6 +264,13 @@ struct InvocationRejection {
     unreported @10 :Void;
     inFlight @11 :UInt32;
   }
+  resource @12 :ResourceLevel;
+  struct ResourceLevel {
+    kind @0 :Text;
+    current @1 :UInt64;
+    limit @2 :UInt64;
+    capacity @3 :UInt64;
+  }
 }
 
 struct RemoteInvocation {
@@ -733,7 +740,7 @@ struct ServerConfig {
 
 struct ProcessPoolConfig {
   count @0 :UInt32 = 1;
-  inFlightLimit @1 :UInt32 = 512;
+  inFlightLimit @1 :UInt32 = 512;  # An explicitly configured shared ordinary and durable process ceiling.
   # Parsed and ignored: each workerd listens on a Unix socket it inherits from the
   # Server, in the stack's run directory, and has no TCP port.
   basePort @2 :UInt32 = 9000;
@@ -761,6 +768,8 @@ struct ProcessPoolConfig {
   threadedThreadIdleMs @17 :UInt32 = 60000;
   # Node-side wait for this tenant's process share, bounded by the call's lease.
   tenantAdmissionWaitMs @18 :UInt32 = 1000;
+  # Optional per-ordinary-process ceiling on the demand-driven kernel. Overrides the shared limit for this role.
+  ordinaryInFlightLimit @19 :UInt32;
 }
 
 struct RotationConfig {
@@ -856,7 +865,7 @@ struct PlacementConfig {
   rejectionAvoidMs @5 :UInt32 = 100;
   connectBackoffMs @6 :UInt32 = 100;
   loadBandForTest @7 :Text = "green";
-  equalLimitsForTest @8 :Bool = false;
+  equalLimitsForTest @8 :Bool = false;  # Deprecated; equality is always invalid.
   # Stateless Service Binding fetch and method calls try the caller's node first, then the ordinary warm/home policy.
   # Measurements found lower local p99 at both tested tenant counts and all three RTTs, at the cost of additional
   # svc replicas on caller nodes. Select "home" for memory-first deployments or large caller fan-out.

@@ -5,6 +5,7 @@
 #include "peer-liveness.h"
 #include "request-lease.h"
 #include "ingress-descriptors.h"
+#include "call-admission.h"
 #include "event-loop.h"
 #include "memory-events.h"
 #include "tenant-line.h"
@@ -45,6 +46,50 @@ struct TempDir {
   ~TempDir() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
   std::filesystem::path operator/(const char* file) const { return std::filesystem::path(path) / file; }
 };
+
+void callResourceAdmission() {
+  using Resource = CallResource;
+  constexpr CallResourceBudget tasks{Resource::NodeTasks, 96, 160, 1};
+  constexpr CallResourceBudget descriptors{Resource::NodeDescriptors, 1024, 1536, 4};
+  constexpr CallResourceBudget memory{Resource::NodeMemory, 8ull << 20, 24ull << 20, 512ull << 10};
+
+  KJ_REQUIRE(!callResourceRefusal(tasks, 55, true, false));
+  const auto root = callResourceRefusal(tasks, 56, true, false);
+  KJ_REQUIRE(root.has_value() && root->resource == Resource::NodeTasks && root->current == 152 &&
+      root->limit == 152 && root->capacity == 160);
+  KJ_REQUIRE(!callResourceRefusal(tasks, 56, true, true), "a reserved call must keep its slot");
+  KJ_REQUIRE(!callResourceRefusal(tasks, 56, false, false), "nested calls can use the reserve");
+  KJ_REQUIRE(!callResourceRefusal(tasks, 63, false, false));
+  KJ_REQUIRE(callResourceRefusal(tasks, 64, false, false).has_value());
+  KJ_REQUIRE(!callResourceRefusal(tasks, 55, true, false), "a released slot is immediately reusable");
+
+  KJ_REQUIRE(!callResourceRefusal(descriptors, 111, true, false));
+  auto fd = callResourceRefusal(descriptors, 112, true, false);
+  KJ_REQUIRE(fd.has_value() && fd->limit == 1472 && fd->current == 1472 && fd->resource == Resource::NodeDescriptors);
+  KJ_REQUIRE(!callResourceRefusal(memory, 27, true, false));
+  const auto bytes = callResourceRefusal(memory, 28, true, false);
+  KJ_REQUIRE(bytes.has_value() && bytes->limit == (22ull << 20) && bytes->current == (22ull << 20));
+  KJ_REQUIRE(callResourceRefusal({Resource::NodeTasks, 2, 1, 1}, 0, false, false).has_value());
+  KJ_REQUIRE(!callResourceRefusal({Resource::NodeTasks, 2, 0, 1}, 100, true, false));
+  KJ_REQUIRE(!callResourceRefusal({Resource::NodeTasks, 2, 3, 1}, 0, true, false));
+  auto observedTasks = tasks;
+  observedTasks.observed = 154;
+  const auto observation = callResourceRefusal(observedTasks, 0, true, false);
+  KJ_REQUIRE(observation.has_value() && observation->current == 154 && observation->limit == 152);
+
+  std::array<char, 17> wire = {'M', 0, 1, 2, 3, 4, 5, 6, 7, 0, 2, 3, 4, 5, 6, 7, 8};
+  auto parsed = parseOrdinaryResourceRefusal(wire);
+  KJ_REQUIRE(parsed.has_value() && parsed->resource == Resource::ProcessMemory &&
+      parsed->current == 0x01020304050607 && parsed->limit == 0x02030405060708);
+  wire[0] = 'X';
+  KJ_REQUIRE(!parseOrdinaryResourceRefusal(wire));
+  wire[0] = 'F';
+  std::fill(wire.begin() + 9, wire.end(), 0);
+  KJ_REQUIRE(!parseOrdinaryResourceRefusal(wire));
+  wire = {'T'};
+  parsed = parseOrdinaryResourceRefusal(wire);
+  KJ_REQUIRE(parsed.has_value() && parsed->resource == Resource::ProcessTasks && parsed->limit == 0);
+}
 
 void peerHalfClose() {
   auto io = kj::setupAsyncIo();
@@ -1065,6 +1110,7 @@ int main(int argc, char* argv[]) {
   KJ_REQUIRE(argc == 2);
   const std::string_view name(argv[1]);
   if (name == "native-config") nativeConfig();
+  else if (name == "call-resource-admission") callResourceAdmission();
   else if (name == "ingress-descriptor-plan") ingressDescriptorPlan();
   else if (name == "peer-half-close") { peerHalfClose(); httpReadBeforeFin(); }
   else if (name == "peer-session-liveness") peerSessionLiveness();

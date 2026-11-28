@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Behavior change.** The demand-driven kernel charges ordinary call slots while they are in flight. Nodes size ordinary admission from available memory, tasks and descriptors, and retain headroom for nested calls. The effective node and process ceilings and resource refusals appear in node state. Existing explicit limits still apply. See [waiting-call capacity](docs/guide/install.md#waiting-call-capacity).
+
 - **Behavior change.** Per-tenant outbound concurrency and rate limits are off by default. Set `egress.concurrency` to `32` and `egress.requestsPerSecond` to `100` to keep the previous defaults. Existing explicit settings keep their values.
 
 - **Diagnostic and profiling renames.** Update environment settings to use the new names. The old names are removed.

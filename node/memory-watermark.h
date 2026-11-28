@@ -1,5 +1,7 @@
 #pragma once
 
+#include "call-admission.h"
+
 #include <kj/async.h>
 #include <kj/timer.h>
 #include <cstdint>
@@ -20,6 +22,7 @@ public:
   void setTestBand(const std::string& value);
   std::string effectiveBand() const;
   std::string json() const;
+  CallResourceBudget callMemoryBudget() const;
   // This process's smaps/task_info and allocator snapshot; unavailable measurements are null.
   // pid: Current daemon namespace PID; startTicks distinguishes PID reuse on Linux.
   // startTicks: Linux /proc/self/stat field 22; null on native macOS.

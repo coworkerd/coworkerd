@@ -93,6 +93,14 @@ delay stays at two seconds. Set `--wait-ms` only for a separate capacity probe w
 hold, which lets larger batches overlap even when they take more than two seconds to reach the
 upstream. Run the fixture with the repository's verified release kernel.
 
+The demand-driven acceptance uses the same fixture. Use `--expect-first-resource` with increasing
+batches and omitted admission settings. Smaller batches must complete and the largest batch must
+show a resource refusal. Set `--node-cpus`, `--node-memory-gib` and `--node-tasks` for the node
+profile. The output captures the first resource and its level at both the node and client. Set
+`--ordinary-limit` and `--idle-worker-count` in two separate runs to compare idle cgroup memory
+at readiness and a minute later, and require the same requested number of loaded Workers.
+
+
 The JSONL includes per-call offers, replies and upstream hold intervals, sampled node occupancy and
 refusals, and per-process RSS, threads and open descriptors. The client and upstream run in separate
 containers on a private network. Cgroup samples record their resource limits and events separately
@@ -214,9 +222,9 @@ counters and requires all replies to contain the row, with the original threaded
 and no admission overloads.
 
 A Linux ARM64 run with the Worker on the database owner served 121 of 128 D1 requests.
-The other seven hit the node's root admission threshold, which counts both Worker roots
-and active database calls on that node. Running the Worker on a peer gives its roots their
-own default node admission budget. [Maintainer decision](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7183434485)
+The other seven hit the historical 128-call root ceiling, which counted both Worker roots
+and active database calls on that node. Running the Worker on a peer gives its roots a
+separate node admission budget. [Maintainer decision](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7183434485)
 
 ### Threaded SQLite memory limit
 
