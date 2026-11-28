@@ -405,14 +405,16 @@ async function run() {
         assert.equal(summary.replies, offered, 'sub-capacity batch refused');
         assert.equal(summary.peak, offered, 'sub-capacity batch did not fully overlap');
       } else {
-        const first = summary.firstResource?.result;
-        assert.ok(first, 'the largest batch must produce a resource refusal');
-        assert.equal(first.code, 'OVERLOADED');
+        const first = after.product?.state?.callResources?.firstRefusal;
+        assert.ok(first?.resource, 'the largest batch must produce a node resource record');
         assert.match(first.resource.kind, /^(node|process)-(memory|tasks|descriptors)$/);
         assert.ok(first.resource.limit > 0 && first.resource.current > 0 && first.inFlight > 0);
-        assert.equal(summary.failureCounts.OVERLOADED, offered - summary.replies, 'unexpected non-capacity failure');
-        const nodeFirst = after.product?.state?.callResources?.firstRefusal;
-        assert.equal(nodeFirst?.resource?.kind, first.resource.kind, 'first node and client resource disagree');
+        const refused = clientResult.calls.filter(({ result }) => result.resource);
+        assert.equal(refused.length, offered - summary.replies, 'unexpected non-capacity failure');
+        assert.ok(refused.every(({ result }) => result.code === 'OVERLOADED' && result.dispatched === false &&
+          result.retryable === true), 'a resource refusal must confirm it can be retried');
+        assert.ok(refused.some(({ result }) => result.resource.kind === first.resource.kind),
+          "the client never received the node's first resource kind");
       }
     }
     if (expectFull) {
