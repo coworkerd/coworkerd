@@ -137,13 +137,14 @@ async function fillWorkers() {
   const before = await empty();
   const participants = new Map();
   let nextRead = performance.now() + 2000;
-  let firstRefusal;
+  let refusalBatch;
   let refusalState;
   let offered = 0;
   try {
-    while (offered < tenants.length && !firstRefusal) {
+    while (offered < tenants.length && !refusalBatch) {
       const batch = tenants.slice(offered, offered + 8);
       const replies = await Promise.all(batch.map(tenant => callObject(tenant, 'pin')));
+      const refusals = [];
       for (let index = 0; index < batch.length; ++index) {
         const reply = replies[index];
         if (reply.status === 200) {
@@ -151,12 +152,14 @@ async function fillWorkers() {
           assert.equal(result.pinned, true);
           participants.set(batch[index], result.copy);
         } else {
-          const refusal = checkCapacityRefusal(reply);
-          firstRefusal ??= { firstRefusedOffer: offered + index + 1, refusal };
+          refusals.push(checkCapacityRefusal(reply));
         }
       }
       offered += batch.length;
-      if (performance.now() >= nextRead || firstRefusal) {
+      if (refusals.length !== 0) {
+        refusalBatch = { offered, batchSize: batch.length, accepted: participants.size, refusals };
+      }
+      if (performance.now() >= nextRead || refusalBatch) {
         // Background work protects each home without leaving an ordinary Worker
         // invocation in flight. A paced read proves that its same copy is still live.
         await visitParticipants([...participants.keys()], async tenant => {
@@ -178,10 +181,10 @@ async function fillWorkers() {
       }, { timeout: 3500, interval: 25 });
       const state = sample(current);
       await record('fill', { offered, pinned: participants.size, ...state });
-      if (firstRefusal) {
+      if (refusalBatch) {
         refusalState = state;
         const resource = reservationReached(state, participants.size);
-        await record('first-refusal', { pinned: participants.size, ...firstRefusal, resource, ...state });
+        await record('refusal-batch', { ...refusalBatch, resource, ...state });
       }
     }
     assert.ok(refusalState, 'increase offers to reach the first reservation refusal');
