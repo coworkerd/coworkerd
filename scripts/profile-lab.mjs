@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, readlinkSync, statSync } from "node:fs";
-import { chmod, copyFile, cp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
@@ -42,8 +42,7 @@ let server = null;
 export function binaries(directory = BIN) {
   const hash = path => existsSync(path) ? sha256(readFileSync(path)) : null;
   return { coworkerdServer: hash(`${directory}/coworkerd-server`), coworkerdLauncher: hash(`${directory}/coworkerd-launcher`),
-    workerd: hash(`${directory}/workerd`), coworkerdThreaded: hash(`${directory}/coworkerd-threaded`),
-    runtime: hash(`${REPO}/runtime/runtime.js`) };
+    workerd: hash(`${directory}/workerd`), coworkerdThreaded: hash(`${directory}/coworkerd-threaded`) };
 }
 
 export async function request(path, options = {}) {
@@ -69,7 +68,7 @@ export async function waitFor(check, label, timeoutMs = 30000, intervalMs = 50) 
   throw new Error(`timed out: ${label}`);
 }
 
-// Writes the stack (manifest, Worker sources, runtime, Server config; owned by the Server's user) and starts the
+// Writes the stack (manifest, Worker sources, Server config; owned by the Server's user) and starts the
 // Server as that user. `sandbox` is the configuration's sandbox.mode; `ownBinaries` copies the three binaries into
 // the stack (a case that replaces files on disk); `keepStack` starts again on the stack as it is (3.4).
 export async function setup({ sandbox, syscalls = null, workers = { ordinary }, config = {}, env = {}, waitReady = true,
@@ -80,7 +79,6 @@ export async function setup({ sandbox, syscalls = null, workers = { ordinary }, 
     await rm(STACK, { recursive: true, force: true });
     await mkdir(`${STACK}/workers`, { recursive: true });
     await mkdir(`${STACK}/logs`, { recursive: true });
-    await cp(`${REPO}/runtime`, `${STACK}/runtime`, { recursive: true });
     const manifest = { compatibilityDate: "2026-08-27", routes: [], workers: [] };
     // A Worker is its source, or { source, bindings } when it calls another one (the service binding of
     // patch 0001, which the runtime makes over run/binding.sock -- the profile's `binding` window).

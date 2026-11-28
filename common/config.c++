@@ -398,7 +398,6 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   // fills may both appear only with the same value.
   result.stackDirectory = root.getStackDirectory().cStr();
   result.workerdPath = root.getWorkerdPath().cStr();
-  result.runtimePath = root.getRuntimePath().cStr();
   result.listenAddress = root.getListenAddress().cStr();
   if (result.processPool.threadedDurableTestStorage) {
     KJ_REQUIRE(!given({"storage"}) && !given({"desiredState", "objectStore"}) &&

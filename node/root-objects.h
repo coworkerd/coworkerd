@@ -37,8 +37,6 @@ std::string rootNamespaceUniqueKey(const std::string& namespaceId);
 // Empty local data is initialized once; existing unmarked data is never changed.
 void checkRootStorageFormat(const std::filesystem::path& stack, bool initialize);
 
-std::string rootLoaderBinding(bool durable);
-std::string rootLoaderService(bool durable, const std::string& storageDirectory);
 struct RootDispatch {
   std::string plan, selection;
   std::string fingerprint;

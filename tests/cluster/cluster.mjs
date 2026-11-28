@@ -139,7 +139,7 @@ export class Cluster {
       const file = `coworkerd-syscalls-${phase}.txt`;
       files[`bin/${file}`] = join(this.kernel, 'allowlist', file);
     }
-    for (const file of ['docker/Dockerfile', 'docker/entrypoint.sh', 'runtime/runtime.js']) files[file] = join(this.productRoot, file);
+    for (const file of ['docker/Dockerfile', 'docker/entrypoint.sh']) files[file] = join(this.productRoot, file);
     await Promise.all(Object.entries(files).map(([file, source]) => copyFile(source, join(context, file))));
     if (this.peerAckGate) await mkdir(this.peerAckGate, { mode: 0o755 });
     if (this.fatalControl) await mkdir(this.fatalControl, { mode: 0o755 });

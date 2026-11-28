@@ -313,7 +313,7 @@ struct ServerConfig {
   uint64_t durableSocketFrameBytesPerNode = 128ull << 20;
   // The configuration file of `serve`. The four paths and addresses are serve only (the
   // positional form takes them as arguments); the shortcuts below them fill the nested fields.
-  std::string stackDirectory, workerdPath, runtimePath, listenAddress;
+  std::string stackDirectory, workerdPath, listenAddress;
   std::string storageCredentialsFile;
   bool serverIdGiven = false, cacheFollowsStack = false;
   // COWORKERD_MANAGEMENT_TOKEN overrides the file's management.token (run()). Without one the node refuses to start
@@ -348,7 +348,7 @@ struct ServerConfig {
   static ServerConfig load(const std::filesystem::path& path);
 
   bool servePathsGiven() const {
-    return !stackDirectory.empty() || !workerdPath.empty() || !runtimePath.empty() || !listenAddress.empty();
+    return !stackDirectory.empty() || !workerdPath.empty() || !listenAddress.empty();
   }
 
   bool hasPlacement(const std::string& workerId) const {

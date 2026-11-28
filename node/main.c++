@@ -10410,7 +10410,7 @@ struct Launch {
   std::string form;              // "serve" or "positional"
   fs::path configFile;           // empty: the positional form without a configuration file
   fs::path stackDirectory, manifestPath;
-  std::string workerd, runtime, listenAddress;
+  std::string workerd, listenAddress;
   std::string ignoredBindingAddress, ignoredSourceAddress;  // positional, unused
   bool experimentalNaiveLease = false;
   ServerConfig config;
@@ -10443,8 +10443,6 @@ Launch serveLaunch(const std::vector<std::string>& args, bool naive) {
   launch.manifestPath = launch.stackDirectory / "workers" / "manifest.json";
   const auto self = executableDirectory();
   launch.workerd = fs::absolute(c.workerdPath.empty() ? self / "workerd" : fs::path(c.workerdPath)).lexically_normal().string();
-  launch.runtime = fs::absolute(c.runtimePath.empty() ? self / ".." / "runtime" / "runtime.js" : fs::path(c.runtimePath))
-      .lexically_normal().string();
   launch.listenAddress = c.listenAddress.empty() ? "0.0.0.0:8930" : c.listenAddress;
   if (c.peerListenAddress.empty()) c.peerListenAddress = "0.0.0.0:8934";
   KJ_REQUIRE(c.desiredState.backend == "objectStore" && !c.desiredState.objectStore.endpoint.empty(),
@@ -10477,10 +10475,9 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
   launch.config = ServerConfig::load(launch.configFile);
   coworkerd::checkNodeLeaseMargin(launch.config.membership);
   KJ_REQUIRE(!launch.config.servePathsGiven(),
-      "stackDirectory, workerdPath, runtimePath and listenAddress are for `serve`; the positional form takes them as arguments");
+      "stackDirectory, workerdPath and listenAddress are for `serve`; the positional form takes them as arguments");
   // <stack>/workers/manifest.json -> <stack>.
   launch.stackDirectory = fs::absolute(launch.manifestPath).parent_path().parent_path();
-  launch.runtime = (launch.stackDirectory / "runtime/runtime.js").string();
   if (launch.config.cacheFollowsStack) launch.config.desiredState.cache.directory = launch.stackDirectory / "cache";
   return launch;
 }
@@ -10755,7 +10752,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       : std::getenv("AWS_ACCESS_KEY_ID") ? "environment" : "none";
   std::ostringstream out;
   out << std::setprecision(17) << "{\"nodeId\":" << q(c.serverId) << ",\"stackDirectory\":" << q(launch.stackDirectory.string())
-      << ",\"workerdPath\":" << q(launch.workerd) << ",\"runtimePath\":" << q(launch.runtime)
+      << ",\"workerdPath\":" << q(launch.workerd)
       << ",\"listenAddress\":" << q(launch.listenAddress) << ",\"peerListenAddress\":" << q(c.peerListenAddress)
       << ",\"advertisedAddress\":" << q(m.advertisedAddress)
       << ",\"membership\":{\"backend\":" << q(m.backend) << ",\"ttlSeconds\":" << m.ttlSeconds
@@ -10914,10 +10911,8 @@ int run(Launch launch) {
   if (serverConfig.peerListenAddress.empty()) {
     serverConfig.peerListenAddress = "127.0.0.1:0";
   }
-  // Environment overrides of the runtime file, the memory watermark and the process pool,
+  // Environment overrides of the memory watermark and the process pool,
   // applied before anything starts so that the configuration printed is the one in effect.
-  const char* runtimeFile = std::getenv("COWORKERD_RUNTIME_FILE");
-  if (runtimeFile) launch.runtime = fs::absolute(runtimeFile).string();
   if (auto* enabled = std::getenv("COWORKERD_MEMORY_WATERMARK_ENABLED")) {
     KJ_REQUIRE(std::string(enabled) == "0" || std::string(enabled) == "1", "invalid memory watermark override");
     serverConfig.memoryWatermarkEnabled = std::string(enabled) == "1";
@@ -11016,7 +11011,7 @@ int run(Launch launch) {
             << "\",\"source\":\"" << jsonEscape(sourceSocketAddress) << "\",\"ignoredBindingAddress\":\""
             << jsonEscape(launch.ignoredBindingAddress) << "\",\"ignoredSourceAddress\":\"" << jsonEscape(launch.ignoredSourceAddress)
             << "\"}" << std::endl;
-  coworkerd::ProcessPool runtime(serverConfig.processPool, launch.workerd, launch.runtime,
+  coworkerd::ProcessPool runtime(serverConfig.processPool, launch.workerd,
       stackDirectory.string(), bindingSocketAddress, sourceSocketAddress, *io.provider, io.unixEventPort,
       *headerTable, suspects);
   runtime.setHostCheckOomGuard([&hostCheck]() { return hostCheck.takeOomExposure(); });
@@ -11371,8 +11366,6 @@ int runSelfCheck(const std::vector<std::string>& args) {
   std::optional<Launch> launch;
   try {
     launch = serveLaunch(options, false);
-    const char* runtimeFile = std::getenv("COWORKERD_RUNTIME_FILE");
-    if (runtimeFile) launch->runtime = fs::absolute(runtimeFile).string();
     applyProcessPoolEnvironment(launch->config, launch->workerd);
     applyNodeDescriptorLimit(launch->config);
     report("configuration", true, ",\"configFile\":\"" + jsonEscape(launch->configFile.string()) + "\",\"nodeId\":\"" +
@@ -11507,7 +11500,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
         c.suspectProbation && c.processPool.quarantineProcesses > 0);
     c.processPool.heatIdleMs = c.idleMs;
     const auto run = directory / "run";
-    coworkerd::ProcessPool pool(c.processPool, launch->workerd, launch->runtime, directory.string(),
+    coworkerd::ProcessPool pool(c.processPool, launch->workerd, directory.string(),
         "unix:" + (run / "binding.sock").string(), "unix:" + (run / "source.sock").string(), *io.provider, io.unixEventPort,
         *headerTable, suspects);
     report("sandbox", true, ",\"mode\":\"" + jsonEscape(c.processPool.sandboxMode) + "\",\"syscalls\":\"" +

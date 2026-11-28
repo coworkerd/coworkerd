@@ -49,14 +49,14 @@ The fixture can vary the home and mailbox limits with `COWORKERD_DO_TEST_HOME_CO
 `COWORKERD_DO_TEST_BUSY_MS` control placement, and `COWORKERD_DO_TEST_FD_HEADROOM` sets the
 descriptor headroom before accounting for the home loops. These settings apply to disposable runs.
 
-On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js measure 4 64`
+On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" measure 4 64`
 to fill one durable child with four copies of 64 real objects each. The tool checks the next object's refusal
 and prints baseline and saturated thread count, RSS, descriptors, and admission counters.
 
 The `placement` mode alternates bounded synchronous work on one object with requests to new objects.
 It checks quiet-copy reuse, a distinct copy after the home becomes busy, pinned existing actors,
 returned event credits, and an unchanged ready child without actor resets or idle retirement.
-For example, `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" runtime/runtime.js placement 4 64 3000`
+For example, `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" placement 4 64 3000`
 uses four homes, 64 roots per copy, and a 3000 ms busy threshold in the four-second window.
 The last argument can vary the threshold for measurements; output includes every work and cold-request
 duration plus the child's thread count, RSS, descriptors, and admission counters. These request durations
@@ -88,7 +88,7 @@ import { dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 
-const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64', busyArg = '3000'] = process.argv.slice(2);
+const [nodeBinary, workerd, scenario, homeArg = '8', treeArg = '64', busyArg = '3000'] = process.argv.slice(2);
 const measure = scenario === 'measure';
 const httpLifecycle = scenario === 'http';
 const homeReservation = scenario === 'home-reservation';
@@ -278,8 +278,6 @@ try {
     await chmod(descriptorLimitedThreaded, 0o755);
     await symlink(threaded, `${descriptorLimitedThreaded}.target`);
   }
-  await mkdir(join(fixture, 'runtime'));
-  await copyFile(runtime, join(fixture, 'runtime', 'runtime.js'));
   const source = exerciseEvents ? `
     import { DurableObject } from "cloudflare:workers";
     const DEFINITION = "first";
@@ -1561,7 +1559,7 @@ try {
       generation: sameChild.generation, admission: counters}));
   }
   assert.deepEqual((await readdir(fixture)).sort(),
-    ['node.json', 'runtime', ...(queueLimit ? ['threaded-fd-limit', 'threaded-fd-limit.target'] : []), 'workers']);
+    ['node.json', ...(queueLimit ? ['threaded-fd-limit', 'threaded-fd-limit.target'] : []), 'workers']);
   child.kill('SIGTERM');
   await exited;
   assert.equal(child.exitCode, 0);

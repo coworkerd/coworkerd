@@ -2,13 +2,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const [nodeBinary, workerd, runtime] = process.argv.slice(2);
+const [nodeBinary, workerd] = process.argv.slice(2);
 assert.equal(process.platform, 'linux');
 const scratch = await mkdtemp(join(tmpdir(), 'cwkd-storage-lifecycle-'));
 const fixture = join(scratch, 'fixture');
@@ -90,8 +90,6 @@ async function request(value) {
 try {
   const modules = join(fixture, 'workers', 'counter', 'v1');
   await mkdir(modules, {recursive: true});
-  await mkdir(join(fixture, 'runtime'));
-  await copyFile(runtime, join(fixture, 'runtime', 'runtime.js'));
   const source = `
     import { DurableObject } from "cloudflare:workers";
     export class Counter extends DurableObject {

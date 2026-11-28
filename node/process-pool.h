@@ -83,7 +83,7 @@ private:
 class ProcessPool final {
 public:
   std::string memoryJson() const;
-  ProcessPool(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
+  ProcessPool(ProcessPoolConfig config, std::string executable,
       std::string directory, std::string bindingAddress, std::string sourceAddress,
       kj::AsyncIoProvider& provider, kj::UnixEventPort& eventPort, const kj::HttpHeaderTable& headers,
       Suspects& suspects);

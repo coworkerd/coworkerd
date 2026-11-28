@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 const source = await readFile(new URL('../sql-database.js', import.meta.url), 'utf8');
 const classSource = source.replace(/^import .*;$/m, '').replace(/^export /gm, '');
-function fixture({ wallDeadline = false } = {}) {
+function fixture() {
   const db = new DatabaseSync(':memory:');
   const sqlite = {
     get databaseSize() { return db.prepare('PRAGMA page_count').get().page_count * 4096; },
@@ -32,7 +32,6 @@ function fixture({ wallDeadline = false } = {}) {
     DurableObject: class { constructor(ctx) { this.ctx = ctx; } },
     ArrayBuffer, Uint8Array, Error, Request, Response, URL, TextEncoder,
   });
-  C.wallDeadline = wallDeadline;
   const worker = new C({ storage });
   const fetch = (body, endpoint = 'query', format = 'ARRAY_OF_OBJECTS') =>
     worker.fetch(new Request(`http://sql/${endpoint}?resultsFormat=${format}`, { method: 'POST', body: JSON.stringify(body) }));
@@ -42,7 +41,7 @@ function fixture({ wallDeadline = false } = {}) {
 }
 
 test('threaded SQL waits for a pending metadata write before entering its transaction', async () => {
-  const f = fixture({ wallDeadline: true });
+  const f = fixture();
   try {
     f.db.exec('CREATE TABLE ledger (value); BEGIN; INSERT INTO ledger VALUES (1)');
     let metadataCommitted = false;
@@ -114,7 +113,7 @@ test('execute converts parameters and BLOB cells while retaining earlier success
 });
 
 test('threaded execute syncs each successful statement before executing the next', async () => {
-  const f = fixture({ wallDeadline: true });
+  const f = fixture();
   try {
     await f.query({ sql: 'CREATE TABLE entries(id INTEGER PRIMARY KEY)' });
     const ids = () => f.db.prepare('SELECT id FROM entries ORDER BY id').all().map(row => row.id);
@@ -132,7 +131,7 @@ test('threaded execute syncs each successful statement before executing the next
 });
 
 test('a threaded deadline returns the typed 503 and rolls back a statement or batch', async () => {
-  const f = fixture({ wallDeadline: true });
+  const f = fixture();
   try {
     await f.query({ sql: 'CREATE TABLE entries(id)' });
     const reason = 'SQL_LIMIT_EXCEEDED: wall limit 30000ms exceeded';
@@ -150,7 +149,7 @@ test('a threaded deadline returns the typed 503 and rolls back a statement or ba
 });
 
 test('a threaded disconnect is passed to the runtime as the original exception', async () => {
-  const f = fixture({ wallDeadline: true });
+  const f = fixture();
   try {
     const error = Object.assign(new Error('SQL client disconnected'), { code: 'SQL_CLIENT_DISCONNECTED' });
     f.storage.sql.checkExecutionDeadline = () => { throw error; };
@@ -161,7 +160,7 @@ test('a threaded disconnect is passed to the runtime as the original exception',
 });
 
 test('threaded SQL reports a pre-commit interruption after assembling a successful reply', async () => {
-  const f = fixture({ wallDeadline: true });
+  const f = fixture();
   try {
     f.db.exec('CREATE TABLE ledger(id); INSERT INTO ledger VALUES (1)');
     const read = { sql: 'SELECT id FROM ledger ORDER BY id' };

@@ -2,13 +2,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const [nodeBinary, workerd, runtime] = process.argv.slice(2);
+const [nodeBinary, workerd] = process.argv.slice(2);
 assert.equal(process.platform, 'linux');
 const reservePort = () => new Promise((resolve, reject) => {
   const socket = createServer();
@@ -30,8 +30,6 @@ for (const [label, options, override, expected] of cases) {
   let child, closed, exited = false, diagnostic = '';
   try {
     await mkdir(join(stack, 'workers'));
-    await mkdir(join(stack, 'runtime'));
-    await copyFile(runtime, join(stack, 'runtime/runtime.js'));
     const manifest = join(stack, 'workers/manifest.json');
     const workerId = 'memory-component';
     const source = 'export default { fetch(){ return new Response("ready") } };';

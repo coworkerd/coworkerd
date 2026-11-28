@@ -6,8 +6,6 @@
 #include "event-loop.h"
 #include "memory-events.h"
 #include "process-heat.h"
-#include "root-objects.h"
-#include "platform-definition.h"
 #include "rpc-error.h"
 #include "memory-observation.h"
 #include "tenancy.h"
@@ -1609,7 +1607,7 @@ public:
   // callback returns (set by the node, setRetiring).
   std::function<uint32_t(const std::string&, uint64_t)> retiring;
   ProcessPoolConfig config;
-  std::string executable, runtimeFile, directory, runDirectory, bindingAddress, sourceAddress;
+  std::string executable, directory, runDirectory, bindingAddress, sourceAddress;
   std::string egressAddress;  // empty while tenant Workers have no network
   kj::AsyncIoProvider& provider;
   kj::UnixEventPort& eventPort;
@@ -1758,11 +1756,11 @@ public:
 
   uint64_t legacyDrainChecks = 0, legacyDrainDisagreements = 0, legacyLimitChecks = 0, legacyLimitDisagreements = 0;
 
-  Impl(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
+  Impl(ProcessPoolConfig config, std::string executable,
       std::string directory, std::string bindingAddress, std::string sourceAddress,
       kj::AsyncIoProvider& provider, kj::UnixEventPort& eventPort, const kj::HttpHeaderTable& headers,
       Suspects& suspects)
-      : config(config), executable(std::move(executable)), runtimeFile(std::move(runtimeFile)),
+      : config(config), executable(std::move(executable)),
         directory(std::move(directory)), runDirectory(this->directory + "/run"), bindingAddress(std::move(bindingAddress)),
         sourceAddress(std::move(sourceAddress)), provider(provider), eventPort(eventPort), headers(headers), suspects(suspects) {
     if (auto* ms = std::getenv("COWORKERD_CPU_LIMIT_MS")) {
@@ -1828,10 +1826,7 @@ public:
     if (this->config.threadedExecutable.empty())
       this->config.threadedExecutable = (std::filesystem::path(this->executable).parent_path() / "coworkerd-threaded").string();
     KJ_REQUIRE(access(this->executable.c_str(), X_OK) == 0, "workerd executable is required");
-    KJ_REQUIRE(this->config.durableProcesses == 0 || std::filesystem::is_regular_file(this->runtimeFile),
-        "durable runtime module is required");
     std::filesystem::create_directories(this->directory + "/logs");
-    std::filesystem::create_directories(this->directory + "/processes");
     std::filesystem::create_directories(runDirectory);
     std::filesystem::permissions(runDirectory, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
     // The durable processes' objects: one SQLite database per object (and its facets), below each root namespace's
@@ -2102,7 +2097,6 @@ public:
     bind("--bind", "/dev/urandom");
     bind("--bind-optional", "/sys/devices/system/cpu");
     bind("--bind-optional", "/etc/localtime");
-    bind("--bind", directory + "/processes");
     // The steady-state table is read by workerd itself, after the mount namespace exists, so unlike the
     // startup table -- which the launcher reads before it builds that namespace -- its file has to be in it.
     if (sandbox.syscalls.steady.active) bind("--bind", sandbox.syscalls.steady.path);
@@ -2479,7 +2473,6 @@ public:
     if (!rotation && p->generation > 1) ++s.restarts;
     auto signal = kj::newPromiseAndFulfiller<void>();
     p->exited = kj::mv(signal.fulfiller); p->exitSignal = kj::mv(signal.promise).fork();
-    const auto path = directory + "/processes/" + p->id + ".capnp";
     if (!egressAddress.empty()) {
       unsigned char random[16];
       KJ_REQUIRE(RAND_bytes(random, sizeof(random)) == 1, "cannot draw an egress token");
@@ -2487,55 +2480,6 @@ public:
       for (auto byte : random) { p->egressToken.push_back(digits[byte >> 4]); p->egressToken.push_back(digits[byte & 15]); }
     }
     p->wasmMemoryCapMiB = wasmMemoryCapMiB();
-    if (p->durable) {
-      std::filesystem::copy_file(runtimeFile, directory + "/processes/" + p->id + ".runtime.js",
-          std::filesystem::copy_options::overwrite_existing);
-      std::ofstream configFile(path);
-      configFile << "using Workerd = import \"/workerd/workerd.capnp\";\nconst config :Workerd.Config = (\n";
-      std::vector<std::string> v8Flags;
-      if (p->wasmMemoryCapMiB) v8Flags = {"--wasm-max-mem-pages=" + std::to_string(uint64_t(p->wasmMemoryCapMiB) * 16),
-          "--enforce-global-heap-limit", "--maximum-global-heap-limit-factor=1"};
-      // Every isolate's old generation starts this small, so its first full collection comes early and is small
-      // (gc.initialOldSpaceMiB); V8 grows it from there.
-      if (config.gcInitialOldSpaceMiB) v8Flags.push_back("--initial-old-space-size=" + std::to_string(config.gcInitialOldSpaceMiB));
-      if (!v8Flags.empty()) {
-        configFile << "v8Flags = [";
-        for (size_t i = 0; i < v8Flags.size(); ++i) configFile << (i ? ", " : "") << "\"" << v8Flags[i] << "\"";
-        configFile << "],\n";
-      }
-      // A durable process selects tenant and platform roots through its private root loader. The runtime runs with
-      // `experimental`: the Worker Loader gives a tenant isolate a streaming tail (its log lines as they are written) only
-      // when its loader has that flag (runtime.js, TenantLog); the tenant isolates' own flags are the definitions'.
-      configFile << "services = [(name = \"runtime\", worker = (compatibilityDate = \"2026-08-27\",\n"
-          "compatibilityFlags = [\"enable_request_signal\", \"experimental\"], modules = [(name = \"runtime.js\", esModule = embed \""
-          << p->id << ".runtime.js\"), (name = \"sql-database.js\", esModule = \""
-          << escape(sqlDatabaseSource()) << "\")], bindings = [\n"
-          "(name = \"LOADER\", workerLoader = (id = \"coworkerd-v1\")),\n"
-          "(name = \"SERVER\", service = \"server\"), (name = \"SOURCE\", service = \"source\"),\n"
-          << (egressAddress.empty() ? std::string() : "(name = \"EGRESS\", service = \"egress\"), (name = \"EGRESS_TOKEN\", text = \"" +
-              p->egressToken + "\"),\n")
-          << rootLoaderBinding(p->durable)
-          << "(name = \"PROCESS_ID\", text = \"" << p->id << "\"), (name = \"PROCESS_GENERATION\", text = \""
-          << p->generation << "\"), (name = \"PATH_TIMING\", text = \""
-          << (std::getenv("COWORKERD_PATH_TIMING") ? "1" : "") << "\")], globalOutbound = \"none\")),\n"
-          << rootLoaderService(p->durable, durableDirectory())
-          << "(name = \"server\", external = (address = \"" << escape(bindingAddress)
-          << "\", capnp = (capnpConnectHost = \"coworkerd-server\"))),\n"
-          "(name = \"source\", external = (address = \"" << escape(sourceAddress) << "\", http = ())),\n"
-          // The tenant Workers' global outbound: the request line carries the whole URL (the proxy form).
-          << (egressAddress.empty() ? std::string() : "(name = \"egress\", external = (address = \"" + escape(egressAddress) +
-              "\", http = (style = proxy))),\n") <<
-          "(name = \"internet\", network = (allow = [], deny = [])),\n"
-          "(name = \"none\", network = (allow = [], deny = []))],\n"
-          // No address: the listening socket is the descriptor given with --socket-fd.
-          "sockets = [(name = \"rpc\", service = \"runtime\", http = (capnpConnectHost = \"coworkerd-runtime\"))]);\n";
-      configFile.close(); KJ_REQUIRE(configFile.good(), "cannot write process configuration");
-    } else {
-      // Remove only the generated configuration of this ordinary slot.
-      std::error_code ignored;
-      std::filesystem::remove(path, ignored);
-      std::filesystem::remove(directory + "/processes/" + p->id + ".runtime.js", ignored);
-    }
     posix_spawn_file_actions_t actions;
     KJ_REQUIRE(posix_spawn_file_actions_init(&actions) == 0);
     auto cleanupActions = kj::defer([&] { posix_spawn_file_actions_destroy(&actions); });
@@ -3837,11 +3781,11 @@ public:
   }
 };
 
-ProcessPool::ProcessPool(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
+ProcessPool::ProcessPool(ProcessPoolConfig config, std::string executable,
     std::string directory, std::string bindingAddress, std::string sourceAddress,
     kj::AsyncIoProvider& provider, kj::UnixEventPort& eventPort, const kj::HttpHeaderTable& headers,
     Suspects& suspects)
-    : impl(std::make_unique<Impl>(config, std::move(executable), std::move(runtimeFile), std::move(directory),
+    : impl(std::make_unique<Impl>(config, std::move(executable), std::move(directory),
         std::move(bindingAddress), std::move(sourceAddress), provider, eventPort, headers, suspects)) {}
 ProcessPool::~ProcessPool() noexcept(false) = default;
 kj::Promise<void> ProcessPool::run() {

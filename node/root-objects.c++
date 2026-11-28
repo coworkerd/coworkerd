@@ -95,16 +95,6 @@ std::string rootNamespaceUniqueKey(const std::string& namespaceId) {
   return std::string(DURABLE_ROOT_UNIQUE_KEY_PREFIX) + namespaceId;
 }
 
-std::string rootLoaderBinding(bool) {
-  return "(name = \"ROOTS\", coworkerdRootLoader = \"roots\"),\n";
-}
-
-std::string rootLoaderService(bool durable, const std::string& storageDirectory) {
-  return "(name = \"roots\", coworkerdRootLoader = (plainOnly = " +
-      std::string(durable ? "false" : "true") + ", storagePath = " +
-      json::quote(durable ? storageDirectory : "") + ")),\n";
-}
-
 std::string_view plainPlanFingerprint(std::string_view plan) {
   constexpr std::string_view field = ",\"versionFingerprint\":\"";
   if (const auto at = plan.rfind(field); at != std::string_view::npos) {

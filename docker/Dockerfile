@@ -1,5 +1,5 @@
 # The Coworkerd image: the binaries of a release package, nothing compiled here. The build context is an
-# unpacked package (bin/, runtime/, docker/), as scripts/release.sh builds it:
+# unpacked package (bin/, docker/), as scripts/release.sh builds it:
 #   docker build --platform linux/<arch> --build-arg COWORKERD_VERSION=<version> -t coworkerd:<version> \
 #     -f docker/Dockerfile <package directory>
 # The base is Debian 13 slim (glibc 2.41, OpenSSL 3), what the binaries are built against; BASE may name the
@@ -8,7 +8,7 @@ ARG BASE=debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2ba
 FROM ${BASE}
 ARG COWORKERD_VERSION=0.0.0-dev
 LABEL org.opencontainers.image.title="coworkerd" \
-      org.opencontainers.image.description="Coworkerd: the node daemon, the control plane (with the deployment tool), workerd and the runtime" \
+      org.opencontainers.image.description="Coworkerd: the node daemon, the control plane (with the deployment tool), the execution kernel" \
       org.opencontainers.image.version="${COWORKERD_VERSION}"
 # The system's root certificates: the node's egress service makes tenants' HTTPS connections itself and verifies
 # the destinations against them (egress.caFile adds more).
@@ -30,7 +30,6 @@ RUN useradd --system --uid 10001 --user-group --home-dir /var/lib/coworkerd --no
 # launcher installs before it executes it; the Server finds them beside its own executable.
 COPY bin/coworkerd bin/coworkerd-apiserver bin/coworkerd-launcher bin/workerd bin/coworkerd-threaded \
      bin/coworkerd-syscalls-startup.txt bin/coworkerd-syscalls-steady.txt /opt/coworkerd/bin/
-COPY runtime/ /opt/coworkerd/runtime/
 COPY docker/entrypoint.sh /usr/local/bin/coworkerd-entrypoint
 ENV PATH=/opt/coworkerd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 USER coworkerd:coworkerd

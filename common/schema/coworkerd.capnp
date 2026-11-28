@@ -381,13 +381,13 @@ struct ServerConfig {
   # The single configuration file of `coworkerd --config FILE`. A minimal file
   # names nodeId and storage.endpoint; every other field has a default. The
   # legacy positional form (manifest, workerd, addresses on the command line) takes the
-  # shortcuts below too, but not the four paths and addresses its arguments give.
-  # Default /var/lib/coworkerd: logs/, run/, cache/, processes/ of this Server. Serve only.
+  # shortcuts below too, while taking paths and addresses from its arguments.
+  # Default /var/lib/coworkerd: logs/, run/, cache/ of this Server. Serve only.
   stackDirectory @25 :Text;
   # Default: `workerd` beside this executable. Serve only.
   workerdPath @26 :Text;
-  # Default: ../runtime/runtime.js from this executable's directory. Serve only.
-  runtimePath @27 :Text;
+  # Keep the retired runtime module path's ordinal unused.
+  unused27 @27 :Void;
   # The ingress. Default 0.0.0.0:8930. Serve only.
   listenAddress @28 :Text;
   # Ordinals 29 and 39 named a store 0.3 used beside the object store; 0.4 has no etcd, and a configuration that still

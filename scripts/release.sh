@@ -12,7 +12,7 @@
 #   coworkerd-<version>-linux-<arch>.tar.gz        bin/ (the node daemon, the control plane, the launcher, workerd,
 #                                                  coworkerd-threaded, cowctl, and the system call allowlist of this
 #                                                  workerd), lib/ (cowctl's Node.js code with
-#                                                  the Wrangler adapter and its dependencies), runtime/,
+#                                                  the Wrangler adapter and its dependencies),
 #                                                  docker/ (compose, entry point, Dockerfile, the hello
 #                                                  example), examples/, docs/ (install, quickstart, compat, errors,
 #                                                  databases, durable-objects), INSTALL.md, VERSION, SHA256SUMS
@@ -161,7 +161,7 @@ BUILD_SECONDS=$((SECONDS - started))
 NAME="coworkerd-$VERSION-linux-$ARCH"
 STAGE="$OUT/$NAME"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/bin" "$STAGE/runtime" "$STAGE/docker/examples" "$STAGE/docs" "$STAGE/lib"
+mkdir -p "$STAGE/bin" "$STAGE/docker/examples" "$STAGE/docs" "$STAGE/lib"
 for binary in coworkerd coworkerd-apiserver coworkerd-launcher; do
   docker cp "$CONTAINER:$TREE/$binary" "$STAGE/bin/$binary" >/dev/null
   chmod 0755 "$STAGE/bin/$binary"
@@ -181,7 +181,6 @@ APISERVER_VERSION_TEXT=$(docker exec "$CONTAINER" "$TREE/coworkerd-apiserver" --
 grep -q "^coworkerd-apiserver $VERSION$" <<<"$APISERVER_VERSION_TEXT" || { echo "the built control plane reports another version: $APISERVER_VERSION_TEXT" >&2; exit 1; }
 
 # ---- The package --------------------------------------------------------------------------------------------
-cp "$ROOT/runtime/runtime.js" "$STAGE/runtime/runtime.js"
 cp "$ROOT/docker/Dockerfile" "$ROOT/docker/docker-compose.yml" "$ROOT/docker/docker-compose.sandbox.yml" "$ROOT/docker/.env.example" "$STAGE/docker/"
 cp "$ROOT/docker/entrypoint.sh" "$ROOT/docker/storage-entrypoint.sh" "$STAGE/docker/"
 chmod 0755 "$STAGE/docker/entrypoint.sh" "$STAGE/docker/storage-entrypoint.sh"
@@ -319,7 +318,7 @@ record = {
     "glibc": json.loads(glibc),
     "workerd": {"upstream": tag, "upstreamCommit": commit, "patchSeries": series.split(","), "patchSeriesSha256": series_sha,
                 "sha256": sha(os.path.join(stage, "bin/workerd")), **json.loads(archive)},
-    "binaries": {p: sha(os.path.join(stage, p)) for p in ("bin/coworkerd", "bin/coworkerd-apiserver", "bin/coworkerd-launcher", "bin/workerd", "bin/coworkerd-threaded", "runtime/runtime.js",
+    "binaries": {p: sha(os.path.join(stage, p)) for p in ("bin/coworkerd", "bin/coworkerd-apiserver", "bin/coworkerd-launcher", "bin/workerd", "bin/coworkerd-threaded",
                                                          "bin/cowctl", "lib/cowctl/bin/cowctl.mjs", "lib/cowctl/adapter.mjs",
                                                          "lib/cowctl/package-lock.json")},
     # The system call allowlist of the workerd above: its files' digests and the workerd it names.
