@@ -137,7 +137,7 @@ async function run() {
   const { egress } = initial;
   const tenantEgress = egress.tenantPolicies.find(policy => policy.tenant === tenantName);
   const egressLimit = tenantEgress.concurrency || egress.concurrency;
-  assert.ok(plan.every(count => count < Math.min(initial.placement.rootLimit, egressLimit,
+  assert.ok(plan.every(count => count < Math.min(initial.placement.rootLimit, egressLimit || Infinity,
     initial.processes.configuration.inFlightLimit)));
   const fixtures = [
     { service: 'apiserver', role: 'apiserver', executable: '/opt/coworkerd/bin/coworkerd-apiserver', argument: '--config' },
