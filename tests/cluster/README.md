@@ -112,6 +112,10 @@ The separate [hot Worker placement measurement](../../docs/hot-worker-placement.
 ingress near twice the measured single-isolate rate and compares another tenant's light-request p99
 with adjacent quiet windows. Its driver runs on demand on a quiet test machine.
 
+The same driver measures [one Worker above three-node capacity](../../docs/hot-worker-overload.md).
+The `overload` mode calibrates the live cluster, runs fixed-rate control and overload windows,
+and records client replies through drain along with per-node root slots and placement counters.
+
 ### Threaded SQL deadline and disconnect
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-deadline` with the matching Linux
