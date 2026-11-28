@@ -9,9 +9,9 @@
 # the verified Linux kernel of the current patch series (use --kernel-dir for a local release mirror),
 # and produces in OUT (default
 # build/release/<version>):
-#   coworkerd-<version>-linux-<arch>.tar.gz        bin/ (the node daemon, the control plane, the launcher, workerd,
-#                                                  coworkerd-threaded, cowctl, and the system call allowlist of this
-#                                                  workerd), lib/ (cowctl's Node.js code with
+#   coworkerd-<version>-linux-<arch>.tar.gz        bin/ (the node daemon, the control plane, the launcher,
+#                                                  coworkerd-threaded, cowctl, and the kernel's system call allowlists),
+#                                                  lib/ (cowctl's Node.js code with
 #                                                  the Wrangler adapter and its dependencies),
 #                                                  docker/ (compose, entry point, Dockerfile, the hello
 #                                                  example), examples/, docs/ (install, quickstart, compat, errors,
@@ -75,7 +75,6 @@ if [[ -n ${COWORKERD_RELEASE_WORKERD:-} || -n ${COWORKERD_RELEASE_ALLOWLIST:-} ]
 fi
 KERNEL_INFO=$(python3 "$ROOT/scripts/fetch-kernel.py" --arch "$KERNEL_ARCH" --json ${KERNEL_SOURCE[@]+"${KERNEL_SOURCE[@]}"})
 KERNEL=$(python3 -c 'import json, sys; print(json.load(sys.stdin)["path"])' <<<"$KERNEL_INFO")
-WORKERD="$KERNEL/workerd"
 THREADED="$KERNEL/coworkerd-threaded"
 ALLOWLIST="$KERNEL/allowlist"
 metadata=$(python3 - "$KERNEL/kernel.json" "$KERNEL_INFO" <<'PY'
@@ -84,12 +83,12 @@ from pathlib import Path
 record = json.loads(Path(sys.argv[1]).read_text())
 series = ",".join(name.removesuffix(".patch") for name in record["patchSeries"])
 print(record["upstream"], record["upstreamCommit"], series, record["patchSeriesSha256"],
-      record["files"]["workerd"], record["files"]["coworkerd-threaded"],
+      record["files"]["coworkerd-threaded"],
       json.dumps(json.loads(sys.argv[2])["archive"]), sep="\t")
 PY
 )
-IFS=$'\t' read -r UPSTREAM_TAG UPSTREAM_COMMIT SERIES_NAMES SERIES_SHA256 WORKERD_SHA256 THREADED_SHA256 KERNEL_ARCHIVE <<< "$metadata"
-ALLOWLIST_SUMMARY=$(python3 "$ROOT/scripts/syscall-allowlist-check.py" "$ALLOWLIST" "$WORKERD_SHA256") || exit 1
+IFS=$'\t' read -r UPSTREAM_TAG UPSTREAM_COMMIT SERIES_NAMES SERIES_SHA256 THREADED_SHA256 KERNEL_ARCHIVE <<< "$metadata"
+ALLOWLIST_SUMMARY=$(python3 "$ROOT/scripts/syscall-allowlist-check.py" "$ALLOWLIST" "$THREADED_SHA256") || exit 1
 log "system call allowlist: $ALLOWLIST_SUMMARY"
 
 for page in install quickstart compat errors databases durable-objects; do
@@ -115,10 +114,10 @@ SOURCE=$COMMIT
 [[ $DIRTY == "$EMPTY" ]] || SOURCE="$COMMIT+$DIRTY"
 if $CHECK_ONLY; then
   python3 - "$VERSION" "$ARCH" "$SOURCE" "$UPSTREAM_TAG" "$UPSTREAM_COMMIT" "$SERIES_NAMES" "$SERIES_SHA256" \
-      "$WORKERD_SHA256" "$THREADED_SHA256" "$KERNEL_ARCHIVE" "$ALLOWLIST" "$GLIBC_FLOOR" "$(node --version)" "$(npm --version)" <<'PY'
+      "$THREADED_SHA256" "$KERNEL_ARCHIVE" "$ALLOWLIST" "$GLIBC_FLOOR" "$(node --version)" "$(npm --version)" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
-(version, arch, source, tag, commit, series, series_sha, workerd_sha, threaded_sha, archive,
+(version, arch, source, tag, commit, series, series_sha, threaded_sha, archive,
  allowlist, floor, node, npm) = sys.argv[1:]
 directory = Path(allowlist)
 record = json.loads((directory / "allowlist.json").read_text())
@@ -126,12 +125,12 @@ syscalls = {kind: {"file": record[kind]["file"], "calls": record[kind]["count"],
                   "sha256": hashlib.sha256((directory / record[kind]["file"]).read_bytes()).hexdigest()}
             for kind in ("startup", "steady")}
 syscalls["recordSha256"] = hashlib.sha256((directory / "allowlist.json").read_bytes()).hexdigest()
+syscalls["workerdSha256"] = threaded_sha
 print(json.dumps({"checkOnly": True, "version": version, "architecture": arch, "source": source,
     "workerd": {"upstream": tag, "upstreamCommit": commit, "patchSeries": series.split(","),
-                "patchSeriesSha256": series_sha, "sha256": workerd_sha,
-                "threadedSha256": threaded_sha, **json.loads(archive)},
+                "patchSeriesSha256": series_sha, "threadedSha256": threaded_sha, **json.loads(archive)},
     "syscalls": syscalls, "GLIBC_FLOOR": floor,
-    "checks": {"workerd": True, "allowlist": True,
+    "checks": {"threadedExecutable": True, "allowlist": True,
                "guides": ["install", "quickstart", "compat", "errors", "databases", "durable-objects"],
                "node": node, "npm": npm}}))
 PY
@@ -166,10 +165,10 @@ for binary in coworkerd coworkerd-apiserver coworkerd-launcher; do
   docker cp "$CONTAINER:$TREE/$binary" "$STAGE/bin/$binary" >/dev/null
   chmod 0755 "$STAGE/bin/$binary"
 done
-cp "$WORKERD" "$THREADED" "$STAGE/bin/"
-chmod 0755 "$STAGE/bin/workerd" "$STAGE/bin/coworkerd-threaded"
+cp "$THREADED" "$STAGE/bin/"
+chmod 0755 "$STAGE/bin/coworkerd-threaded"
 GLIBC=$(cd "$STAGE" && python3 "$ROOT/scripts/glibc-requirement.py" --floor "$GLIBC_FLOOR" \
-  bin/coworkerd bin/coworkerd-apiserver bin/coworkerd-launcher bin/workerd bin/coworkerd-threaded)
+  bin/coworkerd bin/coworkerd-apiserver bin/coworkerd-launcher bin/coworkerd-threaded)
 # The allowlist beside the node daemon: that is where it looks for it (sandbox.syscalls.allowlistPath's default),
 # and the record of how it was generated travels with it.
 cp "$ALLOWLIST/coworkerd-syscalls-startup.txt" "$ALLOWLIST/coworkerd-syscalls-steady.txt" "$STAGE/bin/"
@@ -313,17 +312,18 @@ def sha(path):
             digest.update(chunk)
     return digest.hexdigest()
 stage = os.path.join(out, name)
+threaded_sha = sha(os.path.join(stage, "bin/coworkerd-threaded"))
 record = {
     "version": version, "architecture": arch, "source": source,
     "glibc": json.loads(glibc),
     "workerd": {"upstream": tag, "upstreamCommit": commit, "patchSeries": series.split(","), "patchSeriesSha256": series_sha,
-                "sha256": sha(os.path.join(stage, "bin/workerd")), **json.loads(archive)},
-    "binaries": {p: sha(os.path.join(stage, p)) for p in ("bin/coworkerd", "bin/coworkerd-apiserver", "bin/coworkerd-launcher", "bin/workerd", "bin/coworkerd-threaded",
+                "threadedSha256": threaded_sha, **json.loads(archive)},
+    "binaries": {p: sha(os.path.join(stage, p)) for p in ("bin/coworkerd", "bin/coworkerd-apiserver", "bin/coworkerd-launcher", "bin/coworkerd-threaded",
                                                          "bin/cowctl", "lib/cowctl/bin/cowctl.mjs", "lib/cowctl/adapter.mjs",
                                                          "lib/cowctl/package-lock.json")},
-    # The system call allowlist of the workerd above: its files' digests and the workerd it names.
+    # The selected executable and the digests of its system call tables.
     "syscalls": (lambda record: {
-        "workerdSha256": record["workerd"]["sha256"],
+        "workerdSha256": threaded_sha,
         "architecture": record["architecture"],
         "generatedAt": record["generatedAt"],
         "profiles": [{"run": q["run"], "sha256": q["sha256"]} for q in record["profiles"]],
