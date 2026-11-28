@@ -430,6 +430,15 @@ transfer its transport state before closing the actor. An otherwise idle ineligi
 evicting. Active request wall limits and their invocation leases are separate. An event racing the retirement
 either saves the old actor before close begins or joins the next open, once.
 
+Closing an actor destroys its native storage state. Some JavaScript wrappers and their native allocations
+remain until V8 collects them. After the last actor and any queued starts leave a home, the home drops
+deferred handles, collects the isolate and drains its allocator thread cache. A copy that keeps serving
+objects relies on V8's normal collection and the existing pressure path. The configured isolate limit
+governs the heap and reported external allocations. A process that keeps serving objects can retain allocator
+pages up to its high-water mark. The manager returns unused allocator pages once the entire durable process
+drains. Warm copies, live allocations and any allocator spans that still contain live or cached objects
+continue to occupy memory.
+
 An eligible threaded platform database closes its tree and releases its exclusive copy about
 10 seconds after its last request finishes. Retaining empty copies exhausted the process
 admission budget in a serial scan of distinct databases. Releasing the copy with the tree
