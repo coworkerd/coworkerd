@@ -31,6 +31,7 @@ const WeakContexts = WeakMap;
 const readContext = Function.call.bind(WeakMap.prototype.get);
 const writeContext = Function.call.bind(WeakMap.prototype.set);
 const apply = Reflect.apply;
+export const __coworkerdDefineProperty = Object.defineProperty;
 export function __coworkerdCreateAlarmTimers() {
   const contexts = new WeakContexts();
   let abort;
@@ -583,8 +584,7 @@ function __coworkerdDurableClass(namespace, name) {
         throw new Error("Durable Object class " + name + " has no fetch handler");
       return withEnv(env, () => fetch.apply(this, args));
     } });
-    Object.defineProperty(wrapped.prototype, "__coworkerdAlarm", {
-      configurable: true,
+    __coworkerdDefineProperty(wrapped.prototype, "__coworkerdAlarm", {
       value: function (scheduledAtUnixMs, retryCount, wallMs, timeoutReason) {
         const env = __coworkerdObjectEnvs.get(this);
         return withEnv(env, async () => (await __coworkerdAlarm(this, scheduledAtUnixMs, retryCount, wallMs, timeoutReason)).json());
@@ -901,7 +901,7 @@ async function makeWorkerCode(descriptor, env, ctx, root = false) {
     const classes = Array.isArray(descriptor.durableObjectClasses) ? descriptor.durableObjectClasses : [];
     // A trial load shares this isolate's loader key but has no bindings. Include the namespace helpers here;
     // install bindings from each call's props, independently of the classes declared by this Worker.
-    const bridge = `import { __coworkerdLog, __coworkerdCreateAlarmTimers } from "./${PRELUDE_MODULE}";
+    const bridge = `import { __coworkerdLog, __coworkerdCreateAlarmTimers, __coworkerdDefineProperty } from "./${PRELUDE_MODULE}";
 import { withEnv, DurableObject, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import * as tenant from ${JSON.stringify("./" + descriptor.mainModule)};
 ${root ? `export * from ${JSON.stringify("./" + descriptor.mainModule)};\n` : ""}${TRIAL_SOURCE}

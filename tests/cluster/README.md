@@ -456,11 +456,11 @@ get those files and the cluster runner's combined output in `cluster.log`.
 | `disconnected-request-lease` | A reset cancels foreground work when no `waitUntil` is registered, notifies `request.signal` before headers, and cancels a response body after headers. Registered work can still make a child call inside the single drain window. No work can produce a write after the cutoff. |
 | `graceful-close-request-lease` | A FIN on a silent request with complete headers triggers `request.signal` promptly. Registered work can write inside the shared drain and is canceled at its cutoff. |
 | `response-drain-request-lease` | The streamed body reaches EOF while root and child background work remain live. Both can write near the deadline and both settle at the same ingress cutoff. |
-| `bounded-child-request-leases` | Completed Binding events on peer nodes release their lease records while a root remains live across three batches. |
+| `bounded-child-request-leases` | Three batches release their HTTP, JavaScript RPC, and Durable Object leases across nodes while the root stays live. Each batch also covers a thrown RPC, a canceled response and a fixture failure before dispatch. |
 | `peer-partition-request-lease` | A paused peer with an open TCP connection produces `RESULT_UNCERTAIN` within the watchdog window. The resumed callee releases its old call and cannot write. |
 | `silent-request-lease` | A client isolated at the network layer is released by the configured TCP keepalive. |
 | `actor-request-lease`, `threaded-actor-request-lease` | An object timer between events can fetch and start a fresh object call tree. The upstream role also exercises D1. A callback taken over by a newer event uses that event's lease. |
-| `alarm-wall-time`, `threaded-alarm-wall-time` | Both Durable Object backends end an alarm at the same test-shortened wall limit and continue serving the object. |
+| `alarm-wall-time`, `threaded-alarm-wall-time` | Both Durable Object backends end and retry an alarm at the test-shortened wall limit. The legacy case also attempts to replace the private alarm method. |
 | `sql-atomicity` | A successful SQL batch loses a write, or a write from a failed batch is visible after the duplicate-key error. |
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
 | `process-replacement` | Killing an ordinary workerd process marks a tenant without evidence, leaves its slot unavailable, or prevents the replacement from serving the next Worker request. |

@@ -487,7 +487,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `hostCheck.sampleMiB` | `16` | Fresh anonymous memory touched per round, `1` to `4096` MiB; larger samples increase both detection probability and cost. A failed helper is reported in `state.host` and retried at the next interval; service continues |
 | `idleEvictMs` | `300000` | How long a Worker may stay idle before it is evicted |
 | `drainTimeoutMs` | `30000` | How long to wait for in-flight calls when exiting; `0` turns the drain off (a drain closes the node's WebSocket connections with `1001` at its start) |
-| `ingress.tcpKeepalive.idleSeconds`, `intervalSeconds`, `probes` | `30`, `10`, `3` | TCP keepalive for accepted ingress connections. With the defaults, an unresponsive TCP endpoint is detected in about 60 seconds even while the response is silent. A socket error or a client FIN after a complete Worker request starts the drain promptly. |
+| `ingress.tcpKeepalive.idleSeconds`, `intervalSeconds`, `probes` | `30`, `10`, `3` | TCP keepalive for accepted ingress connections. With the defaults, an unresponsive TCP endpoint is detected in about 60 seconds even while the response is silent. A socket error or a client FIN after the Worker reads the body starts the drain promptly. If an unread body hides the FIN, a reset or keepalive detects the disconnect. |
 | `ingress.webSocketsPerNode` | `0` (use the default) | Ceiling shared by all tenants on this ingress node, capped by the available descriptors. See [inbound WebSocket capacity](#inbound-websocket-capacity) |
 | `durableObjects.socketFrameBytesPerNode` | `134217728` (128 MiB) | Budget shared by all tenants for text and binary payloads in transit to threaded homes on this node. Each message reserves twice its payload size. `0` refuses all nonempty data messages that need home delivery. See [Durable Object WebSockets](durable-objects.md#4-websockets-and-hibernation) |
 | `rotation.*` | see the schema | Process rotation, which replaces a process by a new generation with in-flight requests completing in the old one: `binaryCheckMs` (rotate when the workerd file changes, default 1000), `residentBytes` (rotate a process whose resident memory reaches it; left out, 70% of the node's memory -- its container's `memory.max`, else `memoryBudgetBytes`, else the machine's), `maxAgeMs` (default `0`, off; a value replaces every process after that long, as releases before 0.4.1 did every hour), `maxRequests`, `drainTimeoutMs` and others |
@@ -569,7 +569,7 @@ A Durable Object's outgoing `fetch()` between incoming events has no invocation 
 
 ### Inbound HTTP capacity
 
-A connected Worker request holds a concurrent root slot on its execution node for the duration of the response, including idle streaming time. `placement.rootLimit` caps concurrent roots across tenants on that node. Set `placement.tenantRootLimit` to reserve room for other tenants. A root that reaches either limit receives `503 OVERLOADED` before dispatch.
+A connected Worker request holds a concurrent root slot on its execution node for the duration of the response, including idle streaming time. The node refuses new roots when its combined root and nested occupancy reaches `placement.rootLimit`. Set `placement.tenantRootLimit` to reserve room for other tenants. A new root that reaches either limit receives `503 OVERLOADED` before dispatch.
 
 ### Inbound WebSocket capacity
 

@@ -3055,6 +3055,9 @@ private:
       const coworkerd::RootDispatch* root = nullptr) {
 
     KJ_ON_SCOPE_FAILURE(leases.erase(invocationId));
+    if (!parentInvocationId.empty() && version->workerId == platformDefinitions.failChildOpenForTest) {
+      KJ_FAIL_REQUIRE("child-open fixture stopped dispatch");
+    }
     auto timing = slot ? slot->timing : nullptr;
     if (slot) slot->requestLease = requestLeaseFor(invocationId);
     if (timing) { timing->invocationId = invocationId; timing->treeId = treeId; timing->target = version->key(); }

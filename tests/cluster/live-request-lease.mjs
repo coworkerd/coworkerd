@@ -27,6 +27,15 @@ const serviceWorker = `
     async fetch(request) {
       const url = new URL(request.url);
       const path = url.pathname.split('/').at(-1);
+      if (path === 'cancel-child') {
+        return new Response(new ReadableStream({
+          start(controller) { controller.enqueue(new TextEncoder().encode('started')); },
+          async pull(controller) {
+            await scheduler.wait(60_000);
+            controller.close();
+          },
+        }));
+      }
       if (!['drain-child', 'drain-markers', 'drain-record'].includes(path)) return new Response('service');
       const ledger = this.env.DRAIN_MARKERS.getByName('response');
       const record = async marker => {
@@ -48,6 +57,8 @@ const serviceWorker = `
       return new Response('child-response');
     }
     openHandle() { return new Handle(); }
+    value() { return 'rpc'; }
+    fail() { throw new Error('deliberate child failure'); }
   }
 `;
 
@@ -147,10 +158,29 @@ const worker = `
           const send = message => controller.enqueue(encoder.encode(message + '\\n'));
           send('started');
           for (let batch = 1; batch <= 3; ++batch) {
-            for (let i = 0; i < 32; ++i) {
+            for (let i = 0; i < 28; ++i) {
               const response = await env.SERVICE.fetch('https://service.test/');
               if (await response.text() !== 'service') throw new Error('Unexpected child response');
             }
+            if (await env.SERVICE.value() !== 'rpc') throw new Error('Unexpected child RPC response');
+            const object = await env.OBJECT.getByName('bounded').fetch('https://object.test/');
+            if (await object.text() !== 'object') throw new Error('Unexpected Durable Object response');
+            let thrown;
+            try { await env.SERVICE.fail(); } catch (error) { thrown = error; }
+            if (!thrown?.message.includes('deliberate child failure')) throw new Error('Missing child exception');
+            const canceled = await env.SERVICE.fetch('https://service.test/cancel-child');
+            const reader = canceled.body.getReader();
+            if (new TextDecoder().decode((await reader.read()).value) !== 'started')
+              throw new Error('The canceled child did not start');
+            await reader.cancel();
+            let openFailure;
+            try {
+              const reply = await env.OPEN_FAILURE.fetch('https://service.test/');
+              if (!reply.ok) openFailure = await reply.text();
+            } catch (error) {
+              openFailure = error.message;
+            }
+            if (!openFailure?.includes('child-open fixture stopped dispatch')) throw new Error('Missing child-open failure');
             send(String(batch * 32));
             await scheduler.wait(11_000);
           }
@@ -228,7 +258,7 @@ const worker = `
   };
 `;
 
-async function prepareLeaseWorker(cluster, tenantName, withD1 = false) {
+async function prepareLeaseWorker(cluster, tenantName, withD1 = false, withChildOpenFailure = false) {
   const tenant = await cluster.tenant(tenantName);
   if (withD1) await cluster.api(`${tenant.path}/databases/timer-db`, { method: 'POST', token: tenant.token });
   const drainMarkers = tenantName === 'live-request-drain' ? {
@@ -238,9 +268,11 @@ async function prepareLeaseWorker(cluster, tenantName, withD1 = false) {
     },
   } : {};
   await cluster.deploy(tenant, 'lease-service', serviceWorker, drainMarkers);
+  if (withChildOpenFailure) await cluster.deploy(tenant, 'lease-open-failure', serviceWorker);
   await cluster.deploy(tenant, 'lease-stream', worker, { wrangler: {
     compatibility_flags: ['enable_request_signal'],
-    services: [{ binding: 'SERVICE', service: 'lease-service' }],
+    services: [{ binding: 'SERVICE', service: 'lease-service' },
+      ...(withChildOpenFailure ? [{ binding: 'OPEN_FAILURE', service: 'lease-open-failure' }] : [])],
     durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'LeaseObject' }] },
     migrations: [{ tag: 'v1', new_sqlite_classes: ['LeaseObject'] }],
     ...(withD1 ? { d1_databases: [{ binding: 'DB', database_name: 'timer-db' }] } : {}),
@@ -484,7 +516,7 @@ async function checkDisconnects(cluster, tenant, modes) {
 
 export async function boundedChildRequestLeases(cluster) {
   // These two Workers have different homes under the test's placement policy.
-  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-drain');
+  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-drain', false, true);
   const state = () => Promise.all(cluster.nodes.map(node => cluster.state(node)));
   const started = performance.now();
   const signal = AbortSignal.any([cluster.signal, AbortSignal.timeout(60_000)]);
@@ -509,6 +541,7 @@ export async function boundedChildRequestLeases(cluster) {
         assert.deepEqual(leases.map(lease => lease.invocationId), [rootId]);
         const children = snapshots.flatMap(node => node.executions).filter(event => event.parentInvocationId === rootId);
         assert.equal(children.length, Number(line));
+        assert.equal(children.filter(event => event.kind === 'durable').length, Number(line) / 32);
         assert.ok(snapshots.some(node => node.nodeId !== executionNode.nodeId &&
           node.executions.some(event => event.parentInvocationId === rootId)), 'a child ran on a second execution node');
       }, { timeout: 3000, interval: 100 });
@@ -621,6 +654,20 @@ export async function alarmRequestLease(cluster) {
   await cluster.deploy(tenant, 'alarm', `
     import { DurableObject } from 'cloudflare:workers';
     export class Clock extends DurableObject {
+      constructor(ctx, env) {
+        super(ctx, env);
+        const bridge = Object.getPrototypeOf(this);
+        if (Object.hasOwn(bridge, '__coworkerdAlarm')) {
+          try {
+            Object.defineProperty(bridge, '__coworkerdAlarm', { value: async function (_time, retryCount) {
+              await this.alarm({ retryCount });
+              return { outcome: 'fired', atUnixMs: 0 };
+            } });
+          } catch (error) {
+            if (!(error instanceof TypeError)) throw error;
+          }
+        }
+      }
       async alarm(info) {
         if (info.retryCount) {
           await this.ctx.storage.put('retried', true);

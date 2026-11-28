@@ -140,13 +140,16 @@ void peerSessionLiveness() {
     auto lastAcknowledgement = 2 * kj::SECONDS;
 
     if (stall) {
-      // The node's loop stopped running while a ping and its reply were in
-      // flight. They can be serviced on resume even though wall time passed.
+      // Let the ready timer events run first on resume. The ping and its
+      // reply are still buffered in the transport at this point.
+      timer.advanceTo(start + 10 * kj::SECONDS);
+      waitScope.poll();
+      KJ_REQUIRE(!expired.poll(waitScope) && !inFlight.poll(waitScope),
+          "a local stall must not expire the session before the loop reads queued traffic");
       auto queued = kj::evalLater([&]() {
         receiver.receivedPing();
         unanswered.fulfiller->fulfill();
-      }).eagerlyEvaluate(nullptr);
-      timer.advanceTo(start + 10 * kj::SECONDS);
+      });
       queued.wait(waitScope);
       waitScope.poll();
       KJ_REQUIRE(!expired.poll(waitScope) && !inFlight.poll(waitScope));

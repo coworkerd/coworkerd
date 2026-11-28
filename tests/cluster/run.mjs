@@ -102,7 +102,13 @@ function defaultSuites() {
       },
     })),
     ...Object.entries(leaseCases).map(([name, test]) => ({
-      selected: [[name, test]], options: { configureNode: requestLeaseNode },
+      selected: [[name, test]], options: {
+        configureNode: requestLeaseNode,
+        ...(name === 'bounded-child-request-leases' && {
+          platformFixture: () => [],
+          nodeEnvironment: () => ({ COWORKERD_TEST_FAIL_CHILD_OPEN: 'live-request-drain/lease-open-failure' }),
+        }),
+      },
     })),
     ...Object.entries(actorLeaseCases).map(([name, threadedNodes]) => ({
       selected: [[name, actorRequestLease]],

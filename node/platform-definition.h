@@ -26,6 +26,7 @@ struct PlatformDefinitions {
   const PlatformDefinition product;
   std::optional<PlatformDefinition> fixture;
   std::map<std::pair<std::string, std::string>, PlatformClassRef> fixtureClasses;
+  std::string failChildOpenForTest;
 };
 
 PlatformDefinitions loadPlatformDefinitions();
