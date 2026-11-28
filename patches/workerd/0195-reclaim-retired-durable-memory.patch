@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sat, 28 Nov 2026 11:25:33 +0800
+Date: Sat, 28 Nov 2026 11:29:41 +0800
 Subject: [PATCH] Reclaim memory after durable object retirement
 
 Collect deferred actor handles on the owning home after ordinary retirement, drain the home allocation cache, and let the durable pool manager return free allocator pages without holding a routing or isolate lock.
@@ -8,14 +8,19 @@ Collect deferred actor handles on the owning home after ordinary retirement, dra
 Team cow-a
 
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index b2d1c524acd9ca2f1aaddbde51c2ebda230add16..41186047cca265ce1b2fa7a5fc67a78f9b244f72 100644
+index b2d1c524acd9ca2f1aaddbde51c2ebda230add16..5649a4bbc463a5fee35eefbf8c90bc476fdca8da 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
-@@ -31,7 +31,9 @@ THREADED_DEPS = [
+@@ -26,12 +26,14 @@ THREADED_DEPS = [
+     "//src/workerd/util:autogate",
+     "//src/workerd/util:entropy",
+     "//src/workerd/util:sqlite-metering",
++    "@abseil-cpp//absl/time",
+     "@capnp-cpp//src/capnp:capnp-rpc",
+     "@capnp-cpp//src/capnp/compat:http-over-capnp",
      "@capnp-cpp//src/capnp/compat:json",
      "@capnp-cpp//src/kj:kj-async",
      "@capnp-cpp//src/kj/compat:kj-http",
-+    "@com_google_absl//absl/time",
      "@ssl",
 +    "@tcmalloc//tcmalloc:malloc_extension",
  ]
