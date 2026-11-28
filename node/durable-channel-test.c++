@@ -21,6 +21,47 @@
 namespace coworkerd {
 
 struct DurableLogChannelTest {
+  static void recoveryCompletion() {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-completed-rebuild-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    kj::TimerImpl clock(kj::origin<kj::TimePoint>());
+    ObjectStoreConfig store;
+    store.backend = "directory"; store.directory = temp; store.endpoint = "unused";
+    MembershipView membership;
+    DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), clock,
+        *io.lowLevelProvider, membership, {});
+    const DurableLog::ObjectIdentity identity{std::string(64, '1'), std::string(64, '2'), "tenant", 1, 1, 0};
+    const auto name = durableHostName(identity.namespaceId, identity.objectId, identity.dataEpoch);
+    auto& object = log.objects[name];
+    object.objectName = name;
+    object.shardEpoch = identity.shardEpoch;
+    object.state = DurableLog::ObjectState::REBUILDING;
+
+    auto completed = kj::newPromiseAndFulfiller<void>();
+    auto canceler = std::make_unique<kj::Canceler>();
+    auto pending = canceler->wrap(kj::mv(completed.promise)).fork();
+    log.rebuilding.emplace(name, kj::mv(pending));
+    log.rebuildCancelers.emplace(name, std::move(canceler));
+    auto firstOpen = log.openObject(identity, false).eagerlyEvaluate(nullptr);
+    KJ_REQUIRE(!firstOpen.poll(io.waitScope), "the first open waits for the rebuild");
+
+    // The rebuilt image is local, and the adapter still has to deliver the result to the waiter.
+    object.state = DurableLog::ObjectState::LOCAL;
+    log.settledRebuilds.insert(name);
+
+    auto cleanup = log.healLoop().eagerlyEvaluate(nullptr);
+    io.waitScope.poll();
+    clock.advanceTo(clock.now() + 100 * kj::MILLISECONDS);
+    io.waitScope.poll();
+    KJ_REQUIRE(!log.rebuilding.contains(name) && !log.rebuildCancelers.contains(name),
+        "the cleanup removes the settled rebuild");
+    completed.fulfiller->fulfill();
+    const auto result = firstOpen.wait(io.waitScope);
+    KJ_REQUIRE(result.ready, result.code.c_str(), result.reason.c_str());
+  }
+
   static void recoveryAdmission() {
     auto io = kj::setupAsyncIo();
     kj::TimerImpl clock(kj::origin<kj::TimePoint>());
@@ -2739,6 +2780,7 @@ int main(int argc, char* argv[]) {
   else if (mode == "threaded-alarms") coworkerd::DurableLogChannelTest::threadedAlarms();
   else if (mode == "publish-gate") coworkerd::DurableLogChannelTest::publishGate();
   else if (mode == "recovery-admission") coworkerd::DurableLogChannelTest::recoveryAdmission();
+  else if (mode == "recovery-completion") coworkerd::DurableLogChannelTest::recoveryCompletion();
   else if (mode == "recovery-requeue") coworkerd::DurableLogChannelTest::recoveryRequeue();
   else if (mode == "recovery-final-per-object") coworkerd::DurableLogChannelTest::recoveryFinalPerObject();
   else if (mode == "recovery-final-round" || mode == "recovery-live-owner" || mode == "recovery-local-restart")

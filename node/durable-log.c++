@@ -4905,11 +4905,8 @@ kj::Promise<DurableLog::ObjectReady> DurableLog::openObject(ObjectIdentity ident
     auto alarm = alarms.find(identity.namespaceId + "/" + identity.objectId + "/0");
     if (alarm != alarms.end()) { alarm->second.objectName = objectName;alarm->second.dataEpoch = identity.dataEpoch; }
   }
-  auto settled = rebuilding.find(objectName);
-  if (settled != rebuilding.end() && settledRebuilds.contains(objectName)) {
-    rebuilding.erase(settled);
-    rebuildCancelers.erase(objectName);
-    settledRebuilds.erase(objectName);
+  if (rebuilding.contains(objectName) && settledRebuilds.erase(objectName)) {
+    forgetSettledRebuild(objectName);
   }
   if (!objects.contains(objectName) && !rebuildMetadataFits(REBUILD_ENTRY_BYTES, background)) {
     ++rebuildMetadataRefusals;
@@ -6650,14 +6647,21 @@ void DurableLog::objectFailed(const std::string& namespaceId, const std::string&
       ",\"shardEpoch\":\"" + std::to_string(shardEpoch) + "\",\"step\":" + quote(step) + ",\"reason\":" + quote(reason));
 }
 
+void DurableLog::forgetSettledRebuild(const std::string& name) {
+  auto canceler = rebuildCancelers.find(name);
+  if (canceler != rebuildCancelers.end()) {
+    // The rebuild has finished, but the adapter may still be delivering its result to waiting opens.
+    canceler->second->release();
+    rebuildCancelers.erase(canceler);
+  }
+  rebuilding.erase(name);
+}
+
 kj::Promise<void> DurableLog::healLoop() {
   for (;;) {
     co_await timer.afterDelay(100 * kj::MILLISECONDS);
     // A settled fork is removed by a later event, never by its own continuation.
-    for (const auto& name : settledRebuilds) {
-      rebuilding.erase(name);
-      rebuildCancelers.erase(name);
-    }
+    for (const auto& name : settledRebuilds) forgetSettledRebuild(name);
     settledRebuilds.clear();
   }
 }
