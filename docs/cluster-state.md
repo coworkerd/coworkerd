@@ -237,8 +237,7 @@ it leaves.
 
 The lifecycle publisher targets a 100 ms cadence. A busy maintenance thread can delay publication,
 and an exited process entry can still show its final snapshot. Use the process PID and sample
-timestamp to identify a live, recent reading. The field is absent while an isolate is loading and
-on backends that lack the measurement, including Durable Object homes.
+timestamp to identify a live, recent reading. The field appears only on loaded stateless isolates.
 
 `placement.tenantRootLimit` and `placement.tenantNestedLimit` add independent per-tenant limits to those same calls. Both default to `0` (disabled); the node-wide limit is checked first. A tenant refusal is `503 OVERLOADED` with reason `tenant ingress concurrency limit reached` and reports that tenant's count and limit. It does not cause peers to avoid the node. `placement.tenantAdmission` lists only tenants that currently hold a slot or have received such a refusal since this node started; root and nested in-flight counts and refusals are separate. Scheduled background alarms still use node-wide admission.
 
@@ -246,7 +245,6 @@ When the loaded process's per-tenant concurrency limit is reached, the node can 
 `processPool.tenantAdmissionWaitMs` and the request lease. The state endpoint reports this queue
 under `placement.pausedAdmission.tenant-execution`, and `[admission-wait]` rows identify the
 wait and its outcome.
-
 
 **Forwarding.** A forwarded call carries its Worker and version, the lock table, the call tree's identity and the remaining time -- a duration, so clocks need not agree -- but never secrets or request bytes. The receiver resolves the invocation's own budget, records a forwarded request as the tree's root, executes or refuses it, and never forwards it again. The request body flows only after the receiver accepted the call, so a refused call goes to the next candidate as it is. A call is addressed to the epoch the sender's table names: a process accepts every epoch it has held, expired ones included, while a process that started again holds only its new epoch and refuses calls addressed to its previous life.
 
@@ -325,15 +323,14 @@ before the object's answer goes out, merges the frames of all its objects into s
 each object's manifest naming what makes it up. A node that takes a shard over rebuilds its objects from that history
 and never reads the previous owner's files.
 
-The experimental threaded backend negotiates its role and WAL protocol revision for each child
+Each threaded durable child negotiates its role and WAL protocol revision for its process
 generation. Its homes share the inherited WAL socket through one I/O owner with bounded queues.
 Append acknowledgements identify requests, and checkpoint, seal, break, and close messages identify
 the exact database open. A home reports closure after SQLite closes the connection. For recovery the
 node blocks new dispatch and waits for those closes or for the pool to reap the generation before
 replacing its files. Rotation and node drain also ask for those closes before process termination.
-When recovery has to reset the durable processes, both backends wait for the pool to reap those
-generations. The recovery attempt fails if any affected generation is still unreaped after five seconds.
-Both backends use the same peer protocol, confirmation rules, and log, segment, and manifest formats.
+When recovery has to reset the durable processes, it waits for the pool to reap those generations.
+The recovery attempt fails if any affected generation is still unreaped after five seconds.
 The threaded child's file-preparation thread scans the WAL of a cold open in buffers of at most
 1 MiB. The home still opens its SQLite connection and runs idle or threshold-triggered checkpoints
 on that connection. `durableLog.threadedHomeIo` reports sample counts and observed maxima for the

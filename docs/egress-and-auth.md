@@ -12,7 +12,7 @@ Egress and authentication depend on each other: opening the network to tenants w
 
 ## 2. The policy point
 
-A tenant isolate's global outbound -- where its `fetch()` goes -- is an entry point of the runtime bridge, bound when the isolate loads to the Worker's full name and version taken from the call, never from tenant code. It forwards the request to the node's egress service on the Unix socket `<stack>/run/egress.sock`, adding a header with its process's egress token; the node opens the connection itself, TLS included, and relays the answer.
+The threaded kernel binds an isolate's global outbound to the Worker's full name and version when the isolate loads. Tenant code uses it through `fetch()`. It forwards the request to the node's egress service on the Unix socket `<stack>/run/egress.sock`, adding a header with its process's egress token; the node opens the connection itself, TLS included, and relays the answer.
 
 - **Attribution.** Every workerd generation has its own random egress token. The node accepts a request only with a live process's token and a valid Worker name, and the tenant is the first part of that name; anything else is refused as `unknown-source`.
 - **No identity leaves the node.** The node adds no header of its own and drops its egress headers and the hop-by-hop ones in both directions; a platform service that needs to recognise a tenant uses the tenant's own credentials.

@@ -830,8 +830,8 @@ private:
 // =====================================================================================================================
 // JS RPC: a method call on a Service Binding or on a Durable Object stub (docs/compatibility.md, section 7), carried by
 // workerd's own `EventDispatcher.jsRpcSession` (src/workerd/io/worker-interface.capnp). The node routes capabilities
-// and nothing else: of a call it reads only the name of the method -- our envelope, which the runtime's shim put
-// there -- and copies the arguments, the caller's pusher and the answer from one message to the other, capabilities
+// and reads only the routing envelope that the threaded kernel puts in the first method name. It copies
+// the arguments, the caller's pusher and the answer from one message to the other, capabilities
 // inside them included. A tenant's arguments are therefore serialized in the calling isolate and decoded in the
 // target's, never here, and a capability the target returns reaches the caller as the target's own.
 //
@@ -3729,17 +3729,15 @@ private:
     descriptor.setDepth(depth);
     descriptor.setRequiresChildSequence(leaseConfig.naive());
     descriptor.setColdLoaded(coldLoaded);
-    // The limits this Worker names: the runtime bridge puts them in the loader key, so the version's
-    // isolate is created under them. A limit it does not name stays 0 here and the process's value applies
-    // (and the loader key of a Worker that names none has no limits segment).
+    // The threaded loader uses these limits when identifying and creating the isolate.
+    // A zero limit selects the process default.
     auto limits = namedLimits(version.workerId);
     if (process.threadedDurableRole()) limits.cpuMs = std::min(limits.cpuMs, 30000u);
     else if (limits.cpuMs > 300000) limits.cpuMs = 300000;
     descriptor.setCpuLimitMs(limits.cpuMs);
     descriptor.setMemoryLimitMiB(limits.memoryMiB);
     if (trial) {
-      // A trial load gets no Binding: nothing it may run could call one. The load check is one. Its bridge checks the
-      // Durable Object classes the version declares among the exports.
+      // The threaded loader verifies the trial's declared Durable Object classes against the module exports.
       descriptor.setTrial(true);
       descriptor.setLoadCheck(loadCheck);
       if (!sourceInvocationId.empty()) descriptor.setSourceInvocationId(sourceInvocationId.c_str());
