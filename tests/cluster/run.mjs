@@ -74,7 +74,11 @@ function defaultSuites() {
   return [
     // Keep the shared projects together, including the owner kill at the end of the regular group.
     { selected: Object.entries(regularCases) },
-    { selected: Object.entries(webSocketCases), options: { webSocketsPerNode: 2 } },
+    { selected: Object.entries(webSocketCases), options: {
+      webSocketsPerNode: 2,
+      // Keep the pool fixed so this case can check the exact descriptor reserve.
+      configureNode: () => ({ processPool: { count: 1, inFlightLimit: 512 } }),
+    } },
     ...Object.entries(durableGatedCases).map(([name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs,
       controlDurableLifecycle, delayRecoveryPeers, budgetLifetime, platformFixture, databaseAlarmFixture,
       publishPeerPorts, configureNode, nodeEnvironment, singleNode, holdPeerAcks = true }]) => {

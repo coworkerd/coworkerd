@@ -4,7 +4,7 @@
 #include "invocation-contract.h"
 #include "peer-liveness.h"
 #include "request-lease.h"
-#include "ingress-descriptors.h"
+#include "eager-call-admission.h"
 #include "event-loop.h"
 #include "memory-events.h"
 #include "tenant-line.h"
@@ -45,6 +45,29 @@ struct TempDir {
   ~TempDir() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
   std::filesystem::path operator/(const char* file) const { return std::filesystem::path(path) / file; }
 };
+
+void eagerCallAdmission() {
+  constexpr uint64_t MiB = 1ull << 20;
+  const auto plan = [](uint64_t memory, uint64_t tasks = UINT64_MAX, uint64_t descriptors = UINT64_MAX) {
+    return planEagerCalls(memory, tasks, descriptors, 4, 1, 512, 0);
+  };
+  const auto small = plan(327 * MiB);
+  const auto standard = plan(2621 * MiB);
+  const auto large = plan(10485 * MiB);
+  KJ_REQUIRE(small.slots == 512 && standard.slots == 2621 && large.slots == 10485);
+  KJ_REQUIRE(plan(22000 * MiB).slots == 16384);
+  const auto taskLimited = plan(3276 * MiB, 10000);
+  KJ_REQUIRE(taskLimited.slots == 2500 && taskLimited.taskLimited && !taskLimited.descriptorLimited);
+  const auto descriptorLimited = plan(3276 * MiB, UINT64_MAX, 49152);
+  KJ_REQUIRE(descriptorLimited.slots == 2616 && descriptorLimited.descriptorLimited && !descriptorLimited.taskLimited,
+      descriptorLimited.slots);
+  const auto tied = plan(3276 * MiB, 4 * 2616, 49152);
+  KJ_REQUIRE(tied.taskLimited && tied.descriptorLimited);
+  const auto legacyWebSockets = planIngressDescriptors(0, 49152, poolDescriptors(4, 1, 512, 512), 0);
+  const auto effectiveWebSockets = planIngressDescriptors(0, 49152, poolDescriptors(4, 1, descriptorLimited.slots, 512), 0);
+  KJ_REQUIRE(legacyWebSockets.webSockets == effectiveWebSockets.webSockets);
+  KJ_REQUIRE(plan(3276 * MiB, 3).slots == 0 && plan(3276 * MiB, UINT64_MAX, 256).slots == 0);
+}
 
 void peerHalfClose() {
   auto io = kj::setupAsyncIo();
@@ -1064,6 +1087,7 @@ int main(int argc, char* argv[]) {
   KJ_REQUIRE(argc == 2);
   const std::string_view name(argv[1]);
   if (name == "native-config") nativeConfig();
+  else if (name == "eager-call-admission") eagerCallAdmission();
   else if (name == "ingress-descriptor-plan") ingressDescriptorPlan();
   else if (name == "peer-half-close") { peerHalfClose(); httpReadBeforeFin(); }
   else if (name == "peer-session-liveness") peerSessionLiveness();

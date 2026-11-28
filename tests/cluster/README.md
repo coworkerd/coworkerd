@@ -85,7 +85,8 @@ and 24 and checks that all requests wait at once and return the correct reply.
 
 ```sh
 node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-baseline.jsonl
-node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-defaults.jsonl --batches 128,512,2000
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-defaults.jsonl \
+  --node-memory-gib 20 --batches 2000 --ramp-ms 300 --expect-full
 ```
 
 Use a new output path for each run. Custom batches record refusals and partial overlap. Add
@@ -217,9 +218,9 @@ counters and requires all replies to contain the row, with the original threaded
 and no admission overloads.
 
 A Linux ARM64 run with the Worker on the database owner served 121 of 128 D1 requests.
-The other seven hit the node's root admission threshold, which counts both Worker roots
-and active database calls on that node. Running the Worker on a peer gives its roots their
-own default node admission budget. [Maintainer decision](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7183434485)
+The other seven hit the historical 128-call root ceiling, which counted both Worker roots
+and active database calls on that node. Running the Worker on a peer gives its roots a
+separate node admission budget. [Maintainer decision](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7183434485)
 
 ### Threaded SQLite memory limit
 

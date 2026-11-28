@@ -6,6 +6,25 @@ release on a monotonic clock and returns the request ID. The client verifies the
 node. The reported peak is the maximum overlap of those upstream intervals. Each batch has a fixed
 offer count and a deadline.
 
+## 0.6.0 default configuration
+
+With the released ARM64 kernel pinned at `22aa021`, the node and the merged fixture ran one
+batch of 2,000 two-second waits with all admission settings omitted. On the same eight-vCPU VM,
+the node container had 20 GiB of memory and a 40,000-task budget. It resolved to 2,457 roots,
+3,276 nested calls, 3,276 calls per ordinary process and 512 per durable process.
+All 2,000 replies were correct with zero refusals, and all 2,000 upstream waits overlapped
+for 1.380 s. Client p99 was 2.297 s.
+
+```sh
+kernel=$(python3 scripts/fetch-kernel.py)
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-defaults.jsonl \
+  --node-memory-gib 20 --batches 2000 --ramp-ms 300 --expect-full
+```
+
+[Measured product](https://github.com/coworkerd/coworkerd/tree/22aa0219f1e68cd9f7d0bc60dc2ab1205c5e1c58) · [Verified kernel archive](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-ad2ece2dcdd8-run-46095858558-1)
+
+## Historical measurements
+
 The measurements used the published ARM64 kernel pinned by product `e972a74` and an eight-vCPU
 Docker Desktop Linux VM (Linux 6.10.14, 25,163,026,432 bytes of guest RAM). Ingress placement was
 enabled. The Worker could reach the private upstream, and the per-tenant outbound rate and

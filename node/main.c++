@@ -13,7 +13,7 @@
 #include "rpc-error.h"
 #include "coworkerd.capnp.h"
 #include "config.h"
-#include "ingress-descriptors.h"
+#include "eager-call-admission.h"
 #include "code-package.h"
 #include "log-cleaning.h"
 #include "log-sink.h"
@@ -294,7 +294,12 @@ struct PlacementDefinition {
 
 using coworkerd::OpenEvent;
 // `reason`, when set, says why instead of "no ready ... process" (nothing was sent either way).
-struct ProcessUnavailable { bool quarantine = false; std::string reason; bool secretDictionary = false; };
+struct ProcessUnavailable {
+  bool quarantine = false;
+  std::string reason;
+  bool secretDictionary = false;
+  std::optional<uint32_t> fullLimit;
+};
 // A trial probe that was never sent (TrialService::probe()).
 constexpr kj::Exception::DetailTypeId TRIAL_NOT_SENT_DETAIL = 0x6f1c2e94a7d35b08ull;
 struct DurableDispatchRefused { coworkerd::DurableLog::ObjectReady result; };
@@ -1797,7 +1802,7 @@ public:
     auto started = monotonicTimeMs();
     auto call = runtime.select(worker);
     phaseTiming("process-selection", started);
-    if (!call) throw ProcessUnavailable{runtime.quarantined(worker)};
+    if (!call) throw ProcessUnavailable{runtime.quarantined(worker), {}, false, runtime.fullProcessLimit(worker)};
     return call;
   }
 
@@ -1833,7 +1838,16 @@ public:
               << "\",\"observedAtUnixMs\":" << wallTimeMsForTest() << "}" << std::endl;
   }
 
+  InvocationRejection processCapacityRefusal(uint32_t limit, bool root) {
+    auto value = refusal("OVERLOADED", "process call capacity reached", 503, root);
+    value.category = "process-capacity";
+    value.inFlight = value.limit = limit;
+    value.notExecuted = value.retryable = true;
+    return value;
+  }
+
   InvocationRejection processRefusal(const ProcessUnavailable& error, bool root = false) {
+    if (error.fullLimit) return processCapacityRefusal(*error.fullLimit, root);
     auto value = refusal(error.quarantine ? "QUARANTINE_UNAVAILABLE" : "PROCESS_UNAVAILABLE", !error.reason.empty() ? error.reason :
         error.quarantine ? "no ready quarantine process before dispatch" : "no ready workerd process before dispatch", 503, root);
     value.notExecuted = value.retryable = true;
@@ -1915,6 +1929,11 @@ public:
       if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
       return value;
     }
+    if (const auto limit = runtime.fullProcessLimit(worker, durable ? durable->key() : "")) {
+      auto value = processCapacityRefusal(*limit, root);
+      if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
+      return value;
+    }
     auto value = durable ? refusal("DO_UNAVAILABLE", "the durable process of this object (" +
         runtime.durableProcessFor(durable->key()) + ") is not ready", 503, root) : processRefusal({runtime.quarantined(worker)}, root);
     if (!durable && serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker)) {
@@ -1963,7 +1982,7 @@ public:
       if (tenantLimitRefusal(value)) recordTenantLimitRefusal(worker, root, value, durable);
       else if (processTenantRefusal(value) || coworkerd::placementSaturationRefusal(value.code)) value.avoidMs = 0;
       else {
-        value.category.clear();
+        if (value.category != "process-capacity") value.category.clear();
         value.avoidMs = std::min(serverConfig.rejectionAvoidMs, serverConfig.avoidMaxMs);
       }
       if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
@@ -10512,8 +10531,21 @@ void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& 
   if (plan.mode == "guard-regions") pool.sandboxWasmCapMiB = 1024;
 }
 
+uint64_t nodeHardDescriptorLimit(rlim_t inherited) {
+  auto hard = inherited == RLIM_INFINITY ? UINT64_MAX : uint64_t(inherited);
+#ifdef __APPLE__
+  int maxFilesPerProcess;
+  size_t size = sizeof(maxFilesPerProcess);
+  KJ_SYSCALL(sysctlbyname("kern.maxfilesperproc", &maxFilesPerProcess, &size, nullptr, 0));
+  KJ_REQUIRE(maxFilesPerProcess > 0, "invalid kern.maxfilesperproc", maxFilesPerProcess);
+  hard = std::min(hard, static_cast<uint64_t>(maxFilesPerProcess));
+#endif
+  return hard;
+}
+
 void applyProcessPoolEnvironment(ServerConfig& config, const std::string& workerdPath) {
   auto& pool = config.processPool;
+  const auto memoryBudgetBytes = config.memoryBudgetBytes;
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
   pool.durableCpuLimitMs = 30000;
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
@@ -10541,8 +10573,8 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
       (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
   if (pool.count + pool.quarantineProcesses > 0) {
-    const auto threadsRequired = 32 + (uint64_t(pool.count) + pool.quarantineProcesses + 1) *
-        (uint64_t(pool.inFlightLimit) + 27) + uint64_t(pool.durableProcesses) * 8;
+    const auto nativeGenerations = uint64_t(pool.count) + pool.quarantineProcesses + 1;
+    const auto fixedThreads = 32 + nativeGenerations * 27 + uint64_t(pool.durableProcesses) * 8;
     uint64_t uidThreads = 0;
 #ifdef __linux__
     // RLIMIT_NPROC counts every existing thread of the real UID, including
@@ -10559,15 +10591,11 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
       if (uid == getuid()) uidThreads += threads;
     }
 #endif
-    const auto uidRequired = uidThreads + threadsRequired;
     rlimit processLimit;
-    KJ_REQUIRE(getrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot read thread configuration");
-    KJ_REQUIRE(processLimit.rlim_max == RLIM_INFINITY || processLimit.rlim_max >= uidRequired,
-        "insufficient host thread hard limit", threadsRequired, uidThreads, processLimit.rlim_max);
-    if (processLimit.rlim_cur < uidRequired) {
-      processLimit.rlim_cur = uidRequired;
-      KJ_REQUIRE(setrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot set thread soft limit", uidRequired);
-    }
+    KJ_SYSCALL(getrlimit(RLIMIT_NPROC, &processLimit));
+    const auto uidHeadroom = processLimit.rlim_max == RLIM_INFINITY ? UINT64_MAX :
+        coworkerd::remainingBudget(uint64_t(processLimit.rlim_max), uidThreads);
+    uint64_t cgroupHeadroom = UINT64_MAX;
 #ifdef __linux__
     auto cgroup = fs::path("/sys/fs/cgroup");
     std::ifstream membership("/proc/self/cgroup"); std::string member;
@@ -10580,15 +10608,43 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
       std::string maximum; uint64_t current = 0;
       if (maximumFile >> maximum && maximum != "max" && currentFile >> current) {
         uint64_t bound = 0; auto parsed = std::from_chars(maximum.data(), maximum.data()+maximum.size(), bound);
-        KJ_REQUIRE(parsed.ec == std::errc() && current <= bound && threadsRequired <= bound-current,
-            "insufficient cgroup thread headroom", threadsRequired, current, bound);
+        KJ_REQUIRE(parsed.ec == std::errc() && parsed.ptr == maximum.data()+maximum.size(),
+            "invalid cgroup task limit", maximum.c_str());
+        cgroupHeadroom = std::min(cgroupHeadroom, coworkerd::remainingBudget(bound, current));
       }
     }
 #endif
+    if (!pool.inFlightLimitGiven) {
+      rlimit descriptors;
+      KJ_SYSCALL(getrlimit(RLIMIT_NOFILE, &descriptors));
+      const auto plan = coworkerd::planEagerCalls(pool.threadedMemoryBytes,
+          coworkerd::remainingBudget(std::min(uidHeadroom, cgroupHeadroom), fixedThreads),
+          nodeHardDescriptorLimit(descriptors.rlim_max), nativeGenerations, pool.durableProcesses,
+          pool.durableInFlightLimit(), config.webSocketsPerNode);
+      KJ_REQUIRE(plan.slots > 0, "insufficient host task or descriptor capacity for one ordinary call slot");
+      pool.inFlightLimit = plan.slots;
+      if (plan.slots < plan.requested) {
+        std::cout << "[server] {\"event\":\"warning\",\"subject\":\"ordinary-call-capacity\",\"requested\":"
+            << plan.requested << ",\"effective\":" << plan.slots << ",\"taskLimited\":"
+            << (plan.taskLimited ? "true" : "false") << ",\"descriptorLimited\":"
+            << (plan.descriptorLimited ? "true" : "false") << '}' << std::endl;
+      }
+    }
+    const auto threadsRequired = fixedThreads + nativeGenerations * pool.inFlightLimit;
+    KJ_REQUIRE(threadsRequired <= uidHeadroom, "insufficient host thread hard limit",
+        threadsRequired, uidThreads, processLimit.rlim_max);
+    KJ_REQUIRE(threadsRequired <= cgroupHeadroom, "insufficient cgroup thread headroom",
+        threadsRequired, cgroupHeadroom);
+    const auto uidRequired = uidThreads + threadsRequired;
+    if (processLimit.rlim_cur < uidRequired) {
+      processLimit.rlim_cur = uidRequired;
+      KJ_SYSCALL(setrlimit(RLIMIT_NPROC, &processLimit), "cannot set thread soft limit", uidRequired);
+    }
     const auto minimumMemory = (64ull << 20) + (uint64_t(pool.inFlightLimit) + 16) * (256ull << 10) + (2ull << 20);
     KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, std::max<uint64_t>(8ull << 20, uint64_t(pool.inFlightLimit) << 20)) > minimumMemory,
         "native process memory budget leaves no active Worker", minimumMemory, pool.threadedMemoryBytes);
   }
+  config.resolvePlacementLimits();
   for (auto [name, field] : {std::pair{"COWORKERD_IDLE_EVICT_MS", &pool.idleEvictMs},
                              std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &pool.idleDestroyIntervalMs},
                              std::pair{"COWORKERD_ROTATION_DRAIN_TIMEOUT_MS", &pool.rotationDrainTimeoutMs},
@@ -10653,22 +10709,14 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
 // Budget the active and replacement generations, other ingress traffic, and the open WebSockets together.
 void applyNodeDescriptorLimit(ServerConfig& config) {
   const auto& pool = config.processPool;
-  const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
-  const auto childRequired = uint64_t(pool.inFlightLimit) * 8 + 256;
-  const auto nodeRequired = 256 + generations * (uint64_t(pool.inFlightLimit) * 4 + 128);
-  const auto poolDescriptors = std::max(childRequired, nodeRequired);
+  const auto nativeGenerations = uint64_t(pool.count) + pool.quarantineProcesses + 1;
+  const auto poolDescriptors = coworkerd::poolDescriptors(nativeGenerations, pool.durableProcesses,
+      pool.inFlightLimit, pool.durableInFlightLimit());
   rlimit limits;
   KJ_SYSCALL(getrlimit(RLIMIT_NOFILE, &limits));
   auto soft = limits.rlim_cur == RLIM_INFINITY ? UINT64_MAX : uint64_t(limits.rlim_cur);
-  auto hard = limits.rlim_max == RLIM_INFINITY ? UINT64_MAX : uint64_t(limits.rlim_max);
-#ifdef __APPLE__
-  int maxFilesPerProcess;
-  size_t size = sizeof(maxFilesPerProcess);
-  KJ_SYSCALL(sysctlbyname("kern.maxfilesperproc", &maxFilesPerProcess, &size, nullptr, 0));
-  KJ_REQUIRE(maxFilesPerProcess > 0, "invalid kern.maxfilesperproc", maxFilesPerProcess);
-  hard = std::min(hard, static_cast<uint64_t>(maxFilesPerProcess));
+  const auto hard = nodeHardDescriptorLimit(limits.rlim_max);
   soft = std::min(soft, hard);
-#endif
   const auto plan = coworkerd::planIngressDescriptors(soft, hard, poolDescriptors, config.webSocketsPerNode);
   KJ_REQUIRE(plan.webSockets > 0, "insufficient host descriptor hard limit for the node and one ingress WebSocket",
       "required", poolDescriptors + coworkerd::OTHER_INGRESS_DESCRIPTORS + coworkerd::DESCRIPTORS_PER_WEBSOCKET,
@@ -10725,7 +10773,8 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"prefetchConcurrency\":" << d.cache.prefetchConcurrency
       << "},\"hostCheck\":{\"intervalMs\":" << c.hostCheck.intervalMs << ",\"sampleMiB\":" << c.hostCheck.sampleMiB
       << "},\"processPool\":{\"count\":" << p.count << ",\"quarantineProcesses\":" << p.quarantineProcesses
-      << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
+      << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"durableInFlightLimit\":" << p.durableInFlightLimit()
+      << ",\"threadedMemoryBytes\":" << p.threadedMemoryBytes << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
       << ",\"stuckTimeoutMs\":" << p.stuckTimeoutMs << ",\"restartBackoffMs\":" << p.restartBackoffMs << ",\"restartMaxMs\":" << p.restartMaxMs
       << ",\"pausedAdmissionWaitMs\":" << p.pausedAdmissionWaitMs
       << ",\"watchdog\":" << b(p.watchdog) << ",\"idleEvictMs\":" << p.idleEvictMs << ",\"idleDestroyIntervalMs\":" << p.idleDestroyIntervalMs
@@ -10779,7 +10828,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"clusterAddresses\":" << c.egress.clusterAddresses.size() << ",\"tenants\":" << c.egress.tenants.size()
       << "},\"peerAuth\":{\"keyFile\":" << q(c.peerAuth.keyFile) << ",\"windowMs\":" << c.peerAuth.windowMs
       << "},\"forTest\":{\"clockOffsetMs\":" << c.clockOffsetMsForTest << ",\"disableAlreadyPlaced\":" << b(c.disableAlreadyPlacedForTest)
-      << ",\"loadBand\":" << q(c.loadBandForTest) << ",\"equalLimits\":" << b(c.equalLimitsForTest)
+      << ",\"loadBand\":" << q(c.loadBandForTest)
       << ",\"versionResolution\":" << q(d.versionResolutionForTest) << ",\"deploymentApplyDelayMs\":" << d.deploymentApplyDelayMsForTest
       << ",\"drainAnnounceDelayMs\":" << c.drainAnnounceDelayMsForTest << "}}";
   return out.str();
