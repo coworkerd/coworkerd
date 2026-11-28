@@ -208,13 +208,17 @@ every visible ancestor quota. A node without that reading can still use the isol
 
 Each soft refusal explicitly reports that the call has not been dispatched and can be retried.
 If the first pass finds no candidate that can serve, the ingress revisits each candidate that sent
-an explicit soft refusal, in the same order, with the saturation preference disabled. Each
-candidate gets at most one such retry. The original admission checks and deadline still apply.
+an explicit soft refusal, with the saturation preference disabled. Among candidates with the
+same health priority, it tries the fewest in-flight calls first. Worker saturation reports
+stateless roots and Binding calls for that Worker. CPU saturation and refusals from older peers
+that lack the Worker count use the node-wide count. Each ingress rotates ties across its fallback decisions.
+Nodes under avoidance go behind other candidates, and a draining or expired ingress tries itself
+last. Each candidate gets at most one such retry. The original admission checks and deadline still apply.
 An uncertain outcome ends either pass. Soft refusals do not add node-wide avoidance. The
 `[attempt]` log records `saturationFallback` and the state endpoint counts saturation refusals
 by code and successful second-pass placements under the `saturationFallback` decision.
 
-**Admission limits apply before any wait.** A node refuses new tree roots once `placement.rootLimit` (128) calls are in flight and nested calls only at `placement.nestedLimit` (384) (`503 OVERLOADED`): under overload new trees are held off first, while trees already admitted can finish. The memory band ([process isolation](process-isolation.md)) adds to it: in yellow a node refuses forwarded roots and nested calls for versions cold on it, in red all of them (`LOAD_BAND_REJECTED`); a request executing where it arrived is never refused by the band. A refusal carries the reason, the node's band and load and a suggested avoidance time.
+**Admission limits apply before any wait.** A node refuses new tree roots once `placement.rootLimit` (by default three quarters of the effective ordinary slots) calls are in flight and nested calls only at `placement.nestedLimit` (all the effective ordinary slots by default) (`503 OVERLOADED`): under overload new trees are held off first, while trees already admitted can finish. The memory band ([process isolation](process-isolation.md)) adds to it: in yellow a node refuses forwarded roots and nested calls for versions cold on it, in red all of them (`LOAD_BAND_REJECTED`); a request executing where it arrived is never refused by the band. A refusal carries the reason, the node's band and load and a suggested avoidance time.
 
 **Stateless isolate busy time.** The threaded kernel reports `isolateBusy` on each loaded stateless
 isolate in the node's lifecycle snapshot. The reading covers the 3,000 ms sliding window ending at
@@ -292,7 +296,7 @@ A node that receives SIGTERM or SIGINT, or `POST /__coworkerd/drain`:
 2. **drains**: it waits until its ingress requests, the calls admitted on it and its processes' work -- `waitUntil` included -- reach zero, for at most `drainTimeoutMs` (30 s); what is still running then is killed and ends as `RESULT_UNCERTAIN`.
 3. **leaves**: it closes its workerd processes, writes its last usage, removes its heartbeat and drain marker, retains its suspects object while it contains unexpired suspicions, closes its listeners and exits with 0 -- or with 3 when the drain began because another process took its identity (section 3).
 
-A second signal kills the processes at once and exits with 2. `drainTimeoutMs` `0` turns the drain off: the node exits at once, without the announcement and without writing its last usage. Upgrading a cluster is draining one node at a time, replacing it, and waiting until it is registered and ready; measured with one node leaving under load, no request failed.
+A second signal kills the processes at once and exits with 2. `drainTimeoutMs` `0` turns the drain off: the node exits at once, without the announcement and without writing its last usage. Upgrading a cluster is draining one node at a time, replacing it, and waiting until it is registered and ready; measured with one node leaving under load, no request failed. This procedure assumes compatible peer protocol revisions. Nodes using the HTTP request lease require peer protocol revision 2 and refuse a mismatched session before dispatch. During an upgrade across this change, forwarded stateless placement can try another compatible peer. An object cannot be reached across the revision boundary when its shard owner runs the other revision. Recovery from a surviving peer tail also requires matching revisions.
 
 ## 11. Durable Object shards
 

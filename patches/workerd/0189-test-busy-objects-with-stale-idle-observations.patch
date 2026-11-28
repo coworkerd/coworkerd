@@ -5,10 +5,10 @@ Subject: [PATCH] Exercise busy admission with stale idle observations
 
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 3624896476faf7166c84d336e199037341be6af8..00c34cb80ddf59dc496d47840270269bba4ab351 100644
+index f099d467701bc3eb123aee2afbc45a133b96e1af..3c203bdd5ff1e27b6a668749b741481d36bf2dc2 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -450,8 +450,13 @@ KJ_TEST("ordinary admission refuses before dispatch while full of busy trees and
+@@ -451,8 +451,13 @@ KJ_TEST("ordinary admission refuses before dispatch while full of busy trees and
    ObjectAdmissionFixture test;
    auto& server = test.server;
    auto& table = *server.durableAdmission;

@@ -29,7 +29,7 @@ The experimental native tenant execution share is disabled by default and is not
 | 503 | `RESULT_UNCERTAIN` | Failed after dispatch, before the response started: the Worker threw, the process exited, the connection to the node running it broke, the node's drain deadline passed (or, during the load check, a process exited without being its culprit or could not be reached); once the response has started, a failure cuts it instead and the client gets an incomplete body | Result uncertain | See `cowctl logs`; idempotent requests can be retried |
 | 503 | `SECRET_UNAVAILABLE` | The node running it has no usable value of a secret the version declares: it has not read the value yet (it was just set; nodes read the desired state every 5 seconds), or the value does not open with that node's secrets key; or that node cannot add the values to its log cleaning now: its dictionary is full, the tenant's secret values would take more than its share of it (a quarter; the reason says by how much: fewer or smaller secrets), or it still holds more than 1 MiB of the tenant's earlier secret values for isolates that may still use them (the reason says roughly when that ends); for a Durable Object call also when the tenant's earlier values grow too fast on the node's durable process (a rotation for them less than an hour ago; refused until the hour has passed), and when the values changed after the call was admitted and the dictionary cannot take the new ones (the same code as at admission) | Not executed | Retry a little later (placement tries another node); when it persists on one node, that node's `secrets-key.json` is not the cluster's |
 | 409 | `VERSION_UNAVAILABLE`, `VERSION_PIN_MISMATCH` | The deployment changed during the call, and the node it runs on does not know the version this call is locked to yet; or the node could not fetch or verify the version's code bundle before execution: the next candidate node is tried, and when none can, the call answers `503 PLACEMENT_EXHAUSTED` with `VERSION_UNAVAILABLE` in each attempt (409 itself only for a Worker with a static placement or with ingress placement off). A static asset whose bytes cannot be fetched or verified answers `503 ASSET_UNAVAILABLE` at the node that received the call, without another node being tried | Not executed | Retry |
-| 410 | `LEASE_EXPIRED` | The deadline of this call (or of its parent call) has passed | Not executed | Retry |
+| 410 | `LEASE_EXPIRED` | The call or its parent has no live lease at dispatch. This can happen after a response's drain ends or an alarm attempt reaches its wall limit. | Not executed | Start a new call with a live parent. |
 | 429 | `SUBREQUEST_BUDGET_EXHAUSTED` | The calling invocation spent its subrequest balance. WebSocket delivery refills the balance | Not executed | Make fewer subrequests in this invocation |
 | 503 | `WEBSOCKET_NODE_CAPACITY` | The ingress node's shared WebSocket ceiling is full. `inFlight` counts both pending handshakes and open connections across all tenants. `limit` is the effective ceiling. The response includes `dispatched: false` and `retryable: true` | Not executed | Retry after a connection closes, or connect through another node |
 | 503 | `SERVER_DRAINING`, `PROCESS_UNAVAILABLE`, `QUARANTINE_UNAVAILABLE`, `PLACEMENT_EXHAUSTED`, `PEER_UNAVAILABLE`, `OVERLOADED`, `LOAD_BAND_REJECTED` | This node or all candidate nodes cannot take it for now (exiting, a process not ready, a concurrency limit, memory pressure) | Not executed | Retry, or use another ingress |
@@ -37,6 +37,8 @@ The experimental native tenant execution share is disabled by default and is not
 | 508 | `PLACEMENT_HOPS_EXHAUSTED` | A Binding call relayed along static placements ran out of placement hops | Not executed | Check the nodes' `placements` entries |
 | 508 | `BINDING_HOP_LIMIT` | A call to a Worker would exceed eight levels of nested calls | Not executed | Shorten the chain |
 | 503 | `ASSET_UNAVAILABLE` | A static asset's bytes cannot be fetched or do not verify; while a Worker's asset index cannot be read, every request to that Worker answers it, also for paths its code would serve | Not executed | Recovers by itself once object storage is back |
+
+Peer keepalives normally detect silence within about five seconds. Each peer uses its own event loop's clock, so peers can close sessions with a node that stalls for a few seconds. Sustained overload can delay detection beyond five seconds. After dispatch, losing the peer reply ends placement with an uncertain result.
 
 Once the Worker accepted a WebSocket (`101`), the connection ends with a close code instead of an answer: the Worker's own codes pass as they are; `1001` (going away) when the node holding or running the connection drains, or the process it runs in is replaced -- reconnect, and another node or process takes it --; `1011` with the reason `CPU_LIMIT_EXCEEDED` or `MEMORY_LIMIT_EXCEEDED` when a message went over a limit, `RESULT_UNCERTAIN` when its process ended otherwise; no close frame, which a client reports as `1006`, when the node holding the client's connection lost the node running it.
 
@@ -90,6 +92,21 @@ above never need one.
 For a Worker without a static placement -- an ingress request while ingress placement is on (the default), and every Binding call --, a refusal another node may not share (every code but `RESULT_UNCERTAIN`, `LEASE_EXPIRED` -- the deadline is the call's own, so the call ends with it, and no node is avoided for it -- and a `LOAD_FAILED` other than `package-unavailable`) sends the call to the next candidate node, at most `initialPlacementHops` (8) of them; when every candidate tried refuses, the answer is `503 PLACEMENT_EXHAUSTED` (or `503 LOAD_FAILED` with `package-unavailable` when none could fetch or verify the code package), listing each candidate's `nodeId` and refusal under `attempts`, so codes such as `SECRET_UNAVAILABLE`, `OVERLOADED`, `PROCESS_UNAVAILABLE` or the code bundle's `VERSION_UNAVAILABLE` then appear only there.
 
 The fields in the call answers that refer to a node are called `nodeId`; `/v1`'s deployment answers name the node that ran the trial load in the trial record's `server` fields (`versions[].server`, `attempts[].server`) and as `nodeId` in its verdict, and a `LOAD_FAILED` answer also as a top-level `nodeId`.
+
+### SQLite errors inside a threaded Durable Object
+
+`ctx.storage.sql` throws these JavaScript errors inside the object. The fields describe the SQL
+operation. Catch the error in the object to choose what the handler returns.
+
+| `error.code` | Meaning | Outcome |
+| --- | --- | --- |
+| `SQL_MEMORY_LIMIT_EXCEEDED` | The connection reached its 32 MiB SQLite heap limit | The active transaction rolled back. Reduce the memory needed by the statement. |
+| `OVERLOADED` | The durable process could not reserve more SQLite heap | The active transaction rolled back. The SQL error has `dispatched: false` and `retryable: true`. Retry the transaction when process headroom returns. |
+
+A rollback that affects earlier writes or pending alarm changes fails responses waiting for
+confirmation with HTTP 503. Subsequent calls reopen the last confirmed storage. A rollback
+confined to the failing statement or to an isolated explicit transaction can leave the same
+connection available.
 
 ## 2. The control plane (`/v1` and `cowctl`)
 
@@ -261,7 +278,7 @@ An attempted fetch that reaches the node's egress service and gets `EGRESS_DENIE
 | `EGRESS_DENIED: default-deny` | The cluster's default policy is `deny`, and the tenant's `allow` does not have this destination | The administrator allows it |
 | `EGRESS_DENIED: egress-off` | The node runs with `egress.mode` `off`: tenant code has no outgoing network | The administrator turns egress on |
 | `EGRESS_DENIED: tenant-deny` | The tenant's `deny` rules | -- |
-| `EGRESS_DENIED: concurrency-limit`, `rate-limit` | This tenant's outgoing concurrency (default 32) or requests per second (default 100) on this node are full | Retry a little later, or ask the administrator to raise them |
+| `EGRESS_DENIED: concurrency-limit`, `rate-limit` | This tenant reached its configured limit on outgoing requests in flight or request starts per second on this node. Both limits default to off | Retry a little later, or ask the administrator to raise the limit |
 | `EGRESS_DENIED: scheme`, `url` | A destination the policy point cannot take: not `http`/`https`, or an invalid URL, such as one without a host. A scheme other than `http`/`https` usually never reaches the node -- `fetch` throws `TypeError: Fetch API cannot load` itself --, and a user name and password in the URL are dropped by `fetch`, so the request goes out without them | -- |
 | `EGRESS_FAILED: dns` | The node cannot resolve this name | Check the name |
 | `EGRESS_FAILED: connect`, `tls`, `timeout`, `protocol` | Cannot connect, the TLS handshake or the certificate check failed, a timeout (30 seconds by default), the other side's answer is not valid HTTP | Check the destination; certificates are verified by the node against the system's root certificates |

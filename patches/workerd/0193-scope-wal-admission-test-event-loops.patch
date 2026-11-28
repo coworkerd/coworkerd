@@ -5,10 +5,10 @@ Subject: [PATCH] Keep one Tokio event loop per WAL admission test phase
 
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 5266cd3b93a40de48cd418afda74aad290455a11..236ebdc2269ae1ed520214c6c2a59455ec89d98f 100644
+index 7133f7fcace3dbdb2f20c63edbffd25bec1eb07c..c3cf00ccbd9049dc730a0de76077561e4140266e 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -664,37 +664,48 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
+@@ -665,37 +665,48 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
    KJ_REQUIRE(server.objectVictim.has_value());
    const auto stalled = *server.objectVictim;
    KJ_REQUIRE(stalled.tree == oldest.tree);
@@ -84,7 +84,7 @@ index 5266cd3b93a40de48cd418afda74aad290455a11..236ebdc2269ae1ed520214c6c2a59455
  
    ThreadState nextHome;
    nextHome.durableHome = nextVictim.home;
-@@ -713,10 +724,6 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
+@@ -714,10 +725,6 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
    KJ_REQUIRE(retry.has_value());
    KJ_EXPECT(table.homeFor(retry->tree) == nextVictim.home);
  

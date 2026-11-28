@@ -119,6 +119,15 @@
 0123-confirm-threaded-storage-close-before-reopen.patch
 0186-start-isolate-busy-time-after-load.patch
 0124-bound-threaded-wal-home-notifications.patch
+0160-alarm-wall-limit.patch
+0161-threaded-request-lease-drain.patch
+0162-alarm-limit-visibility.patch
+0163-drain-promise-branch.patch
+0164-own-drain-continuation.patch
+0165-finish-http-before-drain.patch
+0166-gate-alarm-test-limit.patch
+0167-update-isolate-busy-test-invocation.patch
+0187-bound-object-sqlite-memory.patch
 0188-retire-idle-objects-at-admission.patch
 0189-test-busy-objects-with-stale-idle-observations.patch
 0190-harden-ordinary-object-admission.patch

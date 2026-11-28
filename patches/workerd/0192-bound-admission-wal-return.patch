@@ -5,10 +5,10 @@ Subject: [PATCH] Bound the ordinary admission wait for WAL capacity
 
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 20984c908716332898d7d91cb7892643653322a4..5266cd3b93a40de48cd418afda74aad290455a11 100644
+index 29ab0a258fceb877ecf7ad270872356244a75349..7133f7fcace3dbdb2f20c63edbffd25bec1eb07c 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -616,8 +616,9 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
+@@ -617,8 +617,9 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
      std::lock_guard lock(server.durableRoutingMutex);
      KJ_REQUIRE(server.stopObjectAdmissionVictim(picked, test.now));
    }
@@ -20,7 +20,7 @@ index 20984c908716332898d7d91cb7892643653322a4..5266cd3b93a40de48cd418afda74aad2
    KJ_EXPECT(table.homeFor(picked.tree) == picked.home);
    KJ_EXPECT(server.durableAdmissionRetirements.load() == 0);
  
-@@ -625,7 +626,7 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
+@@ -626,7 +627,7 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
    // credit waits for the entire tree, while unrelated existing roots can run.
    closing->shippers.erase(0);
    server.threads[picked.home - 1]->home->walFull = false;
@@ -29,7 +29,7 @@ index 20984c908716332898d7d91cb7892643653322a4..5266cd3b93a40de48cd418afda74aad2
    server.expireDurableAdmissions(picked.deadline);
    KJ_EXPECT(table.homeFor(picked.tree) == picked.home);
    KJ_EXPECT(server.queueDurable(incoming, 0, test.lease, picked.deadline).status == Status::RETIRING);
-@@ -633,15 +634,93 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
+@@ -634,15 +635,93 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
    KJ_EXPECT(server.objectVictim->tree == picked.tree);
  
    closing->shippers.erase(1);
@@ -125,10 +125,10 @@ index 20984c908716332898d7d91cb7892643653322a4..5266cd3b93a40de48cd418afda74aad2
  struct DatabaseAdmissionFixture {
    using Admission = server::DurableAdmission;
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 738a9fe15414d9896e7ebc8a0ae2ff901c7d7ee3..9b10da4f66774801dd4b9d26fe7e8068684ab633 100644
+index 03dc802e94ff0641403f64e463b90b4da7ca3ddf..bf488e29856b8e1b3c45d15b9242abfe136552b5 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -2042,7 +2042,11 @@ struct ThreadState {
+@@ -2055,7 +2055,11 @@ struct ThreadState {
    std::map<Worker::Actor *, uint64_t> durableActorTrees;
    std::map<uint64_t, DurableRoot> durableRoots;
    // A retired actor can still have a reference held by a settling facet or task.
@@ -141,7 +141,7 @@ index 738a9fe15414d9896e7ebc8a0ae2ff901c7d7ee3..9b10da4f66774801dd4b9d26fe7e8068
    kj::TaskSet tasks{errors};
  
    ~ThreadState() noexcept(false) {
-@@ -2674,6 +2678,8 @@ struct ObjectRetirement {
+@@ -2695,6 +2699,8 @@ struct ObjectRetirement {
    bool operator==(const ObjectRetirement&) const = default;
  };
  
@@ -150,16 +150,16 @@ index 738a9fe15414d9896e7ebc8a0ae2ff901c7d7ee3..9b10da4f66774801dd4b9d26fe7e8068
  constexpr auto DATABASE_ADMISSION_GRACE = std::chrono::milliseconds(100);
  
  struct DatabaseRetirement {
-@@ -2746,7 +2752,7 @@ struct ThreadedServer {
-   std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<DatabaseReplacement>>> databaseCapacityWaiters;
+@@ -2768,7 +2774,7 @@ struct ThreadedServer {
    std::atomic<uint64_t> durableHomeSessions{0};
    std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
+   std::atomic<uint64_t> objectSqliteConnections{0};
 -  std::atomic<uint64_t> durableAdmissionRetirements{0};
 +  std::atomic<uint64_t> durableAdmissionRetirements{0}, durableAdmissionWalTimeouts{0};
    std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
    std::atomic<uint64_t> durableTreeResets{0};
    std::atomic<uint64_t> nextDurableActor{0};
-@@ -3284,10 +3290,17 @@ struct ThreadedServer {
+@@ -3306,10 +3312,17 @@ struct ThreadedServer {
      if (databaseVictim && now >= databaseVictim->deadline) {
        finishDatabaseRetirement(databaseVictim->outcome(now, false, false), now);
      }
@@ -181,7 +181,7 @@ index 738a9fe15414d9896e7ebc8a0ae2ff901c7d7ee3..9b10da4f66774801dd4b9d26fe7e8068
      }
      return durableAdmission->expire(now);
    }
-@@ -3659,8 +3672,8 @@ struct ThreadedServer {
+@@ -3681,8 +3694,8 @@ struct ThreadedServer {
          durableAdmission->stopIdleTree(selected.tree, selected.home);
    }
  
@@ -192,7 +192,7 @@ index 738a9fe15414d9896e7ebc8a0ae2ff901c7d7ee3..9b10da4f66774801dd4b9d26fe7e8068
    bool releaseDurableTree(uint64_t tree, uint64_t homeId, bool admissionClosing) {
      KJ_ASSERT(durableAdmission->releaseTree(tree, homeId));
      if (admissionClosing && databaseVictim && databaseVictim->tree == tree &&
-@@ -3681,25 +3694,39 @@ struct ThreadedServer {
+@@ -3703,25 +3716,39 @@ struct ThreadedServer {
      return home.resident.empty();
    }
  
@@ -244,7 +244,7 @@ index 738a9fe15414d9896e7ebc8a0ae2ff901c7d7ee3..9b10da4f66774801dd4b9d26fe7e8068
      }
    }
  
-@@ -3845,9 +3872,9 @@ struct ThreadedServer {
+@@ -3873,9 +3900,9 @@ struct ThreadedServer {
          continue;
        }
        const bool admissionClosing = root.admissionClosing;
@@ -257,7 +257,7 @@ index 738a9fe15414d9896e7ebc8a0ae2ff901c7d7ee3..9b10da4f66774801dd4b9d26fe7e8068
          if (pressured && !root.idleClosing) {
            durablePressureRetirements.fetch_add(1);
            reclaimed = true;
-@@ -3859,9 +3886,11 @@ struct ThreadedServer {
+@@ -3887,9 +3914,11 @@ struct ThreadedServer {
        current->second.stopFacets(nullptr);
        actor.shutdown(0);
        state.durableRoots.erase(current);
@@ -271,7 +271,7 @@ index 738a9fe15414d9896e7ebc8a0ae2ff901c7d7ee3..9b10da4f66774801dd4b9d26fe7e8068
            state.durableSlot->lastUseNs.store(nowNs());
        }
      }
-@@ -3992,6 +4021,7 @@ struct ThreadedServer {
+@@ -4020,6 +4049,7 @@ struct ThreadedServer {
          ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
          ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
          ",\"admissionRetirements\":" + std::to_string(durableAdmissionRetirements.load()) +

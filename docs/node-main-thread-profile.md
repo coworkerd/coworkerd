@@ -132,9 +132,9 @@ The trace records the two placement counters on every successful reservation and
 | Confirmed one-row insert | 16 | 17.7–17.8 | 10.5–10.6 | 32–33 | 25 + 16 = 41 | 34 |
 | Confirmed one-row insert | 32 | 35.4–35.5 | 21.8–22.2 | 68–69 | 49 + 31 = 80 | 74 |
 
-The default `placement.rootLimit` is 128. A new root is refused when the sum of active roots and nested calls is already at the limit. A reservation recheck discounts its own slot. Nested calls can continue admitting under the separate `nestedLimit` of 384, so peak total occupancy can exceed the root refusal threshold. Moving a Worker to another node separates its root from the database's nested slot. [Admission predicate](../node/placement-contract.h) · [Same-node and peer case in #106](https://github.com/coworkerd/coworkerd/issues/95#issuecomment-7183434931)
+The default `placement.rootLimit` was 128 when these readings were taken. A new root is refused when the sum of active roots and nested calls is already at the limit. A reservation recheck discounts its own slot. Nested calls can continue admitting under the separate `nestedLimit` of 384, so peak total occupancy can exceed the root refusal threshold. Moving a Worker to another node separates its root from the database's nested slot. [Admission predicate](../node/placement-contract.h) · [Same-node and peer case in #106](https://github.com/coworkerd/coworkerd/issues/95#issuecomment-7183434931)
 
-To replay the measured successful admissions, the threshold would have to be at least 48 at the 16-client knee and at least 114 for the 32-client sweep. The default of 128 covers all of these arrivals. A separate 64-lane calibration on another Linux VM reached 135–155 occupied slots before successful root admissions on the nested paths. In its heaviest plain Worker window, 4,890 replies were refused when occupancy reached the benchmark threshold of 512. Those windows establish that a larger burst can reach the default threshold well above the measured throughput knee. A root with one active local child consumes two slots, and earlier replies can retain a slot through retirement. Higher limits leave more room for bursts and queueing. [64-lane calibration and refusal log](https://github.com/coworkerd/coworkerd/actions/runs/45826913229)
+To replay the measured successful admissions, the threshold would have to be at least 48 at the 16-client knee and at least 114 for the 32-client sweep. The historical default of 128 covered all of these arrivals. A separate 64-lane calibration on another Linux VM reached 135–155 occupied slots before successful root admissions on the nested paths. In its heaviest plain Worker window, 4,890 replies were refused when occupancy reached the benchmark threshold of 512. Those windows establish that a larger burst could reach the historical default threshold well above the measured throughput knee. A root with one active local child consumes two slots, and earlier replies can retain a slot through retirement. Higher limits leave more room for bursts and queueing. [64-lane calibration and refusal log](https://github.com/coworkerd/coworkerd/actions/runs/45826913229)
 
 ## Reproduce
 
@@ -244,4 +244,70 @@ Verify the checked-in recording from the checkout containing this report.
 
 ```sh
 node tests/cluster/durable-log-io/verify.mjs docs/node-main-thread-profile/durable-log-io
+```
+
+## Dispatch descriptor CPU
+
+The archived control stacks contain `ServerCore::encodeDescriptor` in 597 of 8,294 Worker-response samples (7.2%), 463 of 8,291 no-op samples (5.6%), 381 of 8,103 read samples (4.7%), and 303 of 7,148 insert samples (4.2%). These inclusive counts show the encoder's share of the sampled CPU. Within the encoder, the compact Cap’n Proto JSON formatter allocates a tree of per-field strings and flattens it to a contiguous message. The node now appends compact JSON into one buffer and passes that buffer to the existing descriptor assembly. The schema still supplies the fields, defaults, field order, and numeric values. A regression compares the compact result byte for byte with Cap’n Proto’s formatter. [Archived stacks from the control job](https://github.com/coworkerd/coworkerd/actions/runs/45834753741)
+
+### Same-runner Release comparison
+
+GitHub Actions instance **1000002308** ran both builds in one job on a standard Ubuntu 24.04 x86-64 VM with four vCPUs on an AMD EPYC 9V45, Linux `7.0.0-1020-azure`, and ext4. Both revisions used release `kernel-v1.20261114.1-ae0129282c9c-run-46081583762-1`, x86-64 archive SHA-256 `42a53672a28b3a442c1d103cc4eb2a755ce469b480428a5536727694f075524c`. The baseline already includes the durable-log I/O change in #122. Neither build had tracing instrumentation. [Runner record](node-main-thread-profile/dispatch-cpu/runner.txt) · [Source revisions](node-main-thread-profile/dispatch-cpu/revisions.txt) · [Actions run and artifact](https://github.com/coworkerd/coworkerd/actions/runs/46108491847)
+
+The three pairs ran baseline then candidate, candidate then baseline, and baseline then candidate. Each run used a fresh single-node fixture, 16 persistent HTTP/1.1 lanes, 1.5 seconds of warm-up, and six timed seconds per operation and route. The same bare KJ forwarder binary sent the forwarded requests to each build. The direct CPU columns divide the sum of main-thread CPU by the sum of successful timed replies across the three windows. The forwarder column pools the forwarder's own CPU across both builds. Rates and p99s are window medians. Across 48 timed windows, 396,907 replies passed status and body checks, with zero warm-up or timed failures. The driver checked 68,721 acknowledged inserts including warm-up against the database row counts and local WAL confirmations.
+
+| Workload | Baseline CPU ms/reply | Candidate CPU ms/reply | Change | Budget ms/reply | Bare forwarder CPU ms/reply | Baseline / candidate replies/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| Worker response | 0.308 | 0.296 | -4.0% | 0.100 | 0.078 | 2,992 / 3,083 |
+| No-op Durable Object | 0.941 | 0.876 | -6.9% | 0.200 | 0.100 | 970 / 1,030 |
+| One-row read | 1.087 | 1.030 | -5.3% | — | 0.102 | 815 / 855 |
+| Confirmed one-row insert | 1.195 | 1.140 | -4.6% | — | 0.105 | 748 / 760 |
+
+| Workload | Candidate minus baseline CPU ms/reply by pair | Baseline / candidate p99 ms |
+| --- | --- | --- |
+| Worker response | -0.013 / -0.014 / -0.010 | 13.22 / 13.07 |
+| No-op Durable Object | -0.077 / -0.062 / -0.058 | 25.48 / 24.83 |
+| One-row read | -0.050 / -0.063 / -0.058 | 34.46 / 33.60 |
+| Confirmed one-row insert | -0.024 / -0.059 / -0.081 | 45.02 / 50.34 |
+
+Every direct pair used less main-thread CPU for all four workloads. The ordinary reply still used 2.96 times its CPU budget, and the no-op object call used 4.38 times its budget. The insert p99 rose in the first two pairs and fell in the third. The per-window insert p99 ranged from 40.52 to 48.20 ms on the baseline and from 43.10 to 50.83 ms on the candidate. The three pairs show the CPU saving more consistently than the tail-latency change.
+
+From the checkout containing this report, regenerate the tables from the checked-in window data.
+
+```sh
+python3 tests/cluster/main-thread-profile/tables.py --paired-release docs/node-main-thread-profile/dispatch-cpu
+```
+
+### Reproduce the dispatch comparison
+
+Use a quiet Ubuntu 24.04 x86-64 host with the [build dependencies](../CONTRIBUTING.md#building), Docker Compose and Node.js 22. Make two checkouts of the recorded revisions. The measurement driver lives in the candidate checkout and uses the same bare forwarder binary with both revisions.
+
+```bash
+git fetch origin refs/pull/151/head
+git worktree add --detach ../dispatch-baseline b66d2b4828ed1822d5299ea6cdd2bc74ec419f17
+git worktree add --detach ../dispatch-candidate 20950e4f73d2d900629c988b263c38fbbc6e616c
+baseline=$(realpath ../dispatch-baseline)
+candidate=$(realpath ../dispatch-candidate)
+export CC=clang-19 CXX=clang++-19 CMAKE_BUILD_PARALLEL_LEVEL=4
+cmp "$baseline/patches/workerd/artifacts.json" "$candidate/patches/workerd/artifacts.json"
+for checkout in "$baseline" "$candidate"; do
+  bash "$checkout/scripts/build.sh"
+  cmake --build "$checkout/build" --target coworkerd-launcher
+done
+cmake --build "$candidate/build" --target coworkerd-bench-http-forwarder
+cp "$candidate/build/coworkerd-bench-http-forwarder" "$baseline/build/"
+kernel=$(python3 "$candidate/scripts/fetch-kernel.py" --arch linux-x86_64)
+mkdir -p reports
+export COWORKERD_PROFILE_CONTROL=paired-release
+for pair in 1 2 3; do
+  builds=(baseline candidate)
+  if [[ "$pair" = 2 ]]; then builds=(candidate baseline); fi
+  for variant in "${builds[@]}"; do
+    checkout="${!variant}"
+    COWORKERD_CLUSTER_BIN_DIR="$checkout/build" \
+      node "$candidate/tests/cluster/database-home-benchmark.mjs" object "$checkout" "$kernel" \
+      "$PWD/reports/$pair-$variant.jsonl" --main-thread-profile
+  done
+done
+python3 tests/cluster/main-thread-profile/tables.py --paired-release reports
 ```

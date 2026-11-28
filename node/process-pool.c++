@@ -1,6 +1,7 @@
 #include "process-culprit.h"
 #include "process-pool.h"
 #include "isolate-saturation.h"
+#include "request-lease.h"
 #include "rpc-clock.h"
 #include "event-loop.h"
 #include "memory-events.h"
@@ -318,7 +319,8 @@ public:
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
       std::function<void()> onDispatched, std::function<void(PreExecutionRefusal)> onRefused,
       kj::Own<kj::PromiseFulfiller<void>> ready, kj::Own<kj::PromiseFulfiller<PreExecutionRefusal>> refused,
-      std::shared_ptr<ProcessCall> sqlCall);
+      std::shared_ptr<ProcessCall> sqlCall, std::shared_ptr<RequestLease> lease,
+      std::shared_ptr<const ProcessCall> call);
   kj::Own<kj::NetworkAddress> address;
   kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
@@ -327,14 +329,15 @@ public:
   bool disconnected = false;
   OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps,
       kj::Maybe<capnp::Capability::Client> budgetLifetime, std::function<void()> onDispatched,
-      std::function<void(PreExecutionRefusal)> onRefused, std::shared_ptr<ProcessCall> sqlCall) {
+      std::function<void(PreExecutionRefusal)> onRefused, std::shared_ptr<ProcessCall> sqlCall,
+      std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call) {
     if (threaded) {
       auto ready = kj::newPromiseAndFulfiller<void>();
       auto refusal = threadedDurable ? kj::newPromiseAndFulfiller<PreExecutionRefusal>()
           : kj::PromiseFulfillerPair<PreExecutionRefusal>{PreExecutionRefusal::NONE, {}};
       return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
           kj::mv(budgetLifetime), std::move(onDispatched), std::move(onRefused), kj::mv(ready.fulfiller),
-          kj::mv(refusal.fulfiller), std::move(sqlCall))),
+          kj::mv(refusal.fulfiller), std::move(sqlCall), std::move(lease), std::move(call))),
           kj::mv(ready.promise), kj::mv(refusal.promise)};
     }
     KJ_REQUIRE(!nativeProps, "native loopback props require a threaded process");
@@ -373,11 +376,26 @@ private:
   capnp::Capability::Client token;
 };
 
+class NativeLeaseControl final: public v1::rpc::NativeLeaseControl::Server {
+public:
+  NativeLeaseControl(std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call)
+      : lease(std::move(lease)), call(std::move(call)) {}
+  kj::Promise<void> whenEnded(WhenEndedContext) override {
+    return lease->whenClosed().then([call = call]() -> kj::Promise<void> {
+      if (call->upgradedToWebSocket) return kj::NEVER_DONE;
+      return kj::READY_NOW;
+    });
+  }
+private:
+  std::shared_ptr<RequestLease> lease;
+  std::shared_ptr<const ProcessCall> call;
+};
+
 kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj::String descriptor,
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
     std::function<void()> onDispatched, std::function<void(PreExecutionRefusal)> onRefused,
     kj::Own<kj::PromiseFulfiller<void>> ready, kj::Own<kj::PromiseFulfiller<PreExecutionRefusal>> refused,
-    std::shared_ptr<ProcessCall> sqlCall) {
+    std::shared_ptr<ProcessCall> sqlCall, std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call) {
   auto lifetime = shared_from_this();
   KJ_REQUIRE(deferredDeletes != nullptr);
   auto connection = std::shared_ptr<RuntimeConnection>(new RuntimeConnection(),
@@ -492,10 +510,11 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
         throw;
       }
     };
-    if (nativeProps) {
+    if (nativeProps || (lease && !threadedDurable)) {
       auto request = connection->bootstrap.castAs<v1::rpc::ThreadedBootstrap>().startNativeEventRequest();
       request.setCfBlobJson(descriptor);
-      request.getCoworkerdProps().set(nativeProps->getRoot<capnp::AnyPointer>());
+      if (nativeProps) request.getCoworkerdProps().set(nativeProps->getRoot<capnp::AnyPointer>());
+      if (lease && !threadedDurable) request.setLease(kj::heap<NativeLeaseControl>(std::move(lease), std::move(call)));
       request.setBudgetLifetime(kj::mv(budgetToken));
       request.setBudgetTicket(budgetTicket);
       auto response = request.send();
@@ -2479,7 +2498,7 @@ public:
     p->contextsVisible = !p->threaded;
     p->eventDigest = EVP_MD_CTX_new();
     KJ_REQUIRE(p->eventDigest && EVP_DigestInit_ex(p->eventDigest, EVP_sha256(), nullptr) == 1, "cannot hash the event channel");
-    const int listener = listenUnix(p->socketPath, config.inFlightLimit);
+    const int listener = listenUnix(p->socketPath, config.processInFlightLimit(p->durable));
     auto closeListener = kj::defer([listener] { ::close(listener); });
     const int lifecycle = p->lifecycle.create();
     auto closeLifecycle = kj::defer([lifecycle] { ::close(lifecycle); });
@@ -2640,6 +2659,10 @@ public:
     childEnvironment.push_back("COWORKERD_EVENT_FD=" + std::to_string(EVENT_FD));
     childEnvironment.push_back("COWORKERD_LIFECYCLE_FD=" + std::to_string(LIFECYCLE_FD));
     childEnvironment.push_back("COWORKERD_PARENT_FD=" + std::to_string(PARENT_FD));
+    if (p->durable && config.alarmWallMsForTest) {
+      childEnvironment.push_back("COWORKERD_INTERNAL_TEST_ALARM_WALL_MS=" +
+          std::to_string(*config.alarmWallMsForTest));
+    }
     childEnvironment.push_back("COWORKERD_IDLE_EVICT_MS=" + std::to_string(config.idleEvictMs));
     childEnvironment.push_back("COWORKERD_IDLE_DESTROY_INTERVAL_MS=" + std::to_string(config.idleDestroyIntervalMs));
     if (bandFd >= 0) childEnvironment.push_back("COWORKERD_MEMORY_BAND_FD=" + std::to_string(BAND_FD));
@@ -2660,7 +2683,7 @@ public:
                "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",
                "COWORKERD_DO_TEST_FD_HEADROOM", "COWORKERD_DO_TEST_COMMIT_DELAY_MS",
                "COWORKERD_DO_TEST_REFUSE_GROUP", "COWORKERD_DO_TEST_LIFECYCLE_DIR",
-               "COWORKERD_DO_TEST_SQL_MEMORY_BYTES"}) {
+               "COWORKERD_DO_TEST_SQL_MEMORY_BYTES", "COWORKERD_DO_TEST_OBJECT_SQL_MEMORY_BYTES"}) {
         if (const char* value = std::getenv(name)) childEnvironment.push_back(std::string(name) + "=" + value);
       }
     }
@@ -2709,7 +2732,7 @@ public:
     // launcher itself executed through the descriptor this Server pinned at startup.
     std::vector<std::string> args = {executable, "serve", "--experimental", "--socket-fd", "rpc=" + std::to_string(LISTEN_FD), path};
     if (p->threaded) args = {executable, std::to_string(LISTEN_FD), sourceAddress,
-        p->id + ":" + std::to_string(p->generation), std::to_string(config.inFlightLimit)};
+        p->id + ":" + std::to_string(p->generation), std::to_string(config.processInFlightLimit(p->durable))};
     if (p->durableTestStorage) args.push_back("--durable-test-storage");
     else if (p->durable && p->threaded) args.push_back("--durable-storage");
     std::string file = executable;
@@ -3387,9 +3410,12 @@ public:
       }
     });
   }
-  bool admitted(const ProcessGeneration& p) const {
+  bool readyForDispatch(const ProcessGeneration& p) const {
     return p.pid > 0 && p.state == "ready" && p.runtime && !p.runtime->disconnected &&
-        (!p.durableBudgets || p.durableBudgets->connected) && p.inFlight < config.inFlightLimit;
+        (!p.durableBudgets || p.durableBudgets->connected);
+  }
+  bool admitted(const ProcessGeneration& p) const {
+    return readyForDispatch(p) && p.inFlight < config.processInFlightLimit(p.durable);
   }
   bool admittedTenant(const ProcessGeneration& p, const std::string& worker) const {
     if (!admitted(p)) return false;
@@ -3993,7 +4019,7 @@ ProcessPool::PausedAdmission ProcessPool::pausedAdmission(const std::string& wor
     if (!p) continue;
     if (impl->admitted(*p)) return {};
     if (p->state == "paused" && p->pid > 0 && p->runtime && !p->runtime->disconnected &&
-        !p->closing && !p->retiring && p->inFlight < impl->config.inFlightLimit) result.processes.push_back(p);
+        !p->closing && !p->retiring && p->inFlight < impl->config.processInFlightLimit(p->durable)) result.processes.push_back(p);
   }
   return result;
 }
@@ -4076,14 +4102,16 @@ void ProcessPool::enableEgress(std::string address) {
   impl->egressAddress = std::move(address);
 }
 
-std::optional<std::pair<std::string, uint64_t>> ProcessPool::egressSource(const std::string& token) const {
+std::optional<EgressSource> ProcessPool::egressSource(const std::string& token) const {
   if (token.size() != 32) return std::nullopt;
   for (const auto& slot : impl->slots) {
     for (const auto* generation : {&slot.current, &slot.incoming}) {
-      if (*generation && (*generation)->egressToken == token) return std::pair{(*generation)->id, (*generation)->generation};
+      if (*generation && (*generation)->egressToken == token)
+        return EgressSource{(*generation)->id, (*generation)->generation, (*generation)->durable};
     }
     for (const auto& generation : slot.retiring)
-      if (generation && generation->egressToken == token) return std::pair{generation->id, generation->generation};
+      if (generation && generation->egressToken == token)
+        return EgressSource{generation->id, generation->generation, generation->durable};
   }
   return std::nullopt;
 }
@@ -4142,6 +4170,20 @@ std::shared_ptr<ProcessCall> ProcessPool::select(const std::string& worker) {
   if (!process) return {};
   if (quarantine) ++impl->quarantineDispatches;
   return std::shared_ptr<ProcessCall>(new ProcessCall(process, process->tenantExecution ? tenantOf(worker) : std::string()));
+}
+std::optional<uint32_t> ProcessPool::fullProcessLimit(const std::string& worker, const std::string& objectKey) {
+  impl->refresh();
+  const auto quarantine = quarantined(worker);
+  const auto durableId = objectKey.empty() ? std::string() : impl->durableSlotFor(objectKey);
+  const auto limit = impl->config.processInFlightLimit(!objectKey.empty());
+  bool ready = false;
+  for (const auto& slot : impl->slots) {
+    if (objectKey.empty() ? slot.durable || slot.quarantine != quarantine : !slot.durable || slot.id != durableId) continue;
+    if (!slot.current || !impl->readyForDispatch(*slot.current)) continue;
+    if (slot.current->inFlight < limit) return std::nullopt;
+    ready = true;
+  }
+  return ready ? std::optional(limit) : std::nullopt;
 }
 bool ProcessPool::workerSaturated(const std::string& worker, std::string_view planRevision, double nowMs) const {
   if (planRevision.empty()) return false;
@@ -4312,7 +4354,7 @@ kj::Promise<void> ProcessPool::sampleWorkerSaturation() {
 
 OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor, const std::string& hash,
     std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
-    bool threadedSql) {
+    bool threadedSql, std::shared_ptr<RequestLease> requestLease) {
   auto p = call->process;
   call->startedAtMonotonicMs = mono(); call->startedAtUnixMs = wall();
   p->calls.emplace(call->invocationId, call.get()); p->heat.touch(hash, mono());
@@ -4328,7 +4370,7 @@ OpenEvent ProcessPool::open(std::shared_ptr<ProcessCall> call, kj::StringPtr des
   auto result = p->runtime->open(descriptor, std::move(nativeProps), kj::mv(budgetLifetime), [call] { call->dispatched = true; }, [call](PreExecutionRefusal reason) {
     call->preExecutionRefusal = reason;
     if (reason == PreExecutionRefusal::CAPACITY && call->onCapacityRejected) call->onCapacityRejected();
-  }, threadedSql ? call : nullptr);
+  }, threadedSql ? call : nullptr, std::move(requestLease), call);
   result.ready = kj::mv(result.ready).exclusiveJoin(call->onExit()).catch_([call](kj::Exception&& error) -> kj::Promise<void> {
     return call->rejectAfterCrash(kj::mv(error));
   }).attach(std::shared_ptr<ProcessCall>(call));
@@ -4380,7 +4422,8 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"idleDestroyIntervalMs\":" << impl->config.idleDestroyIntervalMs
       << ",\"quarantineProcesses\":" << impl->config.quarantineProcesses
       << ",\"durableProcesses\":" << impl->config.durableProcesses
-      << ",\"inFlightLimit\":" << impl->config.inFlightLimit << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
+      << ",\"inFlightLimit\":" << impl->config.inFlightLimit
+      << ",\"durableInFlightLimit\":" << impl->config.durableInFlightLimit() << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
       << ",\"probeOverdueMs\":" << impl->config.probeOverdueMs << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
       << ",\"watchdog\":" << (impl->config.watchdog ? "true" : "false") << ",\"restartBackoffMs\":" << impl->config.restartBackoffMs
       << ",\"restartMaxMs\":" << impl->config.restartMaxMs

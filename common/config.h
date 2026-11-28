@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,6 +28,7 @@ struct ProcessPoolConfig {
   bool watchdog = true;
   uint32_t pausedAdmissionWaitMs = 1000;
   uint32_t cpuLimitMs = 30000;
+  std::optional<uint64_t> alarmWallMsForTest;
   uint32_t durableCpuLimitMs = 200;
   uint32_t memoryLimitMiB = 128;
   uint32_t quarantineProcesses = 2;  // sharded by tenant, and the trial loads' processes
@@ -111,6 +113,9 @@ struct ProcessPoolConfig {
   // The largest Wasm memory the plan allows a process's isolates (0: no cap of the sandbox's).
   uint32_t sandboxWasmCapMiB = 0;
   std::string sandboxPlanJson, sandboxWarning;
+  bool inFlightLimitGiven = false;
+  uint32_t durableInFlightLimit() const { return inFlightLimitGiven ? inFlightLimit : 512; }
+  uint32_t processInFlightLimit(bool durable) const { return durable ? durableInFlightLimit() : inFlightLimit; }
   void validate() const;
 };
 
@@ -197,8 +202,8 @@ struct EgressConfig {
   std::string defaultPolicy = "public";
   std::vector<uint16_t> publicPorts = {80, 443};
   uint32_t timeoutMs = 30000;
-  uint32_t concurrency = 32;
-  uint32_t requestsPerSecond = 100;
+  uint32_t concurrency = 0;
+  uint32_t requestsPerSecond = 0;
   uint32_t dnsCacheMs = 10000;
   std::string caFile;
   bool systemTrustStore = true;
@@ -267,6 +272,10 @@ struct ServerConfig {
   int64_t clockOffsetMsForTest = 0;
   uint32_t rootLimit = 128;
   uint32_t nestedLimit = 384;
+  bool rootLimitGiven = false;
+  bool nestedLimitGiven = false;
+  void resolvePlacementLimits();
+  void validatePlacementLimits() const;
   uint32_t tenantRootLimit = 0;
   uint32_t tenantNestedLimit = 0;
   uint32_t tenantBorrowBelowPercent = 0;
@@ -281,7 +290,6 @@ struct ServerConfig {
   bool memoryWatermarkEnabled = true;
   uint64_t memoryBudgetBytes = 0;
   HostCheckConfig hostCheck;
-  bool equalLimitsForTest = false;
   bool ingressPlacement = true;
   coworkerd::ProcessPoolConfig processPool;
   coworkerd::MembershipConfig membership;
@@ -297,6 +305,11 @@ struct ServerConfig {
   bool loadCheck = true;
   // A ceiling for all ingress WebSockets on this node. 0 uses the default, capped by the hard descriptor limit.
   uint32_t webSocketsPerNode = 0;
+  struct TcpKeepalive {
+    int idleSeconds = 30;
+    int intervalSeconds = 10;
+    int probes = 3;
+  } ingressKeepalive;
   // durableObjects: how the node replicates and stores its objects' data (processes is in processPool).
   DurableLogConfig durableLog;
   uint64_t durableSocketFrameBytesPerNode = 128ull << 20;

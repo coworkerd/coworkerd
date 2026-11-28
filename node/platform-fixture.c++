@@ -27,9 +27,26 @@ const std::string& sqlDatabaseSource() {
   return source;
 }
 
+std::optional<uint64_t> alarmWallOverrideForTest(uint64_t maximum) {
+#ifdef COWORKERD_PLATFORM_FIXTURE
+  if (const auto* setting = std::getenv("COWORKERD_TEST_ALARM_WALL_MS")) {
+    auto limit = kj::StringPtr(setting).parseAs<uint64_t>();
+    KJ_REQUIRE(limit > 0 && limit <= maximum, "invalid test alarm wall time");
+    return limit;
+  }
+#else
+  (void)maximum;
+#endif
+  return std::nullopt;
+}
+
 PlatformDefinitions loadPlatformDefinitions() {
   PlatformDefinitions result;
 #ifdef COWORKERD_PLATFORM_FIXTURE
+  if (const auto* worker = std::getenv("COWORKERD_TEST_FAIL_CHILD_OPEN")) {
+    KJ_REQUIRE(workerFullName(worker), "invalid target for the child-open fixture");
+    result.failChildOpenForTest = worker;
+  }
   const char* fixturePath = std::getenv("COWORKERD_PLATFORM_FIXTURE");
   if (fixturePath == nullptr) return result;
   const std::filesystem::path file(fixturePath);

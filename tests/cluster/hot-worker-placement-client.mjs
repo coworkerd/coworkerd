@@ -4,7 +4,9 @@ import { availableParallelism, release } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const input = JSON.parse(readFileSync('/measure.json', 'utf8'));
-const { home, hot, light, nodes, checksum, hotRate, calibrate, longRun, management } = input;
+const { home, hot, light, nodes, checksum, hotRate, pinned, calibrate, overload, sustained, longRun,
+  warmupTimeoutMs, management } = input;
+const sampled = overload || sustained;
 const shortWindowMs = 15_000;
 const loadedWindowMs = longRun ? 60_000 : shortWindowMs;
 const lightRate = 100;
@@ -16,7 +18,8 @@ async function call(worker, id) {
     const response = await fetch(`${url(home)}/${worker}?id=${id}`, { signal: AbortSignal.timeout(45_000) });
     const body = await response.json().catch(() => ({}));
     if (!response.ok) {
-      return { code: /^[A-Z_\d]+$/.test(body.code) ? body.code : `HTTP_${response.status}` };
+      const code = /^[A-Z_\d]+$/.test(body.code) ? body.code : `HTTP_${response.status}`;
+      return sampled ? { code, httpStatus: response.status } : { code };
     }
     if (!nodes.includes(body.nodeId) || (!longRun && worker === light && body.nodeId !== home) ||
         (worker === hot && (body.id !== id || body.checksum !== checksum))) {
@@ -37,13 +40,14 @@ async function offer(worker, id, start, due) {
   const sent = performance.now();
   const result = await call(worker, id);
   const completed = performance.now();
-  return { id, ...result, sendDelayMs: sent - due, latencyMs: completed - due, completionMs: completed - start };
+  return { id, ...result, sendDelayMs: sent - due, latencyMs: completed - due, completionMs: completed - start,
+    ...(sampled && { sentMs: sent - start }) };
 }
 
 async function paced(worker, label, start, windowMs, rate, offset = 0) {
   const spacing = 1_000 / rate;
   const pending = [];
-  for (let slot = 0; slot < windowMs * rate / 1_000; ++slot) {
+  for (let slot = 0; slot < Math.round(windowMs * rate / 1_000); ++slot) {
     const due = start + slot * spacing + offset;
     const id = `${label}-${slot}`;
     await at(due);
@@ -65,7 +69,11 @@ function summarize(rows, windowMs) {
   return { offers: rows.length, replies: complete.length, byNode: byNode(complete),
     inWindowByNode: byNode(inWindow), completedPerSecond: inWindow.length * 1_000 / windowMs, codes,
     p99Ms: latencies[Math.ceil(rows.length * 0.99) - 1] ?? null,
-    replyP99Ms: latencies[Math.ceil(latencies.length * 0.99) - 1] ?? null };
+    replyP99Ms: latencies[Math.ceil(latencies.length * 0.99) - 1] ?? null,
+    ...(sampled && {
+      p50Ms: latencies[Math.ceil(latencies.length * 0.50) - 1] ?? null,
+      p95Ms: latencies[Math.ceil(latencies.length * 0.95) - 1] ?? null,
+    }) };
 }
 
 function cpuTicks() {
@@ -92,8 +100,11 @@ async function nodePlacement(node) {
   assert.equal(response.status, 200, `placement counters at ${node}`);
   const { placement, processes } = await response.json();
   assert.equal(placement.rootLimit, 128);
-  assert.equal(processes.entries.filter(entry => entry.processClass === 'ordinary').length, 1);
-  return placement;
+  const ordinary = processes.entries.filter(entry => entry.processClass === 'ordinary');
+  assert.equal(ordinary.length, 1);
+  if (!sampled) return placement;
+  const worker = ordinary[0].lifecycle?.residentWorkers.find(row => row.workerId === hot);
+  return { ...placement, isolateBusy: worker?.isolateBusy ?? null };
 }
 
 async function rejectionCounters() {
@@ -128,30 +139,172 @@ function counterDelta(before, after) {
   }));
 }
 
+async function nodeSnapshot() {
+  const readings = await Promise.all(nodes.map(node => nodePlacement(node)));
+  return Object.fromEntries(nodes.map((node, i) => {
+    const { inFlight, rootLimit, decisions, rejections, isolateBusy } = readings[i];
+    assert.equal(inFlight.nested, 0);
+    return [node, { roots: inFlight.roots, rootLimit, decisions, rejections, isolateBusy }];
+  }));
+}
+
+async function emptyNodes() {
+  const deadline = performance.now() + 5_000;
+  do {
+    const readings = await nodeSnapshot();
+    if (Object.values(readings).every(node => node.roots === 0)) return readings;
+    await delay(50);
+  } while (performance.now() < deadline);
+  assert.fail('node root slots did not drain');
+}
+
+async function sampleRoots(start, windowMs) {
+  const samples = [];
+  for (let elapsed = 0; elapsed <= windowMs; elapsed += 2_000) {
+    await at(start + elapsed);
+    const sentMs = performance.now() - start;
+    const snapshot = await nodeSnapshot();
+    const roots = Object.fromEntries(nodes.map(node => [node, snapshot[node].roots]));
+    const isolateBusy = Object.fromEntries(nodes.map(node => [node, snapshot[node].isolateBusy]));
+    samples.push({ sentMs, receivedMs: performance.now() - start, roots, isolateBusy });
+  }
+  return samples;
+}
+
+async function closedLoop(label, start, windowMs, laneCount) {
+  await at(start);
+  const lanes = await Promise.all(Array.from({ length: laneCount }, async (_, lane) => {
+    const rows = [];
+    while (performance.now() < start + windowMs) {
+      rows.push(await offer(hot, `${label}-${lane}-${rows.length}`, start, performance.now()));
+    }
+    return rows;
+  }));
+  return lanes.flat();
+}
+
+async function warmForScoring() {
+  // The fixed compute Worker's fetch changes tier around call 513 on the published ARM64 kernel.
+  // Use replies on each execution node to allow for differences in placement and service rate.
+  const repliesRequired = 550;
+  const executionNodes = pinned ? [home] : nodes;
+  const replies = Object.fromEntries(executionNodes.map(node => [node, 0]));
+  const lanes = pinned ? 4 : 72;
+  const start = performance.now();
+  const deadline = start + warmupTimeoutMs;
+  let nodesRemaining = executionNodes.length;
+  await Promise.all(Array.from({ length: lanes }, async (_, lane) => {
+    for (let n = 0; nodesRemaining > 0 && performance.now() < deadline; ++n) {
+      const result = await call(hot, `steady-warm-${lane}-${n}`);
+      assert.ok(Object.hasOwn(replies, result.nodeId), `invalid warm-up response ${JSON.stringify(result)}`);
+      if (++replies[result.nodeId] === repliesRequired) --nodesRemaining;
+    }
+  }));
+  assert.equal(nodesRemaining, 0, `expected ${repliesRequired} warm-up replies per execution node, got ${JSON.stringify(replies)}`);
+  emit({ metric: 'warmup', lanes, repliesRequired, replies, elapsedMs: performance.now() - start });
+}
+
+async function sampledWindow(label, windowMs, send) {
+  const before = await emptyNodes();
+  const start = performance.now() + 100;
+  const [rows, cpu, roots] = await Promise.all([
+    send(start), sampleCpu(start, windowMs), sampleRoots(start, windowMs),
+  ]);
+  const after = await emptyNodes();
+  const perNode = key => counterDelta(
+    Object.fromEntries(nodes.map(node => [node, before[node][key]])),
+    Object.fromEntries(nodes.map(node => [node, after[node][key]])),
+  );
+  const replies = rows.filter(row => row.nodeId);
+  const afterWindow = replies.filter(row => row.completionMs >= windowMs);
+  return {
+    label, windowMs, cpu, roots, before, after, refusalsByNode: perNode('rejections'), decisionsByNode: perNode('decisions'),
+    hotSummary: {
+      ...summarize(rows, windowMs),
+      sent: rows.filter(row => row.sentMs !== undefined).length,
+      outstandingAtStop: rows.filter(row => row.sentMs < windowMs && row.completionMs >= windowMs).length,
+      completedDuringDrain: afterWindow.length,
+      lastReplyAfterStopMs: Math.max(0, ...afterWindow.map(row => row.completionMs - windowMs)),
+    },
+    hot: rows,
+  };
+}
+
+async function calibrateOverload(label, rampMs) {
+  const lanes = 72;
+  const scoredMs = 30_000;
+  const windowMs = rampMs + scoredMs;
+  const result = await sampledWindow(label, windowMs, start => closedLoop(label, start, windowMs, lanes));
+  const scoredByNode = Object.fromEntries(nodes.map(node => [node, result.hot.filter(
+    row => row.nodeId === node && row.completionMs >= rampMs && row.completionMs < windowMs).length]));
+  const completedPerSecond = Object.values(scoredByNode).reduce((sum, count) => sum + count, 0) * 1_000 / scoredMs;
+  emit({ metric: 'overload-calibration', lanes, rampMs, scoredMs, scoredByNode, completedPerSecond, ...result });
+  return completedPerSecond;
+}
+
+async function measureOverload() {
+  // The reply-count warm-up already ran. Score again after the fixed-rate windows
+  // to show whether the calibration held while they ran.
+  const measuredRate = await calibrateOverload('calibration-before', 10_000);
+  const controlRate = Math.round(measuredRate * 0.60 * 10) / 10;
+  const overloadRate = Math.round(measuredRate * 1.10 * 10) / 10;
+  assert.ok(controlRate > 0 && overloadRate > measuredRate && overloadRate <= 100, 'calibration must yield a bounded rate');
+  emit({ metric: 'overload-rates', measuredRate, controlRate, overloadRate });
+
+  await delay(4_000);
+  const windowMs = 20_000;
+  for (let trial = 1; trial <= 3; ++trial) {
+    for (const [condition, rate] of [['control', controlRate], ['overload', overloadRate]]) {
+      const label = `${condition}-${trial}`;
+      const result = await sampledWindow(label, windowMs, start => paced(hot, label, start, windowMs, rate));
+      emit({ metric: 'overload-window', trial, condition, rate, ...result });
+      await delay(4_000);
+    }
+  }
+  await calibrateOverload('calibration-after', 10_000);
+}
+
+async function measureSustained() {
+  const minuteMs = 60_000;
+  const windowMs = 10 * minuteMs;
+  const lanes = nodes.length === 1 ? 24 : 72;
+  const result = await sampledWindow('sustained', windowMs,
+    start => closedLoop('sustained', start, windowMs, lanes));
+  const repliesByMinute = Array.from({ length: windowMs / minuteMs }, () =>
+    Object.fromEntries(nodes.map(node => [node, 0])));
+  for (const { nodeId, completionMs } of result.hot) {
+    if (nodeId && completionMs < windowMs) ++repliesByMinute[Math.floor(completionMs / minuteMs)][nodeId];
+  }
+  emit({ metric: 'sustained', lanes, repliesByMinute, ...result });
+}
+
 const emit = row => console.log(JSON.stringify(row));
 
 for (let i = 0; i < 6; ++i) {
   assert.deepEqual(await call(hot, `warm-${i}`), { nodeId: home });
-  assert.deepEqual(await call(light, `warm-${i}`), { nodeId: home });
+}
+if (!sustained) await warmForScoring();
+if (light) {
+  for (let i = 0; i < 6; ++i) {
+    assert.deepEqual(await call(light, `warm-${i}`), { nodeId: home });
+  }
 }
 await delay(4_000);
 emit({ metric: 'client', node: process.version, linuxRelease: release(), vcpus: availableParallelism(),
-  quietWindowMs: shortWindowMs, loadedWindowMs, lightRate,
+  ...(!sampled && { quietWindowMs: shortWindowMs, loadedWindowMs, lightRate }),
   cgroupQuota: readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim(),
   cgroupCpuset: readFileSync('/sys/fs/cgroup/cpuset.cpus.effective', 'utf8').trim() });
 
-if (calibrate) {
+if (overload) {
+  await measureOverload();
+} else if (sustained) {
+  await measureSustained();
+} else if (calibrate) {
   // Keep a single statically pinned isolate busy with four outstanding requests.
   const start = performance.now() + 100;
-  await at(start);
-  const [lanes, cpu] = await Promise.all([Promise.all(Array.from({ length: 4 }, async (_, lane) => {
-    const rows = [];
-    while (performance.now() < start + shortWindowMs) {
-      rows.push(await offer(hot, `calibration-${lane}-${rows.length}`, start, performance.now()));
-    }
-    return rows;
-  })), sampleCpu(start, shortWindowMs)]);
-  const rows = lanes.flat();
+  const [rows, cpu] = await Promise.all([
+    closedLoop('calibration', start, shortWindowMs, 4), sampleCpu(start, shortWindowMs),
+  ]);
   const summary = summarize(rows, shortWindowMs);
   assert.equal(summary.byNode[home], rows.length, 'calibration must complete on the pinned isolate');
   emit({ metric: 'calibration', cpu, hotSummary: summary, hot: rows });

@@ -2,6 +2,12 @@
 
 This measurement covers the hot Worker and light tenant in [#31](https://github.com/coworkerd/coworkerd/issues/31).
 
+The rates in the 15-second and one-minute windows below describe early throughput. The 5.67 replies/s
+single-isolate calibration and the loaded placement windows ran before V8's change in tier for this
+Worker. The later M4 run measured 4.49 replies/s on one node and 11.93 replies/s through three-node
+ingress over minutes 3–10. The current driver warms each participating isolate by reply count before
+measuring placement. [Ten-minute steady readings](hot-worker-sustained.md#ten-minute-product-readings)
+
 | Configuration | Coworkerd product source | Public Linux ARM64 kernel pin |
 | --- | --- | --- |
 | Before, dynamic ingress | `dec0b3b` (main immediately before [#127](https://github.com/coworkerd/coworkerd/pull/127)) | [`ce00bd62d2d6`](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-ce00bd62d2d6-run-45983799782-1) |
@@ -145,25 +151,28 @@ each window's ramp into load and uses only completions inside that window.
 ## Reproduction
 
 Use a quiet Linux Docker engine with spare CPU and the
-[cluster build prerequisites](../tests/cluster/README.md#requirements-and-commands). Run from the
-checkout containing this driver. Build both revisions before starting the measurements, and run the
-clusters one at a time.
+[cluster build prerequisites](../tests/cluster/README.md#requirements-and-commands). Use the driver
+from the original report at `8b448dc` to reproduce these windows. Build both revisions before
+starting the measurements, and run the clusters one at a time. For new readings, use the driver
+in the current checkout and calibrate after its warm-up.
 
 ```sh
 root=$PWD
 before="$root/build/placement-before"
 landed="$root/build/placement-landed"
+original="$root/build/placement-driver"
 mkdir -p "$root/build"
 git worktree add --detach "$before" dec0b3b
 git worktree add --detach "$landed" 398c7a3
-npm ci --prefix cli --registry=https://registry.npmjs.org
+git worktree add --detach "$original" 8b448dc
+npm ci --prefix "$original/cli" --registry=https://registry.npmjs.org
 for product in "$before" "$landed"; do
   (cd "$product" && bash scripts/build.sh -DCOWORKERD_TEST_WORKERD= &&
     cmake --build build --target coworkerd-launcher)
 done
 before_kernel=$(cd "$before" && python3 scripts/fetch-kernel.py)
 landed_kernel=$(cd "$landed" && python3 scripts/fetch-kernel.py)
-driver=tests/cluster/hot-worker-placement.mjs
+driver="$original/tests/cluster/hot-worker-placement.mjs"
 
 node "$driver" calibrate "$landed" "$landed_kernel" build/landed-calibration.jsonl 150000000
 node "$driver" calibrate "$before" "$before_kernel" build/before-calibration.jsonl 150000000

@@ -65,6 +65,26 @@ void DurableLogConfig::validate() const {
       "durableObjects.uploadRetryMaxMs is at least uploadRetryMs");
 }
 
+void ServerConfig::validatePlacementLimits() const {
+  KJ_REQUIRE(rootLimit > 0, "placement.rootLimit must be positive");
+  KJ_REQUIRE(nestedLimit > rootLimit, "placement.nestedLimit must exceed placement.rootLimit", rootLimit, nestedLimit);
+  KJ_REQUIRE(tenantRootLimit <= rootLimit && tenantNestedLimit <= nestedLimit,
+      "per-tenant placement limits must not exceed their effective node-wide limits",
+      tenantRootLimit, rootLimit, tenantNestedLimit, nestedLimit);
+}
+
+void ServerConfig::resolvePlacementLimits() {
+  const auto ordinarySlots = processPool.inFlightLimit * processPool.count;
+  // A durable-only node has no ordinary capacity from which to derive placement defaults.
+  if (ordinarySlots > 0) {
+    KJ_REQUIRE(ordinarySlots > 1 || (rootLimitGiven && nestedLimitGiven),
+        "one ordinary call slot needs explicit placement.rootLimit and placement.nestedLimit");
+    if (!nestedLimitGiven) nestedLimit = ordinarySlots;
+    if (!rootLimitGiven) rootLimit = std::min(ordinarySlots, nestedLimit) * 3 / 4;
+  }
+  validatePlacementLimits();
+}
+
 void ProcessPoolConfig::validate() const {
   KJ_REQUIRE((count > 0 || threadedDurableTestStorage) && count <= 256 && inFlightLimit > 0,
       "invalid process pool capacity");
@@ -199,6 +219,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   auto placement = root.getPlacement();
   result.rootLimit = placement.getRootLimit();
   result.nestedLimit = placement.getNestedLimit();
+  result.rootLimitGiven = given({"placement", "rootLimit"}).has_value();
+  result.nestedLimitGiven = given({"placement", "nestedLimit"}).has_value();
   result.tenantRootLimit = placement.getTenantRootLimit();
   result.tenantNestedLimit = placement.getTenantNestedLimit();
   result.tenantBorrowBelowPercent = placement.getTenantBorrowBelowPercent();
@@ -208,15 +230,14 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.rejectionAvoidMs = placement.getRejectionAvoidMs();
   result.connectBackoffMs = placement.getConnectBackoffMs();
   result.loadBandForTest = placement.getLoadBandForTest().cStr();
-  result.equalLimitsForTest = placement.getEqualLimitsForTest();
   result.subcalls = placement.getSubcalls().cStr();
   KJ_REQUIRE(result.subcalls == "home" || result.subcalls == "local",
       "placement.subcalls is \"home\" or \"local\"", result.subcalls.c_str());
-  KJ_REQUIRE(result.rootLimit > 0 &&
-      (result.nestedLimit > result.rootLimit ||
-       (result.equalLimitsForTest && result.nestedLimit == result.rootLimit)),
-      "nestedLimit must exceed rootLimit (equalLimitsForTest is only for the control)");
-  KJ_REQUIRE(result.tenantRootLimit <= result.rootLimit && result.tenantNestedLimit <= result.nestedLimit,
+  KJ_REQUIRE(!result.rootLimitGiven || result.rootLimit > 0, "placement.rootLimit must be positive");
+  KJ_REQUIRE(!result.nestedLimitGiven || result.nestedLimit > 1, "placement.nestedLimit must be at least 2");
+  if (result.rootLimitGiven && result.nestedLimitGiven) result.validatePlacementLimits();
+  KJ_REQUIRE((!result.rootLimitGiven || result.tenantRootLimit <= result.rootLimit) &&
+      (!result.nestedLimitGiven || result.tenantNestedLimit <= result.nestedLimit),
       "per-tenant placement limits must not exceed their node-wide limits");
   KJ_REQUIRE(result.tenantBorrowBelowPercent <= 100, "placement.tenantBorrowBelowPercent must be in [0, 100]");
   KJ_REQUIRE(result.idleMs > 0 && result.avoidMaxMs > 0 && result.connectBackoffMs > 0,
@@ -229,6 +250,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool = {pool.getCount(), pool.getInFlightLimit(), pool.getBasePort(),
     pool.getProbeIntervalMs(), pool.getProbeOverdueMs(), pool.getStuckTimeoutMs(),
     pool.getRestartBackoffMs(), pool.getRestartMaxMs(), pool.getWatchdog()};
+  result.processPool.inFlightLimitGiven = given({"processPool", "inFlightLimit"}).has_value();
   result.processPool.pausedAdmissionWaitMs = pool.getPausedAdmissionWaitMs();
   result.processPool.sqlCpuLimitMs = pool.getSqlCpuLimitMs();
   result.processPool.sqlWallLimitMs = pool.getSqlWallLimitMs();
@@ -294,6 +316,11 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.drainTimeoutMs = root.getDrainTimeoutMs();
   result.loadCheck = root.getLoadCheck();
   result.webSocketsPerNode = root.getIngress().getWebSocketsPerNode();
+  const auto keepalive = root.getIngress().getTcpKeepalive().asReader();
+  KJ_REQUIRE(keepalive.getIdleSeconds() > 0 && keepalive.getIdleSeconds() <= 32767 &&
+      keepalive.getIntervalSeconds() > 0 && keepalive.getIntervalSeconds() <= 32767 &&
+      keepalive.getProbes() > 0 && keepalive.getProbes() <= 127, "invalid ingress.tcpKeepalive settings");
+  result.ingressKeepalive = {keepalive.getIdleSeconds(), keepalive.getIntervalSeconds(), keepalive.getProbes()};
   auto rotation = root.getRotation();
   result.processPool.rotationDrainTimeoutMs = rotation.getDrainTimeoutMs();
   result.processPool.rotationTermGraceMs = rotation.getTermGraceMs();
@@ -522,8 +549,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   KJ_REQUIRE(e.mode == "on" || e.mode == "off", "egress.mode must be on or off", e.mode.c_str());
   KJ_REQUIRE(e.defaultPolicy == "public" || e.defaultPolicy == "deny", "egress.defaultPolicy must be public or deny",
       e.defaultPolicy.c_str());
-  KJ_REQUIRE(e.timeoutMs > 0 && e.concurrency > 0 && e.requestsPerSecond > 0,
-      "egress.timeoutMs, egress.concurrency and egress.requestsPerSecond must be positive");
+  KJ_REQUIRE(e.timeoutMs > 0, "egress.timeoutMs must be positive");
   // The peer listener's authentication.
   result.peerAuth = {root.getPeerAuth().getKeyFile().cStr(), root.getPeerAuth().getWindowMs()};
   KJ_REQUIRE(result.peerAuth.windowMs >= 1000 && result.peerAuth.windowMs <= 600000, "peerAuth.windowMs must be 1000 to 600000");
