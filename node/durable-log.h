@@ -426,7 +426,7 @@ public:
   // ---- The durable processes ----
   // The node's end of a durable process's channel is kept and read; the descriptor returned is the one the process
   // inherits, or -1 when this node ships nothing.
-  int openChannel(const std::string& processId, uint64_t threadedGeneration = 0);
+  int openChannel(const std::string& processId, uint64_t threadedGeneration);
   void closeChannel(const std::string& processId);
   bool drainChannel(const std::string& processId);
 
@@ -627,13 +627,6 @@ private:
     bool preparationWaiting = false, rebuildWaiting = false;
     uint64_t wakeUnixMs = 0, fireToken = 0;
     std::string destination;
-  };
-  // What one durable process reports of its resident objects (patches/workerd 0014).
-  struct Residency {
-    uint64_t resident = 0, limit = 0, evicted = 0, woken = 0, wakes = 0;
-    // As the process reports them, in microseconds: waking an object whose class is still loaded is sub-millisecond.
-    uint64_t wakeUsTotal = 0, wakeUsMax = 0;
-    double atMs = 0;
   };
   // A record this node sent and is waiting for its peers on.
   struct InFlight {
@@ -1207,7 +1200,6 @@ private:
   uint64_t alarmTickSamples = 0, alarmTickMaxNs = 0, alarmTickCpuNs = 0;
   std::array<uint64_t, 1024> alarmTickUs{};
   double alarmLoopMaxLagMs = 0;
-  std::map<std::string, Residency> residency;    // processId -> its resident objects
   // What each node published of its tenants' Durable Object bytes, and what this node published last.
   std::map<std::string, std::map<std::string, uint64_t>> publishedBytes;  // nodeId -> tenant -> bytes
   double lastUsagePublishMs = 0, lastUsageReadMs = 0;
