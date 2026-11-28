@@ -37,6 +37,8 @@ def package(args):
             os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"],
             os.environ["GITHUB_RUN_ATTEMPT"], os.environ["GITHUB_WORKFLOW_SHA"],
         )
+    if args.toolchain is not None:
+        provenance["toolchain"] = json.loads(args.toolchain.read_text())
     paths = {name: args.checkout / path for name, path in BINARIES.items()}
     if args.workerd is not None:
         paths["workerd"] = args.workerd
@@ -93,6 +95,7 @@ def main():
     parser.add_argument("--source", type=Path, default=ROOT, help="Coworkerd checkout containing the patch series")
     parser.add_argument("--checkout", type=Path, default=ROOT / "workerd", help="patched workerd checkout with Bazel outputs")
     parser.add_argument("--github-run", action="store_true", help="record provenance from the GitHub Actions environment")
+    parser.add_argument("--toolchain", type=Path, help="JSON record of the kernel build toolchain")
     parser.add_argument("--workerd", type=Path, help="path to the built workerd (default: the Bazel output in --checkout)")
     parser.add_argument("--threaded", type=Path, help="path to the built coworkerd-threaded (default: the Bazel output in --checkout)")
     parser.add_argument("--allowlist", required=True, type=Path, help="directory written by syscall-allowlist.py")

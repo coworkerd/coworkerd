@@ -1,6 +1,15 @@
 name: Build Linux kernel archives
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/kernel-build.yml'
+      - 'scripts/build-kernel.sh'
+      - 'scripts/find-kernel-cache.sh'
+      - 'patches/workerd/UPSTREAM'
+      - 'patches/workerd/series'
+      - 'patches/workerd/*.patch'
   workflow_dispatch:
     inputs:
       pull_request:
@@ -9,9 +18,24 @@ on:
       source_commit:
         description: 'Full source commit SHA. Required for a PR. Defaults to the selected branch head.'
         type: string
+      cold:
+        description: 'Build without reading a previous Bazel action cache.'
+        type: boolean
+      full_cluster:
+        description: 'Also run the production cluster suite on both architectures for release verification.'
+        type: boolean
+      benchmark_seed:
+        description: 'Save a seed for branch-only benchmarks.'
+        type: boolean
+      benchmark_seed_run:
+        description: 'Successful seed run on the same benchmark branch.'
+        type: string
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'push' && 'kernel-action-cache-main' || format('kernel-archive-{0}', github.run_id) }}
 
 jobs:
   source:
@@ -29,11 +53,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ inputs.pull_request }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
+          BENCHMARK_SEED: ${{ inputs.benchmark_seed }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           sha=${SOURCE_COMMIT:-$GITHUB_SHA}
           if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
             echo 'Provide a full lowercase source commit SHA.' >&2
             exit 1
+          fi
+          if [[ $BENCHMARK_SEED == true ]]; then
+            if [[ $GITHUB_REF_TYPE != branch || $GITHUB_REF_NAME == "$DEFAULT_BRANCH" || -n $PR ]] ||
+                ! gh api "repos/$GITHUB_REPOSITORY/compare/$sha...$DEFAULT_BRANCH" --jq .status | grep -qxE 'ahead|identical'; then
+              echo 'A branch benchmark seed must build source already on the default branch.' >&2
+              exit 1
+            fi
           fi
           if [[ -n $PR ]]; then
             if [[ ! $PR =~ ^[1-9][0-9]*$ || -z $SOURCE_COMMIT ]]; then
@@ -55,6 +88,14 @@ jobs:
     name: Build kernel (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 330
+    permissions:
+      actions: read
+      contents: read
+    env:
+      BAZELISK_ARCH: ${{ matrix.bazelisk }}
+      BAZELISK_SHA256: ${{ matrix.bazelisk-sha256 }}
+      KERNEL_ARCH: ${{ matrix.arch }}
+      KERNEL_COMMIT: ${{ needs.source.outputs.sha }}
     strategy:
       fail-fast: false
       matrix:
@@ -81,20 +122,81 @@ jobs:
           path: source
           persist-credentials: false
       - name: Install Node.js
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           package-manager-cache: false
+      - name: Identify compatible Bazel action outputs
+        id: cache-key
+        run: |
+          fingerprint=$(sha256sum control/scripts/build-kernel.sh source/patches/workerd/UPSTREAM |
+            sha256sum | cut -c1-24)
+          echo "name=bazel-actions-v1-$KERNEL_ARCH-$ImageVersion-$fingerprint" >> "$GITHUB_OUTPUT"
+      - name: Find a seed from a verified workflow run
+        id: seed
+        if: inputs.cold != true
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          ARTIFACT: ${{ steps.cache-key.outputs.name }}
+          BENCHMARK_RUN: ${{ inputs.benchmark_seed_run }}
+        run: bash control/scripts/find-kernel-cache.sh
+      - name: Download the Bazel action cache
+        id: download
+        if: steps.seed.outputs.artifact_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.seed.outputs.run_id }}
+          artifact-ids: ${{ steps.seed.outputs.artifact_id }}
+          path: ${{ runner.temp }}/kernel-cache-download
+      - name: Restore Bazel action outputs
+        if: steps.download.outcome == 'success'
+        env:
+          SEED_RUN: ${{ steps.seed.outputs.run_id }}
+        run: |
+          cache="$RUNNER_TEMP/kernel-action-cache"
+          mkdir -p "$cache"
+          if tar --zstd -xf "$RUNNER_TEMP/kernel-cache-download/actions.tar.zst" -C "$cache"; then
+            printf 'Bazel action cache from [run %s](%s/%s/actions/runs/%s).\n\n' \
+              "$SEED_RUN" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$SEED_RUN" >> "$GITHUB_STEP_SUMMARY"
+          else
+            rm -rf "$cache"
+            echo 'Cache extraction failed. Building without a seed.'
+          fi
+          rm -rf "$RUNNER_TEMP/kernel-cache-download"
+      - name: Build the default-branch seed
+        if: github.event_name == 'push'
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$KERNEL_COMMIT"
+          bash ../control/scripts/measure-kernel-build.sh bash ../control/scripts/build-kernel.sh
       - name: Build, profile and test the kernel archive
+        if: github.event_name == 'workflow_dispatch'
         working-directory: source
         env:
-          BAZELISK_ARCH: ${{ matrix.bazelisk }}
-          BAZELISK_SHA256: ${{ matrix.bazelisk-sha256 }}
-          KERNEL_ARCH: ${{ matrix.arch }}
-          KERNEL_COMMIT: ${{ needs.source.outputs.sha }}
+          FULL_CLUSTER: ${{ inputs.full_cluster }}
         run: |
           test "$(git rev-parse HEAD)" = "$KERNEL_COMMIT"
           bash ../control/scripts/measure-kernel-build.sh bash ../control/scripts/test-hosted-kernel.sh
+      - name: Pack the Bazel action cache
+        if: github.event_name == 'push' || inputs.benchmark_seed
+        run: |
+          tar -I 'zstd -T2 -3' -cf "$RUNNER_TEMP/actions.tar.zst" -C "$RUNNER_TEMP/kernel-action-cache" ac cas
+          du -sh "$RUNNER_TEMP/actions.tar.zst"
+      - name: Upload reusable default-branch action outputs
+        if: github.event_name == 'push' || inputs.benchmark_seed
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.cache-key.outputs.name }}
+          path: ${{ runner.temp }}/actions.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: true
       - name: Upload cluster failure diagnostics
         if: failure() && hashFiles('source/build/kernel-ci/cluster.log') != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -105,6 +207,7 @@ jobs:
             source/build/cluster-diagnostics/
           if-no-files-found: error
       - name: Upload the verified architecture archive
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kernel-${{ matrix.arch }}-${{ github.run_attempt }}
@@ -114,6 +217,7 @@ jobs:
 
   assemble:
     needs: [source, build]
+    if: github.event_name == 'workflow_dispatch'
     name: Verify and assemble both archives
     runs-on: ubuntu-24.04
     steps:

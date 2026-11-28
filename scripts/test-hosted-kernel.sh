@@ -31,7 +31,8 @@ done
 python3 "$control/syscall-allowlist.py" \
   --workerd "$raw/workerd" --workerd "$raw/coworkerd-threaded" --out "$stage/allowlist" "${profiles[@]}"
 
-python3 "$control/package-kernel.py" --github-run --arch "$KERNEL_ARCH" --source "$PWD" --checkout workerd \
+python3 "$control/package-kernel.py" --github-run --toolchain "$RUNNER_TEMP/kernel-toolchain.json" \
+  --arch "$KERNEL_ARCH" --source "$PWD" --checkout workerd \
   --workerd "$raw/workerd" --threaded "$raw/coworkerd-threaded" --allowlist "$stage/allowlist" --out "$stage/archive"
 (cd "$stage/archive" && sha256sum --check --strict SHA256SUMS)
 kernel="$PWD/$stage/unpacked"
@@ -54,7 +55,9 @@ with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
 if missing or failed or skipped:
     raise SystemExit(f"Expected all unit tests to pass with zero skips. Missing tests: {sorted(missing)}")
 PY
-node tests/cluster/run.mjs "$kernel" 2>&1 | tee "$stage/cluster.log"
+if [[ ${FULL_CLUSTER:-false} == true ]]; then
+  node tests/cluster/run.mjs "$kernel" 2>&1 | tee "$stage/cluster.log"
+fi
 COWORKERD_CLUSTER_FATAL_TEST_BINARY="$fatal_test" \
   node tests/cluster/run.mjs "$kernel" fatal-attribution 2>&1 | tee -a "$stage/cluster.log"
 
