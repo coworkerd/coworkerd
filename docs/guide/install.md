@@ -556,7 +556,9 @@ When the node and process limits are omitted, the node uses one safety limit for
 root and nested calls. It starts from 8,192 and lowers the limit if its memory, task or descriptor
 budget cannot fund that many slots. The effective counts are reported in the startup configuration
 and in `placement` and `processes.configuration` in node state. The 8,192 ceiling leaves about
-27% below the 11,250-call run in which every request overlapped and completed. A configuration that specifies
+27% below the 11,250-call run in which every request overlapped and completed. With the new
+defaults, all 2,000 two-second waits completed in three consecutive batches, with full
+overlap for 1.343–1.524 s per batch. A configuration that specifies
 only one placement limit keeps the previous default for the other (`128` roots or `384` total
 at nested admission).
 
