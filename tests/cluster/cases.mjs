@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { get } from 'node:http';
 import { createRequire } from 'node:module';
 import { createConnection } from 'node:net';
@@ -249,8 +249,13 @@ async function threadedDatabaseRelease(cluster) {
   });
   assert.deepEqual(result.results, [{ ready: 1 }]);
   const owner = await databaseShardOwner(cluster, database);
-  const process = await durableGeneration(cluster, owner);
-  assert.equal(process.lifecycle.durableServer, 'threaded');
+  const binary = createHash('sha256').update(await readFile(join(cluster.kernel, 'coworkerd-threaded'))).digest('hex');
+  const process = await eventually('the owner runs the pinned threaded executable with default settings', async () => {
+    const generation = await durableGeneration(cluster, owner);
+    assert.equal(generation.lifecycle.durableServer, 'threaded');
+    assert.equal(generation.binarySha256, binary);
+    return generation;
+  });
   await eventually('the release executable dispatched SQL on the threaded owner', async () => {
     const rows = await databaseDispatches(cluster, database, owner);
     assert.ok(rows.some(row => row.workerId === `${tenant.name}/__databases` &&
