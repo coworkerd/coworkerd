@@ -207,29 +207,28 @@ async function overloadWindow(label, windowMs, send) {
   };
 }
 
-async function measureOverload() {
-  const rampMs = 20_000;
+async function calibrateOverload(label, rampMs) {
+  const lanes = 72;
   const scoredMs = 30_000;
-  const rates = [];
-  // Sweep past the point where a smaller backlog can leave the last candidate idle.
-  // Even the largest calibration uses fewer client lanes than one node has root slots.
-  for (const lanes of [48, 72, 96]) {
-    const windowMs = rampMs + scoredMs;
-    const result = await overloadWindow(`calibration-${lanes}`, windowMs,
-      start => closedLoop(`calibration-${lanes}`, start, windowMs, lanes));
-    const scoredByNode = Object.fromEntries(nodes.map(node => [node, result.hot.filter(
-      row => row.nodeId === node && row.completionMs >= rampMs && row.completionMs < windowMs).length]));
-    const completedPerSecond = Object.values(scoredByNode).reduce((sum, count) => sum + count, 0) * 1_000 / scoredMs;
-    rates.push(completedPerSecond);
-    emit({ metric: 'overload-calibration', lanes, rampMs, scoredMs, scoredByNode, completedPerSecond, ...result });
-    await delay(4_000);
-  }
-  const measuredRate = Math.max(...rates);
+  const windowMs = rampMs + scoredMs;
+  const result = await overloadWindow(label, windowMs, start => closedLoop(label, start, windowMs, lanes));
+  const scoredByNode = Object.fromEntries(nodes.map(node => [node, result.hot.filter(
+    row => row.nodeId === node && row.completionMs >= rampMs && row.completionMs < windowMs).length]));
+  const completedPerSecond = Object.values(scoredByNode).reduce((sum, count) => sum + count, 0) * 1_000 / scoredMs;
+  emit({ metric: 'overload-calibration', lanes, rampMs, scoredMs, scoredByNode, completedPerSecond, ...result });
+  return completedPerSecond;
+}
+
+async function measureOverload() {
+  // Sustained work precedes the first score. Score again after the fixed-rate
+  // windows to show whether the calibration held while they ran.
+  const measuredRate = await calibrateOverload('calibration-before', 150_000);
   const controlRate = Math.round(measuredRate * 0.60 * 10) / 10;
   const overloadRate = Math.round(measuredRate * 1.10 * 10) / 10;
   assert.ok(controlRate > 0 && overloadRate > measuredRate && overloadRate <= 100, 'calibration must yield a bounded rate');
   emit({ metric: 'overload-rates', measuredRate, controlRate, overloadRate });
 
+  await delay(4_000);
   const windowMs = 20_000;
   for (let trial = 1; trial <= 3; ++trial) {
     for (const [condition, rate] of [['control', controlRate], ['overload', overloadRate]]) {
@@ -239,6 +238,7 @@ async function measureOverload() {
       await delay(4_000);
     }
   }
+  await calibrateOverload('calibration-after', 10_000);
 }
 
 const emit = row => console.log(JSON.stringify(row));
