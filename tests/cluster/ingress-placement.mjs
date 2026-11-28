@@ -172,14 +172,16 @@ export async function ingressPlacementUnrelatedStreams(cluster) {
     }));
   } };`);
   const controller = new AbortController();
-  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]);
+  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(25000)]);
   const readRoots = async () => (await cluster.state(peer)).placement.inFlight.roots;
   try {
-    await Promise.all(Array.from({ length: streamCount }, async () => {
+    const readers = await Promise.all(Array.from({ length: streamCount }, async () => {
       const response = await fetch(`${cluster.urls[peer]}/${placementStreamWorker}`, { signal });
       assert.equal(response.status, 200);
-      const { value } = await response.body.getReader().read();
+      const reader = response.body.getReader();
+      const { value } = await reader.read();
       assert.equal(Buffer.from(value).toString(), peer);
+      return reader;
     }));
     assert.equal(await readRoots(), streamCount);
 
@@ -192,11 +194,12 @@ export async function ingressPlacementUnrelatedStreams(cluster) {
         assert.equal((await cluster.state(ingress)).placement.inFlight.roots, 0);
       });
     }
+    await Promise.all(readers.map(async reader => assert.equal((await reader.read()).done, true)));
+    await eventually('the completed streams released their slots', async () => assert.equal(await readRoots(), 0),
+      { timeout: 8000 });
   } finally {
     controller.abort();
   }
-  await eventually('idle stream aborts released all root slots', async () => assert.equal(await readRoots(), 0),
-    { timeout: 8000 });
 }
 
 export async function ingressPlacementLiveSaturation(cluster) {
