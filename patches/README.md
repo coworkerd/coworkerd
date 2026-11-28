@@ -186,6 +186,35 @@ pins in `patches/workerd/artifacts.json`. Follow the [publishing steps](../CONTR
 from the tag in `UPSTREAM` by exactly the series, and each patch stays within its permitted paths. All four
 operations validate the series before mutating a checkout or exporting files.
 
+### Hosted Linux archive builds
+
+[Build Linux kernel archives][kernel-build] uses the standard `ubuntu-24.04` and
+`ubuntu-24.04-arm` runners. A push to `main` that changes the kernel series or its
+build recipe seeds Bazel's action cache. A check every 12 hours also seeds a new
+runner image or refreshes a seed due to expire within a day. Either trigger can
+upload one architecture's seed as soon as its compilation completes. Each seed is
+an Actions artifact kept for seven days.
+
+A manual archive build can restore a seed from one of those `main` runs with the
+same architecture, runner image, upstream pin and kernel build recipe. After an
+image update a candidate may have to build cold until the next scheduled check
+and seed build finish. GitHub scheduling or build failures can extend that window.
+Use `cold` to omit the restore. The job summary identifies any seed used.
+
+Bazel matches each action against its command, declared environment, toolchain and
+input digests. Changing a few source files can reuse unrelated compile actions
+while recompiling and relinking affected outputs. Each archive build uses a fresh
+source checkout, reapplies the patch series, runs the kernel tests, and generates
+syscall profiles from its resulting binaries. The archive records its source commit,
+workerd tree, patch series, toolchain declarations and GitHub Actions run.
+
+Archive builds run the instrumented `fatal-attribution` fixture. The required PR
+check runs all production cluster cases across four shards on the x86-64 archive
+named by the PR's pin. For release verification, dispatch the archive build with
+`full_cluster` to also run the production suite on both architectures.
+
+[kernel-build]: https://github.com/coworkerd/coworkerd/actions/workflows/kernel-build.yml
+
 ## Verifying a kernel pull request
 
 Follow [Sending a kernel change](../CONTRIBUTING.md#sending-a-kernel-change) to choose the fork base from
