@@ -36,13 +36,12 @@ struct Fixture {
   fs::path directory;
 };
 
-struct IdleCase { const char* name; unsigned threshold, interval; const char* diagnostic; };
+struct IdleCase { const char* name; unsigned threshold; const char* diagnostic; };
 constexpr std::array idleCases{
-  IdleCase{"off", 0, 10, ""},
-  IdleCase{"valid", 101, 10, ""},
-  IdleCase{"equal", 100, 10, "idleEvictMs"},
-  IdleCase{"below", 99, 10, "idleEvictMs"},
-  IdleCase{"interval-zero", 101, 0, "idleDestroyIntervalMs"},
+  IdleCase{"off", 0, ""},
+  IdleCase{"valid", 101, ""},
+  IdleCase{"equal", 100, "idleEvictMs"},
+  IdleCase{"below", 99, "idleEvictMs"},
 };
 
 void idleConfiguration(Fixture& fixture) {
@@ -50,10 +49,9 @@ void idleConfiguration(Fixture& fixture) {
     std::string reason;
     try {
       const auto config = fixture.load("{\"placement\":{\"idleMs\":100},\"idleEvictMs\":" +
-          std::to_string(row.threshold) + ",\"idleDestroyIntervalMs\":" + std::to_string(row.interval) + "}");
+          std::to_string(row.threshold) + "}");
       config.processPool.validate();
-      KJ_REQUIRE(config.processPool.heatIdleMs == 100 && config.processPool.idleEvictMs == row.threshold &&
-          config.processPool.idleDestroyIntervalMs == row.interval, "idle settings not mapped", row.name);
+      KJ_REQUIRE(config.processPool.heatIdleMs == 100 && config.processPool.idleEvictMs == row.threshold, "idle settings not mapped", row.name);
     } catch (const kj::Exception& error) { reason = error.getDescription().cStr(); }
     if (*row.diagnostic) {
       KJ_REQUIRE(reason.find(row.diagnostic) != std::string::npos, "expected a named refusal", row.name, reason.c_str());
@@ -144,12 +142,24 @@ void webSocketConfiguration(Fixture& fixture) {
 void durableConfiguration(Fixture& fixture) {
   KJ_REQUIRE(fixture.load("{}").processPool.durableProcesses == 1);
   KJ_REQUIRE(fixture.load(R"({"durableObjects":{"processes":0}})").processPool.durableProcesses == 0);
-  for (const auto* value : {"true", "false"}) {
+  for (const auto& [name, config] : std::array{
+      std::pair{"threadedStorage", R"({"durableObjects":{"threadedStorage":true}})"},
+      std::pair{"threadedStorage", R"({"durableObjects":{"threadedStorage":false}})"},
+      std::pair{"alarmFireConcurrency", R"({"durableObjects":{"alarmFireConcurrency":2}})"},
+      std::pair{"runtimePath", R"({"runtimePath":"retired.js"})"},
+      std::pair{"workerdPath", R"({"workerdPath":"retired-workerd"})"},
+      std::pair{"sqlCpuLimitMs", R"({"processPool":{"sqlCpuLimitMs":200}})"},
+      std::pair{"sqlWallLimitMs", R"({"processPool":{"sqlWallLimitMs":800}})"},
+      std::pair{"probeOverdueMs", R"({"processPool":{"probeOverdueMs":400}})"},
+      std::pair{"pausedAdmissionWaitMs", R"({"processPool":{"pausedAdmissionWaitMs":1000}})"},
+      std::pair{"gc", R"({"gc":{"budgetMs":2000}})"},
+      std::pair{"idleDestroyIntervalMs", R"({"idleDestroyIntervalMs":10})"}
+  }) {
     std::string refusal;
-    try { fixture.load(std::string("{\"durableObjects\":{\"threadedStorage\":") + value + "}}"); }
+    try { fixture.load(config); }
     catch (const kj::Exception& error) { refusal = error.getDescription().cStr(); }
     KJ_REQUIRE(refusal.find("Unknown field") != std::string::npos &&
-        refusal.find("threadedStorage") != std::string::npos, value, refusal.c_str());
+        refusal.find(name) != std::string::npos, name, refusal.c_str());
   }
 }
 

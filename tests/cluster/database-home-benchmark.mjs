@@ -59,7 +59,7 @@ const kernel = resolve(kernelArg);
 const output = resolve(outputArg);
 const binaries = resolve(process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(checkout, 'build'));
 // The test-only database mapping is part of the product checkout being measured.
-const BenchmarkCluster = idleWindow
+const BenchmarkCluster = idleWindow || threadedSqlThroughput
   ? (await import(pathToFileURL(join(checkout, 'tests/cluster/cluster.mjs')).href)).Cluster
   : Cluster;
 const settings = {
@@ -93,7 +93,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   durableFixtureNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
   // The imported Cluster from a historical checkout uses the original option.
   threadedNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
-  ...((idleWindow || threadedSqlThroughput) && {
+  ...(BenchmarkCluster !== Cluster && {
     databaseFixtureNodes: ['node-1'],
     // The imported Cluster from a historical checkout uses the singular option.
     databaseFixtureNode: 'node-1',
@@ -127,10 +127,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   }),
 });
 const [owner] = cluster.nodes;
-if (idleWindow) {
-  assert.ok(cluster.databaseFixtureNodes?.has(owner) ?? (cluster.databaseFixtureNode === owner),
-    'supply a database placement checkout');
-}
+const usesDatabaseFixture = cluster.databaseFixtureNodes?.has(owner) || cluster.databaseFixtureNode === owner;
 const tenantName = 'database-benchmark';
 const workload = 'traffic';
 const databaseCount = mixedCeiling === 'memory' ? settings.homes + 120
@@ -152,7 +149,7 @@ async function record(metric, data) {
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const jsonFile = async path => JSON.parse(await readFile(path, 'utf8'));
 const productFiles = ['docker/Dockerfile', 'docker/docker-compose.yml', 'docker/entrypoint.sh',
-  'docker/storage-entrypoint.sh', 'runtime/runtime.js', ...(idleWindow ? ['runtime/sql-database.js'] : [])];
+  'docker/storage-entrypoint.sh', 'runtime/sql-database.js'];
 
 async function provenance() {
   const commit = await cluster.command('git', ['rev-parse', 'HEAD'], { cwd: checkout });
@@ -183,7 +180,7 @@ async function provenance() {
     productHashes[file] = sha256(await readFile(join(checkout, file)));
   }
   const executables = ['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher'];
-  if (idleWindow || threadedSqlThroughput) executables.push('coworkerd-platform-test');
+  if (usesDatabaseFixture) executables.push('coworkerd-platform-test');
   for (const file of executables) {
     hashes[file] = sha256(await readFile(join(binaries, file)));
   }
@@ -214,22 +211,16 @@ async function provenance() {
 }
 
 async function workerSource() {
-  const runtime = await readFile(join(checkout, 'runtime/runtime.js'), 'utf8');
-  const shared = await readFile(join(checkout, 'runtime/sql-database.js'), 'utf8').catch(error => {
-    if (error.code === 'ENOENT') return null;
-    throw error;
-  });
-  const source = shared ?? runtime;
+  const source = await readFile(join(checkout, 'runtime/sql-database.js'), 'utf8');
   const start = source.indexOf('export class SqlDatabase extends DurableObject');
-  const end = shared ? source.length : source.indexOf('export class BoundWorker', start);
-  assert.ok(start >= 0 && end > start, 'locate the pinned SqlDatabase class');
-  const alarmHeader = source.match(/^(?:export )?(const DO_ALARM_HEADER = .*;)$/m)?.[1];
-  assert.ok(alarmHeader);
+  assert.ok(start >= 0, 'locate the platform database class');
+  const alarmHeader = source.match(/^(?:export )?(const DO_ALARM_HEADER = .*;)$/m)?.[1] ?? '';
   // The platform class can use the internal prepare API. A deployed class has the public exec API.
-  const database = source.slice(start, end)
+  const database = source.slice(start)
     .replace('const counters = sqlite.prepare(', 'const counters = () => sqlite.exec(')
     .replace('sqlite.prepare(sql)(...bindings)', 'sqlite.exec(sql, ...bindings)')
-    .replace('this.ctx.storage.sql.abortExecutionLimit()', 'this.ctx.storage.sql.abortExecutionLimit?.()');
+    .replace('this.ctx.storage.sql.abortExecutionLimit()', 'this.ctx.storage.sql.abortExecutionLimit?.()')
+    .replace('this.ctx.storage.sql.checkExecutionDeadline()', 'this.ctx.storage.sql.checkExecutionDeadline?.()');
   assert.ok(!database.includes('sqlite.prepare('), 'adapt all platform-only prepare calls');
   const fixture = await readFile(new URL('./database-home-worker.js', import.meta.url), 'utf8');
   return 'import { DurableObject } from "cloudflare:workers";\n' + alarmHeader + '\n' +

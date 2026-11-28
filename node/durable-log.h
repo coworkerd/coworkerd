@@ -59,11 +59,11 @@ std::string objectSnapshotIndexKey(const std::string& namespaceId, const std::st
 std::string objectSnapshotPartKey(const std::string& namespaceId, const std::string& objectId, uint64_t sequence,
     uint32_t facetId, uint64_t part);
 
-// The id of an object's Host, as workerd derives it from the namespace's unique key and the name
+// The id of an object's local storage, as workerd derives it from the namespace's unique key and the name
 // (src/workerd/server/actor-id-impl.c++): HMAC-SHA256 of the key over the name, its first 16 bytes, then the HMAC of
 // those -- 64 hexadecimal digits, which name the object's files.
 std::string durableHostId(const std::string& uniqueKey, const std::string& name);
-// The name an object's Host is made with: "<namespace>/<object>/<data epoch>" (runtime.js).
+// The storage object's name is "<namespace>/<object>/<data epoch>".
 std::string durableHostName(const std::string& namespaceId, const std::string& objectId, uint64_t dataEpoch);
 // The three parts of such a name.
 struct DurableObjectRef {
@@ -92,7 +92,7 @@ struct LogRecord {
   uint32_t facetId = 0, parentFacetId = 0;
   uint64_t txn = 0;              // the object's transaction number this record starts at
   // Which copy of the object's files on the owner's disk the frames came from: the data epoch is part of the name the
-  // object's Host was made with, but not of the object's history -- a node that takes the shard over writes the same
+  // object's storage was opened with, but not of the object's history -- a node that takes the shard over writes the same
   // history into files of its own data epoch.
   uint64_t dataEpoch = 0;
   uint64_t sentAtMonotonicNs = 0;
@@ -347,7 +347,6 @@ public:
     DurableLogConfig config;
     bool objectStore = true;
     uint32_t tailWaitMs = 25000, peerTimeoutMs = 2000;
-    bool threadedAlarmEvents = false;
   };
   // `openStream` opens a log stream to one peer; `fetchTail` asks a node for what it holds of a previous owner's log
   // for a shard; `knownShardEpoch` is this node's view of who owns a shard, for the fencing of the records it takes
@@ -427,7 +426,7 @@ public:
   // ---- The durable processes ----
   // The node's end of a durable process's channel is kept and read; the descriptor returned is the one the process
   // inherits, or -1 when this node ships nothing.
-  int openChannel(const std::string& processId, uint64_t threadedGeneration = 0);
+  int openChannel(const std::string& processId, uint64_t threadedGeneration);
   void closeChannel(const std::string& processId);
   bool drainChannel(const std::string& processId);
 
@@ -617,7 +616,7 @@ private:
     uint32_t shard = 0, facetId = 0;
     uint64_t dataEpoch = 0, shardEpoch = 0, atUnixMs = 0;
     double notBeforeMs = 0;   // monotonic: a retry waits for it
-    uint32_t retries = 0, countedRetries = 0, backoff = 0;
+    uint32_t retries = 0;
     bool firing = false;
     bool clearing = false;
     // Read from the hint in the store rather than reported by the object: the object's own database decides when it
@@ -628,13 +627,6 @@ private:
     bool preparationWaiting = false, rebuildWaiting = false;
     uint64_t wakeUnixMs = 0, fireToken = 0;
     std::string destination;
-  };
-  // What one durable process reports of its resident objects (patches/workerd 0014).
-  struct Residency {
-    uint64_t resident = 0, limit = 0, evicted = 0, woken = 0, wakes = 0;
-    // As the process reports them, in microseconds: waking an object whose class is still loaded is sub-millisecond.
-    uint64_t wakeUsTotal = 0, wakeUsMax = 0;
-    double atMs = 0;
   };
   // A record this node sent and is waiting for its peers on.
   struct InFlight {
@@ -1208,7 +1200,6 @@ private:
   uint64_t alarmTickSamples = 0, alarmTickMaxNs = 0, alarmTickCpuNs = 0;
   std::array<uint64_t, 1024> alarmTickUs{};
   double alarmLoopMaxLagMs = 0;
-  std::map<std::string, Residency> residency;    // processId -> its resident objects
   // What each node published of its tenants' Durable Object bytes, and what this node published last.
   std::map<std::string, std::map<std::string, uint64_t>> publishedBytes;  // nodeId -> tenant -> bytes
   double lastUsagePublishMs = 0, lastUsageReadMs = 0;

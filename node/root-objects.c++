@@ -95,16 +95,6 @@ std::string rootNamespaceUniqueKey(const std::string& namespaceId) {
   return std::string(DURABLE_ROOT_UNIQUE_KEY_PREFIX) + namespaceId;
 }
 
-std::string rootLoaderBinding(bool) {
-  return "(name = \"ROOTS\", coworkerdRootLoader = \"roots\"),\n";
-}
-
-std::string rootLoaderService(bool durable, const std::string& storageDirectory) {
-  return "(name = \"roots\", coworkerdRootLoader = (plainOnly = " +
-      std::string(durable ? "false" : "true") + ", storagePath = " +
-      json::quote(durable ? storageDirectory : "") + ")),\n";
-}
-
 std::string_view plainPlanFingerprint(std::string_view plan) {
   constexpr std::string_view field = ",\"versionFingerprint\":\"";
   if (const auto at = plan.rfind(field); at != std::string_view::npos) {
@@ -217,82 +207,44 @@ RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionD
 std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
     const VersionDefinition& version, uint32_t cpuLimitMs, uint32_t memoryLimitMib,
     const std::string& namespaceId, const std::string& objectId, uint64_t dataEpoch,
-    bool database, uint64_t alarmAtUnixMs, uint32_t alarmFacetId) {
+    uint64_t alarmAtUnixMs, uint32_t alarmFacetId) {
   using json::quote;
   const auto tenant = tenantOf(version.workerId);
-  std::ostringstream spaces;
-  spaces << '[';
-  bool first = true, selected = false;
-  auto space = [&](const DurableObjectNamespace& value, const std::string& className) {
-    if (value.status != "active") return;
-    spaces << (first ? "" : ",") << "{\"id\":" << quote(value.id) << ",\"className\":" << quote(className)
-        << ",\"binding\":" << quote("root_"+value.id) << ",\"uniqueKey\":" << quote(rootNamespaceUniqueKey(value.id)) << '}';
-    first = false;
-    selected |= value.id == namespaceId;
-  };
-  if (database) {
-    if (const auto* databases = catalog.databases(tenant))
-      for (const auto& [name, value] : *databases)
-        if (value.id == namespaceId) space(value, "SqlDatabase");
-  } else {
-    for (const auto& name : version.declaredClasses)
-      if (const auto* value = catalog.durableNamespace(version.workerId, name)) space(*value, "__coworkerd_do_"+name);
+  std::ostringstream namespaceRevision;
+  bool selected = false;
+  for (const auto& name : version.declaredClasses) {
+    const auto* space = catalog.durableNamespace(version.workerId, name);
+    const auto id = space && space->status == "active" ? space->id : "";
+    selected |= !id.empty() && id == namespaceId;
+    namespaceRevision << quote(name) << ':' << quote(id) << ',';
   }
-  spaces << ']';
   if (!selected) return std::nullopt;
+
   std::ostringstream plan;
-  std::string fingerprint;
-  plan << "{\"kind\":" << quote(database ? "platform" : "tenant") << ",\"tenant\":" << quote(tenant)
-      << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
-      << ",\"compatibilityDate\":" << quote(version.compatibilityDate) << ",\"compatibilityFlags\":[],\"modules\":[]"
-      << ",\"namespaces\":" << spaces.str();
-  auto target = [&](const std::string& entrypoint, const std::string& props) {
-    return "{\"service\":\"runtime\",\"entrypoint\":"+quote(entrypoint)+",\"props\":"+props+'}';
-  };
-  if (database) {
-    plan << ",\"platformClass\":" << target("SqlDatabase", "{}");
-  } else {
-    const auto identity = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+'}';
-    plan << ",\"creationRecord\":{\"present\":true,\"tenant\":" << quote(tenant)
-        << ",\"workerId\":" << quote(version.workerId) << ",\"versionId\":" << quote(version.versionId)
-        << ",\"cpuLimitMs\":" << cpuLimitMs << ",\"memoryLimitMib\":" << memoryLimitMib << '}'
-        << ",\"globalOutbound\":" << target("Egress", identity)
-        << ",\"streamingTail\":" << target("TenantLog", identity) << ",\"durableObjects\":[";
-    bool firstBinding = true;
-    for (const auto& binding : version.durableObjects) {
-      const auto* value = binding.database.empty() ? catalog.durableNamespace(version.workerId, binding.className)
-          : catalog.database(tenant, binding.database);
-      const auto ns = value != nullptr && value->status == "active" ? value->id : "";
-      const auto id = !binding.database.empty() && !ns.empty() ? durableObjectIdFromName(ns, DATABASE_OBJECT_NAME) : "";
-      const auto metadata = "{\"binding\":"+quote(binding.binding)+",\"className\":"+quote(binding.className)+
-          ",\"namespaceId\":"+quote(ns)+",\"database\":"+quote(binding.database)+",\"objectId\":"+quote(id)+'}';
-      const auto props = "{\"workerId\":"+quote(version.workerId)+",\"versionId\":"+quote(version.versionId)+
-          ",\"contentHash\":"+quote(version.contentHash)+",\"definitionHash\":"+quote(version.definitionHash)+
-          ",\"namespaceId\":"+quote(ns)+",\"className\":"+quote(binding.className)+",\"database\":"+quote(binding.database)+'}';
-      plan << (firstBinding ? "" : ",") << "{\"metadata\":" << metadata << ",\"target\":"
-          << target("DurableNamespace", props) << '}';
-      firstBinding = false;
-    }
-    plan << ']';
-    // The source definition alone does not identify resolved bindings or rotated secrets.
-    // Secret revisions identify rotation without deriving any observable bytes from secret values.
-    std::ostringstream environment;
-    for (const auto& value : version.variables)
-      environment << quote(value.name) << ':' << quote(value.type) << ':' << quote(value.value) << ',';
-    for (const auto& name : version.secrets) {
-      const auto* value = catalog.secret(version.workerId, name);
-      environment << quote(name) << ':' << (value ? std::to_string(value->setAtUnixMs) : "null") << ',';
-    }
-    fingerprint = version.definitionHash + ":" + sha256Hex(plan.str() + environment.str());
-    plan << ",\"versionFingerprint\":" << quote(fingerprint);
+  plan << "{\"kind\":\"tenant\",\"durableObjects\":[";
+  bool first = true;
+  for (const auto& binding : version.durableObjects) {
+    const auto* space = binding.database.empty() ? catalog.durableNamespace(version.workerId, binding.className)
+        : catalog.database(tenant, binding.database);
+    const auto ns = space && space->status == "active" ? space->id : "";
+    const auto id = !binding.database.empty() && !ns.empty() ? durableObjectIdFromName(ns, DATABASE_OBJECT_NAME) : "";
+    plan << (first ? "" : ",") << "{\"metadata\":{\"binding\":" << quote(binding.binding)
+        << ",\"className\":" << quote(binding.className) << ",\"namespaceId\":" << quote(ns)
+        << ",\"database\":" << quote(binding.database) << ",\"objectId\":" << quote(id) << "}}";
+    first = false;
   }
-  plan << '}';
+  plan << ']';
+  // Bind the copy to local namespace and secret revisions as well as its code and limits.
+  auto fingerprint = version.definitionHash + ":" + sha256Hex(plan.str() + namespaceRevision.str() +
+      std::to_string(cpuLimitMs) + '\n' + std::to_string(memoryLimitMib) + '\n' +
+      plainEnvironmentRevision(catalog, version));
+  plan << ",\"versionFingerprint\":" << quote(fingerprint) << '}';
   std::ostringstream selection;
   selection << "{\"namespaceId\":" << quote(namespaceId) << ",\"objectId\":" << quote(objectId)
       << ",\"dataEpoch\":" << quote(std::to_string(dataEpoch)) << ",\"dispatchChecked\":true";
   if (alarmAtUnixMs) selection << ",\"alarmFacetId\":" << alarmFacetId;
   selection << '}';
-  return RootDispatch{plan.str(), selection.str(), std::move(fingerprint)};
+  return {RootDispatch{plan.str(), selection.str(), std::move(fingerprint)}};
 }
 
 std::string RootDispatch::descriptor(std::string encoded) const {

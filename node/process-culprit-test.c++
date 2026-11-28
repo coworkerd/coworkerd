@@ -9,7 +9,7 @@ namespace {
 constexpr int fatalStatus = 75 << 8;  // The exit code occupies the high byte of waitpid status.
 struct Call { std::string workerId, versionId, invocationId; bool dispatched = false; };
 struct Process {
-  bool threaded = true, durable = false;
+  bool durable = false;
   uint32_t pid = 11;
   bool oomSignalled = false;
   std::string culpritRow, oomCulpritRow;
@@ -42,7 +42,6 @@ void cpu() {
   active.dispatched = false; KJ_REQUIRE(run() == "null"); active.dispatched = true;
   process.calls.clear(); process.recentDispatched.push_back(active);
   KJ_REQUIRE(run() != "null" && confirmations == 2, "watchdog attributes a just-completed CPU call");
-  process.threaded = false; KJ_REQUIRE(run() == "null"); process.threaded = true;
   report("other/worker"); KJ_REQUIRE(run() == "null");
   report("tenant/worker", "v2"); KJ_REQUIRE(run() == "null");
   report("tenant/worker", "v1", 12); KJ_REQUIRE(run() == "null");

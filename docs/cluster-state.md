@@ -237,14 +237,14 @@ it leaves.
 
 The lifecycle publisher targets a 100 ms cadence. A busy maintenance thread can delay publication,
 and an exited process entry can still show its final snapshot. Use the process PID and sample
-timestamp to identify a live, recent reading. The field is absent while an isolate is loading and
-on backends that lack the measurement, including Durable Object homes.
+timestamp to identify a live, recent reading. The field appears only on loaded stateless isolates.
 
 `placement.tenantRootLimit` and `placement.tenantNestedLimit` add independent per-tenant limits to those same calls. Both default to `0` (disabled); the node-wide limit is checked first. A tenant refusal is `503 OVERLOADED` with reason `tenant ingress concurrency limit reached` and reports that tenant's count and limit. It does not cause peers to avoid the node. `placement.tenantAdmission` lists only tenants that currently hold a slot or have received such a refusal since this node started; root and nested in-flight counts and refusals are separate. Scheduled background alarms still use node-wide admission.
 
-A live paused process is the one exception to immediate refusal. `processPool.pausedAdmissionWaitMs` defaults to 1000 ms (0 disables it) and is shorter than `stuckTimeoutMs`. Waiting occupies the same root or nested admission slot as execution and ends at the earlier of that budget and the call's lease. Admission is checked again after asynchronous package fetching and load checks, immediately before dispatch. These checks reuse the same slot and share one cumulative paused-wait budget. Other ready processes and candidate nodes are tried immediately; only when every candidate explicitly refuses because its eligible processes are paused may one candidate wait. Dynamic placement waits on the local node when it is among the candidates; static placement to a remote node waits on that remote node with serial retries. Pause hints do not trigger avoidance: requests arriving during a pause still try that node first, so `reroutes` can be higher than in 0.5.4. The existing refusal category carries the pause hint, without a new wire field. Exit, kill, disconnection, retirement or a full process does not queue a request for a restart. Expiration retains the existing refusal codes; a lease expires through `LEASE_EXPIRED`. A peer retry is permitted only after an explicit pre-execution refusal; an accepted or uncertain attempt ends retries. The wait budget only decides whether to start another peer retry; an open already sent awaits its normal `peerTimeoutMs`, even if the wait budget expires meanwhile. The wait loop and the receiver enforce the lease. While waiting for a remote node, the sender rechecks its lease and concurrency slot; memory-band admission applies at the executing node.
-
-The state endpoint reports `placement.pausedAdmission`, with `ordinary`, `quarantine` and `durable` counters. Each has `count`, `active`, `maxActive`, outcomes `resumed`, `expired`, `killed`, `lease`, `unavailable`, `canceled`, and `totalWaitMs` / `maxWaitMs`. `[admission-wait]` begin/end rows name the class, id, outcome and wait duration. `[refusal-count]` counts final refusals; a provisional pause hint does not emit that row.
+When the loaded process's per-tenant concurrency limit is reached, the node can wait within
+`processPool.tenantAdmissionWaitMs` and the request lease. The state endpoint reports this queue
+under `placement.pausedAdmission.tenant-execution`, and `[admission-wait]` rows identify the
+wait and its outcome.
 
 **Forwarding.** A forwarded call carries its Worker and version, the lock table, the call tree's identity and the remaining time -- a duration, so clocks need not agree -- but never secrets or request bytes. The receiver resolves the invocation's own budget, records a forwarded request as the tree's root, executes or refuses it, and never forwards it again. The request body flows only after the receiver accepted the call, so a refused call goes to the next candidate as it is. A call is addressed to the epoch the sender's table names: a process accepts every epoch it has held, expired ones included, while a process that started again holds only its new epoch and refuses calls addressed to its previous life.
 
@@ -323,15 +323,14 @@ before the object's answer goes out, merges the frames of all its objects into s
 each object's manifest naming what makes it up. A node that takes a shard over rebuilds its objects from that history
 and never reads the previous owner's files.
 
-The experimental threaded backend negotiates its role and WAL protocol revision for each child
+Each threaded durable child negotiates its role and WAL protocol revision for its process
 generation. Its homes share the inherited WAL socket through one I/O owner with bounded queues.
 Append acknowledgements identify requests, and checkpoint, seal, break, and close messages identify
 the exact database open. A home reports closure after SQLite closes the connection. For recovery the
 node blocks new dispatch and waits for those closes or for the pool to reap the generation before
 replacing its files. Rotation and node drain also ask for those closes before process termination.
-When recovery has to reset the durable processes, both backends wait for the pool to reap those
-generations. The recovery attempt fails if any affected generation is still unreaped after five seconds.
-Both backends use the same peer protocol, confirmation rules, and log, segment, and manifest formats.
+When recovery has to reset the durable processes, it waits for the pool to reap those generations.
+The recovery attempt fails if any affected generation is still unreaped after five seconds.
 The threaded child's file-preparation thread scans the WAL of a cold open in buffers of at most
 1 MiB. The home still opens its SQLite connection and runs idle or threshold-triggered checkpoints
 on that connection. `durableLog.threadedHomeIo` reports sample counts and observed maxima for the
@@ -667,8 +666,7 @@ of a 90,672-byte WAL took 0.250 ms.
   next owner knows which objects to wake; every firing then asks the object's own database, which decides -- a stale hint does not authorize a handler whose database no longer has a due alarm. Delivery can be delayed or repeated across failures; handlers should tolerate retries. The hint carries no correctness: a stale one costs
   one wake, a missing one a delay until the object is next opened.
 - **Resident objects.** A durable process targets `durableObjects.residentObjects` (4096) resident object trees (`0` removes the limit), evicting idle trees in least-recently-used order, facets before their root. Active trees are protected, so the count can temporarily exceed the target; an object with hibernatable WebSockets keeps them
-  connected while it is evicted and is woken by the next message. The state endpoint reports the resident count per
-  process, the limit, the evictions, the wakes and how long they took.
+  connected while it is evicted and is woken by the next message. The state endpoint reports per-process counts under `processes.entries[].lifecycle.durableAdmission`.
 
 On glibc the daemon fixes the mmap/trim thresholds at 128 KiB with no top padding and trims free pages at most once a minute after one minute without own or peer log appends. `memory.daemon.containers` reports retained entries and available payload byte counts: unsealed records are pruned after seal/manifest publication, peer buffers after owner trim/drop, histories at their fixed caps, and usage/auth state at flush/expiry; request-log links without a live invocation lease expire after ten quiet minutes and counter windows after sixty seconds even when idle, while epoch exclusions and known-object/tenant metadata follow their documented lifecycle rather than a fixed entry cap.
 

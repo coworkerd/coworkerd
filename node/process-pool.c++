@@ -6,8 +6,6 @@
 #include "event-loop.h"
 #include "memory-events.h"
 #include "process-heat.h"
-#include "root-objects.h"
-#include "platform-definition.h"
 #include "rpc-error.h"
 #include "memory-observation.h"
 #include "tenancy.h"
@@ -302,7 +300,6 @@ class RuntimeConnection final: private kj::TaskSet::ErrorHandler,
     public std::enable_shared_from_this<RuntimeConnection> {
 public:
   RuntimeConnection(): tasks(*this) {}
-  bool threaded = false;
   bool threadedDurable = false;
   uint32_t threadedProtocol = 0;
   kj::TaskSet* deferredDeletes = nullptr;
@@ -314,10 +311,10 @@ public:
   kj::Promise<void> fill() {
     filling = true;
     auto done = kj::defer([this] { filling = false; });
-    while (!disconnected && idle.size() < IDLE_CONNECTIONS) idle.push_back(co_await address->connect());
+    while (idle.size() < IDLE_CONNECTIONS) idle.push_back(co_await address->connect());
   }
   void replenish() {
-    if (!filling && !disconnected) tasks.add(fill());
+    if (!filling) tasks.add(fill());
   }
   kj::Promise<v1::rpc::EventDispatcher::Client> openThreaded(kj::String descriptor,
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps, kj::Maybe<capnp::Capability::Client> budgetLifetime,
@@ -326,31 +323,20 @@ public:
       std::shared_ptr<ProcessCall> sqlCall, std::shared_ptr<RequestLease> lease,
       std::shared_ptr<const ProcessCall> call);
   kj::Own<kj::NetworkAddress> address;
-  kj::Own<kj::HttpClient> connector;
   kj::Own<kj::AsyncIoStream> stream;
   kj::Own<coworkerd::CoarseTwoPartyClient> rpc;
   v1::rpc::WorkerdBootstrap::Client bootstrap = nullptr;
-  bool disconnected = false;
   OpenEvent open(kj::StringPtr descriptor, std::shared_ptr<capnp::MallocMessageBuilder> nativeProps,
       kj::Maybe<capnp::Capability::Client> budgetLifetime, std::function<void()> onDispatched,
       std::function<void(PreExecutionRefusal)> onRefused, std::shared_ptr<ProcessCall> sqlCall,
       std::shared_ptr<RequestLease> lease, std::shared_ptr<const ProcessCall> call) {
-    if (threaded) {
-      auto ready = kj::newPromiseAndFulfiller<void>();
-      auto refusal = threadedDurable ? kj::newPromiseAndFulfiller<PreExecutionRefusal>()
-          : kj::PromiseFulfillerPair<PreExecutionRefusal>{PreExecutionRefusal::NONE, {}};
-      return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
-          kj::mv(budgetLifetime), std::move(onDispatched), std::move(onRefused), kj::mv(ready.fulfiller),
-          kj::mv(refusal.fulfiller), std::move(sqlCall), std::move(lease), std::move(call))),
-          kj::mv(ready.promise), kj::mv(refusal.promise)};
-    }
-    KJ_REQUIRE(!nativeProps, "native loopback props require a threaded process");
-    onDispatched();
-    auto request = bootstrap.startEventRequest();
-    request.setCfBlobJson(descriptor); request.setFromPersistentStub(false);
-    KJ_IF_SOME(token, budgetLifetime) { request.setBudgetLifetime(kj::mv(token)); }
-    auto response = request.send();
-    return {response.getDispatcher(), response.ignoreResult()};
+    auto ready = kj::newPromiseAndFulfiller<void>();
+    auto refusal = threadedDurable ? kj::newPromiseAndFulfiller<PreExecutionRefusal>()
+        : kj::PromiseFulfillerPair<PreExecutionRefusal>{PreExecutionRefusal::NONE, {}};
+    return {v1::rpc::EventDispatcher::Client(openThreaded(kj::str(descriptor), std::move(nativeProps),
+        kj::mv(budgetLifetime), std::move(onDispatched), std::move(onRefused), kj::mv(ready.fulfiller),
+        kj::mv(refusal.fulfiller), std::move(sqlCall), std::move(lease), std::move(call))),
+        kj::mv(ready.promise), kj::mv(refusal.promise)};
   }
 private:
   void taskFailed(kj::Exception&&) override { filling = false; }
@@ -1072,7 +1058,6 @@ std::function<void(bool)> deferPreparedCpuUsage(const std::shared_ptr<ProcessCal
 
 struct ProcessGeneration {
   std::string id;
-  bool threaded = false;
   bool durableTestStorage = false;
   uint32_t threadedProtocol = 0;
   bool threadedCulpritHandled = false;
@@ -1093,7 +1078,7 @@ struct ProcessGeneration {
   // closing (connections closed, SIGTERM sent); and whether the exit was the rotation's own doing.
   bool rotation = false, retiring = false, closing = false, plannedExit = false;
   std::string exitStatus;
-  double spawnedAt = mono(), readyAt = 0, nextProbeAt = 0, probeStartedAt = 0, exitedAt = 0;
+  double spawnedAt = mono(), readyAt = 0, nextProbeAt = 0, exitedAt = 0;
   uint64_t spawnedAtUnixMs = wall(), readyAtUnixMs = 0, exitedAtUnixMs = 0;
   uint32_t inFlight = 0;
   std::shared_ptr<TenantExecutionState> tenantExecution;
@@ -1123,8 +1108,6 @@ struct ProcessGeneration {
   bool probePending = false;
   double probeAttemptAt = 0;
   uint64_t probeAttempts = 0, probeFailures = 0;
-  uint32_t rootMaintenancePending = 0;
-  uint64_t rootMaintenanceAttempts = 0, rootMaintenanceFailures = 0, rootMaintenanceCompleted = 0;
   // Limit event channel: the read end of the pipe whose write end the child
   // inherited. An observer on the event loop moves whatever arrives into `eventTail` (so the pipe
   // never fills and workerd's writes never wait); rows are parsed and applied only when needed --
@@ -1132,7 +1115,6 @@ struct ProcessGeneration {
   // rest is read up to the end of the pipe.
   struct LimitEvent {
     std::string event, isolate, workerId; uint32_t memoryLimitMiB; uint64_t peakUsedBytes;
-    uint64_t pauseNs = 0; std::string row;  // gc-pause rows: the pause, and the row itself
   };
   bool eventChannel = false, eventsFinal = false, eventsEnded = false;
   int eventFd = -1;
@@ -1150,7 +1132,6 @@ struct ProcessGeneration {
   std::array<std::set<std::string>, 3> terminatedCalls;  // CPU, isolate memory, process pressure: pid, invocation, Worker, version
   // A durable process's limit rows name the request that started the object's context (workerd keeps one per object),
   // not the request that hit the limit: by pid, Worker and version, when each was last read.
-  std::array<std::map<std::string, double>, 2> terminatedWorkers;
   uint64_t eventReadCalls = 0, eventBytes = 0, eventRows = 0, rejectedRows = 0, incompleteTailBytes = 0;
   double nextEventSync = 0;
   // The evidence rows: the latest CPU culprit (withdrawn by a later terminated row of the same
@@ -1175,9 +1156,8 @@ struct ProcessGeneration {
   // from its cpu-progress rows, until its completed row comes.
   std::unordered_map<std::string, uint64_t> meteredCpu;
   std::unordered_map<std::string, double> notExecutedInvocations;
-  uint64_t contextsCompleted = 0, contextsCleared = 0, contextsDropped = 0;
+  uint64_t contextsCompleted = 0, contextsDropped = 0;
   double lastDurableReplyAt = 0;
-  bool drainComparisonRecorded = false;
   double drainLifecycleCheck = 0;  // the Server drain's lifecycle reads
   // The workerd file the Server opened for this generation: its identity, which becomes the
   // generation's `binary` once the generation is ready (an identity is attached after the probe).
@@ -1330,13 +1310,6 @@ struct ProcessGeneration {
     pullEvents();
     return pid > 0 && terminatedCalls[cause].count(callKey(pid, invocation, worker, version)) > 0;
   }
-  // A durable process: a limit row of the Worker's version read since `since` (a request to one of its objects).
-  bool terminatedSince(size_t cause, const std::string& worker, const std::string& version, double since) {
-    pullEvents();
-    if (pid <= 0) return false;
-    auto found = terminatedWorkers[cause].find(callKey(pid, "", worker, version));
-    return found != terminatedWorkers[cause].end() && found->second >= since;
-  }
   std::string channelJson() const {
     std::ostringstream out;
     out << "{\"open\":" << (eventFd >= 0 ? "true" : "false") << ",\"final\":" << (eventsFinal ? "true" : "false")
@@ -1383,7 +1356,7 @@ struct ProcessGeneration {
               << "}" << std::endl;
           continue;
         }
-        if (event == "terminated" || event == "memory-terminated" || (threaded && event == "process-memory-pressure")) {
+        if (event == "terminated" || event == "memory-terminated" || event == "process-memory-pressure") {
           const auto cause = event == "terminated" ? 0 : event == "memory-terminated" ? 1 : 2;
           auto key = callKey(report.getPid(), report.getInvocationId().cStr(),
               report.getWorkerId().cStr(), report.getVersionId().cStr());
@@ -1398,8 +1371,6 @@ struct ProcessGeneration {
               else terminatedCalls[cause].erase(oldest.first);
             }
           }
-          if (durable && cause < 2) terminatedWorkers[cause][callKey(report.getPid(), "", report.getWorkerId().cStr(),
-              report.getVersionId().cStr())] = mono();
         }
         if (event == "completed" && !openContexts.empty()) {
           auto context = openContexts.find(report.getInvocationId().cStr());
@@ -1412,7 +1383,7 @@ struct ProcessGeneration {
           }
         }
         // A tenant's CPU: the rows of its executions; a trial load's or a load check's are the platform's. The collection
-        // CPU the limit did not charge (gc.budgetMs) is the tenant's CPU all the same. A request that lasts reports its CPU
+        // A request that lasts reports its CPU
         // so far in cpu-progress rows (at most once a second, at its events), each counted for what it adds, and its
         // completed row the rest.
         if ((event == "completed" || event == "cpu-progress") && cpuUsage &&
@@ -1442,8 +1413,7 @@ struct ProcessGeneration {
         if (event == "memory-culprit") oomCulpritRow = row;
         fatalEvidence.record(event, row);
         unappliedEvents.push_back({event, report.getIsolate().cStr(), report.getWorkerId().cStr(),
-            report.getMemoryLimitMiB(), report.getPeakUsedBytes(), report.getPauseNs(),
-            event == "gc-pause" ? row : std::string()});
+            report.getMemoryLimitMiB(), report.getPeakUsedBytes()});
       } catch (const kj::Exception& error) {
         ++rejectedRows;
         std::cerr << "[process-pool] CPU report rejected: " << error.getDescription().cStr() << std::endl;
@@ -1534,21 +1504,16 @@ kj::Promise<void> ProcessCall::onExit() {
 }
 // A failed call is classified against this generation's events: a matching
 // row whose pid is the generation's current pid (none once the exit was observed).
-bool ProcessCall::threadedServer() const { return process->threaded; }
 bool ProcessCall::threadedDurableTestRole() const { return process->durableTestStorage; }
-bool ProcessCall::threadedDurableRole() const { return process->durable && process->threaded; }
+bool ProcessCall::threadedDurableRole() const { return process->durable; }
 bool ProcessCall::cpuLimitExceeded() const {
-  if (process->durable && !process->threaded)
-    return process->terminatedSince(0, workerId, versionId, startedAtMonotonicMs);
   return process->terminated(0, invocationId, workerId, versionId);
 }
 bool ProcessCall::memoryLimitExceeded() const {
-  if (process->durable && !process->threaded)
-    return process->terminatedSince(1, workerId, versionId, startedAtMonotonicMs);
   return process->terminated(1, invocationId, workerId, versionId);
 }
 bool ProcessCall::processMemoryPressure() const {
-  return process->threaded && process->terminated(2, invocationId, workerId, versionId);
+  return process->terminated(2, invocationId, workerId, versionId);
 }
 
 
@@ -1570,9 +1535,6 @@ public:
     std::string lastReason;
     uint64_t cpuTerminatedRequests = 0, cpuInvalidatedIsolates = 0, cpuReloadedIsolates = 0;
     uint64_t memoryTerminatedRequests = 0, memoryInvalidatedIsolates = 0, memoryReloadedIsolates = 0;
-    // The long collections of every generation (gc-pause rows, gc.longPauseMs): how many, and the longest one's row.
-    uint64_t gcLongPauses = 0, gcLongestPauseNs = 0;
-    std::string gcLongestPause;
     // Launches that failed before workerd ran (the launcher's `failed` record, or no `exec` one).
     uint64_t launchFailures = 0;
     std::string lastLaunchFailure = "null";
@@ -1618,7 +1580,7 @@ public:
   // callback returns (set by the node, setRetiring).
   std::function<uint32_t(const std::string&, uint64_t)> retiring;
   ProcessPoolConfig config;
-  std::string executable, runtimeFile, directory, runDirectory, bindingAddress, sourceAddress;
+  std::string directory, runDirectory, bindingAddress, sourceAddress;
   std::string egressAddress;  // empty while tenant Workers have no network
   kj::AsyncIoProvider& provider;
   kj::UnixEventPort& eventPort;
@@ -1636,8 +1598,6 @@ public:
   std::deque<std::string> kills;
   std::deque<std::string> memoryCrashes;
   std::deque<std::string> fatalExits;
-  // The latest gc-pause rows of any generation (gc.longPauseMs).
-  std::deque<std::string> recentGcPauses;
   // The limit event channel of the last exited generations: what the Server read, to the end.
   std::deque<std::string> channelExits;
   // The cgroup's OOM kills (memoryEventsPath): the counter as last read, and the increments no exit has taken yet, each
@@ -1680,25 +1640,9 @@ public:
   // process writes -- each row carries the limit it was measured against -- and the largest memory limit to
   // size a new generation's process-wide WebAssembly memory cap.
   ProcessPool::WorkerLimitsView workerLimits;
-  std::function<std::shared_ptr<const std::vector<std::string>>()> rootMaintenance;
-  std::function<void(const std::vector<std::string>&)> rootMaintenanceCompleted;
-  static constexpr size_t ROOT_MAINTENANCE_BATCH_SIZE = 64, ROOT_MAINTENANCE_CONCURRENCY = 4;
-  struct RootMaintenanceTarget {
-    std::weak_ptr<ProcessGeneration> process;
-    bool applied = false, pending = false;
-    double retryAt = 0;
-  };
-  struct RootMaintenanceBatch {
-    std::vector<std::string> ids;
-    std::string body;
-    std::vector<RootMaintenanceTarget> targets;
-  };
-  std::deque<std::shared_ptr<RootMaintenanceBatch>> rootMaintenanceBatches;
-  std::set<std::string> rootMaintenanceQueued;
-  std::shared_ptr<const std::vector<std::string>> rootMaintenanceWanted;
+  std::function<void()> rootMaintenance;
   double nextRootMaintenance = 0;
   BinarySignature configuredBinary;
-  BinarySignature threadedConfiguredBinary;
   uint64_t binaryChecks = 0, binaryChanges = 0, binaryChangedAtUnixMs = 0;
   // The sandbox. The launcher is pinned at startup: this Server starts every process with the file it
   // checked then (through its descriptor), so a launcher replaced on disk -- one of another release -- is
@@ -1780,21 +1724,13 @@ public:
   bool durableClosed = false;
   uint64_t shutdownClearedContexts = 0;
 
-  uint64_t legacyDrainChecks = 0, legacyDrainDisagreements = 0, legacyLimitChecks = 0, legacyLimitDisagreements = 0;
-
-  Impl(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
+  Impl(ProcessPoolConfig config,
       std::string directory, std::string bindingAddress, std::string sourceAddress,
       kj::AsyncIoProvider& provider, kj::UnixEventPort& eventPort, const kj::HttpHeaderTable& headers,
       Suspects& suspects)
-      : config(config), executable(std::move(executable)), runtimeFile(std::move(runtimeFile)),
+      : config(std::move(config)),
         directory(std::move(directory)), runDirectory(this->directory + "/run"), bindingAddress(std::move(bindingAddress)),
         sourceAddress(std::move(sourceAddress)), provider(provider), eventPort(eventPort), headers(headers), suspects(suspects) {
-    if (auto* ms = std::getenv("COWORKERD_CPU_LIMIT_MS")) {
-      char* end = nullptr; auto parsed = std::strtoull(ms, &end, 10);
-      KJ_REQUIRE(*ms && end && !*end && parsed <= UINT32_MAX, "invalid CPU limit override");
-      this->config.cpuLimitMs = static_cast<uint32_t>(parsed);
-      this->config.durableCpuLimitMs = static_cast<uint32_t>(parsed);
-    }
     if (auto* text = std::getenv("COWORKERD_MEMORY_LIMIT_MIB")) {
       char* end = nullptr; auto value = std::strtoull(text, &end, 10);
       KJ_REQUIRE(*text && *text != '-' && end && !*end && value <= UINT32_MAX, "invalid memory limit override");
@@ -1809,7 +1745,6 @@ public:
                                std::pair{"COWORKERD_TENANT_IN_FLIGHT_LIMIT", &this->config.tenantInFlightLimit},
                                std::pair{"COWORKERD_THREADED_RESIDENT_LIMIT", &this->config.threadedResidentLimit},
                                std::pair{"COWORKERD_THREADED_THREAD_IDLE_MS", &this->config.threadedThreadIdleMs},
-                               std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &this->config.idleDestroyIntervalMs},
                                std::pair{"COWORKERD_ROTATION_DRAIN_TIMEOUT_MS", &this->config.rotationDrainTimeoutMs},
                                std::pair{"COWORKERD_ROTATION_TERM_GRACE_MS", &this->config.rotationTermGraceMs},
                                std::pair{"COWORKERD_ROTATION_BINARY_CHECK_MS", &this->config.rotationBinaryCheckMs},
@@ -1817,19 +1752,6 @@ public:
       if (auto* text = std::getenv(setting.first)) {
         char* end = nullptr; auto value = std::strtoull(text, &end, 10);
         KJ_REQUIRE(*text && *text != '-' && end && !*end && value <= UINT32_MAX, "invalid process pool override", setting.first);
-        *setting.second = static_cast<uint32_t>(value);
-      }
-    }
-    for (const auto& setting : {std::pair{"COWORKERD_GC_BUDGET_MS", &this->config.gcBudgetMs},
-                               std::pair{"COWORKERD_GC_REFILL_MS_PER_S", &this->config.gcRefillMsPerSecond},
-                               std::pair{"COWORKERD_GC_LONG_PAUSE_MS", &this->config.gcLongPauseMs},
-                               std::pair{"COWORKERD_IDLE_GC_MS", &this->config.gcIdleCollectAfterMs},
-                               std::pair{"COWORKERD_IDLE_GC_MIN_MIB", &this->config.gcIdleCollectMinGrowthMiB},
-                               std::pair{"COWORKERD_GC_INITIAL_OLD_SPACE_MIB", &this->config.gcInitialOldSpaceMiB},
-                               std::pair{"COWORKERD_STATIC_HEAP_MIB", &this->config.gcRuntimeHeapMiB}}) {
-      if (auto* text = std::getenv(setting.first)) {
-        char* end = nullptr; auto value = std::strtoull(text, &end, 10);
-        KJ_REQUIRE(*text && *text != '-' && end && !*end && value <= UINT32_MAX, "invalid gc override", setting.first);
         *setting.second = static_cast<uint32_t>(value);
       }
     }
@@ -1849,13 +1771,9 @@ public:
     if (auto* path = std::getenv("COWORKERD_SANDBOX_ALLOWLIST")) this->config.allowlistPath = path;
     if (auto* bind = std::getenv("COWORKERD_SANDBOX_BIND_FOR_TEST")) sandbox.bindForTest = bind;
     this->config.validate();
-    if (this->config.threadedExecutable.empty())
-      this->config.threadedExecutable = (std::filesystem::path(this->executable).parent_path() / "coworkerd-threaded").string();
-    KJ_REQUIRE(access(this->executable.c_str(), X_OK) == 0, "workerd executable is required");
-    KJ_REQUIRE(this->config.durableProcesses == 0 || std::filesystem::is_regular_file(this->runtimeFile),
-        "durable runtime module is required");
+    KJ_REQUIRE(access(this->config.threadedExecutable.c_str(), X_OK) == 0,
+        "coworkerd-threaded executable is required", this->config.threadedExecutable.c_str());
     std::filesystem::create_directories(this->directory + "/logs");
-    std::filesystem::create_directories(this->directory + "/processes");
     std::filesystem::create_directories(runDirectory);
     std::filesystem::permissions(runDirectory, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
     // The durable processes' objects: one SQLite database per object (and its facets), below each root namespace's
@@ -1864,7 +1782,7 @@ public:
       std::filesystem::create_directories(durableDirectory());
       std::filesystem::permissions(durableDirectory(), std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
     }
-    for (uint32_t i = 0; i < config.count; ++i) slots.push_back({"p" + std::to_string(i)});
+    for (uint32_t i = 0; i < this->config.count; ++i) slots.push_back({"p" + std::to_string(i)});
     for (uint32_t i = 0; i < this->config.quarantineProcesses; ++i) slots.push_back({"q" + std::to_string(i), true});
     for (uint32_t i = 0; i < this->config.durableProcesses; ++i) {
       Slot slot;
@@ -1899,8 +1817,7 @@ public:
       KJ_REQUIRE(bandFd >= 0, "cannot keep the memory band descriptor");
     }
     setUpSandbox();
-    configuredBinary = statSignature(this->executable);
-    threadedConfiguredBinary = statSignature(this->config.threadedExecutable);
+    configuredBinary = statSignature(this->config.threadedExecutable);
     std::cout << "[process-pool] {\"event\":\"channels\",\"runDirectory\":\"" << escape(runDirectory)
         << "\",\"binding\":\"" << escape(this->bindingAddress) << "\",\"source\":\"" << escape(this->sourceAddress)
         << "\",\"memoryBand\":" << (bandFd >= 0 ? "true" : "false")
@@ -1925,13 +1842,13 @@ public:
   }
   // What a Worker's executions run under: the limits it names, else this node's own.
   WorkerLimits limitsOf(const std::string& workerId, bool durable = false) const {
-    WorkerLimits effective{durable ? config.durableCpuLimitMs : config.cpuLimitMs, config.memoryLimitMiB};
+    WorkerLimits effective{config.cpuLimitMs, config.memoryLimitMiB};
     if (workerLimits.of && !workerId.empty()) {
       const auto named = workerLimits.of(workerId);
       if (named.cpuMs) effective.cpuMs = named.cpuMs;
       if (named.memoryMiB) effective.memoryMiB = named.memoryMiB;
     }
-    if (!durable && effective.cpuMs > 300000) effective.cpuMs = 300000;
+    effective.cpuMs = std::min(effective.cpuMs, durable ? ProcessPoolConfig::DURABLE_CPU_CEILING_MS : 300000u);
     return effective;
   }
   // A new generation's WebAssembly memory cap: a process-wide V8 flag, so it is the largest limit any Worker
@@ -2041,12 +1958,12 @@ public:
   std::string generationSandboxJson(const ProcessGeneration& p) const {
     std::ostringstream out;
     out << "{\"mode\":\"" << sandbox.mode << "\",\"launched\":" << (p.launched ? "true" : "false")
-        << ",\"ordinaryServer\":\"" << (p.threaded ? "threaded" : "upstream")
+        << ",\"ordinaryServer\":\"threaded"
         << "\",\"threadedProtocol\":" << p.threadedProtocol
-        << ",\"defaultCpuLimitMs\":" << (p.durable ? config.durableCpuLimitMs : config.cpuLimitMs)
-        << ",\"limitsEnforced\":" << (!p.threaded || p.threadedProtocol == 3 ? "true" : "false");
+        << ",\"defaultCpuLimitMs\":" << config.processCpuLimitMs(p.durable)
+        << ",\"limitsEnforced\":" << (p.threadedProtocol == 3 ? "true" : "false");
     if (p.durable) out << ",\"durableServer\":\"" <<
-        (p.durableTestStorage ? "threaded-test" : p.threaded ? "threaded" : "upstream") << '"';
+        (p.durableTestStorage ? "threaded-test" : "threaded") << '"';
     if (p.launched) out << ",\"launcherSha256\":\"" << sandbox.launcherSha256 << "\",\"launcherVersion\":\"" << escape(recordField(p.launchRecord, "version"))
         << "\",\"launch\":" << jsonOrNull(p.launchRecord);
     out << ",\"syscalls\":{\"mode\":\"" << escape(p.syscallMode) << "\",\"supervised\":"
@@ -2095,7 +2012,7 @@ public:
   // The interpreter and libraries of the workerd file open as `fd`, once per file.
   void resolveSharedObjects(int fd, const BinarySignature& signature) {
     if (sandbox.sharedObjectsFor.valid && signature == sandbox.sharedObjectsFor) return;
-    sandbox.sharedObjects = sharedObjects(fd, executable);
+    sandbox.sharedObjects = sharedObjects(fd, config.threadedExecutable);
     sandbox.sharedObjectsFor = signature;
   }
   // The launcher's command line for a process (PROTOCOL.md): the sandbox's layers and binds, the system call
@@ -2119,14 +2036,13 @@ public:
       // launcher refuses the pair and reports it as a launch failure (PROTOCOL.md, step `allowlist`).
       args.push_back(programSha256.empty() ? "unknown" : programSha256);
     }
-    if (!check && !program.empty() && program.front() == config.threadedExecutable) args.push_back("--threaded");
+    if (!check) args.push_back("--threaded");
     auto bind = [&](const char* option, const std::string& path) { args.push_back(option); args.push_back(path); };
     for (const auto& path : sandbox.sharedObjects) bind("--bind", path);
     bind("--bind-rw", "/dev/null");
     bind("--bind", "/dev/urandom");
     bind("--bind-optional", "/sys/devices/system/cpu");
     bind("--bind-optional", "/etc/localtime");
-    bind("--bind", directory + "/processes");
     // The steady-state table is read by workerd itself, after the mount namespace exists, so unlike the
     // startup table -- which the launcher reads before it builds that namespace -- its file has to be in it.
     if (sandbox.syscalls.steady.active) bind("--bind", sandbox.syscalls.steady.path);
@@ -2163,7 +2079,7 @@ public:
     sigaddset(&defaults, SIGTERM); sigaddset(&defaults, SIGINT);
     posix_spawnattr_setsigmask(&attr, &mask); posix_spawnattr_setsigdefault(&attr, &defaults);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
-    auto args = launcherCommand(true, {executable}, sandbox.syscalls.programSha256);
+    auto args = launcherCommand(true, {config.threadedExecutable}, sandbox.syscalls.programSha256);
     std::vector<char*> argv;
     for (auto& arg : args) argv.push_back(arg.data());
     argv.push_back(nullptr);
@@ -2248,7 +2164,9 @@ public:
     // comes too late for the first spawn, and every launch is compared against this one).
     s.programSignature = programSignature;
     s.programSha256 = BinaryHasher::digestOf(programFd);
-    if (s.programSha256.empty()) throw std::runtime_error("cannot hash the workerd executable " + executable);
+    if (s.programSha256.empty()) {
+      throw std::runtime_error("cannot hash the threaded executable " + config.threadedExecutable);
+    }
     // The list has to cover the bytes this Server runs; which of its digests that is, is recorded.
     if (std::find(s.workerdSha256.begin(), s.workerdSha256.end(), s.programSha256) == s.workerdSha256.end()) {
       std::string named;
@@ -2340,8 +2258,9 @@ public:
       b.launcherSha256 = BinaryHasher::digestOf(b.launcherFd);
       std::filesystem::create_directories(b.root);
       std::filesystem::permissions(b.root, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+      const auto& executable = config.threadedExecutable;
       const int program = ::open(executable.c_str(), O_RDONLY | O_CLOEXEC);
-      if (program < 0) throw std::runtime_error("cannot open the workerd executable " + executable + ": " + strerror(errno));
+      if (program < 0) throw std::runtime_error("cannot open the threaded executable " + executable + ": " + strerror(errno));
       const int raisedProgram = raised(program);
       auto closeProgram = kj::defer([raisedProgram] { ::close(raisedProgram); });
       struct stat programInfo;
@@ -2479,7 +2398,6 @@ public:
   void spawn(Slot& s, size_t index, bool rotation = false) {
     auto p = std::make_shared<ProcessGeneration>();
     p->durableTestStorage = s.durable && config.threadedDurableTestStorage;
-    p->threaded = true;
     if (!s.durable) p->tenantExecution = makeTenantExecutionState(config.tenantInFlightLimit);
     const auto& executable = config.threadedExecutable;
     p->id = s.id; p->quarantine = s.quarantine; p->durable = s.durable; p->generation = ++s.generation; p->rotation = rotation;
@@ -2493,7 +2411,6 @@ public:
     p->eventFd = eventRead;
     auto closeEventWrite = kj::defer([fd = eventWrite] { ::close(fd); });
     p->eventChannel = true;
-    p->contextsVisible = !p->threaded;
     p->eventDigest = EVP_MD_CTX_new();
     KJ_REQUIRE(p->eventDigest && EVP_DigestInit_ex(p->eventDigest, EVP_sha256(), nullptr) == 1, "cannot hash the event channel");
     const int listener = listenUnix(p->socketPath, config.processInFlightLimit(p->durable));
@@ -2503,7 +2420,6 @@ public:
     if (!rotation && p->generation > 1) ++s.restarts;
     auto signal = kj::newPromiseAndFulfiller<void>();
     p->exited = kj::mv(signal.fulfiller); p->exitSignal = kj::mv(signal.promise).fork();
-    const auto path = directory + "/processes/" + p->id + ".capnp";
     if (!egressAddress.empty()) {
       unsigned char random[16];
       KJ_REQUIRE(RAND_bytes(random, sizeof(random)) == 1, "cannot draw an egress token");
@@ -2511,55 +2427,6 @@ public:
       for (auto byte : random) { p->egressToken.push_back(digits[byte >> 4]); p->egressToken.push_back(digits[byte & 15]); }
     }
     p->wasmMemoryCapMiB = wasmMemoryCapMiB();
-    if (p->durable) {
-      std::filesystem::copy_file(runtimeFile, directory + "/processes/" + p->id + ".runtime.js",
-          std::filesystem::copy_options::overwrite_existing);
-      std::ofstream configFile(path);
-      configFile << "using Workerd = import \"/workerd/workerd.capnp\";\nconst config :Workerd.Config = (\n";
-      std::vector<std::string> v8Flags;
-      if (p->wasmMemoryCapMiB) v8Flags = {"--wasm-max-mem-pages=" + std::to_string(uint64_t(p->wasmMemoryCapMiB) * 16),
-          "--enforce-global-heap-limit", "--maximum-global-heap-limit-factor=1"};
-      // Every isolate's old generation starts this small, so its first full collection comes early and is small
-      // (gc.initialOldSpaceMiB); V8 grows it from there.
-      if (config.gcInitialOldSpaceMiB) v8Flags.push_back("--initial-old-space-size=" + std::to_string(config.gcInitialOldSpaceMiB));
-      if (!v8Flags.empty()) {
-        configFile << "v8Flags = [";
-        for (size_t i = 0; i < v8Flags.size(); ++i) configFile << (i ? ", " : "") << "\"" << v8Flags[i] << "\"";
-        configFile << "],\n";
-      }
-      // A durable process selects tenant and platform roots through its private root loader. The runtime runs with
-      // `experimental`: the Worker Loader gives a tenant isolate a streaming tail (its log lines as they are written) only
-      // when its loader has that flag (runtime.js, TenantLog); the tenant isolates' own flags are the definitions'.
-      configFile << "services = [(name = \"runtime\", worker = (compatibilityDate = \"2026-08-27\",\n"
-          "compatibilityFlags = [\"enable_request_signal\", \"experimental\"], modules = [(name = \"runtime.js\", esModule = embed \""
-          << p->id << ".runtime.js\"), (name = \"sql-database.js\", esModule = \""
-          << escape(sqlDatabaseSource()) << "\")], bindings = [\n"
-          "(name = \"LOADER\", workerLoader = (id = \"coworkerd-v1\")),\n"
-          "(name = \"SERVER\", service = \"server\"), (name = \"SOURCE\", service = \"source\"),\n"
-          << (egressAddress.empty() ? std::string() : "(name = \"EGRESS\", service = \"egress\"), (name = \"EGRESS_TOKEN\", text = \"" +
-              p->egressToken + "\"),\n")
-          << rootLoaderBinding(p->durable)
-          << "(name = \"PROCESS_ID\", text = \"" << p->id << "\"), (name = \"PROCESS_GENERATION\", text = \""
-          << p->generation << "\"), (name = \"PATH_TIMING\", text = \""
-          << (std::getenv("COWORKERD_PATH_TIMING") ? "1" : "") << "\")], globalOutbound = \"none\")),\n"
-          << rootLoaderService(p->durable, durableDirectory())
-          << "(name = \"server\", external = (address = \"" << escape(bindingAddress)
-          << "\", capnp = (capnpConnectHost = \"coworkerd-server\"))),\n"
-          "(name = \"source\", external = (address = \"" << escape(sourceAddress) << "\", http = ())),\n"
-          // The tenant Workers' global outbound: the request line carries the whole URL (the proxy form).
-          << (egressAddress.empty() ? std::string() : "(name = \"egress\", external = (address = \"" + escape(egressAddress) +
-              "\", http = (style = proxy))),\n") <<
-          "(name = \"internet\", network = (allow = [], deny = [])),\n"
-          "(name = \"none\", network = (allow = [], deny = []))],\n"
-          // No address: the listening socket is the descriptor given with --socket-fd.
-          "sockets = [(name = \"rpc\", service = \"runtime\", http = (capnpConnectHost = \"coworkerd-runtime\"))]);\n";
-      configFile.close(); KJ_REQUIRE(configFile.good(), "cannot write process configuration");
-    } else {
-      // Remove only the generated configuration of this ordinary slot.
-      std::error_code ignored;
-      std::filesystem::remove(path, ignored);
-      std::filesystem::remove(directory + "/processes/" + p->id + ".runtime.js", ignored);
-    }
     posix_spawn_file_actions_t actions;
     KJ_REQUIRE(posix_spawn_file_actions_init(&actions) == 0);
     auto cleanupActions = kj::defer([&] { posix_spawn_file_actions_destroy(&actions); });
@@ -2577,7 +2444,7 @@ public:
       KJ_REQUIRE(posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, logPath.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600) == 0);
       KJ_REQUIRE(posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO) == 0);
     }
-    const bool returnsBudgets = p->threaded && p->durable;
+    const bool returnsBudgets = p->durable;
     auto parent = parentPipe(returnsBudgets);
     if (returnsBudgets) p->durableBudgets = std::make_shared<DurableBudgetRegistry>();
     const int parentRead = parent.first;
@@ -2650,10 +2517,8 @@ public:
       std::string value(*entry);
       if (workerdInherits(value.substr(0, value.find('=')))) childEnvironment.push_back(std::move(value));
     }
-    childEnvironment.push_back("COWORKERD_CPU_LIMIT_MS=" + std::to_string(p->durable ? config.durableCpuLimitMs : config.cpuLimitMs));
+    childEnvironment.push_back("COWORKERD_CPU_LIMIT_MS=" + std::to_string(config.processCpuLimitMs(p->durable)));
     childEnvironment.push_back("COWORKERD_MEMORY_LIMIT_MIB=" + std::to_string(config.memoryLimitMiB));
-    childEnvironment.push_back("COWORKERD_SQL_CPU_LIMIT_MS=" + std::to_string(config.sqlCpuLimitMs));
-    childEnvironment.push_back("COWORKERD_SQL_WALL_LIMIT_MS=" + std::to_string(config.sqlWallLimitMs));
     childEnvironment.push_back("COWORKERD_EVENT_FD=" + std::to_string(EVENT_FD));
     childEnvironment.push_back("COWORKERD_LIFECYCLE_FD=" + std::to_string(LIFECYCLE_FD));
     childEnvironment.push_back("COWORKERD_PARENT_FD=" + std::to_string(PARENT_FD));
@@ -2661,8 +2526,6 @@ public:
       childEnvironment.push_back("COWORKERD_INTERNAL_TEST_ALARM_WALL_MS=" +
           std::to_string(*config.alarmWallMsForTest));
     }
-    childEnvironment.push_back("COWORKERD_IDLE_EVICT_MS=" + std::to_string(config.idleEvictMs));
-    childEnvironment.push_back("COWORKERD_IDLE_DESTROY_INTERVAL_MS=" + std::to_string(config.idleDestroyIntervalMs));
     if (bandFd >= 0) childEnvironment.push_back("COWORKERD_MEMORY_BAND_FD=" + std::to_string(BAND_FD));
     // The Durable Object log (workerd's patch coworkerd-wal-shipper.h): where to ship the frames, how long a commit
     // waits for the node's answer, and when to checkpoint.
@@ -2675,7 +2538,7 @@ public:
     if (p->durableTestStorage) {
       childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
     }
-    if (p->durable && p->threaded) {
+    if (p->durable) {
       for (const auto* name : {"COWORKERD_DO_TEST_HOME_COUNT", "COWORKERD_DO_TEST_TREES_PER_COPY",
                "COWORKERD_DO_TEST_PLACEMENT_BYTES", "COWORKERD_DO_TEST_BUSY_MS",
                "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",
@@ -2685,7 +2548,7 @@ public:
         if (const char* value = std::getenv(name)) childEnvironment.push_back(std::string(name) + "=" + value);
       }
     }
-    if (p->durable && p->threaded && !p->durableTestStorage) {
+    if (p->durable && !p->durableTestStorage) {
       KJ_REQUIRE(durableLogFd >= 0, "cannot start a persistent durable home without a WAL channel");
       childEnvironment.push_back("COWORKERD_DO_STORAGE_DIR=" + durableDirectory());
       childEnvironment.push_back("COWORKERD_DO_SQL_DATABASE_SPILL_BYTES=" +
@@ -2693,14 +2556,6 @@ public:
       childEnvironment.push_back("COWORKERD_DO_SQL_PROCESS_SPILL_BYTES=" +
           std::to_string(durableLog.sqlProcessSpillBytes));
     }
-    // V8's collections (gc.*; workerd's patch coworkerd-gc.h): the budget the CPU limit does not charge, the long
-    // pauses it names, the idle collection, and the runtime's heap.
-    childEnvironment.push_back("COWORKERD_GC_BUDGET_MS=" + std::to_string(config.gcBudgetMs));
-    childEnvironment.push_back("COWORKERD_GC_REFILL_MS_PER_S=" + std::to_string(config.gcRefillMsPerSecond));
-    childEnvironment.push_back("COWORKERD_GC_LONG_PAUSE_MS=" + std::to_string(config.gcLongPauseMs));
-    childEnvironment.push_back("COWORKERD_IDLE_GC_MS=" + std::to_string(config.gcIdleCollectAfterMs));
-    childEnvironment.push_back("COWORKERD_IDLE_GC_MIN_MIB=" + std::to_string(config.gcIdleCollectMinGrowthMiB));
-    childEnvironment.push_back("COWORKERD_STATIC_HEAP_MIB=" + std::to_string(config.gcRuntimeHeapMiB));
 #ifdef __linux__
     // What only the process itself can do, once it serves (coworkerd-steady.h): narrow its system calls
     // to the steady table, and make itself non-dumpable again -- the launcher sets that bit before the
@@ -2712,17 +2567,15 @@ public:
     }
     if (p->launched) childEnvironment.push_back("COWORKERD_NON_DUMPABLE=1");
 #endif
-    if (p->threaded) {
-      childEnvironment.push_back("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT=" + std::to_string(config.tenantInFlightLimit));
-      childEnvironment.push_back("COWORKERD_THREADED_MEMORY_BYTES=" + std::to_string(config.threadedMemoryBytes));
-      childEnvironment.push_back("COWORKERD_THREADED_RESIDENT_LIMIT=" + std::to_string(config.threadedResidentLimit));
-      childEnvironment.push_back("COWORKERD_THREADED_THREAD_IDLE_MS=" + std::to_string(config.threadedThreadIdleMs));
-      childEnvironment.push_back("COWORKERD_THREADED_WASM_MAX_MIB=" + std::to_string(p->wasmMemoryCapMiB));
-      childEnvironment.push_back("COWORKERD_THREADED_IDLE_EVICT_MS=" + std::to_string(config.idleEvictMs));
-      childEnvironment.push_back("COWORKERD_THREADED_BINDING_ADDRESS=" + bindingAddress);
-      childEnvironment.push_back("COWORKERD_THREADED_EGRESS_ADDRESS=" + egressAddress);
-      childEnvironment.push_back("COWORKERD_THREADED_EGRESS_TOKEN=" + p->egressToken);
-    }
+    childEnvironment.push_back("COWORKERD_THREADED_TENANT_IN_FLIGHT_LIMIT=" + std::to_string(config.tenantInFlightLimit));
+    childEnvironment.push_back("COWORKERD_THREADED_MEMORY_BYTES=" + std::to_string(config.threadedMemoryBytes));
+    childEnvironment.push_back("COWORKERD_THREADED_RESIDENT_LIMIT=" + std::to_string(config.threadedResidentLimit));
+    childEnvironment.push_back("COWORKERD_THREADED_THREAD_IDLE_MS=" + std::to_string(config.threadedThreadIdleMs));
+    childEnvironment.push_back("COWORKERD_THREADED_WASM_MAX_MIB=" + std::to_string(p->wasmMemoryCapMiB));
+    childEnvironment.push_back("COWORKERD_THREADED_IDLE_EVICT_MS=" + std::to_string(config.idleEvictMs));
+    childEnvironment.push_back("COWORKERD_THREADED_BINDING_ADDRESS=" + bindingAddress);
+    childEnvironment.push_back("COWORKERD_THREADED_EGRESS_ADDRESS=" + egressAddress);
+    childEnvironment.push_back("COWORKERD_THREADED_EGRESS_TOKEN=" + p->egressToken);
     std::vector<char*> childEnv;
     for (auto& entry: childEnvironment) childEnv.push_back(entry.data());
     childEnv.push_back(nullptr);
@@ -2923,33 +2776,31 @@ public:
             p->probeClient->request(kj::HttpMethod::GET, "/__coworkerd/probe", probeHeaders).response);
         auto identity = co_await response.body->readAllText(1024);
         KJ_REQUIRE(response.statusCode == 200 && identity == kj::str(p->id.c_str(), ":", p->generation), "wrong process readiness identity");
-        if (p->threaded) {
-          bool matchesProtocol = false;
-          uint32_t roleHeaders = 0;
-          uint32_t walHeaders = 0;
-          bool matchesRole = false, matchesWal = false;
-          response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
-            if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "3") matchesProtocol = true;
-            if (strcasecmp(name.cStr(), "x-coworkerd-threaded-role") == 0) {
-              ++roleHeaders;
-              matchesRole = value == (p->durableTestStorage ? "durable-test" : "durable");
-            }
-            if (strcasecmp(name.cStr(), "x-coworkerd-wal-protocol") == 0) {
-              ++walHeaders;
-              matchesWal = value == "1";
-            }
-          });
-          KJ_REQUIRE(matchesProtocol, "native process protocol 3 is required");
-          const bool roleNegotiated = p->durable ? roleHeaders == 1 && matchesRole : roleHeaders == 0;
-          const bool walNegotiated = p->durable && !p->durableTestStorage
-              ? walHeaders == 1 && matchesWal : walHeaders == 0;
-          KJ_REQUIRE(roleNegotiated,
-              "native process role does not match the slot");
-          KJ_REQUIRE(walNegotiated,
-              "native process WAL protocol does not match the slot");
-          p->threadedProtocol = 3;
-          p->contextsVisible = true;
-        }
+        bool matchesProtocol = false;
+        uint32_t roleHeaders = 0;
+        uint32_t walHeaders = 0;
+        bool matchesRole = false, matchesWal = false;
+        response.headers->forEach([&](kj::StringPtr name, kj::StringPtr value) {
+          if (strcasecmp(name.cStr(), "x-coworkerd-threaded-protocol") == 0 && value == "3") matchesProtocol = true;
+          if (strcasecmp(name.cStr(), "x-coworkerd-threaded-role") == 0) {
+            ++roleHeaders;
+            matchesRole = value == (p->durableTestStorage ? "durable-test" : "durable");
+          }
+          if (strcasecmp(name.cStr(), "x-coworkerd-wal-protocol") == 0) {
+            ++walHeaders;
+            matchesWal = value == "1";
+          }
+        });
+        KJ_REQUIRE(matchesProtocol, "native process protocol 3 is required");
+        const bool roleNegotiated = p->durable ? roleHeaders == 1 && matchesRole : roleHeaders == 0;
+        const bool walNegotiated = p->durable && !p->durableTestStorage
+            ? walHeaders == 1 && matchesWal : walHeaders == 0;
+        KJ_REQUIRE(roleNegotiated,
+            "native process role does not match the slot");
+        KJ_REQUIRE(walNegotiated,
+            "native process WAL protocol does not match the slot");
+        p->threadedProtocol = 3;
+        p->contextsVisible = true;
         if (!p->binary.valid) {
           // The generation's identity attaches once it answered its probe: it is the workerd
           // file the Server opened for it at the spawn -- what the launcher bound, or what posix_spawn
@@ -2963,28 +2814,13 @@ public:
         auto r = std::make_shared<RuntimeConnection>();
         r->timer = &provider.getTimer();
         r->address = co_await provider.getNetwork().parseAddress(text.c_str());
-        r->connector = kj::newHttpClient(provider.getTimer(), headers, *r->address);
-        if (p->threaded) {
-          r->threaded = true;
-          r->threadedDurable = p->durable;
-          r->durableBudgets = p->durableBudgets;
-          r->threadedProtocol = p->threadedProtocol;
-          r->deferredDeletes = &tasks;
-          co_await r->fill();
-        } else {
-        auto tunnel = r->connector->connect("coworkerd-runtime", kj::HttpHeaders(headers), {});
-        auto status = co_await provider.getTimer().timeoutAfter(500 * kj::MILLISECONDS, kj::mv(tunnel.status));
-        KJ_REQUIRE(status.statusCode == 200, "workerd rejected CONNECT");
-        r->stream = kj::mv(tunnel.connection); r->rpc = kj::heap<coworkerd::CoarseTwoPartyClient>(*r->stream);
-        r->bootstrap = r->rpc->bootstrap().castAs<v1::rpc::WorkerdBootstrap>();
-        }
+        r->threadedDurable = p->durable;
+        r->durableBudgets = p->durableBudgets;
+        r->threadedProtocol = p->threadedProtocol;
+        r->deferredDeletes = &tasks;
+        co_await r->fill();
         if (p->pid == 0) co_return;
         p->runtime = r;
-        // Weak: closing a generation releases its connection; a destroyed RPC system
-        // rejects this promise, which is expected.
-        if (!p->threaded) tasks.add(r->rpc->onDisconnect().then([weak = std::weak_ptr<RuntimeConnection>(r)] {
-          if (auto connection = weak.lock()) connection->disconnected = true;
-        }, [](kj::Exception&&) {}));
         p->state = "ready"; p->readyAt = mono(); p->readyAtUnixMs = wall(); p->nextProbeAt = mono();
         event(*p, "ready"); co_return;
       } catch (const kj::Exception&) {}
@@ -3010,104 +2846,24 @@ public:
       if (p->pid == 0 || p->state == "killed" || p->closing) co_return;
       if (p->probeDelays.size() == 1024) p->probeDelays.pop_front();
       p->probeDelays.push_back(mono() - p->probeAttemptAt);
-      if (p->state == "paused") event(*p, "resume");
       // A draining generation answers probes but never becomes selectable again.
-      p->state = p->retiring ? "draining" : "ready"; p->probeStartedAt = 0; p->nextProbeAt = mono() + config.probeIntervalMs;
+      p->state = p->retiring ? "draining" : "ready"; p->nextProbeAt = mono() + config.probeIntervalMs;
     } catch (const kj::Exception&) {
-      // The supervisor makes the overdue/kill decision using the original start time.
-      if (p->pid > 0 && p->probeStartedAt == 0) p->probeStartedAt = mono();
       ++p->probeFailures;
       p->nextProbeAt = mono() + config.probeIntervalMs;
     }
   }
   void maybeProbe(const std::shared_ptr<ProcessGeneration>& p) {
     if (!config.watchdog || !p || p->closing || p->probePending || mono() < p->nextProbeAt) return;
-    if (p->state != "ready" && p->state != "paused" && p->state != "draining") return;
+    if (p->state != "ready" && p->state != "draining") return;
     p->probePending = true; p->probeAttemptAt = mono();
-    if (p->probeStartedAt == 0) p->probeStartedAt = p->probeAttemptAt;
-    tasks.add(probe(p));
-  }
-  kj::Promise<void> maintainRoots(std::shared_ptr<ProcessGeneration> p,
-      std::shared_ptr<RootMaintenanceBatch> batch, size_t targetIndex) {
-    auto completed = kj::defer([p, batch, targetIndex] {
-      --p->rootMaintenancePending;
-      batch->targets[targetIndex].pending = false;
-    });
-    const auto& body = batch->body;
-    ++p->rootMaintenanceAttempts;
-    try {
-      // A separate client keeps a closing namespace from delaying this generation's health probes.
-      auto client = kj::newHttpClient(provider.getTimer(), headers, *p->probeAddress);
-      kj::HttpHeaders requestHeaders(headers);requestHeaders.setPtr(kj::HttpHeaderId::HOST, "runtime");
-      requestHeaders.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
-      auto request = client->request(kj::HttpMethod::POST, "/__coworkerd/root-maintenance", requestHeaders, body.size());
-      co_await provider.getTimer().timeoutAfter(1000 * kj::MILLISECONDS,
-          request.body->write(kj::arrayPtr(body.data(), body.size()).asBytes()));
-      request.body = nullptr;
-      auto response = co_await provider.getTimer().timeoutAfter(35000 * kj::MILLISECONDS, kj::mv(request.response));
-      auto text = co_await provider.getTimer().timeoutAfter(1000 * kj::MILLISECONDS, response.body->readAllText(2 * 1024 * 1024));
-      if (p->pid == 0 || p->closing) co_return;
-      if (response.statusCode != 200) {
-        if (std::string(text.cStr()).find("namespace-closing") != std::string::npos) {
-          for (size_t i = 0; i < slots.size(); ++i) if (slots[i].current == p) {
-            enqueueAutomatic(i, "root-namespace-close");
-            break;
-          }
-        }
-        KJ_FAIL_REQUIRE("root namespace cleanup was refused", response.statusCode);
-      }
-      batch->targets[targetIndex].applied = true;
-      ++p->rootMaintenanceCompleted;
-    } catch (const kj::Exception&) {
-      ++p->rootMaintenanceFailures;
-      batch->targets[targetIndex].retryAt = mono() + 1000;
-    }
+      tasks.add(probe(p));
   }
   void maybeMaintainRoots() {
-    if (!rootMaintenance || mono() < nextRootMaintenance) return;
     const auto now = mono();
+    if (!rootMaintenance || now < nextRootMaintenance) return;
     nextRootMaintenance = now + 100;
-    std::erase_if(rootMaintenanceBatches, [&](const auto& batch) {
-      const bool applied = std::all_of(batch->targets.begin(), batch->targets.end(), [](const auto& target) {
-        auto p = target.process.lock();
-        return target.applied || !p || p->pid == 0;
-      });
-      if (!applied) return false;
-      if (rootMaintenanceCompleted) rootMaintenanceCompleted(batch->ids);
-      for (const auto& id : batch->ids) rootMaintenanceQueued.erase(id);
-      return true;
-    });
-    const auto wanted = rootMaintenance();
-    if (wanted && wanted != rootMaintenanceWanted) {
-      rootMaintenanceWanted = wanted;
-      auto batch = std::make_shared<RootMaintenanceBatch>();
-      auto publish = [&]() {
-        if (batch->ids.empty()) return;
-        std::ostringstream body;body << "{\"namespaces\":[";
-        for (size_t i = 0; i < batch->ids.size(); ++i) body << (i ? ",\"" : "\"") << batch->ids[i] << '"';
-        body << "]}";batch->body = body.str();
-        for (auto& slot : slots) if (slot.durable) eachGeneration(slot, [&](const auto& p) {
-          if (p->pid > 0) batch->targets.push_back({p});
-        });
-        rootMaintenanceBatches.push_back(std::move(batch));
-        batch = std::make_shared<RootMaintenanceBatch>();
-      };
-      for (const auto& id : *wanted) if (rootMaintenanceQueued.insert(id).second) {
-        batch->ids.push_back(id);
-        if (batch->ids.size() == ROOT_MAINTENANCE_BATCH_SIZE) publish();
-      }
-      publish();
-    }
-    for (const auto& batch : rootMaintenanceBatches) for (size_t i = 0; i < batch->targets.size(); ++i) {
-      auto& target = batch->targets[i];
-      auto p = target.process.lock();
-      if (target.applied || target.pending || target.retryAt > now || !p || p->pid == 0 ||
-          p->rootMaintenancePending >= ROOT_MAINTENANCE_CONCURRENCY || p->closing ||
-          (p->state != "ready" && p->state != "draining") || !p->probeAddress) continue;
-      target.pending = true;
-      ++p->rootMaintenancePending;
-      tasks.add(maintainRoots(p, batch, i));
-    }
+    rootMaintenance();
   }
   // Applies the generation's newly read limit events to the counters.
   void applyEvents(Slot& s, ProcessGeneration& p) {
@@ -3130,11 +2886,6 @@ public:
         ++s.memoryTerminatedRequests;
         if (s.memoryInvalidated.insert(e.isolate).second) ++s.memoryInvalidatedIsolates;
         if (!e.workerId.empty()) ++workerMemoryStats[e.workerId].terminated;
-      } else if (e.event == "gc-pause") {
-        ++s.gcLongPauses;
-        if (e.pauseNs > s.gcLongestPauseNs) { s.gcLongestPauseNs = e.pauseNs; s.gcLongestPause = e.row; }
-        if (recentGcPauses.size() == 32) recentGcPauses.pop_front();
-        recentGcPauses.push_back(e.row);
       }
     }
     p.unappliedEvents.clear();
@@ -3143,7 +2894,7 @@ public:
       // Examine the whole batch, then inspect without consuming the reaper's status.
       bool alive = p.pid > 0 && p.state != "killed" && !p.closing && !p.eventsEnded &&
           !p.crashEventPending && p.culpritRow.empty() &&
-          p.runtime && !p.runtime->disconnected;
+          p.runtime;
       if (alive) {
         siginfo_t info = {};
         int result;
@@ -3163,7 +2914,7 @@ public:
     for (auto& s : slots) eachGeneration(s, [&](const auto& p) {
       if (p->pid == 0 || now < p->nextEventSync) return;
       applyEvents(s, *p);
-      if (p->threaded && !p->threadedCulpritHandled && !p->culpritRow.empty()) {
+      if (!p->threadedCulpritHandled && !p->culpritRow.empty()) {
         const auto offender = culprit(*p);
         if (offender != "null") {
           capnp::MallocMessageBuilder message;
@@ -3181,8 +2932,6 @@ public:
   }
   bool labelledIsolate(ProcessGeneration& process, const std::string& isolate,
       const std::string& worker, const std::string& version) {
-    const auto legacy = isolate.starts_with("coworkerd-v1:" + worker + "@" + version + "#");
-    ++legacyLimitChecks;
     const auto snapshot = process.lifecycle.read();
     if (snapshot.empty()) return false;
     try {
@@ -3195,7 +2944,6 @@ public:
         const auto name = json::field(row, "isolate"), owner = json::field(row, "workerId"), revision = json::field(row, "versionId");
         if (name.isString() && owner.isString() && revision.isString() && std::string(name.getString().cStr()) == isolate &&
             std::string(owner.getString().cStr()) == worker && std::string(revision.getString().cStr()) == version) {
-          if (!legacy) ++legacyLimitDisagreements;
           return !process.durable;
         }
       }
@@ -3207,7 +2955,7 @@ public:
   bool memoryExit(Slot& slot, ProcessGeneration& p, int status) {
     const auto& row = p.oomCulpritRow;
     std::string offender = "null";
-    const bool oomExit = p.durable || !p.threaded || (WIFEXITED(status) && WEXITSTATUS(status) == 74);
+    const bool oomExit = p.durable || (WIFEXITED(status) && WEXITSTATUS(status) == 74);
     bool v8Oom = oomExit && p.oomSignalled;
     uint64_t oomIsolateHeap = 0;
     bool oomIsolateHeapReported = false;
@@ -3293,12 +3041,6 @@ public:
         << "\",\"generation\":" << p.generation << ",\"pid\":" << p.pid << ",\"reason\":\"" << escape(reason)
         << "\",\"stuckDurationMs\":" << duration << ",\"observedAtUnixMs\":" << wall() << ",\"inFlight\":" << p.inFlightJson();
     auto offender = culprit(p);
-    if (reason == "watchdog timeout" && offender != "null") {
-      capnp::MallocMessageBuilder message;
-      auto report = message.initRoot<v1::rpc::CpuReport>();
-      capnp::JsonCodec().decode(kj::StringPtr(offender.c_str()), report);
-      suspects.confirm(report.getWorkerId().cStr(), p.id, p.generation, report.getInvocationId().cStr());
-    }
     out << ",\"culprit\":" << offender << ",\"culpritStatus\":\""
         << (offender == "null" ? "undetermined" : "confirmed") << "\"}";
     if (kills.size() == 32) kills.pop_front();
@@ -3353,7 +3095,7 @@ public:
     const bool syscallDenied = p->launched && enforcing && !p->plannedExit && p->state != "killed" &&
         WIFSIGNALED(status) && WTERMSIG(status) == SYSCALL_DENIED_SIGNAL;
     const bool sandboxRefused = !p->sandboxRefusal.empty();
-    if ((p->threaded || sandboxRefused) && !p->plannedExit && WIFEXITED(status) && WEXITSTATUS(status) == 78) {
+    if (!p->plannedExit && WIFEXITED(status) && WEXITSTATUS(status) == 78) {
       // Not restarted: the same machine refuses the same way.
       s.configurationFailed = true;
       s.lastExitCategory = sandboxRefused ? "sandbox" : "configuration";
@@ -3365,8 +3107,8 @@ public:
     } else if (syscallDenied) {
       recordSyscallDenial(s, *p);
     } else if (!p->plannedExit) {
-      s.lastExitCategory = p->lastReason == "watchdog timeout" ? "cpu-watchdog" : "other";
-      if (p->lastReason.empty() && !(config.memoryLimitMiB && memoryExit(s, *p, status)) && p->threaded && !p->durable)
+      s.lastExitCategory = "other";
+      if (p->lastReason.empty() && !(config.memoryLimitMiB && memoryExit(s, *p, status)) && !p->durable)
         fatalExit(s, *p, status);
     }
     auto reason = p->lastReason.empty() ? p->exitStatus : p->lastReason;
@@ -3390,7 +3132,7 @@ public:
     s.restartAt = mono() + delay;
   }
   // Process state for dispatch decisions; no file is opened or read here except at an exit. One request asks
-  // several times in one turn of the event loop (available, select, pausedAdmission, ...); nothing this reads
+  // several times in one turn of the event loop (available, select, ...); nothing this reads
   // changes for the dispatch within that turn, so the first call of a turn refreshes and the others reuse it.
   coworkerd::OncePerTurn refreshTurn{tasks};
   void refresh() {
@@ -3400,15 +3142,10 @@ public:
       drainSyscallObservations(*p);
 #endif
       if (p->pid > 0) reap(s, p);
-      if (config.watchdog && !p->threaded && p->pid > 0 && p->probeStartedAt > 0 && !p->closing) {
-        auto delay = mono() - p->probeStartedAt;
-        if (delay >= config.stuckTimeoutMs) killProcess(*p, "watchdog timeout", delay);
-        else if (delay >= config.probeOverdueMs && p->state == "ready") { p->state = "paused"; event(*p, "pause"); }
-      }
     });
   }
   bool readyForDispatch(const ProcessGeneration& p) const {
-    return p.pid > 0 && p.state == "ready" && p.runtime && !p.runtime->disconnected &&
+    return p.pid > 0 && p.state == "ready" && p.runtime &&
         (!p.durableBudgets || p.durableBudgets->connected);
   }
   bool admitted(const ProcessGeneration& p) const {
@@ -3467,7 +3204,7 @@ public:
       std::vector<std::shared_ptr<ProcessGeneration>> generations;
       std::vector<std::pair<std::string, std::filesystem::path>> reports;
       auto collect = [&](const std::shared_ptr<ProcessGeneration>& process) {
-        if (!process || !process->durable || !process->threaded || process->durableTestStorage || process->pid == 0 ||
+        if (!process || !process->durable || process->durableTestStorage || process->pid == 0 ||
             process->storageCloseUnconfirmed) return;
         auto snapshot = process->lifecycle.read(&process->lastCloseCheckPublication);
         if (snapshot.empty()) return;
@@ -3509,11 +3246,11 @@ public:
     }
   }
   // The slot's current generation runs other bytes than the configured executable.
-  bool binaryMismatch(size_t index, const std::string& configured) const {
+  bool binaryMismatch(size_t index) const {
     const auto& p = slots[index].current;
     if (!p || p->pid == 0 || !p->binary.valid) return false;
-    const auto expected = p->threaded ? threadedConfiguredBinary : configuredBinary;
-    const auto digest = p->threaded ? hasher.lookup(expected) : configured;
+    const auto expected = configuredBinary;
+    const auto digest = hasher.lookup(expected);
     if (digest.empty() || p->binary == expected) return false;
     auto running = hasher.lookup(p->binary);
     return !running.empty() && running != digest;
@@ -3527,6 +3264,7 @@ public:
     if (config.rotationBinaryCheckMs && now >= nextBinaryCheck) {
       nextBinaryCheck = now + config.rotationBinaryCheckMs;
       ++binaryChecks;
+      const auto& executable = config.threadedExecutable;
       auto signature = statSignature(executable);
       if (signature.valid && !(signature == configuredBinary)) {
         ++binaryChanges; binaryChangedAtUnixMs = wall();
@@ -3536,20 +3274,10 @@ public:
         configuredBinary = signature;
       }
       hasher.request(executable, configuredBinary);
-      if (config.ordinaryServer == "threaded") {
-        auto native = statSignature(config.threadedExecutable);
-        if (native.valid && !(native == threadedConfiguredBinary)) {
-          ++binaryChanges; binaryChangedAtUnixMs = wall();
-          automaticRetryAt = 0; automaticBackoffMs = 0;
-          threadedConfiguredBinary = native;
-        }
-        hasher.request(config.threadedExecutable, threadedConfiguredBinary);
-      }
     }
     if (now < automaticRetryAt) return;
     if (config.rotationBinaryCheckMs) {
-      const auto configured = hasher.lookup(configuredBinary);
-      for (size_t i = 0; i < slots.size(); ++i) if (binaryMismatch(i, configured)) enqueueAutomatic(i, "binary");
+      for (size_t i = 0; i < slots.size(); ++i) if (binaryMismatch(i)) enqueueAutomatic(i, "binary");
     }
     for (size_t i = 0; i < slots.size(); ++i) {
       const auto& p = slots[i].current;
@@ -3587,7 +3315,7 @@ public:
   kj::Promise<std::string> closeGenerations(std::function<bool(const Slot&)> which, double deadline = 0);
 
   bool durableStorageDrained(const ProcessGeneration& process) {
-    return !process.durable || !process.threaded || process.durableTestStorage || !durableChannelDrain ||
+    return !process.durable || process.durableTestStorage || !durableChannelDrain ||
         durableChannelDrain(process.id + "-" + std::to_string(process.generation));
   }
   void abortRotation(double now, const std::string& why = "the Server is shutting down") {
@@ -3619,7 +3347,7 @@ public:
       if (!expired && (s.incoming || !s.current || s.current->pid == 0 || s.current->state != "ready")) continue;
       auto request = std::move(*it);
       rotationQueue.erase(it);
-      if (expired || (request.reason == "binary" && !binaryMismatch(request.slot, hasher.lookup(configuredBinary)))) {
+      if (expired || (request.reason == "binary" && !binaryMismatch(request.slot))) {
         for (auto id : request.ids) track(id, "skipped");
         ++rotationCounts["skipped"];
         std::cout << "[process-rotation] {\"event\":\"skipped\",\"processId\":\"" << s.id
@@ -3677,7 +3405,7 @@ public:
       r.contextsAtSwitch = old->openContexts.size();
       r.backgroundAtSwitch = old->backgroundContexts();
       old->retiring = true;
-      if (old->state == "ready" || old->state == "paused") old->state = "draining";
+      if (old->state == "ready") old->state = "draining";
       s.retiring.push_back(old);
       event(*old, "drain", r.reason);
       if (retiring) r.webSocketsClosed = retiring(old->id, old->generation);
@@ -3691,7 +3419,7 @@ public:
     return generationDrained(*r.old, r.switchedAt, now, drainAllowance(*r.old), r.lastLifecycleCheck, r.clearedContexts);
   }
   uint64_t drainAllowance(const ProcessGeneration& process) const {
-    if (process.threaded && (!process.durable || process.durableTestStorage)) {
+    if (!process.durable || process.durableTestStorage) {
       return std::max<uint64_t>(config.rotationDrainTimeoutMs, uint64_t(300000) + config.rotationTermGraceMs);
     }
     return config.rotationDrainTimeoutMs;
@@ -3702,68 +3430,15 @@ public:
       double& lastLifecycleCheck, uint64_t& cleared) {
     old.pullEvents();
     if (old.inFlight > 0) return false;
-    // Ordinary generations retain the original fast path when no context remains.
-    if (!old.durable && !old.threaded && old.openContexts.empty()) return true;
     if (!old.contextsVisible) return now - since >= periodMs;
     if (now - lastLifecycleCheck < (old.durable ? 20 : 100)) return false;
     lastLifecycleCheck = now;
-    if (old.durable || old.threaded) {
-      const auto snapshot = old.lifecycle.readDrain();
-      if (!snapshot || snapshot->observedMs < std::max(since, old.lastDurableReplyAt)) return false;
-      const bool result = !snapshot->active && !snapshot->background && !snapshot->unknown;
-      if (old.durable && !old.drainComparisonRecorded) {
-        old.drainComparisonRecorded = true;
-        ++legacyDrainChecks;
-        // The old durable path registered no invocation contexts and drained at inFlight == 0.
-        if (!result) ++legacyDrainDisagreements;
-      }
-      if (result && old.threaded) {
-        cleared += old.openContexts.size();
-        old.openContexts.clear();
-      }
-      return result;
-    }
-    const auto lifecycle = old.lifecycle.read();
-    if (lifecycle.empty() || lifecycle.front() != '{' || lifecycle.back() != '}') return false;
-    try {
-      capnp::MallocMessageBuilder arena;
-      auto value = arena.initRoot<capnp::JsonValue>();
-      capnp::JsonCodec().decodeRaw(kj::arrayPtr(lifecycle.data(), lifecycle.size()), value);
-      const auto workers = json::field(value, "residentWorkers");
-      if (!workers.isArray()) return false;
-      std::set<std::string> owners, legacyOwners;
-      bool unknownBusy = false;
-      for (auto resident : workers.getArray()) {
-        const auto worker = json::field(resident, "workerId"), version = json::field(resident, "versionId");
-        const auto revision = json::field(resident, "planRevision"), tenant = json::field(resident, "tenant");
-        const auto active = json::field(resident, "active"), background = json::field(resident, "backgroundActive");
-        const bool typed = tenant.isString() && tenant.getString().size() && worker.isString() && worker.getString().size() &&
-            version.isString() && version.getString().size() && revision.isString() && revision.getString().size() &&
-            json::field(resident, "loadGeneration").isNumber() && json::field(resident, "instance").isNumber();
-        const bool busy = (active.isNumber() && active.getNumber() > 0) || (background.isBoolean() && background.getBoolean());
-        if (!typed) {unknownBusy |= busy; continue;}
-        owners.insert(std::string(worker.getString().cStr()) + "@" + version.getString().cStr());
-        const auto name = json::field(resident, "isolate");
-        if (name.isString()) {
-          const std::string isolate = name.getString().cStr();
-          if (isolate.starts_with("coworkerd-v1:")) {
-            const auto hash = isolate.find('#');
-            if (hash != std::string::npos) legacyOwners.insert(isolate.substr(13, hash - 13));
-          }
-        }
-      }
-      if (unknownBusy) return false;
-      const bool legacyWouldDrain = std::all_of(old.openContexts.begin(), old.openContexts.end(), [&](const auto& entry) {
-        return entry.second.finishedAt != 0 && !legacyOwners.contains(entry.second.workerId + "@" + entry.second.versionId);
-      });
-      ++legacyDrainChecks;
-      std::erase_if(old.openContexts, [&](const auto& entry) {
-        if (!entry.second.finishedAt || owners.contains(entry.second.workerId + "@" + entry.second.versionId)) return false;
-        ++old.contextsCleared; ++cleared; return true;
-      });
-      if (legacyWouldDrain != old.openContexts.empty()) ++legacyDrainDisagreements;
-    } catch (const kj::Exception&) {return false;}
-    return old.openContexts.empty();
+    const auto snapshot = old.lifecycle.readDrain();
+    if (!snapshot || snapshot->observedMs < std::max(since, old.lastDurableReplyAt)) return false;
+    if (snapshot->active || snapshot->background || snapshot->unknown) return false;
+    cleared += old.openContexts.size();
+    old.openContexts.clear();
+    return true;
   }
 
   void closeConnections(ProcessGeneration& p) {
@@ -3946,27 +3621,6 @@ public:
         << "\",\"sandbox\":" << generationSandboxJson(*p) << "}";
     return out.str();
   }
-  // A slot's collections: the long ones of every generation (their gc-pause rows) and the current generation's own
-  // counts from its lifecycle snapshot -- full, minor and idle collections, the longest pause of any kind.
-  std::string gcJson(const Slot& s, const std::shared_ptr<ProcessGeneration>& p) const {
-    std::string generation = "null";
-    if (p) {
-      auto row = p->lifecycle.read();
-      if (!row.empty() && row.front() == '{') try {
-        capnp::MallocMessageBuilder message;
-        auto value = message.initRoot<capnp::JsonValue>();
-        capnp::JsonCodec().decodeRaw(kj::arrayPtr(row.data(), row.size()), value);
-        auto gc = json::field(value, "gc");
-        if (gc.isObject()) generation = capnp::JsonCodec().encodeRaw(gc).cStr();
-      } catch (const kj::Exception&) {}
-    }
-    std::ostringstream out;
-    out << std::setprecision(17) << "{\"longPauseMs\":" << config.gcLongPauseMs << ",\"longPauses\":" << s.gcLongPauses
-        << ",\"longestPauseMs\":" << double(s.gcLongestPauseNs) / 1e6
-        << ",\"longestPause\":" << (s.gcLongestPause.empty() ? std::string("null") : s.gcLongestPause)
-        << ",\"generation\":" << generation << "}";
-    return out.str();
-  }
   // The state endpoint carries the latest records; /__coworkerd/rotation carries the whole history.
   std::string rotationStateJson(size_t recentLimit = ROTATION_HISTORY) const {
     std::ostringstream out;
@@ -3975,7 +3629,8 @@ public:
         << ",\"maxAgeMs\":" << config.rotationMaxAgeMs << ",\"maxRequests\":" << config.rotationMaxRequests
         << ",\"residentBytes\":" << config.rotationResidentBytes << ",\"residentBytesSource\":\""
         << escape(config.rotationResidentBytesSource) << "\",\"retryMs\":" << config.rotationRetryMs
-        << ",\"concurrency\":1},\"binary\":{\"path\":\"" << escape(executable) << "\",\"sha256\":\"" << hasher.lookup(configuredBinary)
+        << ",\"concurrency\":1},\"binary\":{\"path\":\"" << escape(config.threadedExecutable)
+        << "\",\"sha256\":\"" << hasher.lookup(configuredBinary)
         << "\",\"checks\":" << binaryChecks << ",\"changes\":" << binaryChanges << ",\"changedAtUnixMs\":" << binaryChangedAtUnixMs
         << ",\"hashes\":" << hasher.counts().first << ",\"hashFailures\":" << hasher.counts().second
         << "},\"automaticBackoffMs\":" << automaticBackoffMs << ",\"inProgress\":";
@@ -4003,11 +3658,11 @@ public:
   }
 };
 
-ProcessPool::ProcessPool(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
+ProcessPool::ProcessPool(ProcessPoolConfig config,
     std::string directory, std::string bindingAddress, std::string sourceAddress,
     kj::AsyncIoProvider& provider, kj::UnixEventPort& eventPort, const kj::HttpHeaderTable& headers,
     Suspects& suspects)
-    : impl(std::make_unique<Impl>(config, std::move(executable), std::move(runtimeFile), std::move(directory),
+    : impl(std::make_unique<Impl>(std::move(config), std::move(directory),
         std::move(bindingAddress), std::move(sourceAddress), provider, eventPort, headers, suspects)) {}
 ProcessPool::~ProcessPool() noexcept(false) = default;
 kj::Promise<void> ProcessPool::run() {
@@ -4053,7 +3708,7 @@ std::optional<ProcessPool::TenantExecutionLimit> ProcessPool::tenantExecutionLim
   const auto tenant = tenantOf(worker);
   TenantExecutionLimit result;
   for (const auto& s : impl->slots) if (!s.durable && s.quarantine == quarantine && s.current &&
-      s.current->threaded && impl->admitted(*s.current)) {
+      impl->admitted(*s.current)) {
     if (s.current->tenantExecution->limited(tenant)) {
       if (result.states.empty()) {
         result.inFlight = s.current->tenantExecution->count(tenant);
@@ -4063,28 +3718,6 @@ std::optional<ProcessPool::TenantExecutionLimit> ProcessPool::tenantExecutionLim
     }
   }
   if (result.states.empty()) return std::nullopt;
-  return result;
-}
-bool ProcessPool::PausedAdmission::alive() const {
-  for (const auto& p : processes)
-    if (p->pid > 0 && (p->state == "paused" || p->state == "ready") && p->runtime &&
-        !p->runtime->disconnected && !p->closing && !p->retiring) return true;
-  return false;
-}
-ProcessPool::PausedAdmission ProcessPool::pausedAdmission(const std::string& worker, const std::string& objectKey) {
-  impl->refresh();
-  PausedAdmission result;
-  if (impl->closingAll || (!objectKey.empty() && impl->durableClosed)) return result;
-  const auto quarantine = quarantined(worker);
-  const auto durableId = objectKey.empty() ? std::string() : impl->durableSlotFor(objectKey);
-  for (const auto& s : impl->slots) {
-    if (objectKey.empty() ? (s.durable || s.quarantine != quarantine) : (!s.durable || s.id != durableId)) continue;
-    const auto& p = s.current;
-    if (!p) continue;
-    if (impl->admitted(*p)) return {};
-    if (p->state == "paused" && p->pid > 0 && p->runtime && !p->runtime->disconnected &&
-        !p->closing && !p->retiring && p->inFlight < impl->config.processInFlightLimit(p->durable)) result.processes.push_back(p);
-  }
   return result;
 }
 uint32_t ProcessPool::durableProcesses() const { return impl->config.durableProcesses; }
@@ -4187,14 +3820,14 @@ std::optional<EgressSource> ProcessPool::egressSource(const std::string& token) 
 
 bool ProcessPool::ready() const {
   return std::all_of(impl->slots.begin(), impl->slots.end(), [](const auto& s) {
-    return s.quarantine || s.durable || (s.current && s.current->state == "ready" && s.current->runtime && !s.current->runtime->disconnected);
+    return s.quarantine || s.durable || (s.current && s.current->state == "ready" && s.current->runtime);
   });
 }
 std::string ProcessPool::quarantineReadinessJson() const {
   std::string out = "[";
   for (const auto& s : impl->slots) {
     if (!s.quarantine) continue;
-    const bool ready = s.current && s.current->state == "ready" && s.current->runtime && !s.current->runtime->disconnected;
+    const bool ready = s.current && s.current->state == "ready" && s.current->runtime;
     if (ready) continue;
     out += std::string(out.size() > 1 ? "," : "") + "{\"processId\":\"" + escape(s.id) + "\",\"state\":\"" +
         escape(s.current ? s.current->state : std::string("none")) + "\"}";
@@ -4204,9 +3837,8 @@ std::string ProcessPool::quarantineReadinessJson() const {
 uint32_t ProcessPool::cpuLimitMs() const { return impl->config.cpuLimitMs; }
 uint32_t ProcessPool::memoryLimitMiB() const { return impl->config.memoryLimitMiB; }
 void ProcessPool::setWorkerLimits(WorkerLimitsView view) { impl->workerLimits = std::move(view); }
-void ProcessPool::setRootMaintenance(std::function<std::shared_ptr<const std::vector<std::string>>()> request,
-    std::function<void(const std::vector<std::string>&)> applied) {
-  impl->rootMaintenance = std::move(request);impl->rootMaintenanceCompleted = std::move(applied);
+void ProcessPool::setRootMaintenance(std::function<void()> maintain) {
+  impl->rootMaintenance = std::move(maintain);
 }
 void ProcessPool::setHostCheckOomGuard(std::function<bool()> guard) { impl->hostCheckOomGuard = std::move(guard); }
 WorkerLimits ProcessPool::effectiveLimits(const std::string& workerId, bool durable) const { return impl->limitsOf(workerId, durable); }
@@ -4263,7 +3895,7 @@ std::optional<std::pair<std::string, uint64_t>> ProcessPool::threadedGenerationH
   const auto quarantine = quarantined(worker);
   std::vector<std::string> ids;
   for (const auto& s : impl->slots)
-    if (!s.durable && s.quarantine == quarantine && s.current && s.current->threaded && s.current->pid > 0) ids.push_back(s.id);
+    if (!s.durable && s.quarantine == quarantine && s.current && s.current->pid > 0) ids.push_back(s.id);
   if (ids.size() == 1) {
     for (const auto& s : impl->slots)
       if (s.id == ids.front() && s.current && impl->admittedTenant(*s.current, worker)) return std::pair{s.id, s.current->generation};
@@ -4373,7 +4005,6 @@ std::vector<SecretDictionary::Residents> ProcessPool::residentPlans() const {
     entry.processId = p->id;
     entry.generation = p->generation;
     entry.current = p == s.current;
-    if (!p->threaded) return;
     const auto snapshot = p->lifecycle.read();
     if (snapshot.empty() || snapshot.front() != '{') return;
     try {
@@ -4400,7 +4031,7 @@ kj::Promise<void> ProcessPool::sampleWorkerSaturation() {
   std::vector<std::shared_ptr<ProcessGeneration>> generations;
   for (const auto& slot : impl->slots) {
     auto process = slot.current;
-    if (!process || !process->threaded || slot.durable || process->pid <= 0) continue;
+    if (!process || slot.durable || process->pid <= 0) continue;
     auto snapshot = process->lifecycle.read();
     if (snapshot.find("\"isolateBusy\":") == std::string::npos) {
       process->saturatedPlans.clear();
@@ -4488,19 +4119,14 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"threadedThreadIdleMs\":" << impl->config.threadedThreadIdleMs
       << ",\"wasmMemoryCapMiB\":" << impl->wasmMemoryCapMiB()
       << ",\"idleEvictMs\":" << impl->config.idleEvictMs
-      << ",\"idleDestroyIntervalMs\":" << impl->config.idleDestroyIntervalMs
       << ",\"quarantineProcesses\":" << impl->config.quarantineProcesses
       << ",\"durableProcesses\":" << impl->config.durableProcesses
       << ",\"inFlightLimit\":" << impl->config.inFlightLimit
       << ",\"durableInFlightLimit\":" << impl->config.durableInFlightLimit() << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
-      << ",\"probeOverdueMs\":" << impl->config.probeOverdueMs << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
+      << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
       << ",\"watchdog\":" << (impl->config.watchdog ? "true" : "false") << ",\"restartBackoffMs\":" << impl->config.restartBackoffMs
       << ",\"restartMaxMs\":" << impl->config.restartMaxMs
-      << ",\"gc\":{\"budgetMs\":" << impl->config.gcBudgetMs << ",\"refillMsPerSecond\":" << impl->config.gcRefillMsPerSecond
-      << ",\"longPauseMs\":" << impl->config.gcLongPauseMs << ",\"idleCollectAfterMs\":" << impl->config.gcIdleCollectAfterMs
-      << ",\"idleCollectMinGrowthMiB\":" << impl->config.gcIdleCollectMinGrowthMiB
-      << ",\"initialOldSpaceMiB\":" << impl->config.gcInitialOldSpaceMiB << ",\"runtimeHeapMiB\":" << impl->config.gcRuntimeHeapMiB
-      << "},\"v8Sandbox\":" << (impl->config.sandboxPlanJson.empty() ? std::string("null") : impl->config.sandboxPlanJson)
+      << ",\"v8Sandbox\":" << (impl->config.sandboxPlanJson.empty() ? std::string("null") : impl->config.sandboxPlanJson)
       << "},\"entries\":[";
   size_t i = 0;
   for (const auto& s : impl->slots) {
@@ -4513,13 +4139,9 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
         << ",\"residentBytes\":" << residentBytes(p ? p->pid : 0)
         << ",\"state\":\"" << (p ? p->state : "starting") << "\",\"restartCount\":" << s.restarts << ",\"exitCount\":" << s.exits
         << ",\"cpuTerminatedRequests\":" << s.cpuTerminatedRequests << ",\"cpuInvalidatedIsolates\":" << s.cpuInvalidatedIsolates
-        << ",\"cpuReloadedIsolates\":" << s.cpuReloadedIsolates << ",\"gc\":" << impl->gcJson(s, p)
+        << ",\"cpuReloadedIsolates\":" << s.cpuReloadedIsolates
         << ",\"probeAttempts\":" << (p ? p->probeAttempts : 0)
         << ",\"probeFailures\":" << (p ? p->probeFailures : 0)
-        << ",\"rootMaintenanceAttempts\":" << (p ? p->rootMaintenanceAttempts : 0)
-        << ",\"rootMaintenanceFailures\":" << (p ? p->rootMaintenanceFailures : 0)
-        << ",\"rootMaintenanceCompleted\":" << (p ? p->rootMaintenanceCompleted : 0)
-        << ",\"rootMaintenancePending\":" << (p ? p->rootMaintenancePending : 0)
         << ",\"lastExitedGeneration\":" << s.lastExitedGeneration << ",\"lastExitAtUnixMs\":" << s.lastExitAtUnixMs
         << ",\"lastReason\":\"" << escape(p && !p->lastReason.empty() ? p->lastReason : s.lastReason) << "\",\"inFlight\":" << (p ? p->inFlight : 0)
         << ",\"lastExitCategory\":\"" << s.lastExitCategory << "\",\"memoryTerminatedRequests\":" << s.memoryTerminatedRequests
@@ -4565,16 +4187,12 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
     out << (firstResidentTenant ? "" : ",") << "\"" << escape(tenant) << "\":" << count;
     firstResidentTenant = false;
   }
-  out << "},\"legacyLifecycleComparison\":{\"drainChecks\":" << impl->legacyDrainChecks
-      << ",\"drainDisagreements\":" << impl->legacyDrainDisagreements
-      << ",\"limitChecks\":" << impl->legacyLimitChecks << ",\"limitDisagreements\":" << impl->legacyLimitDisagreements << "}"
+  out << "}"
       << ",\"lifecycleLabels\":{\"typed\":" << sampled.resident.typed
       << ",\"missing\":" << sampled.resident.missing << ",\"comparable\":" << sampled.resident.comparable
       << ",\"matches\":" << sampled.resident.matches << ",\"mismatches\":" << sampled.resident.mismatches
       << "},\"recentKills\":[";
   for (size_t j = 0; j < impl->kills.size(); ++j) { if (j) out << ','; out << impl->kills[j]; }
-  out << "],\"recentGcPauses\":[";
-  for (size_t j = 0; j < impl->recentGcPauses.size(); ++j) { if (j) out << ','; out << impl->recentGcPauses[j]; }
   out << "],\"workerCpuStats\":[";
   size_t workerIndex = 0;
   for (const auto& [worker, stats] : impl->workerCpuStats) {
@@ -4894,7 +4512,6 @@ std::string ProcessPool::memoryJson() const {
   };
   strings("kills", impl->kills);  // Latest 32 CPU kill records.
   strings("memoryCrashes", impl->memoryCrashes);  // Latest 32 memory crash records.
-  strings("recentGcPauses", impl->recentGcPauses);  // Latest 32 long-GC records.
   strings("channelExits", impl->channelExits);  // Latest 32 exited limit channel records.
   strings("recentLaunchFailures", impl->recentLaunchFailures);  // Latest 32 failed launches.
   strings("recentDenials", impl->sandbox.syscalls.recentDenials);  // Latest 32 syscall denials.

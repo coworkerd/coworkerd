@@ -1,4 +1,4 @@
-// The driver prepends the pinned runtime's SqlDatabase class, DurableObject import and backend flag.
+// The driver prepends the platform SqlDatabase class, DurableObject import and binding selection.
 const statements = {
   cold: ['SELECT 1 AS value'],
   create: ['CREATE TABLE IF NOT EXISTS sample(id INTEGER PRIMARY KEY, value INTEGER NOT NULL)'],

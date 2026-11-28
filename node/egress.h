@@ -10,16 +10,14 @@
 #include <string>
 #include <vector>
 
-// Tenant Workers' outbound requests (docs/egress-and-auth.md). Every tenant Worker's global outbound is the
-// runtime's Egress entrypoint (runtime/runtime.js), bound to that Worker's identity when the loader loads it; it hands
-// the request to the external service "egress" of the workerd configuration, <stack>/run/egress.sock, in the proxy
-// form (the request line carries the whole URL), with the header
+// Tenant Workers' outbound requests reach the node's egress socket from the threaded kernel
+// in proxy form, with the full destination URL in the request line and this header:
 //
 //   x-coworkerd-egress-source: <the process's egress token> {"workerId":...,"versionId":...}
 //
 // workerId is the Worker's full name, <tenant>/<worker>; its tenant is the one the limits, the rules and the
 // metering are kept for.
-// The token is the one this node gave that workerd process (its configuration's EGRESS_TOKEN): only the runtime holds
+// The token is the one this node gave the threaded process at launch. Only the kernel holds
 // it, no tenant code can read it, so a request without a live process's token is not from a runtime and is refused
 // (rule unknown-source). The service then, per request: the tenant's limits (in flight, per second); the rules on the
 // name; the node's own resolution of the name, every address checked and the connection pinned to the checked

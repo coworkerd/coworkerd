@@ -335,7 +335,7 @@ struct DurableLogChannelTest {
   static void threadedAlarms() {
     auto io = kj::setupAsyncIo();
     MembershipView membership;
-    DurableLog log({.config = {}, .objectStore = false, .threadedAlarmEvents = true},
+    DurableLog log({.config = {}, .objectStore = false},
         {}, io.provider->getNetwork(), io.provider->getTimer(), *io.lowLevelProvider, membership, {});
     double now = 1000;
     uint64_t wall = 500000;
@@ -426,7 +426,7 @@ struct DurableLogChannelTest {
     complete(AlarmOutcome::FIRED);
     now = log.alarms.at(key).notBeforeMs;
     flush();
-    KJ_REQUIRE(attempts.back().alarm.retryCount == 0 && log.alarms.at(key).countedRetries == 0);
+    KJ_REQUIRE(attempts.back().alarm.retryCount == 0 && log.alarms.at(key).retries == 0);
 
     complete(AlarmOutcome::NOT_DUE, wall + 50);
     KJ_REQUIRE(log.alarms.at(key).atUnixMs == wall + 50);
@@ -656,7 +656,7 @@ struct DurableLogChannelTest {
           }
           return forced ? *forced : tracker.judge(epoch, now);
         }, [&](std::string) { ++lost; });
-    const int peer = log.openChannel("d0");
+    const int peer = log.openChannel("d0", 1);
     KJ_REQUIRE(peer >= 0);
     auto& channel = log.channels.at("d0");
     const auto ns = std::string(64, '1'), id = std::string(64, '3');
@@ -1146,7 +1146,7 @@ struct DurableLogChannelTest {
     log.settings.config.peers = 1;
     log.setNodeEpoch(1).wait(io.waitScope);
     KJ_REQUIRE(!log.logAppendFailed);
-    const int process = log.openChannel("d0");
+    const int process = log.openChannel("d0", 1);
     KJ_REQUIRE(process >= 0);
     auto& channel = log.channels.at("d0");
     std::vector<std::string> hosts;

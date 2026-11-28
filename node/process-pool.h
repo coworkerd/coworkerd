@@ -46,7 +46,6 @@ public:
   std::function<void()> closeSqlInput;
   kj::Promise<void> rejectAfterCrash(kj::Exception&& error);
   kj::Promise<void> onExit();
-  bool threadedServer() const;
   bool threadedDurableTestRole() const;
   bool threadedDurableRole() const;
   bool cpuLimitExceeded() const;
@@ -83,7 +82,7 @@ private:
 class ProcessPool final {
 public:
   std::string memoryJson() const;
-  ProcessPool(ProcessPoolConfig config, std::string executable, std::string runtimeFile,
+  ProcessPool(ProcessPoolConfig config,
       std::string directory, std::string bindingAddress, std::string sourceAddress,
       kj::AsyncIoProvider& provider, kj::UnixEventPort& eventPort, const kj::HttpHeaderTable& headers,
       Suspects& suspects);
@@ -95,16 +94,6 @@ public:
     std::vector<std::shared_ptr<TenantExecutionState>> states;
   };
   std::optional<TenantExecutionLimit> tenantExecutionLimit(const std::string& worker);
-  // The original paused generations, only when none of this target's processes is admitted.
-  // Retaining the snapshot never waits for a replacement generation after death or rotation.
-  struct PausedAdmission {
-    explicit operator bool() const { return !processes.empty(); }
-    bool alive() const;
-  private:
-    friend class ProcessPool;
-    std::vector<std::shared_ptr<ProcessGeneration>> processes;
-  };
-  PausedAdmission pausedAdmission(const std::string& worker, const std::string& objectKey = {});
   bool quarantined(const std::string& worker) const;
   // Ready to take work: every ordinary process (a quarantine shard's state does not decide it).
   bool ready() const;
@@ -122,9 +111,8 @@ public:
     std::function<uint32_t()> maxMemoryMiB;
   };
   void setWorkerLimits(WorkerLimitsView view);
-  // Local namespace removals from the node's current catalog, retried independently for each durable generation.
-  void setRootMaintenance(std::function<std::shared_ptr<const std::vector<std::string>>()> request,
-      std::function<void(const std::vector<std::string>&)> applied);
+  // Poll namespace removals from the node's catalog on the supervisor cadence.
+  void setRootMaintenance(std::function<void()> maintain);
   // cgroup OOM counters have no victim identity: helper exposure makes a new
   // increment foreign, rather than evidence against a workerd SIGKILL exit.
   void setHostCheckOomGuard(std::function<bool()> guard);

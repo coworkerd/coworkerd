@@ -364,8 +364,9 @@ network. It uses one node, one ordinary workerd process and one threaded durable
 with a fresh cluster. Run the trial on an otherwise quiet Linux machine with the build tools above.
 The [Linux throughput report](../../docs/database-throughput.md) records the exact product revisions and raw runs.
 
-Build the current Object product and the two products from [the original comparison](../../docs/database-home-benchmark.md).
-The native SQLite experiment was built separately in #59. Its daemon and kernel pin come from that checkout.
+Build the current Object product to measure current throughput. The two products from
+[the original comparison](../../docs/database-home-benchmark.md) use the archived driver
+that prepared their Worker fixture. Their daemons and kernel pins come from their own checkouts.
 
 ```sh
 # Run from the checkout containing this benchmark. Use absolute paths for the product checkouts.
@@ -373,18 +374,20 @@ object_main=$PWD
 git fetch origin refs/pull/59/head
 git worktree add --detach ../object-84 3cd208d51ebe78d1c19c7e7e7ec7e85cbf29e2dd
 git worktree add --detach ../native-84 e88acea9a3630c67388dbccdd994b4d843a953eb
+git worktree add --detach ../database-benchmark-driver 6f0c75fa55447c1a519a45de4a6d4a018f24254b
+archived_driver=$(cd ../database-benchmark-driver && pwd)
 
 measure() {
-  local side=$1 checkout=$2 report=$3 kernel
+  local driver=$1 side=$2 checkout=$3 report=$4 kernel
   (cd "$checkout" && bash scripts/build.sh) || return
   kernel=$(cd "$checkout" && python3 scripts/fetch-kernel.py) || return
-  COWORKERD_CLUSTER_BIN_DIR="$checkout/build" node tests/cluster/database-home-benchmark.mjs \
+  COWORKERD_CLUSTER_BIN_DIR="$checkout/build" node "$driver/tests/cluster/database-home-benchmark.mjs" \
     "$side" "$checkout" "$kernel" "$report" --throughput
 }
 
-measure object "$object_main" "$PWD/throughput-object-main.jsonl"
-measure object "$(cd ../object-84 && pwd)" "$PWD/throughput-object-84.jsonl"
-measure native "$(cd ../native-84 && pwd)" "$PWD/throughput-native-84.jsonl"
+measure "$object_main" object "$object_main" "$PWD/throughput-object-main.jsonl"
+measure "$archived_driver" object "$(cd ../object-84 && pwd)" "$PWD/throughput-object-84.jsonl"
+measure "$archived_driver" native "$(cd ../native-84 && pwd)" "$PWD/throughput-native-84.jsonl"
 ```
 
 Finish builds and other CPU or I/O work before starting a timed trial. Use `--throughput-smoke` in place of

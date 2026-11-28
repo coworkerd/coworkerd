@@ -16,8 +16,7 @@ namespace coworkerd {
 // has been killed so the drainer can read each pipe to its end.
 //
 // Tenant lines: the node hands the drainer each Worker's console lines as that process's runtime sent them over the
-// source socket, from the tail channel workerd gives each loaded Worker under the Worker's own identity
-// (runtime/runtime.js, TenantLog). The drainer keeps them in a per-tenant buffer: at most linesPerSecond lines per
+// source socket with the Worker's identity. The drainer keeps them in a per-tenant buffer: at most linesPerSecond lines per
 // tenant and second (the rest dropped and counted in one [dropped] entry), lines cut at maxLineBytes; a tenant's own
 // quota replaces both limits. Nothing a workerd process writes on its standard output or error counts as a Worker's
 // line, whatever it holds.
