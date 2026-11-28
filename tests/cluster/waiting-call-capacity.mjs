@@ -37,7 +37,7 @@ const plan = options.batches === undefined ? [8, 16, 24, 16, 24, 8, 24, 8, 16] :
   options.batches.split(',').map(value => integer(value, 1, maxCalls));
 assert.ok(plan.length <= 12 && plan.reduce((total, count) => total + count, 0) <= 60000,
   'use at most 12 batches and 60,000 offers in one run');
-const waitMs = integer(options['wait-ms'], 2000, 12000);
+const waitMs = integer(options['wait-ms'], 2000, 24000);
 const rampMs = integer(options['ramp-ms'], 0, waitMs - 500);
 const expectFull = options['expect-full'] || options.batches === undefined;
 const rootLimit = optionalLimit('root-limit');
@@ -400,8 +400,11 @@ async function run() {
     console.log(JSON.stringify({ offered, ...summary, recovered: !recovered.error }));
     assert.ok(!recovered.error, recovered.error);
     if (options['expect-first-resource']) {
-      if (number < plan.length - 1) assert.equal(summary.replies, offered, 'sub-capacity batch refused');
-      else {
+      assert.equal(summary.heldFullDelay, summary.replies, 'each admitted call must wait for the full hold');
+      if (number < plan.length - 1) {
+        assert.equal(summary.replies, offered, 'sub-capacity batch refused');
+        assert.equal(summary.peak, offered, 'sub-capacity batch did not fully overlap');
+      } else {
         const first = summary.firstResource?.result;
         assert.ok(first, 'the largest batch must produce a resource refusal');
         assert.equal(first.code, 'OVERLOADED');

@@ -10931,6 +10931,9 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << "},\"processPool\":{\"count\":" << p.count << ",\"quarantineProcesses\":" << p.quarantineProcesses
       << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"ordinaryInFlightLimit\":" << p.inFlightLimit
       << ",\"durableInFlightLimit\":" << p.durableInFlightLimit()
+      << ",\"ordinaryCeilingSource\":" << q(p.ordinaryInFlightLimit ? "processPool.ordinaryInFlightLimit" :
+          p.sharedInFlightLimit ? "processPool.inFlightLimit" : p.demandDrivenCalls ? "process-memory-budget" : "legacy-default")
+      << ",\"threadedMemoryBytes\":" << p.threadedMemoryBytes
       << ",\"demandDrivenCalls\":" << b(p.demandDrivenCalls) << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
       << ",\"stuckTimeoutMs\":" << p.stuckTimeoutMs << ",\"restartBackoffMs\":" << p.restartBackoffMs << ",\"restartMaxMs\":" << p.restartMaxMs
       << ",\"pausedAdmissionWaitMs\":" << p.pausedAdmissionWaitMs
@@ -10953,7 +10956,10 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"syscalls\":{\"mode\":" << q(p.syscallsMode) << ",\"allowlistPath\":" << q(p.allowlistPath)
       << ",\"steady\":{\"mode\":" << q(p.steadySyscallsMode) << ",\"allowlistPath\":" << q(p.steadyAllowlistPath) << "}}"
       << "},\"placement\":{\"ingressPlacement\":" << b(c.ingressPlacement) << ",\"rootLimit\":" << c.rootLimit << ",\"nestedLimit\":" << c.nestedLimit
+      << ",\"rootLimitExplicit\":" << b(c.rootLimitGiven) << ",\"nestedLimitExplicit\":" << b(c.nestedLimitGiven)
       << ",\"nodeTaskBudget\":" << c.callTasks.capacity << ",\"nodeTaskReserve\":" << c.callTasks.baseline
+      << ",\"nodeTaskBudgetSource\":" << q(!c.callTasksSource.empty() ? "pids.max" :
+          c.callTasks.capacity != 0 ? "RLIMIT_NPROC" : "unreported")
       << ",\"nodeDescriptorBudget\":" << c.callDescriptors.capacity << ",\"nodeDescriptorReserve\":" << c.callDescriptors.baseline
       << ",\"tenantRootLimit\":" << c.tenantRootLimit << ",\"tenantNestedLimit\":" << c.tenantNestedLimit
       << ",\"tenantBorrowBelowPercent\":" << c.tenantBorrowBelowPercent
