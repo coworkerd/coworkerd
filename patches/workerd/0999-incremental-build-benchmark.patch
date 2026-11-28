@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Team cow-b <codex@openai.com>
+Date: Sat, 28 Nov 2026 10:50:48 +0800
+Subject: [PATCH] Exercise incremental builds with two server source edits
+
+
+diff --git a/src/workerd/server/actor-id-impl.c++ b/src/workerd/server/actor-id-impl.c++
+index 61af4ed..533771b 100644
+--- a/src/workerd/server/actor-id-impl.c++
++++ b/src/workerd/server/actor-id-impl.c++
+@@ -90,7 +90,7 @@ kj::Own<ActorIdFactory::ActorId> ActorIdFactoryImpl::idFromStringNamed(
+   auto decoded = kj::decodeHex(str);
+   JSG_REQUIRE(str.size() == SHA256_DIGEST_LENGTH * 2 && !decoded.hadErrors &&
+           decoded.size() == SHA256_DIGEST_LENGTH,
+-      TypeError, "Invalid Durable Object ID: must be 64 hex digits");
++      TypeError, "Invalid Durable Object ID: expected 64 hexadecimal digits");
+   return idFromRaw(decoded, kj::mv(name));
+ }
+ 
+diff --git a/src/workerd/server/schema-file.c++ b/src/workerd/server/schema-file.c++
+index 24f2875..d772651 100644
+--- a/src/workerd/server/schema-file.c++
++++ b/src/workerd/server/schema-file.c++
+@@ -12,11 +12,11 @@ namespace workerd::server {
+ kj::Maybe<kj::Own<capnp::SchemaFile>> tryImportBulitin(kj::StringPtr name) {
+   if (name == "/capnp/c++.capnp") {
+     return kj::heap<BuiltinSchemaFileImpl>("/capnp/c++.capnp", CPP_CAPNP_SCHEMA);
+-  } else if (name == "/workerd/workerd.capnp") {
++  }
++  if (name == "/workerd/workerd.capnp") {
+     return kj::heap<BuiltinSchemaFileImpl>("/workerd/workerd.capnp", WORKERD_CAPNP_SCHEMA);
+-  } else {
+-    return kj::none;
+   }
++  return kj::none;
+ }
+ 
+ }  // namespace workerd::server
