@@ -100,6 +100,20 @@ The sequential report includes the cumulative `admissionWalTimeouts` and the cha
 node tests/cluster/durable-idle-measure.mjs "$kernel" build/durable-residency.jsonl --residency
 ```
 
+### Threaded unconfirmed close recovery
+
+```sh
+node tests/cluster/run.mjs "$kernel" durable-threaded-unconfirmed-close
+```
+
+The fixture supplies an unconfirmed-close lifecycle count for one threaded generation while both
+replication peers hold a write's acknowledgements. It checks the pre-execution refusal during drain,
+releases the acknowledgements, and observes the old process exit before the successor starts and reads
+the confirmed value. It prints the elapsed time from setting the report to the first successful read and
+the times recorded by the rotation supervisor. The old report stays in place. The fixture also leaves
+a second report queued behind another rotation while the reported process exits. Once the queue
+advances, the node skips the stale request and the ready replacement keeps serving.
+
 ### Single-node waiting calls
 
 The fixture enables ingress placement and sends ordinary stateless Worker requests to a private

@@ -1817,8 +1817,15 @@ public:
     auto value = closeUnconfirmed
         ? refusal("DO_UNAVAILABLE", DURABLE_CLOSE_UNCONFIRMED_REASON)
         : refusal("OVERLOADED", DURABLE_CAPACITY_REASON);
-    value.notExecuted = true;
-    value.retryable = !closeUnconfirmed;
+    value.notExecuted = value.retryable = true;
+    return value;
+  }
+
+  std::optional<InvocationRejection> durableCloseRecoveryRefusal(const std::string& objectKey) {
+    if (!runtime.durableCloseRecoveryPending(objectKey)) return std::nullopt;
+    auto value = refusal("DO_UNAVAILABLE", "the durable process of this object (" +
+        runtime.durableProcessFor(objectKey) + ") is being replaced after an unconfirmed storage close");
+    value.notExecuted = value.retryable = true;
     return value;
   }
 
@@ -1927,6 +1934,10 @@ public:
       value.inFlight = limited->inFlight; value.limit = limited->limit;
       value.notExecuted = value.retryable = true;
       if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
+      return value;
+    }
+    if (durable) if (auto value = durableCloseRecoveryRefusal(durable->key())) {
+      if (record) observeRefusal(*value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
       return value;
     }
     if (const auto limit = runtime.fullProcessLimit(worker, durable ? durable->key() : "")) {
@@ -7779,6 +7790,8 @@ private:
     if (alarm == nullptr && !coworkerd::acceptsForwardedAlarm(target.alarmAtUnixMs)) {
       co_return refused(server.refusal("NOT_SUPPORTED", "the threaded durable role only accepts local alarm dispatch", 501));
     }
+    const auto objectKey = target.key();
+    if (auto recovering = server.durableCloseRecoveryRefusal(objectKey)) co_return refused(*recovering);
     // This machine's files for the object are brought up to date with its replicated history first: a shard taken
     // over from another node, or an object whose write was not confirmed, is rebuilt before it serves anything
     // (node/durable-log.h). The object's data is its log, not this machine's files.
@@ -7802,8 +7815,10 @@ private:
     // Recovery may close the durable process to discard refused local frames. Wait for its replacement after
     // rebuilding as well as after an independent restart, before admission or opening the event.
     const auto waitUntil = std::min(deadline, monotonicTimeMs() + DURABLE_WAIT_MS);
-    while (!target.alarmAtUnixMs && !server.durableReady(target.key()) && monotonicTimeMs() < waitUntil)
+    while (!target.alarmAtUnixMs && !server.durableReady(objectKey) && monotonicTimeMs() < waitUntil) {
+      if (auto recovering = server.durableCloseRecoveryRefusal(objectKey)) co_return refused(*recovering);
       co_await server.clock().afterDelay(10 * kj::MILLISECONDS);
+    }
     auto admitted = co_await server.admit(version->workerId, version->definitionHash, false, deadline, false, false,
         &target, target.alarmAtUnixMs == 0);
     if (admitted.refused) co_return refused(*admitted.refused);

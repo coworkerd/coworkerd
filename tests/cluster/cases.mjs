@@ -1484,20 +1484,25 @@ async function threadedObjectSqlHeap(cluster) {
     assert.equal(state.objectSqliteConnections, 0);
     return state;
   });
+  assert.equal(idle.unconfirmedCloseIdentities, 0);
   // One request must reopen the confirmed storage without waiting for the
   // retained cursor from the old connection or starting repair.
   const reopened = json(await call(0, 'read'), 200, 'first request after confirmed SQLite close');
   assert.notEqual(reopened.instance, first.instance);
   assert.deepEqual(reopened.values, first.values);
-  await eventually('the reopened SQLite connection is charged', async () => {
+  const afterReopen = await eventually('the reopened SQLite connection is charged', async () => {
     const after = await snapshot();
     assert.equal(after.objectSqliteConnections, 1);
     assert.ok(after.sqliteHeapReservedBytes > 0);
+    return after;
   }, { timeout: 5000 });
+  assert.equal(afterReopen.unconfirmedCloseIdentities, 0);
   assert.doesNotMatch(await cluster.compose(['logs', '--no-color', cluster.nodes[0]], {
     maxBuffer: 8 * 1024 ** 2,
   }), /did not find a valid scope|memoryBytes underflow|SQLite heap charge remained/);
   console.log(JSON.stringify({
+    unconfirmedAfterRetirement: idle.unconfirmedCloseIdentities,
+    unconfirmedAfterReopen: afterReopen.unconfirmedCloseIdentities,
     pid: original.pid, generation: original.generation, openConnections: count,
     oneConnectionReservedBytes: opened.sqliteHeapReservedBytes,
     warmedConnectionReservedBytes: warmed.sqliteHeapReservedBytes,
@@ -3643,6 +3648,158 @@ async function waitForDurableRotation(cluster, node, before, requestId, drainOut
   }, { timeout: 45000 });
 }
 
+async function durableUnconfirmedClose(cluster) {
+  const [owner, ...peers] = cluster.nodes;
+  await waitForDurableMembership(cluster);
+  const tenant = await cluster.tenant('unconfirmed-close');
+  await cluster.deploy(tenant, 'record', `
+    import { DurableObject } from 'cloudflare:workers';
+    export class Record extends DurableObject {
+      async fetch(request) {
+        if (request.method === 'POST') {
+          const value = await request.json();
+          await this.ctx.storage.put('value', value);
+          return Response.json(value);
+        }
+        return Response.json(await this.ctx.storage.get('value') ?? null);
+      }
+    }
+    export default { async fetch(request, env) {
+      const url = new URL(request.url);
+      if (url.searchParams.has('upload')) return new Response(await request.text());
+      return env.RECORDS.getByName(url.searchParams.get('object')).fetch(request);
+    } };
+  `, { wrangler: {
+    durable_objects: { bindings: [{ name: 'RECORDS', class_name: 'Record' }] },
+    migrations: [{ tag: 'v1', new_sqlite_classes: ['Record'] }],
+  } });
+  const namespace = () => cluster.api(`${tenant.path}/workers/record/namespaces/Record`, { token: tenant.token });
+  const { namespaceId, shards } = await namespace();
+  const path = `/${tenant.name}/record`;
+  let target;
+  for (let i = 0; i < 32 && !target; ++i) {
+    const name = `object-${i}`;
+    const id = createHash('sha256').update(Buffer.from(namespaceId, 'hex')).update('name').update(name).digest('hex');
+    const shard = Number(BigInt(`0x${id.slice(0, 16)}`) % BigInt(shards));
+    const candidate = `${path}?object=${name}`;
+    await eventually('the candidate Durable Object opens', async () => {
+      assert.equal(json(await request(cluster.urls[owner], candidate), 200, 'initial read'), null);
+    });
+    if ((await namespace()).owners.some(row => row.shard === shard && row.nodeId === owner && !row.released)) {
+      target = candidate;
+    }
+  }
+  assert.ok(target, 'the threaded node owns a candidate object');
+  assert.equal(json(await request(cluster.urls[owner], target, { method: 'POST', body: 'warm' }),
+    200, 'open the peer confirmation streams'), 'warm');
+  await waitForWalPeers(cluster, owner);
+  const report = generation => writeFile(join(cluster.durableLifecycleGate,
+    `unconfirmed-close-${generation.processId}-${generation.generation}`), '');
+  const rotation = async () => (await cluster.state(owner)).processes.rotation;
+  const old = await durableGeneration(cluster, owner);
+  assert.equal(old.lifecycle.durableAdmission.unconfirmedCloseIdentities, 0);
+  const confirmed = 'confirmed during recovery drain';
+  let reportedAt;
+  assert.equal(await heldPeerWrite(cluster, peers, cluster.urls[owner] + target, confirmed, async () => {
+    reportedAt = performance.now();
+    await report(old);
+    await eventually('the close report drains the old generation while peer acknowledgements are held', async () => {
+      const { inProgress } = await rotation();
+      assert.equal(inProgress?.reason, 'unconfirmed-close');
+      assert.equal(inProgress.oldGeneration, old.generation);
+      assert.equal(inProgress.phase, 'draining');
+      assert.ok(inProgress.inFlightAtSwitch > 0);
+      assert.equal(inProgress.oldExitedAtUnixMs, 0);
+      assert.equal(inProgress.newGeneration, 0);
+    }, { timeout: 2500, interval: 25 });
+    const refusal = json(await request(cluster.urls[owner], target), 503, 'read during close recovery');
+    assert.equal(refusal.code, 'DO_UNAVAILABLE');
+    assert.equal(refusal.dispatched, false);
+    assert.equal(refusal.retryable, true);
+  }), false, 'the old generation waits for write confirmation before it exits');
+
+  const recovered = await eventually('the reported generation exits and its successor reads the confirmed write', async () => {
+    const { recent } = await rotation();
+    const record = recent.find(row => row.reason === 'unconfirmed-close');
+    assert.equal(record?.outcome, 'completed');
+    assert.equal(record.oldGeneration, old.generation);
+    assert.ok(record.queuedMs >= 0);
+    assert.equal(record.drainOutcome, 'drained');
+    assert.equal(record.sigkill, false);
+    assert.ok(record.terminatedAtUnixMs > 0 && record.oldExitedAtUnixMs >= record.terminatedAtUnixMs);
+    const successor = await durableGeneration(cluster, owner);
+    assert.equal(successor.generation, old.generation + 1);
+    assert.equal(successor.generation, record.newGeneration);
+    assert.equal(successor.pid, record.newPid);
+    assert.ok(successor.spawnedAtUnixMs >= record.oldExitedAtUnixMs);
+    assert.equal(json(await request(cluster.urls[owner], target), 200, 'confirmed value after exit'), confirmed);
+    return { record, successor, reportToReadMs: Math.round(performance.now() - reportedAt) };
+  }, { interval: 25 });
+  const { record, successor, reportToReadMs } = recovered;
+  console.log(`Unconfirmed close recovery ${JSON.stringify({
+    reportToReadMs, queuedMs: record.queuedMs, drainMs: record.drainMs, closeMs: record.closeMs,
+    exitToReadyMs: record.readyAtUnixMs - record.oldExitedAtUnixMs,
+  })}`);
+  assert.equal((await rotation()).requestedByReason['unconfirmed-close'], 1);
+
+  // Keep a separate rotation active until the next reported generation has exited on its own.
+  const ordinary = (await cluster.state(owner)).processes.entries.find(row => row.processClass === 'ordinary');
+  let upload;
+  const held = fetch(`${cluster.urls[owner]}${path}?upload`, {
+    method: 'POST', duplex: 'half', signal: AbortSignal.timeout(15000),
+    body: new ReadableStream({
+      start(controller) {
+        upload = controller;
+        upload.enqueue(new TextEncoder().encode('held'));
+      },
+      cancel() { upload = undefined; },
+    }),
+  }).catch(error => ({ error }));
+  let queued;
+  let replacement;
+  let heldResponse;
+  try {
+    await eventually('the ordinary generation holds the upload', async () => {
+      const entry = (await cluster.state(owner)).processes.entries.find(row => row.processId === ordinary.processId);
+      assert.ok(entry.inFlight > 0);
+    });
+    const blocker = await rotationRequest(cluster, owner, ordinary.processId);
+    await eventually('the upload holds the ordinary rotation in drain', async () => {
+      const { records: [current] } = await rotationStatus(cluster, owner, blocker);
+      assert.equal(current?.phase, 'draining');
+    });
+    await report(successor);
+    queued = await eventually('the second report queues against the still-live generation', async () => {
+      const { queue } = await rotation();
+      const rows = queue.filter(row => row.reason === 'unconfirmed-close');
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].requestIds.length, 1);
+      return rows[0].requestIds[0];
+    }, { interval: 25 });
+    await cluster.compose(['exec', '-T', owner, 'sh', '-c', 'kill -TERM "$1"', 'sh', String(successor.pid)]);
+    replacement = await eventually('the regular reaper replaces the generation while its report is queued', async () => {
+      const generation = await durableGeneration(cluster, owner);
+      assert.equal(generation.generation, successor.generation + 1);
+      const row = (await rotation()).queue.find(row => row.requestIds.includes(queued));
+      assert.deepEqual(row?.requestIds, [queued]);
+      return generation;
+    }, { interval: 25 });
+  } finally {
+    upload?.close();
+    heldResponse = await held;
+  }
+  if (heldResponse.error) throw heldResponse.error;
+  assert.equal(heldResponse.status, 200);
+  assert.equal(await heldResponse.text(), 'held');
+  await eventually('the stale report is skipped without retiring the ready successor', async () => {
+    const { requests: [status] } = await rotationStatus(cluster, owner, queued);
+    assert.equal(status.status, 'skipped');
+  }, { interval: 25 });
+  assert.equal((await durableGeneration(cluster, owner)).pid, replacement.pid);
+  assert.equal(json(await request(cluster.urls[owner], target), 200, 'confirmed value after a stale report'), confirmed);
+  assert.equal((await rotation()).requestedByReason['unconfirmed-close'], 2);
+}
+
 async function durableRotationRecovery(cluster) {
   const [threaded, ingress, other] = cluster.nodes;
   const peers = [ingress, other];
@@ -4974,5 +5131,8 @@ export const durableGatedCases = {
   },
   'durable-threaded-retirement': {
     test: threadedSocketRetirement, nodes: ['node-1', 'node-2', 'node-3'], controlDurableLifecycle: true,
+  },
+  'durable-threaded-unconfirmed-close': {
+    test: durableUnconfirmedClose, nodes: ['node-1'], controlDurableLifecycle: true, confirmTimeoutMs: 10000,
   },
 };
