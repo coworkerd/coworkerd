@@ -59,7 +59,7 @@ export class Cluster {
     holdPeerAcks = false, durableFixtureNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
     budgetLifetime, nodeEnvironment, nodeVolumes, nodeComposeResources, binariesDirectory, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
-    databaseFixtureNodes = [], databaseAlarmFixture = false, alarmWallMs,
+    databaseAlarmFixture = false, alarmWallMs,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -95,7 +95,6 @@ export class Cluster {
     this.productRoot = productRoot;
     this.publishPeerPorts = publishPeerPorts;
     this.platformFixture = platformFixture;
-    this.databaseFixtureNodes = new Set(databaseFixtureNodes);
     this.databaseAlarmFixture = databaseAlarmFixture;
     this.alarmWallMs = alarmWallMs;
   }
@@ -206,14 +205,6 @@ export class Cluster {
         volumes: [{ type: 'bind', source: config, target, read_only: true }, ...(this.nodeVolumes?.(node) ?? [])],
       };
       if (this.budgetLifetime) overrides[node].environment.COWORKERD_LEASE_TTL_MS = String(this.budgetLifetime.leaseMs);
-      // The database benchmark can run archived product binaries that require the placement fixture.
-      if (this.databaseFixtureNodes.has(node)) {
-        overrides[node].environment.COWORKERD_TEST_THREADED_DATABASES = '1';
-        if (!this.databaseAlarmFixture) {
-          overrides[node].volumes.push({ type: 'bind', source: join(binaries, 'coworkerd-platform-test'),
-            target: '/opt/coworkerd/bin/coworkerd', read_only: true });
-        }
-      }
       if (this.alarmWallMs !== undefined) {
         overrides[node].environment.COWORKERD_TEST_ALARM_WALL_MS = String(this.alarmWallMs);
       }

@@ -93,7 +93,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   durableFixtureNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
   // The imported Cluster from a historical checkout uses the original option.
   threadedNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
-  ...((idleWindow || threadedSqlThroughput) && {
+  ...(BenchmarkCluster !== Cluster && {
     databaseFixtureNodes: ['node-1'],
     // The imported Cluster from a historical checkout uses the singular option.
     databaseFixtureNode: 'node-1',
@@ -127,10 +127,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   }),
 });
 const [owner] = cluster.nodes;
-if (idleWindow) {
-  assert.ok(cluster.databaseFixtureNodes?.has(owner) ?? (cluster.databaseFixtureNode === owner),
-    'supply a database placement checkout');
-}
+const usesDatabaseFixture = cluster.databaseFixtureNodes?.has(owner) || cluster.databaseFixtureNode === owner;
 const tenantName = 'database-benchmark';
 const workload = 'traffic';
 const databaseCount = mixedCeiling === 'memory' ? settings.homes + 120
@@ -183,7 +180,7 @@ async function provenance() {
     productHashes[file] = sha256(await readFile(join(checkout, file)));
   }
   const executables = ['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher'];
-  if (idleWindow || threadedSqlThroughput) executables.push('coworkerd-platform-test');
+  if (usesDatabaseFixture) executables.push('coworkerd-platform-test');
   for (const file of executables) {
     hashes[file] = sha256(await readFile(join(binaries, file)));
   }
