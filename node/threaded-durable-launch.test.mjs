@@ -32,8 +32,8 @@ check the new instance and stored value, while the child must retain its ready P
 It does not send JavaScript RPC calls.
 The disposable role defaults to four home loops, capped by the startup thread limit, and 64 roots per
 copy. Cold placement closes at 64 MiB or 3000 ms busy time in a four-second window. The per-object
-waiting mailbox defaults to 512 events/2 MiB. Reservations keep 256 descriptors plus five per home
-outside admission, then charge 16 KiB/four descriptors per root and 4 KiB/one descriptor per event plus
+waiting mailbox defaults to 512 events/2 MiB. Reservations keep 256 descriptors for process control and charge five per
+created home, then charge 16 KiB/four descriptors per root and 4 KiB/one descriptor per event plus
 declared waiting bytes. Facets reserve their own metadata and descriptors. The capacity, queue,
 pressure and overlap measurements in PR #43 cover these reservation costs. Actual body execution
 remains subject to the copy/process memory limits.
@@ -44,7 +44,7 @@ ingress fixture uses 32 call slots so its concurrency limit does not hide durabl
 The `group-refusal` mode injects one empty V8-group factory result only in the disposable role, then
 requires returned reservations, successful retry and the original ready child. This does not simulate
 physical address-space exhaustion; `COWORKERD_DO_TEST_REFUSE_GROUP` is zero by default.
-The fixture can vary the home and mailbox limits with `COWORKERD_DO_TEST_HOME_COUNT`,
+The fixture varies the home ceiling via `durableObjects.maxHomes` and the placement and mailbox limits via
 `COWORKERD_DO_TEST_TREES_PER_COPY`, `COWORKERD_DO_TEST_MAILBOX_EVENTS` and
 `COWORKERD_DO_TEST_MAILBOX_BYTES`. `COWORKERD_DO_TEST_PLACEMENT_BYTES` and
 `COWORKERD_DO_TEST_BUSY_MS` control placement, and `COWORKERD_DO_TEST_FD_HEADROOM` sets the
@@ -116,6 +116,11 @@ const placement = scenario === 'placement' || placementControl;
 const exerciseEvents = loadCancel || cpuEvents || warmCopies || boundedEvents || measure || placement || httpLifecycle || outputGate || httpMemory || groupRefusal || overlap;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
+const maxHomes = overlap ? 4
+  : homeReservation || warmCopies || loadCancel ? 2
+  : cpuEvents ? 1
+  : queues || measure || placement || httpLifecycle || httpMemory ? homeCount
+  : undefined;
 if (measure || placement) {
   assert.ok(Number.isInteger(homeCount) && homeCount >= 1 && homeCount <= 32);
   assert.ok(Number.isInteger(Number(busyArg)) && Number(busyArg) > 0 && Number(busyArg) <= 4000);
@@ -130,22 +135,18 @@ const env = {
   TMPDIR: scratch,
   ...(outputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
   ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
-  ...(overlap ? { COWORKERD_DO_TEST_HOME_COUNT: '4' } : {}),
-  ...(homeReservation || warmCopies ? { COWORKERD_DO_TEST_HOME_COUNT: '2' } : {}),
-  ...(loadCancel ? { COWORKERD_DO_TEST_HOME_COUNT: '2', COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST: '2500',
+  ...(loadCancel ? { COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST: '2500',
     COWORKERD_LEASE_TTL_MS: '4000' } : {}),
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
-  ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg, COWORKERD_DO_TEST_MAILBOX_EVENTS: '4',
+  ...(queues ? { COWORKERD_DO_TEST_MAILBOX_EVENTS: '4',
     COWORKERD_DO_TEST_MAILBOX_BYTES: String(mailboxBytes) } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
-  ...(cpuEvents ? { COWORKERD_CPU_LIMIT_MS: '250', COWORKERD_THREADED_TRACE_FOR_TEST: '1',
-    COWORKERD_DO_TEST_HOME_COUNT: '1' } : {}),
+  ...(cpuEvents ? { COWORKERD_CPU_LIMIT_MS: '250', COWORKERD_THREADED_TRACE_FOR_TEST: '1' } : {}),
   ...(boundedEvents ? {
     COWORKERD_CPU_LIMIT_MS: '250',
     COWORKERD_THREADED_TRACE_FOR_TEST: '1',
   } : {}),
   ...(measure || placement || httpLifecycle || httpMemory ? {
-    COWORKERD_DO_TEST_HOME_COUNT: homeArg,
     COWORKERD_DO_TEST_TREES_PER_COPY: treeArg,
     ...(placement ? { COWORKERD_DO_TEST_BUSY_MS: busyArg } : {}),
   } : {}),
@@ -161,9 +162,9 @@ const config = {
   nodeId: 'fixture',
   ...(httpMemory ? { memoryLimitMiB: 128 } : {}),
   durableObjects: {
-    processes: 1, threadedTestStorage: true, ...(measure || placement || queues || httpLifecycle || httpMemory ? { residentObjects: 0 } : {}),
+    processes: 1, threadedTestStorage: true, maxHomes, ...(measure || placement || queues || httpLifecycle || httpMemory ? { residentObjects: 0 } : {}),
   },
-  processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: overlap ? 32 : 8,
+  processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: overlap ? 32 : Math.max(8, maxHomes ?? 0),
     ...(queueLimit ? { threadedExecutable: descriptorLimitedThreaded } : {}) },
   quarantineProcesses: 0,
   sandbox: { mode: 'off', syscalls: { mode: 'off' } },
@@ -525,8 +526,11 @@ try {
   assert.equal(paths.length, 1);
   const stack = join(scratch, paths[0]);
   const socketPath = join(stack, 'run', processInfo.socket);
-  assert.equal((await readAdmission(socketPath)).workerThreads,
-    Number(env.COWORKERD_DO_TEST_HOME_COUNT ?? Math.min(4, config.processPool.inFlightLimit)));
+  const empty = await readAdmission(socketPath);
+  assert.equal(empty.maxHomes, maxHomes ?? 16384);
+  assert.equal(empty.workerThreads, 0);
+  assert.equal(empty.homeReservedBytes, 0);
+  assert.equal(empty.homeReservedDescriptors, 0);
   const ordinary = await sendPreface(socketPath, 'T');
   ordinary.socket.destroy();
   assert.equal(ordinary.receipt, 'R');
@@ -591,11 +595,12 @@ try {
       const tasks = join('/proc', String(processInfo.pid), 'task');
       const rows = await Promise.all((await readdir(tasks)).map(async tid =>
         [(await readFile(join(tasks, tid, 'comm'), 'utf8')).trim(), Number(tid)]));
-      return rows.filter(([name]) => name === 'cwkd-call').map(([, tid]) => tid).sort((a, b) => a - b);
+      return rows.filter(([name]) => name === 'cwkd-home').map(([, tid]) => tid).sort((a, b) => a - b);
     };
     // Observe actual Linux home loops, not just the reservation table's thread dimension.
-    const originalThreads = await homeThreads();
-    assert.equal(originalThreads.length, 2);
+    const preludeThreads = await homeThreads();
+    assert.equal(preludeThreads.length, 1);
+    let originalThreads;
     const keep = [];
     const claim = async (id, definition) => {
       const connection = await sendPreface(socketPath,
@@ -611,7 +616,10 @@ try {
       }
       const occupied = await waitForAdmission(socketPath, 2, 2);
       assert.equal(occupied.homes, 2);
-      assert.deepEqual(await homeThreads(), originalThreads);
+      originalThreads = await homeThreads();
+      assert.equal(originalThreads.length, 2);
+      assert.ok(originalThreads.includes(preludeThreads[0]));
+      assert.equal(occupied.homeReservedDescriptors, 10);
       const refused = await claim('3', 'definition-three');
       assert.equal(refused.receipt, 'R',
         'a definition without a reservable home must be refused before acknowledgement');
@@ -622,6 +630,7 @@ try {
       assert.equal(bounded.reservedBytes, occupied.reservedBytes);
       assert.equal(bounded.reservedDescriptors, occupied.reservedDescriptors);
       assert.deepEqual(await homeThreads(), originalThreads, 'refusal must not create another home thread');
+      assert.equal(bounded.lastHomeRefusal, 'home-ceiling');
     } finally {
       for (const socket of keep) socket.destroy();
     }
@@ -1207,7 +1216,7 @@ try {
         const maxFiles = Number(soft);
         assert.equal(maxFiles, 512);
         assert.equal(Number(hard), 512);
-        const remaining = maxFiles - 256 - homeCount * 5 - reserved.reservedDescriptors;
+        const remaining = maxFiles - 256 - reserved.homeReservedDescriptors - reserved.reservedDescriptors;
         assert.ok(remaining >= 0 && remaining < (accepted % 4 === 0 ? 5 : 1));
         assert.ok(full.descriptors <= maxFiles - 256, 'fixed descriptor headroom consumed');
       } else if (queueMemory) {

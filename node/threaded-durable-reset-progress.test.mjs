@@ -17,7 +17,7 @@ const configPath = join(fixture, 'node.json');
 const manifestPath = join(fixture, 'workers', 'manifest.json');
 const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
-  TMPDIR: scratch, COWORKERD_DO_TEST_HOME_COUNT: '1', COWORKERD_CPU_LIMIT_MS: '250',
+  TMPDIR: scratch, COWORKERD_CPU_LIMIT_MS: '250',
 };
 const token = 'fixture-management-placeholder';
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -141,7 +141,7 @@ try {
     }]}],
   });
   const config = JSON.stringify({nodeId: 'fixture',
-    durableObjects: {processes: 1, threadedTestStorage: true},
+    durableObjects: {processes: 1, threadedTestStorage: true, maxHomes: 1},
     processPool: {count: 1, inFlightLimit: 4}, quarantineProcesses: 0,
     sandbox: {mode: 'off', syscalls: {mode: 'off'}}, peerListenAddress: '127.0.0.1:0',
     memoryWatermarkEnabled: false, hostCheck: {intervalMs: 0}, management: {token},

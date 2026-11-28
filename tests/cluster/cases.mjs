@@ -953,6 +953,111 @@ async function threadedDatabaseAdmission(cluster) {
   console.log('Three busy homes refused a fourth database. Idle admission preserved the queued read and confirmed rows.');
 }
 
+async function durableHomeReuse(cluster) {
+  const [owner] = cluster.nodes;
+  const tenants = [];
+  for (const name of ['home-first', 'home-second', 'home-third']) {
+    const tenant = await cluster.tenant(name);
+    tenants.push(tenant);
+    await cluster.deploy(tenant, 'worker', `
+      import { DurableObject } from 'cloudflare:workers';
+      let copy;
+      export class Counter extends DurableObject {
+        instance = crypto.randomUUID();
+        async fetch(request) {
+          copy ??= crypto.randomUUID();
+          const op = new URL(request.url).pathname;
+          if (op === '/hold') {
+            await new Promise(resolve => { this.release = resolve; });
+            this.release = undefined;
+          }
+          if (op === '/release') this.release?.();
+          if (op === '/write') await this.ctx.storage.put('value', await request.text());
+          return Response.json({ copy, instance, value: (await this.ctx.storage.get('value')) ?? null });
+        }
+      }
+      export default { fetch(request, env) {
+        const { pathname, searchParams } = new URL(request.url);
+        return env.OBJECT.getByName(pathname.split('/').at(-1)).fetch(
+          'http://object/' + (searchParams.get('op') ?? 'read'),
+          searchParams.has('value') ? { method: 'POST', body: searchParams.get('value') } : {});
+      } };
+    `, { wrangler: {
+      durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'Counter' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['Counter'] }],
+    } });
+  }
+  const [first, second, third] = tenants;
+  const call = (tenant, root, params = {}) => request(cluster.urls[owner],
+    `/${tenant.name}/worker/${root}?${new URLSearchParams(params)}`, { timeout: 12000 });
+  const read = async (tenant, root) => json(await call(tenant, root), 200, `${tenant.name}/${root}`);
+  const snapshot = () => durableGeneration(cluster, owner);
+  const initial = await eventually('the empty child reserves no homes', async () => {
+    const child = await snapshot();
+    assert.equal(child.lifecycle.durableAdmission.workerThreads, 0);
+    assert.equal(child.lifecycle.durableAdmission.homeReservedDescriptors, 0);
+    assert.equal(child.lifecycle.durableAdmission.homeReservedBytes, 0);
+    return child;
+  });
+  await waitForDatabaseCatalog(cluster);
+  const roots = new Map();
+  for (const tenant of [first, second]) {
+    const copies = [];
+    for (const root of ['a', 'b']) {
+      const value = tenant.name + '-' + root;
+      const saved = json(await call(tenant, root, { op: 'write', value }), 200, 'confirmed write');
+      assert.equal(saved.value, value);
+      roots.set(value, saved);
+      copies.push(saved.copy);
+    }
+    assert.equal(copies[0], copies[1], 'both roots share one home');
+  }
+  assert.notEqual(roots.get('home-first-a').copy, roots.get('home-second-a').copy);
+
+  const holdFirst = call(first, 'a', { op: 'hold' });
+  const holdSecond = call(second, 'a', { op: 'hold' });
+  void holdFirst.catch(() => {});
+  void holdSecond.catch(() => {});
+  try {
+    await eventually('both homes have a running event and an idle sibling', async () => {
+      const { lifecycle: { durableAdmission: state } } = await snapshot();
+      assert.equal(state.running, 2);
+      assert.equal(state.residentRoots, 4);
+    }, { interval: 25 });
+    const refusal = json(await call(third, 'a'), 503, 'all homes are in use');
+    assertDurableCapacityRefusal(refusal);
+    assert.equal((await snapshot()).lifecycle.durableAdmission.homeRetirements, 0);
+    json(await call(first, 'a', { op: 'release' }), 200, 'release the first home');
+    json(await holdFirst, 200, 'first running event completed');
+
+    const newcomer = await read(third, 'a');
+    assert.notEqual(newcomer.copy, roots.get('home-first-a').copy);
+    const retained = await read(second, 'b');
+    assert.deepEqual(retained, roots.get('home-second-b'), 'the other home was preserved');
+    await eventually('one retirement returned both roots on the same child', async () => {
+      const state = await snapshot();
+      assert.equal(state.pid, initial.pid);
+      assert.equal(state.generation, initial.generation);
+      assert.equal(state.lifecycle.durableAdmission.workerThreads, 2);
+      assert.equal(state.lifecycle.durableAdmission.homeRetirements, 1);
+      assert.equal(state.lifecycle.durableAdmission.admissionRetirements, 2);
+    }, { interval: 25 });
+
+    const reopened = await read(first, 'a');
+    assert.equal(reopened.value, 'home-first-a');
+    assert.notEqual(reopened.instance, roots.get(reopened.value).instance);
+    assert.notEqual(reopened.copy, roots.get(reopened.value).copy);
+    const sibling = await read(first, 'b');
+    assert.equal(sibling.value, 'home-first-b');
+    assert.notEqual(sibling.instance, roots.get(sibling.value).instance);
+    assert.equal(sibling.copy, reopened.copy);
+  } finally {
+    const releases = await Promise.allSettled([first, second].map(tenant => call(tenant, 'a', { op: 'release' })));
+    assert.ok(releases.some(result => result.status === 'fulfilled'));
+    json(await holdSecond, 200, 'the event on the protected home completed');
+  }
+}
+
 async function threadedDatabaseAdmissionMixed(cluster) {
   const [owner] = cluster.nodes;
   const homes = 4;
@@ -4438,11 +4543,16 @@ export const durableGatedCases = {
   'durable-threaded-database-admission': {
     test: threadedDatabaseAdmission, nodes: ['node-1'],
     controlDurableLifecycle: true, confirmTimeoutMs: 15000,
-    nodeEnvironment: () => ({ COWORKERD_DO_TEST_HOME_COUNT: '3' }),
+    configureNode: () => ({ durableObjects: { threadedStorage: true, confirmTimeoutMs: 15000, maxHomes: 3 } }),
+  },
+  'durable-threaded-home-reuse': {
+    test: durableHomeReuse, nodes: ['node-1'], singleNode: true, holdPeerAcks: false,
+    configureNode: () => ({ durableObjects: { threadedStorage: true, peers: 0, maxHomes: 2 } }),
   },
   'durable-threaded-database-admission-mixed': {
     test: threadedDatabaseAdmissionMixed, nodes: ['node-1'],
     singleNode: true, holdPeerAcks: false,
+    configureNode: () => ({ durableObjects: { threadedStorage: true, maxHomes: 4 } }),
   },
   'durable-threaded-database-accounting': {
     test: threadedDatabaseAccounting, nodes: ['node-1'], holdPeerAcks: false,

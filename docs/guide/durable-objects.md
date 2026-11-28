@@ -189,19 +189,25 @@ An acknowledged alarm whose hint or owner marker has not published before its no
 | Tenant bytes | 10 GiB by default (`durableObjectBytes`), using lagging per-node summaries; deleting namespaces / databases stop counting |
 | Logs | 256 KiB per event before truncation; the tenant's line rate, line size and buffer limits also apply |
 
-By default, a threaded durable process has four homes. Each version isolate copy can
-hold up to 1,024 object trees. A memory reset of a copy discards the in-memory instances
-of every tree it holds. Their confirmed SQLite state is available on reopen.
+A threaded durable process starts home threads as placements need them. Each home owns
+one version isolate copy, which can hold up to 1,024 object trees. Available process memory,
+native threads and file descriptors bound how many homes the process can run. Each home
+reserves one thread, five file descriptors and 256 KiB for its native loop. The isolate's
+heap, SQLite and other allocations also count toward process memory. Each root reserves
+four descriptors and 16 KiB for routing. The safety ceiling `durableObjects.maxHomes`
+defaults to 16,384 and reserves no resources at startup.
 
-When a new ordinary object needs a place in a threaded durable process, it waits for an
-eligible idle tree to retire. The router prefers homes ready to run retirement and chooses
-by least recent use among them. This selection is process-wide. A new object can retire
-another tenant's idle object, which then reloads from confirmed storage on its next call.
-When a working set exceeds the available places, objects can retire and reopen repeatedly.
+Placement first looks for a compatible copy. An eligible idle tree can give up its place
+when a compatible copy or the process's resident-object budget is full. When an incoming
+definition needs a home and the process cannot start one, it reuses the least recently used
+home whose trees are all idle. This can retire several trees from another tenant at once.
+Each retired tree reloads from confirmed SQLite storage on its next call. A working set
+larger than the available resources can cause repeated retirement and reopening. A memory
+reset of a copy also discards every in-memory tree in that copy.
 
 Retirement follows the existing facet and WebSocket hibernation rules. Queued calls, active
 events, tracked pending work and unfinished handoffs keep their tree in place. When no
-eligible tree can make room, the call receives `OVERLOADED` with `dispatched: false` and
+eligible tree or home can make room, the call receives `OVERLOADED` with `dispatched: false` and
 `retryable: true`. If the node's five-second retirement retry window runs out, it returns
 the same capacity refusal. Per-copy placement, memory and descriptor limits also apply.
 With the upstream backend, active trees can temporarily exceed the resident target.

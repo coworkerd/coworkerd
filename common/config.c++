@@ -79,6 +79,8 @@ void ProcessPoolConfig::validate() const {
       "processPool.threadedResidentLimit must be between 1 and 1840");
   KJ_REQUIRE(quarantineProcesses <= 256, "invalid quarantine process capacity");
   KJ_REQUIRE(durableProcesses <= 64, "durableObjects.processes is at most 64");
+  KJ_REQUIRE(durableMaxHomes > 0 && durableMaxHomes <= 16384,
+      "durableObjects.maxHomes is between 1 and 16384");
   KJ_REQUIRE(sqlCpuLimitMs > 0 && sqlCpuLimitMs <= 60000,
       "processPool.sqlCpuLimitMs is between 1 and 60000");
   KJ_REQUIRE(sqlWallLimitMs > 0 && sqlWallLimitMs <= 60000,
@@ -256,6 +258,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.quarantineProcesses = root.getQuarantineProcesses();
   auto durable = root.getDurableObjects();
   result.processPool.durableProcesses = durable.getProcesses();
+  result.processPool.durableMaxHomes = durable.getMaxHomes();
   result.durableSocketFrameBytesPerNode = durable.getSocketFrameBytesPerNode();
   result.durableLog.peers = durable.getPeers();
   result.durableLog.confirmTimeoutMs = durable.getConfirmTimeoutMs();

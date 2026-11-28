@@ -588,6 +588,7 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | --- | --- | --- |
 | `processes` | `1` | Number of durable workerd slots, not per tenant |
 | `threadedStorage` | `false` | Experimental Linux opt-in with object-store membership. Serves Worker Durable Object HTTP requests and JavaScript RPC. When this node owns a database shard, it serves [HTTP SQL and D1](databases.md#threaded-database-capacity) on the threaded backend. Persistent facet cloning is refused as `NOT_SUPPORTED`. Keep the default upstream backend for product deployments. |
+| `maxHomes` | `16384` | Safety ceiling for home threads in each threaded durable process. Range 1–16384. Threads, memory and descriptors are reserved on demand. |
 | `peers` | `2` | Reachable peers that hold committed frames in memory; at most 8; fewer reachable peers reduce K; an empty selected list uses a local flush, but an entirely unreachable nonempty list waits / times out |
 | `confirmTimeoutMs` | `5000` | Confirmation deadline; range 100–29000 ms |
 | `recoverTimeoutMs` | `30000` | How long an object request waits for recovery; at least 1000 ms |
@@ -610,8 +611,14 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
 | `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
 
-See [threaded object admission](durable-objects.md#threaded-object-admission) for the experimental
-backend's per-object waiting limits.
+A threaded durable process draws its home threads from the thread budget given by
+`processPool.inFlightLimit`. Each created home reserves one thread, five descriptors and
+256 KiB for its loop. A new isolate copy also reserves 2.5 MiB to begin loading, then charges
+the process for its allocated heap, SQLite and other tracked memory. A root reserves four
+descriptors and 16 KiB for routing. Objects of one Worker definition can share a copy.
+Each open database owns a copy and a home. Empty home threads can be reused after their trees
+retire. See [threaded object admission](durable-objects.md#threaded-object-admission) for
+per-object waiting limits.
 
 A single encoded WAL record is limited to `min(64 MiB, 256 MiB, peerBufferBytes, UInt32 message limit) - 4 KiB`
 (67,104,768 bytes with defaults), so an acknowledged record fits the existing peer recovery RPC. The normal

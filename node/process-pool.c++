@@ -2655,7 +2655,8 @@ public:
       childEnvironment.push_back("COWORKERD_DO_RESIDENT_OBJECTS=" + std::to_string(durableLog.residentObjects));
     }
     if (p->durable && p->threaded) {
-      for (const auto* name : {"COWORKERD_DO_TEST_HOME_COUNT", "COWORKERD_DO_TEST_TREES_PER_COPY",
+      childEnvironment.push_back("COWORKERD_DO_MAX_HOMES=" + std::to_string(config.durableMaxHomes));
+      for (const auto* name : {"COWORKERD_DO_TEST_TREES_PER_COPY",
                "COWORKERD_DO_TEST_PLACEMENT_BYTES", "COWORKERD_DO_TEST_BUSY_MS",
                "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",
                "COWORKERD_DO_TEST_FD_HEADROOM", "COWORKERD_DO_TEST_COMMIT_DELAY_MS",

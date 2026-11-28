@@ -17,13 +17,15 @@ by `durableObjectBytes` (10 GiB by default).
 
 A Linux shard owner with [`durableObjects.threadedStorage`](install.md#durable-objects-and-local-storage)
 enabled serves both D1 bindings and HTTP SQL. Each open database has its own isolate copy and
-home. At the default home count, one durable process handled four busy databases at once.
-Two processes handled eight when the database keys were distributed across both. Each process
-receives a share of the node's memory budget, and a smaller resource budget can lower capacity.
+home. Memory, native threads and descriptors determine how many stay open in each durable
+process. The home reserves a thread, five descriptors and 256 KiB for the native loop. Its root
+reserves four descriptors and 16 KiB for routing. The isolate and SQLite allocations also
+count toward the process's memory share. The safety ceiling `durableObjects.maxHomes`
+defaults to 16,384 and starts home threads on demand.
 
-When a new database needs room, the process releases its least recently used eligible idle
-database. An active call, queued call, or pending storage confirmation keeps its database
-resident. A later call reopens the released database with its confirmed data.
+When a new database needs a home, the process can reuse the least recently used eligible
+idle home. An active call, queued call, or pending storage confirmation keeps its home in
+place. A later call reopens a retired database with its confirmed data.
 An eligible idle database also releases its copy about 10 seconds after its last request.
 An explicit admission refusal returns HTTP `503 OVERLOADED` with `dispatched: false`
 and `retryable: true`.
