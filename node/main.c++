@@ -10542,7 +10542,8 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << ",\"prefetchConcurrency\":" << d.cache.prefetchConcurrency
       << "},\"hostCheck\":{\"intervalMs\":" << c.hostCheck.intervalMs << ",\"sampleMiB\":" << c.hostCheck.sampleMiB
       << "},\"processPool\":{\"count\":" << p.count << ",\"quarantineProcesses\":" << p.quarantineProcesses
-      << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
+      << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"durableInFlightLimit\":" << p.durableInFlightLimit
+      << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
       << ",\"stuckTimeoutMs\":" << p.stuckTimeoutMs << ",\"restartBackoffMs\":" << p.restartBackoffMs << ",\"restartMaxMs\":" << p.restartMaxMs
       << ",\"pausedAdmissionWaitMs\":" << p.pausedAdmissionWaitMs
       << ",\"watchdog\":" << b(p.watchdog) << ",\"idleEvictMs\":" << p.idleEvictMs << ",\"idleDestroyIntervalMs\":" << p.idleDestroyIntervalMs

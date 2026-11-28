@@ -81,6 +81,13 @@ void memoryConfiguration(Fixture& fixture) {
 void tenantBorrowConfiguration(Fixture& fixture) {
   const auto defaults = fixture.load("{}");
   KJ_REQUIRE(defaults.tenantRootLimit == 0 && defaults.tenantNestedLimit == 0 && defaults.tenantBorrowBelowPercent == 0);
+  KJ_REQUIRE(defaults.rootLimit == 2048 && defaults.nestedLimit == 2304);
+  KJ_REQUIRE(defaults.processPool.inFlightLimitFor(false) == 2432 && defaults.processPool.inFlightLimitFor(true) == 512);
+  const auto oldRootOnly = fixture.load(R"({"placement":{"rootLimit":200},"processPool":{"inFlightLimit":600}})");
+  KJ_REQUIRE(oldRootOnly.rootLimit == 200 && oldRootOnly.nestedLimit == 384);
+  KJ_REQUIRE(oldRootOnly.processPool.inFlightLimitFor(false) == 600 && oldRootOnly.processPool.inFlightLimitFor(true) == 600);
+  const auto oldNestedOnly = fixture.load(R"({"placement":{"nestedLimit":300}})");
+  KJ_REQUIRE(oldNestedOnly.rootLimit == 128 && oldNestedOnly.nestedLimit == 300);
   const auto explicitConfig = fixture.load(R"({"placement":{"tenantRootLimit":16,"tenantNestedLimit":16,"tenantBorrowBelowPercent":88}})");
   KJ_REQUIRE(explicitConfig.tenantRootLimit == 16 && explicitConfig.tenantNestedLimit == 16 && explicitConfig.tenantBorrowBelowPercent == 88);
   KJ_REQUIRE(fixture.load(R"({"placement":{"tenantBorrowBelowPercent":100}})").tenantBorrowBelowPercent == 100);

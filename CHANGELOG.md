@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Behavior change.** The node defaults allow 2,048 roots, with nested calls admitted up to 2,304 total calls in flight. Ordinary and quarantine processes default to 2,432 simultaneous calls. The durable-process default stays at 512. A configuration that specifies just one placement limit keeps the previous default for the other. See the [installation guide](docs/guide/install.md#waiting-call-capacity) for the reading and startup requirements.
+
 - **Behavior change.** Per-tenant outbound concurrency and rate limits are off by default. Set `egress.concurrency` to `32` and `egress.requestsPerSecond` to `100` to keep the previous defaults. Existing explicit settings keep their values.
 
 - **Diagnostic and profiling renames.** Update environment settings to use the new names. The old names are removed.

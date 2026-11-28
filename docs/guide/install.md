@@ -471,6 +471,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `management.token` | required | The management token (see section 8); the environment variable `COWORKERD_MANAGEMENT_TOKEN` takes precedence. A node without one refuses to start |
 | `management.allowWithoutToken` | `false` | `true` lets a development node start without a token: its management endpoints are then open to whoever reaches its ingress or peer port, and it warns at startup |
 | `processPool.count` | `1` | The number of ordinary workerd processes |
+| `processPool.inFlightLimit` | `2432` for ordinary and quarantine processes, `512` for durable processes | Concurrent calls per process. An explicit value applies to every process class. This setting sizes the native call-thread pool for ordinary and quarantine processes. |
 | `processPool.ordinaryServer` | `threaded` | C++ backend for ordinary and quarantine processes: HTTP, JS RPC, outbound calls, logs, bindings, object stubs, CPU and memory limits, eviction and generation draining. `upstream` is refused for this setting. Durable processes use the Rust backend |
 | `processPool.threadedExecutable` | `coworkerd-threaded` beside `workerdPath` | Executable used when the ordinary backend is `threaded`. Build it with `//src/workerd/threaded:coworkerd-threaded` in the matching workerd fork |
 | `processPool.threadedMemoryBytes` | `0` | Native process memory budget in bytes. `0` divides 80% of the node's actual memory budget among ordinary, quarantine and durable processes plus one replacement generation. An explicit value cannot exceed this share |
@@ -510,6 +511,8 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `membership.clockSkewToleranceMs` / `membership.createSettleMs` | `2000` / `1000` | How far this machine's clock may be from the store's `Date` (more refuses the start, and is only warned of while running); how long a new epoch's registration settles before it is read back |
 | `membership.backend` / `desiredState.backend` | `objectStore` with the `storage` block | Where the members and the desired state are kept: a node started with `--config` requires `objectStore` for both, and `file` is only the command line's test form (a 0.3 `etcd` backend is refused, section 9) |
 | `desiredState.pollIntervalMs` | `5000` | How often the node reads the tenant index's hint, and what changed (50 to 3600000) |
+| `placement.rootLimit` | `2048` | Refuse a new root call once the node has this many roots and nested calls in flight. |
+| `placement.nestedLimit` | `2304` | Refuse a new nested call once the node has this many roots and nested calls in flight. It must exceed the root limit. |
 | `placement.tenantRootLimit` | `0` | Per-tenant share for concurrent root calls on this node. `0` disables this check; the node-wide `rootLimit` still applies. |
 | `placement.tenantNestedLimit` | `0` | Per-tenant share for concurrent nested calls on this node. `0` disables this check; the node-wide `nestedLimit` still applies. |
 | `placement.tenantBorrowBelowPercent` | `0` | Integer between `0` and `100`. `0` keeps enabled per-tenant limits hard. Otherwise, a tenant beyond its share can borrow while total node occupancy (roots plus nested calls) is strictly below this percentage of `rootLimit` for a root or `nestedLimit` for a nested call. At or above that threshold, new calls beyond a tenant’s share get the existing retryable `503 OVERLOADED` tenant refusal. Calls already admitted may finish. Node state at `placement.tenantAdmission` shows current `borrowed` occupancy and cumulative `busyRejections` by tenant and call type. |
@@ -546,6 +549,22 @@ Names ending in `_FOR_TEST` are for tests only.
 `COWORKERD_PEER_KEY_FILE` (by default `cluster-key.json` there, used when present), `COWORKERD_PEER_ADDRESS`, `COWORKERD_LISTEN_ADDRESS`, `COWORKERD_PEER_LISTEN_ADDRESS`,
 `COWORKERD_PROCESS_COUNT`, `COWORKERD_STACK_DIR`, and `COWORKERD_CONTROL_ADDRESS` (the control plane's address, written into `egress.clusterAddresses`, default `apiserver:8940`);
 with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give the same configuration. The secrets directory is `COWORKERD_SECRETS_DIR` (default `/var/lib/coworkerd-secrets`); either way the management token, `COWORKERD_MANAGEMENT_TOKEN` or else the secrets directory's `management-token`, reaches the node through its environment, so it takes precedence over a file's `management.token`.
+
+### Waiting-call capacity
+
+The root and nested placement limits both count the node's total calls in flight. The gap between
+the defaults reserves 256 slots so calls already admitted can make nested calls. The ordinary
+and quarantine process limit leaves 128 additional slots beyond the node's nested threshold.
+A configuration that specifies only one placement limit keeps the previous default for the
+other (`128` roots or `384` total at nested admission).
+
+At startup the default Linux pool (one ordinary process, two quarantine processes and one durable
+process) requires about 4.6 GiB of node memory and at least 9,876 tasks of headroom for call threads
+and generation replacement. The Linux UID and cgroup task limits are both checked. The file
+descriptor budget also grows with the process limit. With the default 2,048 WebSocket upgrades,
+the calculated daemon descriptor soft limit is at least 53,888. A node with smaller resource
+budgets can set `placement.rootLimit`, `placement.nestedLimit` and `processPool.inFlightLimit`
+explicitly. [Inbound WebSocket capacity](#inbound-websocket-capacity)
 
 ### Invocation budgets
 
