@@ -616,8 +616,8 @@ a replacement generation. Each created home reserves one thread, five descriptor
 256 KiB for its loop. A new isolate copy also reserves 2.5 MiB to begin loading, then charges
 the process for its allocated heap, SQLite and other tracked memory. A root reserves four
 descriptors and 16 KiB for routing. Objects of one Worker definition can share a copy.
-Each open database owns a copy and a home. A created home thread stays available for reuse
-after its copy retires. See [threaded object admission](durable-objects.md#threaded-object-admission)
+Each open database owns a copy and a home. A home thread exits and returns its
+reservations after its copy and calls have settled. See [threaded object admission](durable-objects.md#threaded-object-admission)
 for per-object waiting limits.
 
 A single encoded WAL record is limited to `min(64 MiB, 256 MiB, peerBufferBytes, UInt32 message limit) - 4 KiB`

@@ -196,8 +196,8 @@ reserves one thread, five file descriptors and 256 KiB for its native loop. The 
 the home ceiling in its host task-limit check. The isolate's heap, SQLite and other
 allocations also count toward process memory. Each root reserves four descriptors and
 16 KiB for routing. The safety ceiling `durableObjects.maxHomes` defaults to one home per MiB
-of the process budget, with a minimum of 512 and a maximum of 16,384. A created thread stays
-available for reuse after its copy retires.
+of the process budget, with a minimum of 512 and a maximum of 16,384. The home returns its
+thread and reservations once its copy and calls have settled.
 
 Placement first looks for a compatible copy. An eligible idle tree can give up its place
 when a compatible copy or the process's resident-object budget is full. When an incoming

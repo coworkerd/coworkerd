@@ -28,7 +28,7 @@ When a new database needs a home, the process can reuse the least recently used 
 idle home. An active call, queued call, or pending storage confirmation keeps its home in
 place. A later call reopens a retired database with its confirmed data.
 An eligible idle database releases its copy about 10 seconds after its last request.
-The home thread stays available for another database or Worker.
+The home thread exits and returns its reservations once the copy and calls have settled.
 An explicit admission refusal returns HTTP `503 OVERLOADED` with `dispatched: false`
 and `retryable: true`.
 [Admission measurements and commands](../database-home-benchmark.md#database-admission-at-the-ceiling)

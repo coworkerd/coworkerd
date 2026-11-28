@@ -136,7 +136,8 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0194 reserves one thread, descriptor credits and memory for each home on demand.
   It reuses the least recently used home when all its trees remain idle through the home loop's
   final check. It changes the threaded server and its native tests.
-  Patch 0195 preserves the database replacement credit in routing and reports the resource
+  Patch 0195 returns empty home threads and their reservations, preserves the database
+  replacement credit in routing, and reports the resource
   that refused a durable preface. An already fenced home remains selected until its trees
   and copy release. It changes the threaded server and the durable admission table and tests.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
