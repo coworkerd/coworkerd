@@ -3204,7 +3204,7 @@ public:
       std::vector<std::shared_ptr<ProcessGeneration>> generations;
       std::vector<std::pair<std::string, std::filesystem::path>> reports;
       auto collect = [&](const std::shared_ptr<ProcessGeneration>& process) {
-        if (!process || !process->durable || !process->threaded || process->durableTestStorage || process->pid == 0 ||
+        if (!process || !process->durable || process->durableTestStorage || process->pid == 0 ||
             process->storageCloseUnconfirmed) return;
         auto snapshot = process->lifecycle.read(&process->lastCloseCheckPublication);
         if (snapshot.empty()) return;
