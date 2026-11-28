@@ -671,7 +671,7 @@ try {
     const tasks = join('/proc', String(processInfo.pid), 'task');
     const tids = new Set();
     for (const tid of await readdir(tasks)) {
-      if ((await readFile(join(tasks, tid, 'comm'), 'utf8')).trim() === 'cwkd-call') tids.add(Number(tid));
+      if ((await readFile(join(tasks, tid, 'comm'), 'utf8')).trim() === 'cwkd-home') tids.add(Number(tid));
     }
     assert.equal(tids.size, 1);
     const samples = [];

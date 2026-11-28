@@ -1051,10 +1051,11 @@ async function durableHomeReuse(cluster) {
     assert.equal(sibling.value, 'home-first-b');
     assert.notEqual(sibling.instance, roots.get(sibling.value).instance);
     assert.equal(sibling.copy, reopened.copy);
-  } finally {
-    const releases = await Promise.allSettled([first, second].map(tenant => call(tenant, 'a', { op: 'release' })));
-    assert.ok(releases.some(result => result.status === 'fulfilled'));
+    json(await call(second, 'a', { op: 'release' }), 200, 'release the protected home');
     json(await holdSecond, 200, 'the event on the protected home completed');
+  } finally {
+    await Promise.allSettled([first, second].map(tenant => call(tenant, 'a', { op: 'release' })));
+    await Promise.allSettled([holdFirst, holdSecond]);
   }
 }
 

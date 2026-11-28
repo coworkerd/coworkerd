@@ -443,8 +443,8 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
             KJ_EXCEPTION(OVERLOADED, "durable routing identity is stale"), "DO_UNAVAILABLE"));
       }
       if (threadedDurable && decision == 'I') {
-        // The previous idle tree is closing before execution begins. Retry
-        // the preface so this invocation can enter after the close settles.
+        // Idle trees may be closing to return a tree or an entire home.
+        // Retry the preface so this invocation can enter after the close settles.
         connection->stream = nullptr;
         if (timer->now() + retryDelay >= waitUntil) {
           refuseCapacity("durable idle retirement did not settle; nothing executed");
