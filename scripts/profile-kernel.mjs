@@ -51,6 +51,12 @@ USER coworkerd:coworkerd
         const configPath = service.volumes[0].source;
         const config = JSON.parse(await readFile(configPath, 'utf8'));
         config.sandbox = { mode: 'off' };
+        // The default call ceiling follows the runner's memory, and a process starts one thread for each
+        // slot. Under strace that takes longer than the readiness check allows. The calls a process makes
+        // do not depend on the number of slots, so the profile names the ceiling unless a case does.
+        if (config.processPool?.inFlightLimit === undefined) {
+          config.processPool = { ...config.processPool, inFlightLimit: 512 };
+        }
         await writeFile(configPath, JSON.stringify(config));
         service.volumes.push({ type: 'bind', source: directory, target: '/profiles' });
       }
