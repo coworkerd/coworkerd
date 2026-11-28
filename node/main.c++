@@ -3732,7 +3732,9 @@ private:
     // The threaded loader uses these limits when identifying and creating the isolate.
     // A zero limit selects the process default.
     auto limits = namedLimits(version.workerId);
-    if (process.threadedDurableRole()) limits.cpuMs = std::min(limits.cpuMs, 30000u);
+    if (process.threadedDurableRole()) {
+      limits.cpuMs = std::min(limits.cpuMs, coworkerd::ProcessPoolConfig::DURABLE_CPU_CEILING_MS);
+    }
     else if (limits.cpuMs > 300000) limits.cpuMs = 300000;
     descriptor.setCpuLimitMs(limits.cpuMs);
     descriptor.setMemoryLimitMiB(limits.memoryMiB);
@@ -10327,7 +10329,6 @@ void applyProcessPoolEnvironment(ServerConfig& config) {
       ? executableDirectory() / "coworkerd-threaded" : fs::path(pool.threadedExecutable)).lexically_normal().string();
   const auto memoryBudgetBytes = config.memoryBudgetBytes;
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
-  pool.durableCpuLimitMs = 30000;
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
   pool.quarantineProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_QUARANTINE_PROCESSES", pool.quarantineProcesses, 256));
   pool.durableProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_DURABLE_PROCESSES", pool.durableProcesses, 64));

@@ -154,8 +154,10 @@ const manifestPath = join(fixture, 'workers', 'manifest.json');
 const descriptorLimitedThreaded = join(fixture, 'threaded-fd-limit');
 const workerId = 'counter';
 const token = 'fixture-management-placeholder';
+const configuredCpuLimitMs = cpuEvents || boundedEvents ? 500 : scenario === undefined ? 1200 : undefined;
 const config = {
   nodeId: 'fixture',
+  ...(configuredCpuLimitMs === undefined ? {} : { cpuLimitMs: configuredCpuLimitMs }),
   ...(httpMemory ? { memoryLimitMiB: 128 } : {}),
   durableObjects: {
     processes: 1, threadedTestStorage: true, ...(measure || placement || queues || httpLifecycle || httpMemory ? { residentObjects: 0 } : {}),
@@ -523,7 +525,7 @@ try {
   assert.equal(processInfo.generation, 1);
   assert.equal(processInfo.sandbox.durableServer, 'threaded-test');
   assert.equal(processInfo.sandbox.threadedProtocol, 3);
-  assert.equal(processInfo.sandbox.defaultCpuLimitMs, boundedEvents || cpuEvents ? 250 : 30000);
+  assert.equal(processInfo.sandbox.defaultCpuLimitMs, boundedEvents || cpuEvents ? 250 : (configuredCpuLimitMs ?? 30000));
   const environment = (await readFile(`/proc/${processInfo.pid}/environ`, 'utf8')).split('\0');
   assert.ok(environment.some(value => value.startsWith('COWORKERD_PARENT_FD=')));
   assert.ok(environment.every(value => !value.startsWith('COWORKERD_DO_WAL_FD=')));

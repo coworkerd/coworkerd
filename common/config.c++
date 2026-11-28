@@ -247,7 +247,6 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.threadedResidentLimit = pool.getThreadedResidentLimit();
   result.processPool.threadedThreadIdleMs = pool.getThreadedThreadIdleMs();
   result.processPool.cpuLimitMs = root.getCpuLimitMs();
-  if (given({"cpuLimitMs"})) result.processPool.durableCpuLimitMs = root.getCpuLimitMs();
   result.processPool.memoryLimitMiB = root.getMemoryLimitMiB();
   // A limit of 0 leaves the isolates of this node without one, and with it the culprit a stuck or exhausted process
   // names, the suspect it makes and the quarantine processes it would run in: a configuration file alone cannot turn a

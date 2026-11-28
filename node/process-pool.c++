@@ -1724,12 +1724,6 @@ public:
       : config(std::move(config)),
         directory(std::move(directory)), runDirectory(this->directory + "/run"), bindingAddress(std::move(bindingAddress)),
         sourceAddress(std::move(sourceAddress)), provider(provider), eventPort(eventPort), headers(headers), suspects(suspects) {
-    if (auto* ms = std::getenv("COWORKERD_CPU_LIMIT_MS")) {
-      char* end = nullptr; auto parsed = std::strtoull(ms, &end, 10);
-      KJ_REQUIRE(*ms && end && !*end && parsed <= UINT32_MAX, "invalid CPU limit override");
-      this->config.cpuLimitMs = static_cast<uint32_t>(parsed);
-      this->config.durableCpuLimitMs = static_cast<uint32_t>(parsed);
-    }
     if (auto* text = std::getenv("COWORKERD_MEMORY_LIMIT_MIB")) {
       char* end = nullptr; auto value = std::strtoull(text, &end, 10);
       KJ_REQUIRE(*text && *text != '-' && end && !*end && value <= UINT32_MAX, "invalid memory limit override");
@@ -1841,13 +1835,13 @@ public:
   }
   // What a Worker's executions run under: the limits it names, else this node's own.
   WorkerLimits limitsOf(const std::string& workerId, bool durable = false) const {
-    WorkerLimits effective{durable ? config.durableCpuLimitMs : config.cpuLimitMs, config.memoryLimitMiB};
+    WorkerLimits effective{config.cpuLimitMs, config.memoryLimitMiB};
     if (workerLimits.of && !workerId.empty()) {
       const auto named = workerLimits.of(workerId);
       if (named.cpuMs) effective.cpuMs = named.cpuMs;
       if (named.memoryMiB) effective.memoryMiB = named.memoryMiB;
     }
-    if (!durable && effective.cpuMs > 300000) effective.cpuMs = 300000;
+    effective.cpuMs = std::min(effective.cpuMs, durable ? ProcessPoolConfig::DURABLE_CPU_CEILING_MS : 300000u);
     return effective;
   }
   // A new generation's WebAssembly memory cap: a process-wide V8 flag, so it is the largest limit any Worker
@@ -1959,7 +1953,7 @@ public:
     out << "{\"mode\":\"" << sandbox.mode << "\",\"launched\":" << (p.launched ? "true" : "false")
         << ",\"ordinaryServer\":\"threaded"
         << "\",\"threadedProtocol\":" << p.threadedProtocol
-        << ",\"defaultCpuLimitMs\":" << (p.durable ? config.durableCpuLimitMs : config.cpuLimitMs)
+        << ",\"defaultCpuLimitMs\":" << config.processCpuLimitMs(p.durable)
         << ",\"limitsEnforced\":" << (p.threadedProtocol == 3 ? "true" : "false");
     if (p.durable) out << ",\"durableServer\":\"" <<
         (p.durableTestStorage ? "threaded-test" : "threaded") << '"';
@@ -2516,7 +2510,7 @@ public:
       std::string value(*entry);
       if (workerdInherits(value.substr(0, value.find('=')))) childEnvironment.push_back(std::move(value));
     }
-    childEnvironment.push_back("COWORKERD_CPU_LIMIT_MS=" + std::to_string(p->durable ? config.durableCpuLimitMs : config.cpuLimitMs));
+    childEnvironment.push_back("COWORKERD_CPU_LIMIT_MS=" + std::to_string(config.processCpuLimitMs(p->durable)));
     childEnvironment.push_back("COWORKERD_MEMORY_LIMIT_MIB=" + std::to_string(config.memoryLimitMiB));
     childEnvironment.push_back("COWORKERD_EVENT_FD=" + std::to_string(EVENT_FD));
     childEnvironment.push_back("COWORKERD_LIFECYCLE_FD=" + std::to_string(LIFECYCLE_FD));

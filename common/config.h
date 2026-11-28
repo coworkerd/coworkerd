@@ -3,6 +3,7 @@
 #include "object-store.h"
 #include "cpu-capacity.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -17,6 +18,7 @@
 namespace coworkerd {
 
 struct ProcessPoolConfig {
+  static constexpr uint32_t DURABLE_CPU_CEILING_MS = 30000;
   uint32_t count = 1;
   uint32_t inFlightLimit = 512;
   uint32_t basePort = 9000;  // ignored (workerd listens on an inherited Unix socket)
@@ -27,7 +29,6 @@ struct ProcessPoolConfig {
   bool watchdog = true;
   uint32_t cpuLimitMs = 30000;
   std::optional<uint64_t> alarmWallMsForTest;
-  uint32_t durableCpuLimitMs = 200;
   uint32_t memoryLimitMiB = 128;
   uint32_t quarantineProcesses = 2;  // sharded by tenant, and the trial loads' processes
   // The durable processes d0, d1, ... (durableObjects.processes): each object runs in one of them, by its id. They are
@@ -102,6 +103,9 @@ struct ProcessPoolConfig {
   bool inFlightLimitGiven = false;
   uint32_t durableInFlightLimit() const { return inFlightLimitGiven ? inFlightLimit : 512; }
   uint32_t processInFlightLimit(bool durable) const { return durable ? durableInFlightLimit() : inFlightLimit; }
+  uint32_t processCpuLimitMs(bool durable) const {
+    return durable ? std::min(cpuLimitMs, DURABLE_CPU_CEILING_MS) : cpuLimitMs;
+  }
   void validate() const;
 };
 

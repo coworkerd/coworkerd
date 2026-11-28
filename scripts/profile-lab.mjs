@@ -30,8 +30,8 @@ export const ordinary = `export default { async fetch(request) {
 } };\n`;
 
 // Production defaults (common/schema/coworkerd.capnp) on one machine: four ordinary processes and two quarantine
-// processes, CPU 200 ms, memory 128 MiB, idle eviction 300 s, rotation on a workerd change, by hand or at 70% of the
-// memory, the collections' defaults (gc), the memory watermark on; homeProbability 0, so every call runs where it
+// processes, CPU 30,000 ms, memory 128 MiB and idle eviction after 300 s. The memory watermark is on.
+// The profile sets homeProbability to 0 so each call runs where it
 // arrives. `nodeId` names the node. The management endpoints the profile reads are open (a development node: 0.4
 // requires a management token otherwise).
 export const DEFAULTS = { nodeId: "s1", processPool: { count: 4 }, placement: { homeProbability: 0 },
