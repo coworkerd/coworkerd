@@ -1445,18 +1445,6 @@ async function rpcEntrypoint(value, env, ctx) {
 }
 
 async function serve(request, env, ctx) {
-  if (new URL(request.url).pathname === "/__coworkerd/root-maintenance" && request.cf?.invocationId === undefined && env.ROOTS) {
-    if (request.method !== "POST") return new Response(null, { status: 405 });
-    const body = await request.json();
-    if (!Array.isArray(body.namespaces) || body.namespaces.some(id => typeof id !== "string" || !/^[0-9a-f]{64}$/.test(id)))
-      return new Response("Invalid root maintenance request", { status: 400 });
-    for (const namespaceId of body.namespaces) {
-      const response = await env.ROOTS.fetch("http://roots/remove-namespace", { method: "POST",
-        body: JSON.stringify({ namespaceId, permanent: true }) });
-      if (!response.ok) return response;
-    }
-    return env.ROOTS.fetch("http://roots/collect", { method: "POST" });
-  }
   if (new URL(request.url).pathname === "/__coworkerd/probe" && request.cf?.invocationId === undefined) {
     return new Response(`${env.PROCESS_ID}:${env.PROCESS_GENERATION}`);
   }

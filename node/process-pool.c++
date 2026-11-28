@@ -1119,8 +1119,6 @@ struct ProcessGeneration {
   bool probePending = false;
   double probeAttemptAt = 0;
   uint64_t probeAttempts = 0, probeFailures = 0;
-  uint32_t rootMaintenancePending = 0;
-  uint64_t rootMaintenanceAttempts = 0, rootMaintenanceFailures = 0, rootMaintenanceCompleted = 0;
   // Limit event channel: the read end of the pipe whose write end the child
   // inherited. An observer on the event loop moves whatever arrives into `eventTail` (so the pipe
   // never fills and workerd's writes never wait); rows are parsed and applied only when needed --
@@ -1673,22 +1671,7 @@ public:
   // process writes -- each row carries the limit it was measured against -- and the largest memory limit to
   // size a new generation's process-wide WebAssembly memory cap.
   ProcessPool::WorkerLimitsView workerLimits;
-  std::function<std::shared_ptr<const std::vector<std::string>>()> rootMaintenance;
-  std::function<void(const std::vector<std::string>&)> rootMaintenanceCompleted;
-  static constexpr size_t ROOT_MAINTENANCE_BATCH_SIZE = 64, ROOT_MAINTENANCE_CONCURRENCY = 4;
-  struct RootMaintenanceTarget {
-    std::weak_ptr<ProcessGeneration> process;
-    bool applied = false, pending = false;
-    double retryAt = 0;
-  };
-  struct RootMaintenanceBatch {
-    std::vector<std::string> ids;
-    std::string body;
-    std::vector<RootMaintenanceTarget> targets;
-  };
-  std::deque<std::shared_ptr<RootMaintenanceBatch>> rootMaintenanceBatches;
-  std::set<std::string> rootMaintenanceQueued;
-  std::shared_ptr<const std::vector<std::string>> rootMaintenanceWanted;
+  std::function<void()> rootMaintenance;
   double nextRootMaintenance = 0;
   BinarySignature configuredBinary;
   BinarySignature threadedConfiguredBinary;
@@ -3020,87 +3003,11 @@ public:
     if (p->probeStartedAt == 0) p->probeStartedAt = p->probeAttemptAt;
     tasks.add(probe(p));
   }
-  kj::Promise<void> maintainRoots(std::shared_ptr<ProcessGeneration> p,
-      std::shared_ptr<RootMaintenanceBatch> batch, size_t targetIndex) {
-    auto completed = kj::defer([p, batch, targetIndex] {
-      --p->rootMaintenancePending;
-      batch->targets[targetIndex].pending = false;
-    });
-    const auto& body = batch->body;
-    ++p->rootMaintenanceAttempts;
-    try {
-      // A separate client keeps a closing namespace from delaying this generation's health probes.
-      auto client = kj::newHttpClient(provider.getTimer(), headers, *p->probeAddress);
-      kj::HttpHeaders requestHeaders(headers);requestHeaders.setPtr(kj::HttpHeaderId::HOST, "runtime");
-      requestHeaders.setPtr(kj::HttpHeaderId::CONTENT_TYPE, "application/json");
-      auto request = client->request(kj::HttpMethod::POST, "/__coworkerd/root-maintenance", requestHeaders, body.size());
-      co_await provider.getTimer().timeoutAfter(1000 * kj::MILLISECONDS,
-          request.body->write(kj::arrayPtr(body.data(), body.size()).asBytes()));
-      request.body = nullptr;
-      auto response = co_await provider.getTimer().timeoutAfter(35000 * kj::MILLISECONDS, kj::mv(request.response));
-      auto text = co_await provider.getTimer().timeoutAfter(1000 * kj::MILLISECONDS, response.body->readAllText(2 * 1024 * 1024));
-      if (p->pid == 0 || p->closing) co_return;
-      if (response.statusCode != 200) {
-        if (std::string(text.cStr()).find("namespace-closing") != std::string::npos) {
-          for (size_t i = 0; i < slots.size(); ++i) if (slots[i].current == p) {
-            enqueueAutomatic(i, "root-namespace-close");
-            break;
-          }
-        }
-        KJ_FAIL_REQUIRE("root namespace cleanup was refused", response.statusCode);
-      }
-      batch->targets[targetIndex].applied = true;
-      ++p->rootMaintenanceCompleted;
-    } catch (const kj::Exception&) {
-      ++p->rootMaintenanceFailures;
-      batch->targets[targetIndex].retryAt = mono() + 1000;
-    }
-  }
   void maybeMaintainRoots() {
-    if (!rootMaintenance || mono() < nextRootMaintenance) return;
     const auto now = mono();
+    if (!rootMaintenance || now < nextRootMaintenance) return;
     nextRootMaintenance = now + 100;
-    std::erase_if(rootMaintenanceBatches, [&](const auto& batch) {
-      const bool applied = std::all_of(batch->targets.begin(), batch->targets.end(), [](const auto& target) {
-        auto p = target.process.lock();
-        return target.applied || !p || p->pid == 0;
-      });
-      if (!applied) return false;
-      if (rootMaintenanceCompleted) rootMaintenanceCompleted(batch->ids);
-      for (const auto& id : batch->ids) rootMaintenanceQueued.erase(id);
-      return true;
-    });
-    const auto wanted = rootMaintenance();
-    if (wanted && wanted != rootMaintenanceWanted) {
-      rootMaintenanceWanted = wanted;
-      auto batch = std::make_shared<RootMaintenanceBatch>();
-      auto publish = [&]() {
-        if (batch->ids.empty()) return;
-        std::ostringstream body;body << "{\"namespaces\":[";
-        for (size_t i = 0; i < batch->ids.size(); ++i) body << (i ? ",\"" : "\"") << batch->ids[i] << '"';
-        body << "]}";batch->body = body.str();
-        for (auto& slot : slots) if (slot.durable) eachGeneration(slot, [&](const auto& p) {
-          if (p->pid > 0) batch->targets.push_back({p});
-        });
-        rootMaintenanceBatches.push_back(std::move(batch));
-        batch = std::make_shared<RootMaintenanceBatch>();
-      };
-      for (const auto& id : *wanted) if (rootMaintenanceQueued.insert(id).second) {
-        batch->ids.push_back(id);
-        if (batch->ids.size() == ROOT_MAINTENANCE_BATCH_SIZE) publish();
-      }
-      publish();
-    }
-    for (const auto& batch : rootMaintenanceBatches) for (size_t i = 0; i < batch->targets.size(); ++i) {
-      auto& target = batch->targets[i];
-      auto p = target.process.lock();
-      if (target.applied || target.pending || target.retryAt > now || !p || p->pid == 0 ||
-          p->rootMaintenancePending >= ROOT_MAINTENANCE_CONCURRENCY || p->closing ||
-          (p->state != "ready" && p->state != "draining") || !p->probeAddress) continue;
-      target.pending = true;
-      ++p->rootMaintenancePending;
-      tasks.add(maintainRoots(p, batch, i));
-    }
+    rootMaintenance();
   }
   // Applies the generation's newly read limit events to the counters.
   void applyEvents(Slot& s, ProcessGeneration& p) {
@@ -4125,9 +4032,8 @@ std::string ProcessPool::quarantineReadinessJson() const {
 uint32_t ProcessPool::cpuLimitMs() const { return impl->config.cpuLimitMs; }
 uint32_t ProcessPool::memoryLimitMiB() const { return impl->config.memoryLimitMiB; }
 void ProcessPool::setWorkerLimits(WorkerLimitsView view) { impl->workerLimits = std::move(view); }
-void ProcessPool::setRootMaintenance(std::function<std::shared_ptr<const std::vector<std::string>>()> request,
-    std::function<void(const std::vector<std::string>&)> applied) {
-  impl->rootMaintenance = std::move(request);impl->rootMaintenanceCompleted = std::move(applied);
+void ProcessPool::setRootMaintenance(std::function<void()> maintain) {
+  impl->rootMaintenance = std::move(maintain);
 }
 void ProcessPool::setHostCheckOomGuard(std::function<bool()> guard) { impl->hostCheckOomGuard = std::move(guard); }
 WorkerLimits ProcessPool::effectiveLimits(const std::string& workerId, bool durable) const { return impl->limitsOf(workerId, durable); }
@@ -4437,10 +4343,6 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
         << ",\"cpuReloadedIsolates\":" << s.cpuReloadedIsolates << ",\"gc\":" << impl->gcJson(s, p)
         << ",\"probeAttempts\":" << (p ? p->probeAttempts : 0)
         << ",\"probeFailures\":" << (p ? p->probeFailures : 0)
-        << ",\"rootMaintenanceAttempts\":" << (p ? p->rootMaintenanceAttempts : 0)
-        << ",\"rootMaintenanceFailures\":" << (p ? p->rootMaintenanceFailures : 0)
-        << ",\"rootMaintenanceCompleted\":" << (p ? p->rootMaintenanceCompleted : 0)
-        << ",\"rootMaintenancePending\":" << (p ? p->rootMaintenancePending : 0)
         << ",\"lastExitedGeneration\":" << s.lastExitedGeneration << ",\"lastExitAtUnixMs\":" << s.lastExitAtUnixMs
         << ",\"lastReason\":\"" << escape(p && !p->lastReason.empty() ? p->lastReason : s.lastReason) << "\",\"inFlight\":" << (p ? p->inFlight : 0)
         << ",\"lastExitCategory\":\"" << s.lastExitCategory << "\",\"memoryTerminatedRequests\":" << s.memoryTerminatedRequests

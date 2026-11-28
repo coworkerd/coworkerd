@@ -11236,9 +11236,7 @@ int run(Launch launch) {
       server.webSockets().goAwayNamespaces(*pending);
       server.rootsMaintained(durableLog.drainThreadedNamespaces(*pending));
     }
-    return std::shared_ptr<const std::vector<std::string>>{};
-  },
-      [&server](const auto& ids) { server.rootsMaintained(ids); });
+  });
   server.addStateSection("webSockets", [&server]() { return server.webSockets().json(); });
   server.addStateSection("readiness", [&server, &runtime]() {
     return "{\"ready\":" + std::string(server.processesReady() && !server.draining() ? "true" : "false") + ",\"quarantine\":" +

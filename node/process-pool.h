@@ -122,9 +122,8 @@ public:
     std::function<uint32_t()> maxMemoryMiB;
   };
   void setWorkerLimits(WorkerLimitsView view);
-  // Local namespace removals from the node's current catalog, retried independently for each durable generation.
-  void setRootMaintenance(std::function<std::shared_ptr<const std::vector<std::string>>()> request,
-      std::function<void(const std::vector<std::string>&)> applied);
+  // Poll namespace removals from the node's catalog on the supervisor cadence.
+  void setRootMaintenance(std::function<void()> maintain);
   // cgroup OOM counters have no victim identity: helper exposure makes a new
   // increment foreign, rather than evidence against a workerd SIGKILL exit.
   void setHostCheckOomGuard(std::function<bool()> guard);
