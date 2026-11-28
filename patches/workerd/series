@@ -124,3 +124,4 @@
 0190-harden-ordinary-object-admission.patch
 0191-return-wal-slots-before-admission-tree-credit.patch
 0192-bound-admission-wal-return.patch
+0193-scope-wal-admission-test-event-loops.patch

@@ -385,7 +385,8 @@ def allowed_path(name, path):
                                    '0192-bound-admission-wal-return.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
-                          name == '0189-test-busy-objects-with-stale-idle-observations.patch' and path ==
+                          name in {'0189-test-busy-objects-with-stale-idle-observations.patch',
+                                   '0193-scope-wal-admission-test-event-loops.patch'} and path ==
                               'src/workerd/threaded/threaded-server-test.c++' or
                           name == '0178-keep-platform-databases-open-after-sql-interruption.patch' and path in {
                               'src/workerd/api/actor-state.c++',
