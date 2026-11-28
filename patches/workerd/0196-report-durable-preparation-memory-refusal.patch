@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sat, 28 Nov 2026 15:34:14 +0800
+Subject: [PATCH] Confirm durable event preparation before opening a new actor
+
+
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 9bee770c46a58f24569242784675e53f3f2f70e6..601e803406775af4d66f5b021276c247fb6c7479 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -494,7 +494,8 @@ struct ResourceBudget {
+       bool admission = false,
+       bool observe = false,
+       uint64_t *memoryBeforeRelease = nullptr,
+-      int64_t sqliteDelta = 0) {
++      int64_t sqliteDelta = 0,
++      const char** refusal = nullptr) {
+     std::lock_guard lock(mutex);
+     const auto reserved = memoryReserved.load();
+     if (memoryBeforeRelease != nullptr) *memoryBeforeRelease = reserved;
+@@ -503,7 +504,13 @@ struct ResourceBudget {
+     auto ceiling = admission ? admissionMaximum : memoryMaximum;
+     const bool accepted = (!admission && newMemory <= oldMemory && newAddress <= oldAddress) ||
+         fits(memory, newMemory, address, newAddress, ceiling);
+-    if (!accepted && !observe) return false;
++    if (!accepted && !observe) {
++      if (refusal != nullptr) {
++        *refusal = newAddress > addressMaximum - kj::min(address, addressMaximum)
++            ? "copy-address-space" : "copy-memory";
++      }
++      return false;
++    }
+     memoryReserved.store(memory + newMemory);
+     addressReserved.store(address + newAddress);
+     if (sqliteDelta != 0) sqliteMemoryReserved.fetch_add(sqliteDelta);
+@@ -547,12 +554,13 @@ struct ResourceReservation final: SqliteProcessMemoryBudget {
+     std::lock_guard lock(mutex);
+     return registered ? budget->replacementCeiling(memoryCharge, addressCharge) : std::nullopt;
+   }
+-  bool resize(bool admission = false, bool observe = false, int64_t sqliteDelta = 0) {
++  bool resize(bool admission = false, bool observe = false, int64_t sqliteDelta = 0,
++      const char** refusal = nullptr) {
+     auto memory =
+         NATIVE_OVERHEAD + source + heap + otherExternal + ownedExternal + logs + sqliteBytes;
+     auto address = kj::max(2 * MiB, heap);
+     bool fits = budget->change(
+-        memoryCharge, memory, addressCharge, address, admission, observe, nullptr, sqliteDelta);
++        memoryCharge, memory, addressCharge, address, admission, observe, nullptr, sqliteDelta, refusal);
+     if (fits || observe) {
+       memoryCharge = memory;
+       addressCharge = address;
+@@ -581,9 +589,9 @@ struct ResourceReservation final: SqliteProcessMemoryBudget {
+     preparing = 1;
+     return true;
+   }
+-  bool prepare() {
++  bool prepare(const char** refusal = nullptr) {
+     std::lock_guard lock(mutex);
+-    if (!resize(true)) return false;
++    if (!resize(true, false, 0, refusal)) return false;
+     ++preparing;
+     return true;
+   }
+@@ -599,12 +607,15 @@ struct ResourceReservation final: SqliteProcessMemoryBudget {
+     otherExternal = stats.external_memory() > owned ? stats.external_memory() - owned : 0;
+     return resize(false, true);
+   }
+-  bool retainSource(uint64_t length) {
++  bool retainSource(uint64_t length, const char** refusal = nullptr) {
+     std::lock_guard lock(mutex);
+-    if (length > (256ull << 20)) return false;
++    if (length > (256ull << 20)) {
++      if (refusal != nullptr) *refusal = "copy-memory";
++      return false;
++    }
+     auto old = source;
+     source = length * 5;
+-    if (resize()) return true;
++    if (resize(false, false, 0, refusal)) return true;
+     source = old;
+     return false;
+   }
+@@ -709,6 +720,12 @@ kj::Exception capacityError(CapacityScope scope = CapacityScope::PROCESS) {
+   return error;
+ }
+ 
++kj::Exception durableCopyBudgetRefusal(kj::StringPtr resource) {
++  auto error = capacityError();
++  error.setDetail(DURABLE_COPY_RESERVATION_REFUSED, kj::heapArray(resource.asBytes()));
++  return error;
++}
++
+ // Whether a finished load's failure stays out of the registry, so that the next request loads
+ // the Worker again instead of receiving this failure: one before the source was fetched, a caller
+ // failure (DISCONNECTED), memory pressure at startup (which becomes capacityError()), and any
+@@ -3117,10 +3134,15 @@ struct ThreadedServer {
+   }
+ 
+   std::shared_ptr<ResourcePreparation> prepareSlot(const std::shared_ptr<Slot> &slot) {
+-    while (!slot->reservation->prepare()) {
++    const bool durable = bool(slot->resetDurableRoot);
++    if (durable && refuseCopyReservationForTest()) {
++      kj::throwRecoverableException(durableCopyBudgetRefusal("copy-memory"));
++    }
++    const char* refusal = nullptr;
++    while (!slot->reservation->prepare(&refusal)) {
+       if (!evictOne(slot.get())) {
+         resources->rejections.fetch_add(1);
+-        kj::throwRecoverableException(capacityError());
++        kj::throwRecoverableException(durable ? durableCopyBudgetRefusal(refusal) : capacityError());
+       }
+     }
+     return std::make_shared<ResourcePreparation>(slot->reservation);
+@@ -4626,10 +4648,12 @@ struct ThreadedServer {
+     }
+     auto length =
+         KJ_REQUIRE_NONNULL(response.body->tryGetLength(), "Trusted source omitted its length");
+-    while (!slot.reservation->retainSource(length)) {
++    const char* refusal = nullptr;
++    while (!slot.reservation->retainSource(length, &refusal)) {
+       if (state.durableHome != 0 || !resources->reclaim(length * 5)) {
+-        if (slot.reservation->retainSource(length)) break;
+-        kj::throwRecoverableException(capacityError());
++        if (slot.reservation->retainSource(length, &refusal)) break;
++        kj::throwRecoverableException(
++            state.durableHome != 0 ? durableCopyBudgetRefusal(refusal) : capacityError());
+       }
+     }
+     auto content = co_await response.body->readAllText(256u << 20);
+@@ -4933,9 +4957,8 @@ struct ThreadedServer {
+       reservation = std::make_shared<ResourceReservation>(
+           resources, workerLimit(input, "memoryLimitMiB", "COWORKERD_MEMORY_LIMIT_MIB"), platformDatabase);
+     }
+-    if (refuseCopyReservationForTest() ||
+-        (!registered && !(co_await registerDurablePreparation(
+-            *reservation, platformDatabase, [this] { return reclaimIdleDatabase(); })))) {
++    if (!registered && !(co_await registerDurablePreparation(
++            *reservation, platformDatabase, [this] { return reclaimIdleDatabase(); }))) {
+       auto error = capacityError();
+       error.setDetail(DURABLE_COPY_RESERVATION_REFUSED, kj::heapArray<kj::byte>(0));
+       kj::throwRecoverableException(kj::mv(error));
+@@ -7891,6 +7914,9 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+   auto slot = co_await server.getDurableWorker(state, descriptor, route.open.definition);
+   KJ_REQUIRE(slot->actorClasses.contains(route.open.className),
+       "durable class missing from pinned Worker");
++  // Confirm the event's copy credit before opening a new actor or its SQLite
++  // connection. A trusted refusal here can still prove the event did not run.
++  auto preparation = server.prepareSlot(slot);
+   auto found = state.durableRoots.find(ticket.tree);
+   // Keep sharing the preparation until a home publishes the root. There can
+   // be new arrivals between the scanner's completion and opening SQLite.
+@@ -8065,7 +8091,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+   }
+   if (entry.get() == nullptr) {
+     checkSqlDeadline();
+-    entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props), nullptr,
++    entry = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props), std::move(preparation),
+         nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor), kj::none, std::move(sqlDeadline))
+                 .entry;
+   }

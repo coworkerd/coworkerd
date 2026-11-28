@@ -124,12 +124,23 @@ async function empty() {
   return before;
 }
 
-function reservationReached(state, pinned) {
-  const resource = state.admission.lastDurableRefusal;
-  assert.match(resource, /^(copy-(memory|residents|address-space)|home-(threads|descriptors|memory)|threads|descriptors|memory|address-space)$/);
-  assert.ok(state.admission.overloaded > 0);
-  assert.ok(pinned > 4);
-  return resource;
+async function refusalResources(refusals) {
+  const logs = await cluster.compose(['logs', '--no-color', '--no-log-prefix', '--tail', '500', owner]);
+  const rows = tag => logs.split('\n').filter(line => line.startsWith(tag))
+    .map(line => JSON.parse(line.slice(tag.length)));
+  const resources = new Map(rows('[durable-admission] ')
+    .map(row => [row.invocationId, row.resource]));
+  const rejected = rows('[execution-rejected] ');
+  return refusals.map(({ tenant, ...reply }) => {
+    const receipts = rejected.filter(row => row.target === tenant + '/app@v1');
+    assert.equal(receipts.length, 1, tenant + ' has one node rejection');
+    const [receipt] = receipts;
+    assert.equal(receipt.dispatched, false);
+    assert.equal(receipt.code, reply.code);
+    const resource = resources.get(receipt.invocationId);
+    assert.match(resource, /^(copy-(memory|residents|address-space)|home-(threads|descriptors|memory)|threads|descriptors|memory|address-space)$/);
+    return { tenant, ...reply, resource, invocationId: receipt.invocationId };
+  });
 }
 
 async function visitParticipants(tenants, action) {
@@ -158,12 +169,16 @@ async function fillWorkers() {
           assert.equal(result.pinned, true);
           participants.set(batch[index], result.copy);
         } else {
-          refusals.push(checkCapacityRefusal(reply, batch[index]));
+          refusals.push({ tenant: batch[index].name, ...checkCapacityRefusal(reply, batch[index]) });
         }
       }
       offered += batch.length;
       if (refusals.length !== 0) {
-        refusalBatch = { offered, batchSize: batch.length, accepted: participants.size, refusals };
+        assert.ok(participants.size > 4);
+        const receipts = await refusalResources(refusals);
+        const resources = [...new Set(receipts.map(receipt => receipt.resource))];
+        refusalBatch = { offered, batchSize: batch.length, accepted: participants.size,
+          refusals: receipts, resources };
       }
       if (performance.now() >= nextRead || refusalBatch) {
         // Background work protects each home without leaving an ordinary Worker
@@ -189,16 +204,15 @@ async function fillWorkers() {
       await record('fill', { offered, pinned: participants.size, ...state });
       if (refusalBatch) {
         refusalState = state;
-        const resource = reservationReached(state, participants.size);
-        await record('refusal-batch', { ...refusalBatch, resource, ...state });
+        await record('refusal-batch', { ...refusalBatch, ...state });
       }
     }
     assert.ok(refusalState, 'increase offers to reach the first reservation refusal');
   } finally {
     await visitParticipants([...participants.keys()], tenant => callObject(tenant, 'release'));
   }
-  console.log(JSON.stringify({ homes: participants.size, resource: refusalState.admission.lastDurableRefusal,
-    admission: refusalState.admission }));
+  console.log(JSON.stringify({ homes: participants.size, resources: refusalBatch.resources,
+    refused: refusalBatch.refusals.length, generation: refusalState.generation }));
 }
 
 try {

@@ -127,3 +127,4 @@
 0193-scope-wal-admission-test-event-loops.patch
 0194-reserve-durable-homes-on-demand.patch
 0195-report-durable-home-admission-pressure.patch
+0196-report-durable-preparation-memory-refusal.patch

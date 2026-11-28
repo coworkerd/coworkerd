@@ -2886,6 +2886,11 @@ async function durableCopyReservationRefusal(cluster) {
     const reply = await call();
     assert.equal(await recordedRefusals(), before + 1,
       `the owner records one refusal for marker ${request} (received HTTP ${reply.status})`);
+    const logs = await cluster.compose(['logs', '--no-color', '--no-log-prefix', owner]);
+    const copyMemory = logs.split('\n').filter(line => line.startsWith('[durable-admission] '))
+      .map(line => JSON.parse(line.slice('[durable-admission] '.length)))
+      .filter(row => row.resource === 'copy-memory');
+    assert.equal(copyMemory.length, refusal, 'event preparation refusal reports the copy memory budget');
     await eventually('the refused event released its mailbox credit in the same process', async () => {
       const current = await durableGeneration(cluster, owner);
       assert.equal(current.generation, initial.generation);

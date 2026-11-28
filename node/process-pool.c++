@@ -500,8 +500,16 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
         co_return result.getDispatcher();
       } catch (const kj::Exception& error) {
         // Only the trusted start reply can establish that the event never ran.
-        if (error.getDetail(DURABLE_COPY_RESERVATION_REFUSED) != kj::none) {
-          recordAdmissionRefusal("copy-preparation");
+        KJ_IF_SOME(detail, error.getDetail(DURABLE_COPY_RESERVATION_REFUSED)) {
+          kj::StringPtr resource = "copy-preparation";
+          for (kj::StringPtr known : {"copy-memory", "copy-address-space"}) {
+            if (detail.size() == known.size() &&
+                std::memcmp(detail.begin(), known.begin(), detail.size()) == 0) {
+              resource = known;
+              break;
+            }
+          }
+          recordAdmissionRefusal(resource);
           confirmRefusal(PreExecutionRefusal::CAPACITY);
         } else if (error.getDetail(WAL_HOME_CAPACITY_REFUSED) != kj::none) {
           recordAdmissionRefusal("wal-home");
