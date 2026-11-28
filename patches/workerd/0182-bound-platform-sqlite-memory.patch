@@ -155,7 +155,7 @@ index 7322e843d394af515a78b2ae1d28e6bd02d57b7e..bf632d528b7c2fc9d3a0d7e97e92a6e4
    if (rc != SQLITE_OK) {
      logRow(kj::str("{\"event\":\"checkpoint-failed\",\"object\":", jsonString(key), ",\"rc\":", rc,
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index e05a3275d2077123fecb09891f9578d2708c66b4..1174e5a0fdea79713a88256b94006969f77212e0 100644
+index 49f75d0671f250e71e0bd9d0ac62376c316de4b0..9e77c889fb77f5fa1a2af9a1368cdf9c51d5ab67 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
 @@ -24,6 +24,7 @@ THREADED_DEPS = [
@@ -167,7 +167,7 @@ index e05a3275d2077123fecb09891f9578d2708c66b4..1174e5a0fdea79713a88256b94006969
      "@capnp-cpp//src/capnp/compat:http-over-capnp",
      "@capnp-cpp//src/capnp/compat:json",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index cca899fe5587696686ccf4b5bb8f2b1b9ecebf00..e819eb97a66e64dcae549bca5d9b51f16c2c4bd0 100644
+index 019d3b1dd589939dd6a502e950f468a39cf839dd..2244bfe619986a415635365abd40f5256fbd34a6 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -36,6 +36,7 @@
@@ -178,7 +178,7 @@ index cca899fe5587696686ccf4b5bb8f2b1b9ecebf00..e819eb97a66e64dcae549bca5d9b51f1
  #include <workerd/util/stream-utils.h>
  
  #include <arpa/inet.h>
-@@ -7011,7 +7012,13 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7031,7 +7032,13 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
                         ActorCache::Hooks &,
                         SqliteObserver &observer) -> kj::Maybe<kj::Own<ActorCacheInterface>> {
      const auto localOpenStartedNs = tree->state.wal ? nowNs() : 0;
@@ -193,7 +193,7 @@ index cca899fe5587696686ccf4b5bb8f2b1b9ecebf00..e819eb97a66e64dcae549bca5d9b51f1
      if (tree->state.wal) {
        auto shipper = tree->storage().ship(tree->uniqueKey,
            {.objectName = kj::str(tree->objectName), .storageId = kj::str(tree->storageId),
-@@ -7909,6 +7916,7 @@ int main(int argc, char **argv) {
+@@ -7929,6 +7936,7 @@ int main(int argc, char **argv) {
      kj::Own<const kj::Directory> directory;
      kj::Own<server::ThreadedWalLog> wal;
      if (persistent) {

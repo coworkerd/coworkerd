@@ -14,7 +14,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
 ## How the series is maintained
 
 - **The fork.** The patched workerd is the fork [coworkerd/workerd](https://github.com/coworkerd/workerd): one branch
-  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261114.1`), which contains the ordered patch commits plus the v95 follow-up to 0010. Feature branches carry additions until they are merged into the tag branch.
+  per upstream tag, `coworkerd-<tag>` (now `coworkerd-v1.20261114.1`), which contains the ordered patch
+  commits plus the architecture-specific steady filter allocation fix folded into 0010. Feature branches
+  carry additions until they are merged into the tag branch.
   `patches/workerd/` is exported from that branch so that every change to workerd can be reviewed here; a change to
   the branch and its exported copy go into the same change of this repository.
 - **Thin patches.** Changes normally stay in `src/workerd/server/` (`scripts/workerd-patches.py` checks it), with explicit

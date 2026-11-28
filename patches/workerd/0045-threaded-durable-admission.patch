@@ -609,7 +609,7 @@ index 0000000000000000000000000000000000000000..e2a95ec94c1e656d0eec3d914e6d6bae
 +
 +}  // namespace workerd::server
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index d8295d11e322c9dbe65627b31a6f7859f36edaa9..67de7fde2e8eeaf3e10d87812c43af64b1625fa8 100644
+index d863959e0b78449e4410f5a6b3d4059e4c6d1730..944a5e096500818290aa84f2e31251a0e52cc879 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1890,6 +1890,7 @@ struct ThreadedServer {
@@ -643,7 +643,7 @@ index d8295d11e322c9dbe65627b31a6f7859f36edaa9..67de7fde2e8eeaf3e10d87812c43af64
            if (sent != 1 || admission == 'R')
              ::close(fd);
 @@ -4044,7 +4047,9 @@ void acceptLoop(ThreadedServer &server, int listener, int parent) {
-                    "lifecycle controls require S1c\"}";
+                    "does not implement this control request\"}";
            }
            connection.output = "HTTP/1.1 " + std::string(status) +
 -              "\r\nX-Coworkerd-Threaded-Protocol: 3\r\nContent-Length: " +

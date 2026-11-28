@@ -6,7 +6,7 @@ Subject: [PATCH] Expose bounded test-storage confirmation delay for
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index fbb86c9698bbca6e95059b8808addb85086163cd..7a6106fd53acdacdefa63332431f82e074be2a72 100644
+index 05210d92a67bcb2b271a37438d051a87f6b4cf53..0dcbfc43fc039b3547b221b18065f13b1d06685d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2194,6 +2194,8 @@ struct ThreadedServer {

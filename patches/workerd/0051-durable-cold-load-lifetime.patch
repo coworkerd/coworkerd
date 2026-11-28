@@ -5,7 +5,7 @@ Subject: [PATCH] Finish durable cold-load accounting before returning its slot
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index ff82c83fed897a543389d0846e0c24c234d86bad..74ea0c08f960c089f6ffe0cc41cb090d8cf01951 100644
+index af11b5a2bd9a44321091f0fc7abc977bd6c1fc64..683f511724360ad98bce65e7a6a35ab261f6a1b6 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -3346,14 +3346,17 @@ struct ThreadedServer {

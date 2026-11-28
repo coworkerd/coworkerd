@@ -8,7 +8,7 @@ Cancel home tasks, destroy the resident roots and then cancel any facet drains t
 Exercise scope teardown with production root and facet actors, real SQLite connections and lifetime markers that verify pending task cancellation, both CLOSED callbacks and actor index cleanup.
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 4c793547cf799e161aabb914ec5d74ddb1a5b3c4..2d0a094081c3ec544e1c62a186b5bd3ce7a8adad 100644
+index 0109d84789a034c749aeac1ca63f340a4057923f..f382c97fafc57ea960cc475fe0030b1dc947525d 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -4,6 +4,8 @@
@@ -156,7 +156,7 @@ index 4c793547cf799e161aabb914ec5d74ddb1a5b3c4..2d0a094081c3ec544e1c62a186b5bd3c
    initializeV8();
    auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 1);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index cee37c292d322dd58849260b7652968baa2c39c5..20f5e0299499088e0c7fcdfaa89a9e7ed3ce62d7 100644
+index 25fd66efc65cee23465622dbf3a001e267627bba..354e6fa2ecd75f358541d846634ddae7ad7e4d27 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1969,13 +1969,12 @@ struct ThreadState {

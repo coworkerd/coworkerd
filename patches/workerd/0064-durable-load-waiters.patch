@@ -14,7 +14,7 @@ for and counts it in canceledLoads. A waiter of another definition is
 refused instead of joining it.
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index e3cd6ba59bd0e289783ab909c9c2d0f4ece78571..4f06fd15bf7fc60cc0585756d14c51b5c34c25c9 100644
+index 61ea5c9d212eeffb23ed1ec2f16fd9cae06ee98f..79fcb09415ddc39bc9b3471aacd7d2a3e615b049 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1649,7 +1649,15 @@ struct ThreadState {

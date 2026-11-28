@@ -35,7 +35,7 @@ index 27ead7ad05c3ce86c9476b81bb717914c2e304e5..a6ae671461633de4f44a27e2133ddf95
 +    visibility = ["//src/workerd/threaded:__pkg__"],
 +)
 diff --git a/src/workerd/server/factory/coworkerd-steady.c++ b/src/workerd/server/factory/coworkerd-steady.c++
-index c2dc2a1e31432cabb0d67ae433a1a201b6ee9f53..5d82d06bb84b18394bb1af58ec11285942f1efa1 100644
+index 6fcc13201d77b2fa551a0ee13faf7844702207c9..70ce5c34c090ed7dd8b3492dfdc9288f3ba0c360 100644
 --- a/src/workerd/server/factory/coworkerd-steady.c++
 +++ b/src/workerd/server/factory/coworkerd-steady.c++
 @@ -1,5 +1,7 @@
@@ -633,7 +633,7 @@ index 0000000000000000000000000000000000000000..cf178aff6687e0b9ec73a5d7c87a2c04
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..0e4813ffca23f7d0d02b193f904cc1dd01385fa2
+index 0000000000000000000000000000000000000000..f96289ea77076ad4904f0ccef152481600360264
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -0,0 +1,914 @@
@@ -1009,8 +1009,8 @@ index 0000000000000000000000000000000000000000..0e4813ffca23f7d0d02b193f904cc1dd
 +// A 500 MB one-byte string first: V8 takes the first object of the young
 +// large-object space without checking its capacity or collecting, so the
 +// tenant check (after a collection) does not see it; then one maximum string.
-+// Before the near-heap-limit callback this ended the process (exit 74,
-+// raw/s27-x500).
++// Before the near-heap-limit callback, the second allocation caused a fatal
++// OOM (exit 74).
 +constexpr kj::StringPtr YOUNG500_THEN_STRING =
 +    "const a = ' '.repeat(5e8); a.indexOf('z'); globalThis.kept = a;"
 +    "globalThis.retained = '\\u0100'.repeat(2**29 - 24); globalThis.retained.indexOf('z')"_kj;
@@ -1553,7 +1553,7 @@ index 0000000000000000000000000000000000000000..0e4813ffca23f7d0d02b193f904cc1dd
 +}  // namespace workerd
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..9e5db7888f2b74e154bce23cdac7fc3b123e8520
+index 0000000000000000000000000000000000000000..c11b10ad02470dc6e5347f89c5caceea0c696ce1
 --- /dev/null
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -0,0 +1,3895 @@
@@ -1757,7 +1757,7 @@ index 0000000000000000000000000000000000000000..9e5db7888f2b74e154bce23cdac7fc3b
 +static_assert(MAX_SINGLE_HEAP_OBJECT < (2ull << 30));
 +// The tenant limit counts live bytes, but V8's ceiling counts pages, and pages
 +// are not filled exactly: regular objects never span a 256 KiB page, so large
-+// ones waste up to half of it (cwkd-p40: 126 MiB live in 88 KB double arrays
++// ones waste up to half of it (126 MiB live in 88 KB double arrays
 +// took 1212.0 MB of pages with the maximum string, 1150.1 MB live). Pages stay
 +// under twice the limit, so the ceiling keeps the limit itself plus 32 MiB for
 +// the other spaces on top of one maximum object: finishing that object never
@@ -2285,8 +2285,8 @@ index 0000000000000000000000000000000000000000..9e5db7888f2b74e154bce23cdac7fc3b
 +    // V8 takes the first object of the young large-object space without a
 +    // collection, so no tenant check sees it until the next one, and the next
 +    // large allocation can then meet the fixed ceiling with that object live
-+    // (cwkd-p40: a 500 MB string, then a maximum string, ended the process,
-+    // raw/s27-x500). Near the ceiling the isolate is over its limit: it is
++    // (a 500 MB string followed by a maximum-size string caused a fatal OOM).
++    // Near the ceiling, the isolate has exceeded its limit and is
 +    // terminated as such, and its ceiling is raised once by one maximum
 +    // object so that the allocation in progress finishes; its call ends with
 +    // MEMORY_LIMIT_EXCEEDED and the isolate is retired, as any isolate over
@@ -5362,8 +5362,8 @@ index 0000000000000000000000000000000000000000..9e5db7888f2b74e154bce23cdac7fc3b
 +          if (!connection.input.starts_with("GET /__coworkerd/probe ") &&
 +              !connection.input.starts_with("GET /__coworkerd/threaded ")) {
 +            status = "501 Not Implemented";
-+            body = "{\"code\":\"NOT_SUPPORTED\",\"message\":\"threaded "
-+                   "lifecycle controls require S1c\"}";
++            body = "{\"code\":\"NOT_SUPPORTED\",\"message\":\"the threaded server "
++                   "does not implement this control request\"}";
 +          }
 +          connection.output = "HTTP/1.1 " + std::string(status) +
 +              "\r\nX-Coworkerd-Threaded-Protocol: 3\r\nContent-Length: " +

@@ -74,7 +74,7 @@ index c0c4c227f21b79dd99240933dae79ae17a127031..351e17522c3945771debb3279b62bddf
      static constexpr kj::Duration PROGRESS_INTERVAL = 1 * kj::SECONDS;
      kj::TimePoint lastProgress = kj::origin<kj::TimePoint>();
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
-index f3602112d929d1be35d44b1117429d95524eced7..10003e7818ffa0eb6183e7bc849b49b3753e1cf8 100644
+index 1b40c8e1d02743aa4ba800b7225840c6e940f386..4c215e270479eba77cbb10ae184fd031afa7cd98 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.h
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
 @@ -1,6 +1,7 @@
@@ -115,7 +115,7 @@ index f3602112d929d1be35d44b1117429d95524eced7..10003e7818ffa0eb6183e7bc849b49b3
 +    if (!dynamic && gcSettings().staticHeapBytes) recordStaticHeapLimit(value, name);
    }
    bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
-   // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
+   // Report the execution identity so a fatal OOM can be attributed to the request.
 @@ -219,14 +230,15 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
          escapeCpuJsonString(version), ",\"invocationId\":", escapeCpuJsonString(invocation), ',');
    }

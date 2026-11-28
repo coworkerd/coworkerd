@@ -5,7 +5,7 @@ Subject: [PATCH] Report durable memory placement and reset transitions
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 7a6106fd53acdacdefa63332431f82e074be2a72..6bb333c8aafd2f2abb0ac95e8de6f2eab299c109 100644
+index 0dcbfc43fc039b3547b221b18065f13b1d06685d..a58d2eb26bcc817603befd7cac4e411a8a08aeb2 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2771,16 +2771,23 @@ struct ThreadedServer {

@@ -5,7 +5,7 @@ Subject: [PATCH] Format durable context limit construction
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 236a078415595ef2de29e207e65c4cdfb8792d5f..fbb86c9698bbca6e95059b8808addb85086163cd 100644
+index c28eadc92518af4be983a1345b359e4cda0dc842..05210d92a67bcb2b271a37438d051a87f6b4cf53 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -4489,7 +4489,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,

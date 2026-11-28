@@ -85,7 +85,7 @@ index 527353fe2ae5875fb9a62b425bbdacb70d03b33f..994481dbbc8bed5a33ced41e6bbf2ba1
  
      static constexpr inline Hooks& getDefaultHooks() {
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index fdb5c3a611a9598e5d03ea6d5382c5cbb301b35b..7db0275a1f06f14f4e6c447defb44688e24ce08e 100644
+index 676a98140baa31985b705e304ba0303d2b5774a1..b814983dd5e8b3e380645c5068faeac47fcffd86 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -3716,20 +3716,80 @@ class DurableTestHttp final: public kj::HttpService {

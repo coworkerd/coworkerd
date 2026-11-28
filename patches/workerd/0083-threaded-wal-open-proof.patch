@@ -147,7 +147,7 @@ index 622ebd4c76c410232b6ca7c977cd2d0e25df1df7..3a5c53e6a35fa5d7861b718b1c57526c
  // An ACK's status. A refusal carries the code the caller sees: the node could not make the write durable, the
  // object is past its own size limit, or the tenant's Durable Object storage quota is exhausted. Reads are not
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index f4862ad2b84d719e0b8ee967ab4056d1ba66136a..011ef2fb0904c062113d12ee52361c07bd3f5c9c 100644
+index bf42eaacc36675e9ba0556b0dae9b4d4ce8c7770..d60d75b3fb8f6f028db4515c7beff6a418d6d357 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -5015,13 +5015,15 @@ kj::Promise<void> LocalFacet::initialize() {

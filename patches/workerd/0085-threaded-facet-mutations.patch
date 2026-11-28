@@ -100,7 +100,7 @@ index e81b7c14a13e5e9faaa020d48906d282cdd8582e..9432902f7dc56f33cb68e9090f56c78d
    kj::StringPtr getKey() {
      return key;
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 146ee13368100c65dacb141541f25d69a711aa5f..766faaa09ee4238c7d639b6f70dd65ff0c6ac910 100644
+index 24e9eb0c3975191babe9a2bd681423efb97a3d51..179bb592855b8f4d98681e3124549f353c2aeb48 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -4934,7 +4934,7 @@ class DurableActorHooks final: public Worker::Actor::Loopback,

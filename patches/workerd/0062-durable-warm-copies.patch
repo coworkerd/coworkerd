@@ -5,7 +5,7 @@ Subject: [PATCH] Prefer matching warm durable copies after root retirement
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index f7fa17d49626668d038c26da99d96ae2967062d6..e3cd6ba59bd0e289783ab909c9c2d0f4ece78571 100644
+index ae66aff14d2975e1f1be9076a963280c4560fd2f..61ea5c9d212eeffb23ed1ec2f16fd9cae06ee98f 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2227,6 +2227,7 @@ struct ThreadedServer {

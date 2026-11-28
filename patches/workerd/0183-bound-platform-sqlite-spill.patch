@@ -181,7 +181,7 @@ index bf632d528b7c2fc9d3a0d7e97e92a6e4303803f4..267e2045897757e97bf48a558be2b82b
  
  void DurableLogShipper::afterReset(SqliteDatabase& database) {
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 05d0b8e7dabf85fcdbc6fa194e575631479a2afc..5f8009232c1b74fa0662bc4879dc23a59811653c 100644
+index 2244bfe619986a415635365abd40f5256fbd34a6..a257ca7f12fb3720b10702376cf16d0f676ff92d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2747,7 +2747,9 @@ struct ThreadedServer {

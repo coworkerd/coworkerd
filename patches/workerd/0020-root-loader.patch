@@ -155,7 +155,7 @@ index 0000000000000000000000000000000000000000..6d0f07748f0fa68afb26da6791f85bed
 +
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
-index 26c8c7daffe28caae120f0fac9e5112b9626ebde..00c12e4f371aaf239fcbe0e3279e03ac68e41225 100644
+index 2a4a43033f1ded15448a95e88da6f535c8edd95a..6ef62d3b25063b740c3711295b971b4f8a631999 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.h
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
 @@ -16,11 +16,13 @@

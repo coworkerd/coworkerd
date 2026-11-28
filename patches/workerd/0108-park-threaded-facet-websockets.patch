@@ -380,7 +380,7 @@ index 01a63e71876e698ed3515bab81f9b711703df30d..be4772b1936089b2d8326fae2ecf5c85
  
  interface Bootstrap @0xa0c731b2df279451 extends(Worker.WorkerdBootstrap) {
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 7045a3fe12e0a36d6ce0c7cd987f346cf7b6f5a4..67eb486f1d73adba9a141bd82f17d3cdf8faffd1 100644
+index 3d79c5ae1bafd264da7dfd0b7abfb95c36e910ec..de82f7885126124a33dc9ef0f6b5ec649dc78c2f 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -1371,6 +1371,59 @@ KJ_TEST("four simultaneous near-GiB heap objects preserve the process and a neig
@@ -444,7 +444,7 @@ index 7045a3fe12e0a36d6ce0c7cd987f346cf7b6f5a4..67eb486f1d73adba9a141bd82f17d3cd
    for (auto literal: {"123456789.12345679", "123456789.12345678", "9007199254740991",
           "1.2345678901234567e+12", "1e+09", "0.00100", "0"}) {
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index bb9a4c4516f0e1588d9a5273e25dbcc908bdb026..7f355641445dd2329a222cf84eedeaf028c1b154 100644
+index fdccb01d1b7d3da65429ef3e782236a72e33773c..48b5cd4ee530d752d540dc73aaf1b6d550cef58e 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1806,6 +1806,9 @@ server::DurableIdleLifecycle::Time durableIdleNow() {

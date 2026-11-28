@@ -3,17 +3,6 @@ From: maslow <wangfugen@126.com>
 Date: Wed, 25 Nov 2026 14:14:58 +0800
 Subject: [PATCH] Hold invocation budgets through runtime request drain
 
----
- src/workerd/io/io-channels.h                  |  1 +
- src/workerd/io/worker-entrypoint.c++          |  1 +
- src/workerd/io/worker-interface.capnp         |  4 +-
- .../server/factory/coworkerd-cpu-limit.c++    |  2 +-
- .../server/factory/worker-factory-rpc.c++     | 12 +++-
- src/workerd/server/factory/worker-factory.c++ | 20 +++---
- src/workerd/server/factory/worker-factory.h   |  2 +-
- src/workerd/threaded/protocol.capnp           |  2 +-
- src/workerd/threaded/threaded-server.c++      | 63 ++++++++++++-------
- 9 files changed, 69 insertions(+), 38 deletions(-)
 
 diff --git a/src/workerd/io/io-channels.h b/src/workerd/io/io-channels.h
 index a7ffc2e0209eda35cb6559d7b813ae1c59c81373..51e779255a9fc2cf8eacb92ef6028b16f514d279 100644
@@ -199,10 +188,10 @@ index be4772b1936089b2d8326fae2ecf5c859a5f2430..1ec43c46f76a3a595553b3f19fa99d81
    socketControl @1 () -> (control :ThreadedSocketControl);
  }
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267da806eaa7 100644
+index 72f388200e876ea7993e72e2a3f3e175b0853ea0..f337a66f47369cdab5e052fb7bb26d640bdda039 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1591,8 +1591,8 @@ struct RequestLimits final: LimitEnforcer {
+@@ -1592,8 +1592,8 @@ struct RequestLimits final: LimitEnforcer {
    }
    kj::Maybe<IoContext::IncomingRequest &> getActorEventRequest() override {
      if (scope == nullptr || !scope->event) return kj::none;
@@ -213,7 +202,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
    }
    struct EventToken {
      const std::weak_ptr<int> owner;
-@@ -2255,11 +2255,13 @@ struct InvocationState: kj::Refcounted {
+@@ -2285,11 +2285,13 @@ struct InvocationState: kj::Refcounted {
  
  class Invocation final: public kj::HttpService {
   public:
@@ -229,7 +218,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
    kj::Promise<void> request(kj::HttpMethod method,
        kj::StringPtr url,
        const kj::HttpHeaders &headers,
-@@ -2271,21 +2273,24 @@ class Invocation final: public kj::HttpService {
+@@ -2301,21 +2303,24 @@ class Invocation final: public kj::HttpService {
    ThreadState &state;
    kj::String descriptor;
    Frankenvalue props;
@@ -257,7 +246,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
      return kj::READY_NOW;
    }
    kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override;
-@@ -2295,6 +2300,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
+@@ -2325,6 +2330,7 @@ class Dispatcher final: public rpc::EventDispatcher::Server {
    ThreadState &state;
    kj::String descriptor;
    Frankenvalue props;
@@ -265,7 +254,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
    bool used = false;
  };
  
-@@ -2308,7 +2314,7 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2338,7 +2344,7 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
      KJ_REQUIRE(!params.getFromPersistentStub() && !params.getFromHandoff(),
          "NOT_SUPPORTED: persistent objects and handoff");
      context.initResults().setDispatcher(
@@ -274,7 +263,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
      return kj::READY_NOW;
    }
  
-@@ -2317,7 +2323,7 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2347,7 +2353,7 @@ class Bootstrap final: public threaded::rpc::Bootstrap::Server {
      used = true;
      auto params = context.getParams();
      context.getResults().setDispatcher(kj::heap<Dispatcher>(server, state,
@@ -283,7 +272,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
      return kj::READY_NOW;
    }
  
-@@ -2363,7 +2369,8 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
+@@ -2393,7 +2399,8 @@ class DurableBootstrap final: public threaded::rpc::Bootstrap::Server {
    std::shared_ptr<DurableSessionScope> scope;
    bool used = false;
  
@@ -293,7 +282,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
  };
  
  struct SubrequestBudget {
-@@ -5052,6 +5059,7 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+@@ -5082,6 +5089,7 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
    ThreadState &state;
    ThreadedServer &server;
    std::shared_ptr<Slot> slot;
@@ -301,7 +290,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
    uint64_t sequence = 0;
    std::shared_ptr<uint32_t> subrequests = std::make_shared<uint32_t>(0);
    threaded::InvocationLogBudget logBudget;
-@@ -5589,6 +5597,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+@@ -5619,6 +5627,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
      std::shared_ptr<Slot> slot,
      Json::Reader input,
      kj::StringPtr raw,
@@ -309,7 +298,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
      Frankenvalue props,
      std::shared_ptr<ResourcePreparation> preparation,
      std::shared_ptr<TenantPermit> tenant,
-@@ -5617,6 +5626,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+@@ -5647,6 +5656,8 @@ PreparedInvocation prepareInvocation(ThreadState &state,
      entrypoint.assign(name.begin(), name.size());
    }
    auto channels = kj::rc<Channels>(state, server, slot, raw);
@@ -318,7 +307,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
    auto tracer = kj::rc<TenantTracer>(channels.addRef());
    auto identity = kj::str("\"workerId\":", encode(field(input, "workerId")),
        ",\"versionId\":", encode(field(input, "versionId")),
-@@ -5626,6 +5637,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
+@@ -5656,6 +5667,7 @@ PreparedInvocation prepareInvocation(ThreadState &state,
      observer = kj::refcounted<DurableEventObserver>(
          std::make_shared<DurableEventCpu>(kj::str(identity), slot->limits->memoryMiB));
    }
@@ -326,7 +315,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
    auto limits =
        kj::heap<RequestLimits>(*slot, invocation->measurement, state.timer, kj::mv(identity));
    if (slot->resetDurableRoot) {
-@@ -6093,7 +6105,7 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
+@@ -6123,7 +6135,7 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
    void stop(const kj::Exception &reason);
    kj::Promise<kj::Rc<LocalFacet>> openSocketFacet(uint id, kj::StringPtr descriptor);
    kj::Promise<std::pair<kj::Own<WorkerInterface>, kj::Own<Worker::Actor>>> openSocket(
@@ -335,7 +324,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
  
   private:
    struct Invocation {
-@@ -6108,7 +6120,8 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
+@@ -6138,7 +6150,8 @@ class LocalFacet final: public IoChannelFactory::ActorChannel {
  
    kj::Promise<void> initialize(kj::String descriptor);
    kj::Promise<void> ensureStarted(kj::StringPtr descriptor);
@@ -345,7 +334,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
  
    std::shared_ptr<DurableTreeContext> tree;
    std::shared_ptr<DurableFacetReservation> reservation;
-@@ -6339,8 +6352,10 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
+@@ -6369,8 +6382,10 @@ kj::Own<WorkerInterface> LocalFacet::startRequest(IoChannelFactory::SubrequestMe
    auto &channels =
        KJ_ASSERT_NONNULL(dynamic_cast<Channels *>(&IoContext::current().getIoChannelFactory()));
    KJ_REQUIRE(tree->slot.lock() == channels.slot, "facet request must stay on the original home");
@@ -357,7 +346,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
  }
  
  kj::Promise<void> LocalFacet::initialize(kj::String descriptor) {
-@@ -6454,19 +6469,19 @@ kj::Promise<kj::Rc<LocalFacet>> LocalFacet::openSocketFacet(uint id, kj::StringP
+@@ -6484,19 +6499,19 @@ kj::Promise<kj::Rc<LocalFacet>> LocalFacet::openSocketFacet(uint id, kj::StringP
  }
  
  kj::Promise<std::pair<kj::Own<WorkerInterface>, kj::Own<Worker::Actor>>> LocalFacet::openSocket(
@@ -381,7 +370,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
        kj::addRef(*KJ_ASSERT_NONNULL(actor).value), className.asPtr());
    co_return kj::mv(prepared.entry).attach(kj::mv(invocation));
  }
-@@ -6549,7 +6564,7 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
+@@ -6579,7 +6594,7 @@ kj::Promise<server::DurableWalPosition> prepareRootWal(ThreadedServer& server,
  }
  
  kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
@@ -390,7 +379,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
    KJ_REQUIRE(!used, "one event per durable connection");
    used = true;
    KJ_REQUIRE(!server.durableLog || server.durableLog->ready(), "durable WAL channel unavailable");
-@@ -6731,7 +6746,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6763,7 +6778,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
      auto socketActor = kj::addRef(*root.actor);
      if (facetId != 0) {
        auto facet = co_await root.hooks->getSocketFacet(facetId, descriptor);
@@ -399,7 +388,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
        entry = kj::mv(opened.first);
        socketActor = kj::mv(opened.second);
      }
-@@ -6739,7 +6754,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+@@ -6771,7 +6786,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
        kj::mv(socketActor), text(socketDescriptor, "id"), durableNumber(socketDescriptor, "frame")};
    }
    if (entry.get() == nullptr) {
@@ -408,7 +397,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
          nullptr, kj::refcounted<RequestObserver>(), kj::addRef(*root.actor))
                  .entry;
    }
-@@ -6767,7 +6782,7 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
+@@ -6799,7 +6814,7 @@ kj::Promise<void> DurableBootstrap::startEvent(StartEventContext context) {
    try {
      KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
      auto dispatcher =
@@ -417,7 +406,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
      context.getResults().setDispatcher(kj::mv(dispatcher));
      if (accepted->isWaiting()) accepted->fulfill();
    } catch (const kj::Exception &error) {
-@@ -6781,7 +6796,7 @@ kj::Promise<void> DurableBootstrap::startNativeEvent(StartNativeEventContext con
+@@ -6813,7 +6828,7 @@ kj::Promise<void> DurableBootstrap::startNativeEvent(StartNativeEventContext con
    try {
      KJ_REQUIRE(!scope->ended, "durable session ended before its event was prepared");
      auto dispatcher = co_await scope->preparing.wrap(prepare(
@@ -426,7 +415,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
      context.getResults().setDispatcher(kj::mv(dispatcher));
      if (accepted->isWaiting()) accepted->fulfill();
    } catch (const kj::Exception &error) {
-@@ -6829,7 +6844,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
+@@ -6861,7 +6876,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
      co_await server.confirmDecision(input, state, "load-rejected", error.getDescription(), stage);
      kj::throwRecoverableException(error.clone());
    }
@@ -435,7 +424,7 @@ index 69a54c498db6924c7a7fd4604f8f0031d9ce9bb2..39de789e08ca274a53e810cecc72267d
        std::move(preparation), std::move(tenant));
    auto identity = invocationIdentity(*slot, input);
    startBoundRpcSession(context.getResults(),
-@@ -6970,7 +6985,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
+@@ -7002,7 +7017,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
      co_await output->write(report.asBytes());
      co_return;
    }

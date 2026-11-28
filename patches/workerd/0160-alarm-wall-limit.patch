@@ -83,7 +83,7 @@ index 07b2b49119784dc6a8d210fb3b3a72ea114f6e78..a0760cbdddb59298b737203d83e27666
    size_t getBufferingLimit() override {
      return kj::maxValue;
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index b2d1c524acd9ca2f1aaddbde51c2ebda230add16..826470760ed770ebdfea1ed21f6faf92aea3f71c 100644
+index a7646f6291c3c7d4d6a87b6681f30adb04a6f6d1..c903498b042370c9b1d3270c0476dd04f25b44e8 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
 @@ -15,6 +15,7 @@ THREADED_DEPS = [
@@ -95,7 +95,7 @@ index b2d1c524acd9ca2f1aaddbde51c2ebda230add16..826470760ed770ebdfea1ed21f6faf92
      "//src/workerd/server/factory:coworkerd-durable-cpu",
      "//src/workerd/server/factory:coworkerd-durable-placement",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index cfe75f0372931bccee40b3b3e45a2c80df8eb321..9139eb3ab715551d051af1791a323d5649cecc6c 100644
+index 2b15a2779d17c53b63e08e218185b0267c0a143b..e45aff2c9e412f4007cae96ed9602d4544bbff89 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -25,6 +25,7 @@

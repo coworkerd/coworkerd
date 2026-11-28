@@ -5,7 +5,7 @@ Subject: [PATCH] Release durable copies after process-memory pressure
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 8a8373db2082aebd9e1979e44d884229e95231b8..d7f8d488c31e675e91fcdd79191f7d697f88684e 100644
+index 752e3d37f6a07e37a36e0dad258bdf25333f7409..29095c9e5525477e5fdb334421d0da46806ef338 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -756,10 +756,13 @@ struct MemoryBudget final: v8::ArrayBuffer::Allocator {

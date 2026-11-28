@@ -37,7 +37,7 @@ index b13e0ff4511578c0b7bd6ddd73c91927edc5be10..60ab17ba9f46b0a750c1868a863c3ba4
    // is performed. Note that the source here may not be a string: V8 also reports
    // each object argument to new Function() before converting it to a string.
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index 1174e5a0fdea79713a88256b94006969f77212e0..b2d1c524acd9ca2f1aaddbde51c2ebda230add16 100644
+index 9e77c889fb77f5fa1a2af9a1368cdf9c51d5ab67..a7646f6291c3c7d4d6a87b6681f30adb04a6f6d1 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
 @@ -5,6 +5,7 @@ load("//:build/wd_cc_library.bzl", "wd_cc_library")
@@ -273,7 +273,7 @@ index 0000000000000000000000000000000000000000..4b0233b18b938e470f3c90a156cc3a15
 +
 +}  // namespace workerd::threaded
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 477cef832e7392b3c9c2135cf6a8230266e6314d..94edf00375b8b5ff1eec655e65199b07aeb880a1 100644
+index 266c8746be1052b094114bcfc86d33cde803f4d4..b7a9ddb01e3330c886d83309d5cf1dc2e02bc15b 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -3,6 +3,7 @@

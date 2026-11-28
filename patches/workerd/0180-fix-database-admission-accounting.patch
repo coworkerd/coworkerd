@@ -11,7 +11,7 @@ Exercise the threaded server paths with controlled time and simulated
 reservations. Part of coworkerd/coworkerd#81.
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index f5029f64355bb091fee49f6d92ff9f3aae09d959..d1164d9463d31ce41fce91019133458f2aac7308 100644
+index 911d664965f036c6f4a939e0e9d8d945a0710bff..cd5a863932ecc9e2deb20944ec2b2dd767d7d8e0 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -159,7 +159,7 @@ KJ_TEST("database retirement waits for the final reservation holder only until i
@@ -349,9 +349,9 @@ index f5029f64355bb091fee49f6d92ff9f3aae09d959..d1164d9463d31ce41fce91019133458f
 +  KJ_EXPECT(budget->lent == 0);
  }
  
- // Each long operation below ended the process before v138 (exit 74 at the
+ // Each long operation below previously ended the process (exit 74 at the
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 5f8009232c1b74fa0662bc4879dc23a59811653c..f391261748c3f980c6ea8760d1a0b7b6492ee342 100644
+index a257ca7f12fb3720b10702376cf16d0f676ff92d..9ba5c7117849923c45eb81b6df7e605f1e438025 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -354,7 +354,7 @@ struct ResourceBudget {

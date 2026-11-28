@@ -6,7 +6,7 @@ Subject: [PATCH] Drop deferred actor handles before durable pressure
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 6bb333c8aafd2f2abb0ac95e8de6f2eab299c109..e36881dff4b5ac1ef5bb777fa7315c06da3e463e 100644
+index a58d2eb26bcc817603befd7cac4e411a8a08aeb2..7b3802a96aa12dad61fa43a98c50cccd79142ccc 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2718,11 +2718,13 @@ struct ThreadedServer {

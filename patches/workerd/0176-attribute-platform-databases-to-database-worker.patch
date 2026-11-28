@@ -5,7 +5,7 @@ Subject: [PATCH] Attribute threaded database events to the database Worker
 
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index d706e00f8c866295dbd39e4363610f498065df6c..66ce9ab55a53f590172d2fd9f931e5ed1765276c 100644
+index 630e865d7467270ed53feda54c153ec7bd9a50ec..b740b0793d39c2cac0f56f07dbc80c854d577ee4 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -45,6 +45,8 @@ KJ_TEST("platform durable plans pin the class and copy to the tenant") {
@@ -58,10 +58,10 @@ index d706e00f8c866295dbd39e4363610f498065df6c..66ce9ab55a53f590172d2fd9f931e5ed
    KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
    route.key = {"namespace-one", "object-two"};
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index e3b59b78493fc01094ae8b36be636fb0094af102..ec0f8ede3412f15313c0fbce0e3b33ec484c0aaf 100644
+index a4891131ed90379e6b79218c52ccfe090ae869be..df080f6e3c4d7bad1bdf7762191a2aae0c2c2722 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -2147,7 +2147,10 @@ bool platformDurablePlan(Json::Reader input, Json::Reader plan, Json::Reader sel
+@@ -2157,7 +2157,10 @@ bool platformDurablePlan(Json::Reader input, Json::Reader plan, Json::Reader sel
    const auto database = field(field(input, "durableObject"), "database");
    const bool isDatabase = database.isString() && database.getString().size() > 0;
    if (isDatabase != (productPlatformPlan(plan) && route.open.className == "SqlDatabase")) return false;

@@ -489,7 +489,7 @@ index f2fe8312b10840d141b47ebe57df78f63a7b6af9..e4b514269b2e43a60f2e5b5d41e0cf6a
    class PreparedOpen {
     public:
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 974470feb6085ee0f537f33022c5fd492097f987..37b1e2c9be4859eb2adafee54c865d433b527140 100644
+index 907c9ded66108f9b6ba78e4d4a542198cbc4a292..85a474a7821cca25ca8bd5fe03d0d28737874c0b 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -462,6 +462,25 @@ struct DatabaseAdmissionFixture {
@@ -519,7 +519,7 @@ index 974470feb6085ee0f537f33022c5fd492097f987..37b1e2c9be4859eb2adafee54c865d43
    DatabaseAdmissionFixture test;
    auto& server = test.server;
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 9656855c948c66daf2ea8a93aa05e484324a8723..cfe75f0372931bccee40b3b3e45a2c80df8eb321 100644
+index 49bbfc97b3208ca3aeab60a3c772976490fd70e2..2b15a2779d17c53b63e08e218185b0267c0a143b 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2771,6 +2771,7 @@ struct ThreadedServer {

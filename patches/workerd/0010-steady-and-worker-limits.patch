@@ -53,14 +53,14 @@ index 3cc49921f9ec4ef55d35fadf2a6a6bc0c3bc3658..c0c4c227f21b79dd99240933dae79ae1
    static const int pid = getpid();
    return pid;
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
-index 37ab83e5910ecfeac23baca44f241d4116c6b47b..f3602112d929d1be35d44b1117429d95524eced7 100644
+index cd3dc6d145d6f571b5d361d9d17e9ba4880b3e24..1b40c8e1d02743aa4ba800b7225840c6e940f386 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.h
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
 @@ -33,6 +33,16 @@ struct CoworkerdWorkerIdentity {
    uint64_t generation = 0;
  };
  uint32_t cpuLimitFromEnvironment();
-+// The limits one Worker names (Coworkerd v49), as the loader key the node's runtime bridge chose carries them:
++// The node's runtime bridge carries the Worker's explicit limits in the loader key:
 +// the isolate name's last segment `limits=<cpuMs>:<memoryMiB>` (either may be 0: the process's value, which
 +// COWORKERD_CPU_LIMIT_MS and COWORKERD_MEMORY_LIMIT_MIB give, applies to it instead). Both are zero for any
 +// other name, so an isolate whose Worker names no limit behaves as before. An isolate's heap constraint is
@@ -90,9 +90,9 @@ index 37ab83e5910ecfeac23baca44f241d4116c6b47b..f3602112d929d1be35d44b1117429d95
      }
      if (isEnabled()) { cpuEventsDescriptor(); watchdog = &LimitWatchdog::start(); }
 @@ -161,7 +171,11 @@ class CpuIsolateLimitEnforcer final: public IsolateLimitEnforcer {
-   // OOM): this isolate has a memory limit -- its Worker's own (v49) or the process's -- or the process has
-   // one while this isolate has none, as before v49, so that every isolate of a process with a memory limit
-   // keeps reporting who was executing.
+   // A Worker-specific memory limit enables reporting for its isolate. A process-wide
+   // memory limit enables reporting for every isolate, even those without their own
+   // limit.
 -  bool memoryIdentityWanted() const { return memoryLimitFromEnvironment() != 0; }
 +  bool memoryIdentityWanted() const { return memory != nullptr || memoryLimitFromEnvironment() != 0; }
 +  // The limits in force here, whichever named them: what the state endpoint shows as applied.
@@ -112,7 +112,7 @@ index 37ab83e5910ecfeac23baca44f241d4116c6b47b..f3602112d929d1be35d44b1117429d95
    kj::String startupIdentity;
 diff --git a/src/workerd/server/factory/coworkerd-steady.c++ b/src/workerd/server/factory/coworkerd-steady.c++
 new file mode 100644
-index 0000000000000000000000000000000000000000..c2dc2a1e31432cabb0d67ae433a1a201b6ee9f53
+index 0000000000000000000000000000000000000000..6fcc13201d77b2fa551a0ee13faf7844702207c9
 --- /dev/null
 +++ b/src/workerd/server/factory/coworkerd-steady.c++
 @@ -0,0 +1,295 @@
@@ -315,9 +315,9 @@ index 0000000000000000000000000000000000000000..c2dc2a1e31432cabb0d67ae433a1a201
 +  }
 +};
 +
-+// Everything this process does once it serves: the dumpable bit the launcher cleared before it executed us
-+// (the kernel sets it again for a readable, same-owner binary -- which is why v44's state endpoint reported
-+// `nonDumpable` false and why this is done from here), and the steady-state filter.
++// Clear the dumpable bit and install the steady-state filter when serving starts.
++// The kernel can set the bit again when the launcher executes a readable, same-owner
++// binary, so clearing it in the launcher does not guarantee `nonDumpable` here.
 +void narrow() {
 +  const char* modeText = std::getenv("COWORKERD_SECCOMP_STEADY_MODE");
 +  const char* path = std::getenv("COWORKERD_SECCOMP_STEADY_FILE");
@@ -364,7 +364,7 @@ index 0000000000000000000000000000000000000000..c2dc2a1e31432cabb0d67ae433a1a201
 +      installed = true;
 +    }
 +  }
-+  // Test only: a call this process no longer has (v49's acceptance 3.1). The startup table holds the calls only
++  // Test only: exercise a syscall that the steady-state filter blocks. The startup table holds the calls only
 +  // the startup needs -- execve above all, since the launcher has to execve this program -- and the steady table
 +  // does not; with the narrow filter in force, making one of them must end the process. Honoured in `enforce`
 +  // alone: in `observe` the call would be let through, and an execve of this process is not something to let
@@ -413,14 +413,14 @@ index 0000000000000000000000000000000000000000..c2dc2a1e31432cabb0d67ae433a1a201
 +}  // namespace workerd::server
 diff --git a/src/workerd/server/factory/coworkerd-steady.h b/src/workerd/server/factory/coworkerd-steady.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..b9bcb7d8629e65dec163f9e7449c6f47b4753a90
+index 0000000000000000000000000000000000000000..976906e7418ff210402eec0a841fe5fadc23e814
 --- /dev/null
 +++ b/src/workerd/server/factory/coworkerd-steady.h
 @@ -0,0 +1,9 @@
 +#pragma once
 +
 +namespace workerd::server {
-+// Coworkerd v49: the moment this process starts serving. Called at the start of every request; the first
++// Apply serving-time restrictions. Called at the start of every request; the first
 +// call -- the node's first readiness probe, before anything has been answered -- makes the process
 +// non-dumpable and installs the steady-state system call filter, as the node's environment asks. Nothing
 +// happens without that environment, and nothing happens outside Linux.

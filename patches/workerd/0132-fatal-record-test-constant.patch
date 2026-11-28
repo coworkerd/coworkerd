@@ -5,7 +5,7 @@ Subject: [PATCH] Use the supported KJ string constructor in the fatal test
 
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 058a61eb4a36493f7649ba1d8cb770b3cb6c5661..6265dcf47e0eec3c9935a170b9c32c4d2ecf2264 100644
+index 8c87fe20452d78f5fe645a82ffa8c5db075e4e80..27a2b756b67f35272bb8160b1a6590db00e26c2b 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -57,7 +57,7 @@ KJ_TEST("fatal record identifies only the invocation on the current V8 thread")

@@ -5,7 +5,7 @@ Subject: [PATCH] Allow a one-shot V8 group refusal in disposable durable tests
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 44af36d96b36dd4c0c55e9e31a0938ef2d99d27a..2e189837085cb5bd0b11e466608c91f35cc72f88 100644
+index f2c210af8dd745cc4010ede56c9f76b25196bf13..8ba7acd7ca1a5c16b3854cab51b03248710fc57d 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2195,6 +2195,7 @@ struct ThreadedServer {

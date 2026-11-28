@@ -776,7 +776,7 @@ index f49268a48222ee29dd41f0e5aab49b6d4b4169fb..8a906acb41176e4468eaf9fec3cbd015
    // ActorSqlite's commit callback: the frames of everything committed since the last one go to the replicator and
    // the promise resolves when it confirms them. It is rejected -- which breaks the output gate, so the object is
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 94edf00375b8b5ff1eec655e65199b07aeb880a1..64357521a0629f9245743c228a7db44d1b3496cb 100644
+index b7a9ddb01e3330c886d83309d5cf1dc2e02bc15b..832b62c4e3e3b06af459c6878531bb0f8cdd0166 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2002,8 +2002,9 @@ struct ThreadState {

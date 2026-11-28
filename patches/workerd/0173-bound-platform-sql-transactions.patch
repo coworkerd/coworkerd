@@ -211,7 +211,7 @@ index d96f3fd4f09458a1ba04c7a3fd8195281615f913..7322e843d394af515a78b2ae1d28e6bd
        lastCommitCk2 = s2;
        ++commitsHere;
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index e3b59b78493fc01094ae8b36be636fb0094af102..15a2ca20bfc1ff61773addb75acf4765df989f94 100644
+index e53aa6ece507e03e27d5502b427b2007d23d7b84..4e15ba038621126344134a89d237cec03b8db71c 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -6214,7 +6214,8 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t

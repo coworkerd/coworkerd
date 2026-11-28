@@ -6,7 +6,7 @@ Subject: [PATCH] Require an active invocation for fatal errors outside initial
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 321dcf9052c5abaef63307be61143f83a1019972..471b3f300d24806426b6793bdf18aa240dd3895b 100644
+index 403311ff39b4ff0e2e11239e72e4cd45a2462714..4c15d73fae00bad4bc5da7ba3e03c0f76e49d4ad 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1272,7 +1272,7 @@ struct IsolateLimits final: IsolateLimitEnforcer {

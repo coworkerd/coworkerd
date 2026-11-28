@@ -624,7 +624,7 @@ index 53044781b353534a6fbabb5b07c426300a8ef136..52523c6ff8f33e1715cc5ef0ea02b67f
 +  socketControl @1 () -> (control :ThreadedSocketControl);
  }
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index c750f8afb3cbc5488db87171b6c2ed48abf8f51f..5a5f2008d42ce911dffb5fb07e005034d9445e48 100644
+index 378e040ee6faf48dc82691e2e6a1c0d82bace0dd..5a826bdb1b22df3cf62a3ae440a7f22fb9b9b64a 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -13,6 +13,7 @@

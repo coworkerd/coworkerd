@@ -54,7 +54,7 @@ index 38150300875c76a16bc3b3ee9ec6519427f94f1c..47268eb6be34d7cdfdef0314cffcb016
  kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
      CpuIsolateLimitEnforcer& limits) {
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
-index d81e4d1e938ae950894d4a3b173b056784269c59..26c8c7daffe28caae120f0fac9e5112b9626ebde 100644
+index 2a80d5269766e9e95592e545a7a33cf9d7a5474f..2a4a43033f1ded15448a95e88da6f535c8edd95a 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.h
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
 @@ -2,6 +2,7 @@

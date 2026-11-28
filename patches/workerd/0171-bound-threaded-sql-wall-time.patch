@@ -98,7 +98,7 @@ index eb1afcf0087f3013226e09f9c8ffb8308cf6af6d..6d3ed006d4b839a2800768c69154eaff
      committed = true;
    }
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 593c2a0fdecf25d0d14d24b09a6f57417cb15ab2..c93757d6d6b1b2db5c1825f957cff9a3c8958870 100644
+index fff2905a8d715adcd7abe7a764f4995c096f42b6..4828036cf89041e9e236601cbe22363795804ed4 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1075,13 +1075,14 @@ class CpuWatchdog {

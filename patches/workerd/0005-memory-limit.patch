@@ -213,7 +213,7 @@ index cce2d15c3feee19f307e8cd156a115c60c51d5b5..3cc49921f9ec4ef55d35fadf2a6a6bc0
  }
  kj::Own<WorkerInterface> wrapCpuWorkerInterface(kj::Own<WorkerInterface> entry,
 diff --git a/src/workerd/server/factory/coworkerd-cpu-limit.h b/src/workerd/server/factory/coworkerd-cpu-limit.h
-index 35eed676153cd3a0b9a22de688a31abf9dbb5fff..37ab83e5910ecfeac23baca44f241d4116c6b47b 100644
+index 35eed676153cd3a0b9a22de688a31abf9dbb5fff..cd3dc6d145d6f571b5d361d9d17e9ba4880b3e24 100644
 --- a/src/workerd/server/factory/coworkerd-cpu-limit.h
 +++ b/src/workerd/server/factory/coworkerd-cpu-limit.h
 @@ -1,10 +1,14 @@
@@ -327,10 +327,10 @@ index 35eed676153cd3a0b9a22de688a31abf9dbb5fff..37ab83e5910ecfeac23baca44f241d41
 +    if (memory) memory->customize(value);
 +  }
 +  bool isEnabled() const { return cpuNs != 0 || memory != nullptr; }
-+  // Whether a request of this isolate carries the memory execution identity (v33's attribution of a fatal
-+  // OOM): this isolate has a memory limit -- its Worker's own (v49) or the process's -- or the process has
-+  // one while this isolate has none, as before v49, so that every isolate of a process with a memory limit
-+  // keeps reporting who was executing.
++  // Report the execution identity so a fatal OOM can be attributed to the request.
++  // A Worker-specific memory limit enables reporting for its isolate. A process-wide
++  // memory limit enables reporting for every isolate, even those without their own
++  // limit.
 +  bool memoryIdentityWanted() const { return memoryLimitFromEnvironment() != 0; }
 +  // A dynamic Worker's request contexts report their end on the event pipe, limits or not.
    bool reportsCompletion() const { return dynamic && cpuEventsDescriptor() >= 0; }

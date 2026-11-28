@@ -5,10 +5,10 @@ Subject: [PATCH] Use an empty object identity for ordinary D1 and object calls
 
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 7b0c5b5aeeb1d1c2addfafb7f80ffc200452d05f..69a54c498db6924c7a7fd4604f8f0031d9ce9bb2 100644
+index 8825de427f59958f998dd9015d73b9df4e4bb6b5..72f388200e876ea7993e72e2a3f3e175b0853ea0 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -5148,10 +5148,12 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
+@@ -5178,10 +5178,12 @@ struct Channels final: IoChannelFactory, InvocationLogBuffer {
        return encode(root.asReader());
      };
      auto target = field(input(), "durableObject");

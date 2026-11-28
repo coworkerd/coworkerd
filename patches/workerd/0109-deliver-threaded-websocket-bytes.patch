@@ -6,7 +6,7 @@ Subject: [PATCH] Read threaded Durable Object WebSocket frames as bytes
 Use typed metadata from the node invocation descriptor and read the fixed-length body directly into the hibernation event buffer. Preserve the existing Worker event types and output gate.
 
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 20f5e0299499088e0c7fcdfaa89a9e7ed3ce62d7..477cef832e7392b3c9c2135cf6a8230266e6314d 100644
+index 354e6fa2ecd75f358541d846634ddae7ad7e4d27..266c8746be1052b094114bcfc86d33cde803f4d4 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -4839,11 +4839,52 @@ class DurableAlarmHttp final: public kj::HttpService {

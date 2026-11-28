@@ -209,7 +209,7 @@ index 1c5ba1ca18fb5e73dd43aa588dae9a19cf97cd24..2a7fda3b1d4458d659e77fb067374736
    SqliteDatabase::Vfs vfs;
  };
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index a0ce95f57019979e612e3d598591b67fd52dc32e..d86074a7c43851efe64114f32eb45717e79472cf 100644
+index dbbe3a5532273815797be998c5193498c5d3ca45..9ba75359d426905615ab3d76adbdc3c13db4d751 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -51,6 +51,7 @@

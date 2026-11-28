@@ -290,7 +290,7 @@ index 2a7fda3b1d4458d659e77fb0673747365563f390..65e553a205e162d7c71cea6aae246e9e
   private:
    void ensureNamespace(kj::StringPtr uniqueKey, kj::StringPtr storageId) const;
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index d86074a7c43851efe64114f32eb45717e79472cf..ff82c83fed897a543389d0846e0c24c234d86bad 100644
+index 9ba75359d426905615ab3d76adbdc3c13db4d751..af11b5a2bd9a44321091f0fc7abc977bd6c1fc64 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -36,7 +36,6 @@

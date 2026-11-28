@@ -22,7 +22,7 @@ index 4b0233b18b938e470f3c90a156cc3a15dcb5b11b..ac923f797991659724a24cc8392394ad
    // takes the V8 locker. Only the outer V8 lock owner calls acquired() and releasing().
    void acquired() {
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 2d0a094081c3ec544e1c62a186b5bd3ce7a8adad..974470feb6085ee0f537f33022c5fd492097f987 100644
+index f382c97fafc57ea960cc475fe0030b1dc947525d..907c9ded66108f9b6ba78e4d4a542198cbc4a292 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -42,6 +42,88 @@ void customizeEntered(IsolateLimits& limits, v8::Isolate* isolate) {
@@ -115,7 +115,7 @@ index 2d0a094081c3ec544e1c62a186b5bd3ce7a8adad..974470feb6085ee0f537f33022c5fd49
    JsonDoc input(kj::str(R"({"workerId":"alpha/:platform","format":"v2","versionId":"build-a",
        "definitionHash":"definition","contentHash":"package","cpuLimitMs":200,"memoryLimitMiB":64})"));
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 64357521a0629f9245743c228a7db44d1b3496cb..9656855c948c66daf2ea8a93aa05e484324a8723 100644
+index 832b62c4e3e3b06af459c6878531bb0f8cdd0166..49bbfc97b3208ca3aeab60a3c772976490fd70e2 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2714,6 +2714,7 @@ struct ThreadedServer {

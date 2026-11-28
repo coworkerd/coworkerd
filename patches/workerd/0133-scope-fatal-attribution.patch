@@ -5,7 +5,7 @@ Subject: [PATCH] Keep fatal records in the Worker invocation scope
 
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 6265dcf47e0eec3c9935a170b9c32c4d2ecf2264..9af1fc6c304cc03fd5542d1dd988ecc6debe9845 100644
+index 27a2b756b67f35272bb8160b1a6590db00e26c2b..83aaf4050209fd2f5b61fd34fed03d66e83b05ba 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -55,9 +55,11 @@ KJ_TEST("fatal record identifies only the invocation on the current V8 thread")
@@ -35,7 +35,7 @@ index 6265dcf47e0eec3c9935a170b9c32c4d2ecf2264..9af1fc6c304cc03fd5542d1dd988ecc6
  }
  
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 471b3f300d24806426b6793bdf18aa240dd3895b..3b00db1f3dfa43bd162a7e759ca2b7d1a9b8e812 100644
+index 4c15d73fae00bad4bc5da7ba3e03c0f76e49d4ad..3aebe26776194f9447feb141df896cc3dabfa5be 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -39,8 +39,8 @@

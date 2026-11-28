@@ -77,7 +77,7 @@ index 02a537fb70304cd83f5b0b26082431974b9155c4..a8234f55d3ccffc92ea3b47140a3ebcb
    std::vector<Ticket> expire(Time now);
  
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 39610fc917c3df3dbbc7b412f9bd0b3c557b6353..f7fa17d49626668d038c26da99d96ae2967062d6 100644
+index ae6d255150870cefa9e9c899eb2506b7f56d8caa..ae66aff14d2975e1f1be9076a963280c4560fd2f 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -2539,15 +2539,9 @@ struct ThreadedServer {

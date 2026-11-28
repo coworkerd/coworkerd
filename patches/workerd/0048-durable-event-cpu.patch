@@ -488,7 +488,7 @@ index 0000000000000000000000000000000000000000..8163b61441a52a4e3425673673e5ff10
 +
 +}  // namespace workerd::server
 diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
-index 344e9c2464569dda5eef74572d7d25b7ec1786d7..019b6299a951a6682023542d692199bcb828715c 100644
+index 133c05a0c81a3cd5e319406cf297e60b25151c1a..520d11b2d816ac9a39b98dbc4daa6804655bc744 100644
 --- a/src/workerd/threaded/BUILD.bazel
 +++ b/src/workerd/threaded/BUILD.bazel
 @@ -14,6 +14,7 @@ THREADED_DEPS = [
@@ -500,7 +500,7 @@ index 344e9c2464569dda5eef74572d7d25b7ec1786d7..019b6299a951a6682023542d692199bc
      "//src/workerd/server/factory:coworkerd-durable-test-storage",
      "//src/workerd/server/factory:coworkerd-sandbox",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 0f2e1e817e6644bbc66ca40ebf1bd36f0ccc2ed3..a0ce95f57019979e612e3d598591b67fd52dc32e 100644
+index 62997247d86c88f9b8abbeb53c43af1e30601218..dbbe3a5532273815797be998c5193498c5d3ca45 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -19,9 +19,11 @@

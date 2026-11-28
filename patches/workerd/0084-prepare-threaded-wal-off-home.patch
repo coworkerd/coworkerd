@@ -360,7 +360,7 @@ index 389c14ab9dce2ad180986fd84e5f441ca7b42b9d..e81b7c14a13e5e9faaa020d48906d282
  
  }  // namespace workerd::server
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 011ef2fb0904c062113d12ee52361c07bd3f5c9c..146ee13368100c65dacb141541f25d69a711aa5f 100644
+index d60d75b3fb8f6f028db4515c7beff6a418d6d357..24e9eb0c3975191babe9a2bd681423efb97a3d51 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1671,6 +1671,11 @@ struct ThreadState {
