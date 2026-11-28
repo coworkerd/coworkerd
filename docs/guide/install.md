@@ -549,6 +549,26 @@ Names ending in `_FOR_TEST` are for tests only.
 `COWORKERD_PROCESS_COUNT`, `COWORKERD_STACK_DIR`, and `COWORKERD_CONTROL_ADDRESS` (the control plane's address, written into `egress.clusterAddresses`, default `apiserver:8940`);
 with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give the same configuration. The secrets directory is `COWORKERD_SECRETS_DIR` (default `/var/lib/coworkerd-secrets`); either way the management token, `COWORKERD_MANAGEMENT_TOKEN` or else the secrets directory's `management-token`, reaches the node through its environment, so it takes precedence over a file's `management.token`.
 
+### Waiting-call capacity
+
+The default placement thresholds are 128 calls in flight for new roots and 384 for nested calls.
+The default per-process limit is 512. In two batches of 2,000 ordinary calls with a two-second
+upstream wait, each batch completed 128 calls and refused 1,872 at the node's root threshold.
+With explicit experimental node and process limits on the same published ARM64 kernel,
+two batches completed all 2,000 calls. The full waits overlapped for 1.392 s and 1.524 s.
+
+A separate 12-second probe on the same eight-vCPU Linux VM and a 20 GiB node container completed
+11,250 calls with full overlap for 8.062 s. A larger batch briefly reached the configured
+11,400-call ceiling. Each wait added about one native thread, four daemon descriptors, five
+ordinary-process descriptors and 486 KiB of node cgroup memory at the 11,250-call sample.
+At startup the same node budget accepted 11,516 configured process slots and refused 11,517
+because the ordinary-process memory share could no longer fund an active Worker.
+
+The threaded kernel reserves memory for configured slots at startup. Reserving more slots
+reduces the memory available for Worker isolates even when the node is idle. The measured
+live-call cost and the startup reservation both enter capacity planning.
+[Readings, resource budgets and reproduction commands](../waiting-call-capacity.md)
+
 ### Invocation budgets
 
 Each invocation starts with 10,000 subrequests by default, including invocations through Service Bindings and Durable Object calls. Set `limits.subrequests` in a Worker's Wrangler configuration to give that version a limit from 1 through 10,000,000. An administrator can set a lower tenant default for versions that omit the field.
