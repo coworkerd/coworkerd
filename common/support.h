@@ -46,6 +46,7 @@ std::string sha256Hex(std::string_view value);
 // it: "" when it is the token, else what was wrong -- "missing", "malformed" (repeated, or not Bearer)
 // or "wrong". Compared in time independent of where the bytes differ; the token is never echoed.
 std::string bearerRefusal(const std::string& token, const kj::HttpHeaders& headers);
+void appendJsonEscaped(std::string& output, std::string_view value);
 std::string jsonEscape(const std::string& value);
 // A management endpoint without its token: 401, the same answer on every listener (and the control plane's).
 kj::Promise<void> sendUnauthorized(kj::HttpService::Response& response, const kj::HttpHeaderTable& table);

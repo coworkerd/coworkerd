@@ -3726,9 +3726,13 @@ private:
       bool loadCheck = false, const std::string& sourceInvocationId = {}, bool coldLoaded = false,
       const DurableTarget* durable = nullptr, const coworkerd::RootDispatch* root = nullptr,
       const std::string& dispatchReceipt = {}, const coworkerd::DurableLog* durableLog = nullptr) const {
-    auto encodeNative = [&](kj::String encoded) {
-      if (!process.threadedServer()) return encoded;
-      std::string value(encoded.cStr()); value.pop_back();
+    auto encodeJson = [&](rpc::InvocationDescriptor::Reader descriptor) {
+      capnp::MallocMessageBuilder message(128);
+      auto json = message.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().encode(descriptor, json);
+      auto value = coworkerd::json::encodeCompact(json.asReader());
+      if (!process.threadedServer()) return value;
+      value.pop_back();
       value += ",\"nativeNamespaces\":[";
       bool first = true;
       for (const auto& className: version.declaredClasses) {
@@ -3738,7 +3742,7 @@ private:
         first = false;
       }
       value += "]}";
-      return kj::str(value.c_str());
+      return value;
     };
     capnp::MallocMessageBuilder message;
     auto descriptor = message.initRoot<rpc::InvocationDescriptor>();
@@ -3819,10 +3823,10 @@ private:
         auto classes = descriptor.initDurableObjectClasses(version.declaredClasses.size());
         for (size_t i = 0; i < version.declaredClasses.size(); ++i) classes.set(i, version.declaredClasses[i].c_str());
       }
-      capnp::JsonCodec json;
       const coworkerd::VersionPins emptyPins;
       const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version, emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
-      auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
+      auto encoded = encodeJson(descriptor.asReader());
+      encoded.pop_back();
       if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
       encoded += '}';
       holdSecrets(plain.plan);
@@ -3876,10 +3880,9 @@ private:
       target.setAlarmFacetId(durable->alarmFacetId);
       if (durable->alarmAtUnixMs) target.setAlarmWallMs(leaseConfig.alarmWallMs);
       descriptor.initBindings(0);
-      capnp::JsonCodec json;
       holdSecrets(root != nullptr ? root->plan : std::string());
       if (root != nullptr) {
-        auto encoded = root->descriptor(encodeNative(json.encode(descriptor.asReader())).cStr());
+        auto encoded = root->descriptor(encodeJson(descriptor.asReader()));
         if (process.threadedDurableRole()) {
           KJ_REQUIRE(!root->fingerprint.empty(), "missing pinned durable definition");
           const auto storage = coworkerd::makeRootStorageRef(durable->namespaceId, durable->objectId, durable->dataEpoch);
@@ -3929,7 +3932,7 @@ private:
         }
         return kj::str(encoded.c_str());
       }
-      return encodeNative(json.encode(descriptor.asReader()));
+      return kj::str(encodeJson(descriptor.asReader()).c_str());
     }
     auto bindingPins = pins;
     if (perCallForTest()) {
@@ -3955,11 +3958,11 @@ private:
       bindings[index].setDefinitionHash(target.definitionHash.c_str());
       bindings[index].setEntrypoint(version.bindings[index].entrypoint.c_str());
     }
-    capnp::JsonCodec json;
     const coworkerd::VersionPins emptyPins;
     const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version,
         bindingPins ? *bindingPins : emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
-    auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
+    auto encoded = encodeJson(descriptor.asReader());
+    encoded.pop_back();
     if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
     encoded += '}';
     holdSecrets(plain.plan);

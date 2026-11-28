@@ -94,7 +94,8 @@ const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.len
 export async function runProfile({ cluster, container, owner, binaries, runCell, record, smoke, control }) {
   const proxy = cluster.project + '-proxy';
   const forwarder = join(binaries, 'coworkerd-bench-http-forwarder');
-  const observePerf = process.env.COWORKERD_PROFILE_PERF !== '0';
+  const pairedRelease = control === 'paired-release';
+  const observePerf = !pairedRelease && process.env.COWORKERD_PROFILE_PERF !== '0';
   const stackOutput = process.env.COWORKERD_PROFILE_STACKS;
   async function nodeHostPid() {
     // Compose starts the daemon below its PID 1 init process.
@@ -135,6 +136,7 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
       const result = await runCell({ operation, clients, profileMode, round,
         ...(profileMode === 'forwarded' && { site: proxy, extraPids: { forwarder: proxyPid } }),
         observe: async drive => {
+          if (pairedRelease) return drive();
           const profile = profileMode === 'profiled' && observePerf;
           const row = profile ? await recordPerf({ pid, data: perfData, script: perfScript, drive, seconds: smoke ? 5 : 14 }) : await drive();
           await cluster.command('docker', ['cp', container + ':' + traceInContainer, trace]);
@@ -159,7 +161,13 @@ export async function runProfile({ cluster, container, owner, binaries, runCell,
       return result.perSecond;
     }
 
-    if (control) {
+    if (pairedRelease) {
+      for (const operation of profileOperations) {
+        for (const mode of ['direct', 'forwarded']) await measure(operation, smoke ? 2 : 16, mode, 1);
+      }
+      return;
+    }
+    if (control === 'traced') {
       assert.ok(observePerf && !smoke, 'the traced control requires perf and full windows');
       for (let round = 1; round <= 3; ++round) {
         for (const operation of profileOperations) {

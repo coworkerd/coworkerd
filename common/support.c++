@@ -69,29 +69,37 @@ std::string bearerRefusal(const std::string& token, const kj::HttpHeaders& heade
   return difference == 0 ? std::string() : "wrong";
 }
 
+void appendJsonEscaped(std::string& output, std::string_view value) {
+  size_t start = 0;
+  for (size_t i = 0; i < value.size(); ++i) {
+    const auto ch = static_cast<unsigned char>(value[i]);
+    if (ch >= 0x20 && ch != '"' && ch != '\\') continue;
+    output.append(value.substr(start, i - start));
+    start = i + 1;
+    switch (ch) {
+      case '"': output += "\\\""; break;
+      case '\\': output += "\\\\"; break;
+      case '\b': output += "\\b"; break;
+      case '\f': output += "\\f"; break;
+      case '\n': output += "\\n"; break;
+      case '\r': output += "\\r"; break;
+      case '\t': output += "\\t"; break;
+      default: {
+        constexpr char hex[] = "0123456789abcdef";
+        output += "\\u00";
+        output += hex[ch >> 4];
+        output += hex[ch & 0x0f];
+        break;
+      }
+    }
+  }
+  output.append(value.substr(start));
+}
+
 std::string jsonEscape(const std::string& value) {
   std::string result;
   result.reserve(value.size() + 8);
-  for (unsigned char ch : value) {
-    switch (ch) {
-      case '"': result += "\\\""; break;
-      case '\\': result += "\\\\"; break;
-      case '\b': result += "\\b"; break;
-      case '\f': result += "\\f"; break;
-      case '\n': result += "\\n"; break;
-      case '\r': result += "\\r"; break;
-      case '\t': result += "\\t"; break;
-      default:
-        if (ch < 0x20) {
-          const char* hex = "0123456789abcdef";
-          result += "\\u00";
-          result += hex[ch >> 4];
-          result += hex[ch & 0x0f];
-        } else {
-          result += static_cast<char>(ch);
-        }
-    }
-  }
+  appendJsonEscaped(result, value);
   return result;
 }
 

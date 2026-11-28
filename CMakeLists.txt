@@ -442,6 +442,11 @@ foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")
 endforeach()
 add_test(NAME node-error-contract COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/node/error-contract.test.mjs")
+add_test(NAME node-compact-invocation-json COMMAND coworkerd-node-contract-test compact-invocation-json)
+
+add_executable(coworkerd-bench-http-forwarder EXCLUDE_FROM_ALL
+  tests/cluster/main-thread-profile/http-forwarder.c++)
+target_link_libraries(coworkerd-bench-http-forwarder PRIVATE kj-http)
 
 set(COWORKERD_NATIVE_TEST_LOG "" CACHE FILEPATH "Output of the native KJ contract test")
 set(COWORKERD_NATIVE_TEST_RECEIPT "" CACHE FILEPATH "Native test source and result receipt")
