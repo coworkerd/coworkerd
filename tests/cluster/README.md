@@ -57,7 +57,9 @@ Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different b
 `durable-threaded-admission-refusal` holds the single resident object slot busy on one owner and uses a one-event database
 mailbox on another. It checks Worker and object calls through fetch and RPC, plus public HTTP SQL and the D1
 binding. The child records the refusals without dispatching the writes. Closing the held invocation lets admission retire the idle tree. Once capacity returns, each caller
-retries once and the stored counter or row confirms one write per retry.
+retries once and the stored counter or row confirms one write per retry. The object slot also
+stays occupied while a timer and an unawaited Service Binding promise finish their writes.
+The case checks that both stored values survive subsequent admission retirement and reopen.
 
 `durable-threaded-copy-reservation-refusal` consumes a one-shot marker at the cold-copy reservation step
 after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` each confirm that the write
@@ -69,7 +71,9 @@ constraint failure retain their ordinary error results.
 Run the acceptance fixture in residency mode with a verified kernel that reports
 `objectSqliteConnections`. It probes 4,096 ordinary roots with bounded concurrency and
 checks the resident count and open SQLite count in the same publication from one child.
-The JSONL records the copy and SQLite reservations, process limits and any refused probes.
+The JSONL records each resident copy's V8 heap, external bytes and instance ID, plus SQLite
+reservations, process limits, reset counters and refused probes. The run requires every
+copy to retain its instance and all tree and isolate reset counts to stay at zero.
 Use `--sequential` to run only the sequential seed and reopen passes. The hosted idle job runs both
 workloads in separate clusters and uploads `idle.jsonl` and `idle-residency.jsonl`.
 

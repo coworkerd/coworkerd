@@ -53,11 +53,18 @@ async function measureResidency(cluster, node, record, call, onSameChild, child)
   const initial = await onSameChild();
   assert.ok(Number.isSafeInteger(initial.objectSqliteConnections),
     'the kernel must publish the ordinary SQLite connection count');
+  assert.ok(Number.isSafeInteger(initial.treeResets) && Array.isArray(initial.copies),
+    'the kernel must publish tree resets and per-copy heap');
+  const copyInstances = new Map();
   const samples = [];
   let peak;
   const started = performance.now();
   const sample = async () => {
     const admission = await onSameChild();
+    for (const copy of admission.copies) {
+      if (!copyInstances.has(copy.home)) copyInstances.set(copy.home, new Set());
+      copyInstances.get(copy.home).add(copy.instance);
+    }
     const row = { elapsedMs: performance.now() - started, ...admission };
     samples.push(row);
     const simultaneous = Math.min(row.residentRoots, row.objectSqliteConnections);
@@ -113,7 +120,16 @@ async function measureResidency(cluster, node, record, call, onSameChild, child)
     await sampling;
   }
   const limits = await cluster.compose(['exec', '-T', '--user', '0', node, 'cat', `/proc/${child.pid}/limits`]);
-  const result = { child, residentTarget, rounds, copies: copies.size, peak, limits, errors };
+  const resets = {
+    actor: peak.actorResets - initial.actorResets,
+    tree: peak.treeResets - initial.treeResets,
+    isolate: peak.isolateResets - initial.isolateResets,
+    observedAfterBaseline: samples.some(row => row.actorResets !== initial.actorResets ||
+      row.treeResets !== initial.treeResets || row.isolateResets !== initial.isolateResets ||
+      row.resettingHomes !== 0 || row.copies.some(copy => copy.resetting)),
+    replacedCopies: [...copyInstances.values()].filter(instances => instances.size > 1).length,
+  };
+  const result = { child, residentTarget, rounds, observedWorkerCopies: copies.size, peak, limits, resets, errors };
   await record('simultaneous-residency-samples', { child, samples });
   await record('simultaneous-residency-summary', result);
   console.log(JSON.stringify({ ...result, errors: errors.length }));
@@ -121,6 +137,12 @@ async function measureResidency(cluster, node, record, call, onSameChild, child)
   assert.equal(peak.residentRoots, residentTarget, 'simultaneously resident ordinary root trees');
   assert.equal(peak.objectSqliteConnections, residentTarget, 'simultaneously open ordinary SQLite connections');
   assert.ok(peak.sqliteHeapReservedBytes > 0, 'the live SQLite heap was charged');
+  assert.deepEqual([initial.actorResets, initial.treeResets, initial.isolateResets], [0, 0, 0]);
+  assert.equal(resets.observedAfterBaseline, false, 'no actor, tree or isolate reset during the run');
+  assert.equal(resets.replacedCopies, 0, 'each loaded home kept its original isolate');
+  assert.equal(peak.copies.reduce((sum, copy) => sum + copy.residentRoots, 0), residentTarget);
+  assert.ok(peak.copies.every(copy => Number.isSafeInteger(copy.heapBytes) && copy.heapBytes > 0),
+    'the peak reports the live V8 heap of every resident copy');
 }
 
 async function measure(cluster, node, record, residencyOnly) {

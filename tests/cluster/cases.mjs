@@ -2488,6 +2488,12 @@ async function durableAdmissionRefusal(cluster) {
   const tenant = await cluster.tenant('durable-refusal', { durableObjectNamespaces: 48 });
   const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[databaseOwner, 1]]));
   const [db] = databases.get(databaseOwner);
+  await cluster.deploy(tenant, 'admission-delay', `
+    export default { async fetch() {
+      await scheduler.wait(5000);
+      return new Response('promise committed');
+    } };
+  `);
   await cluster.deploy(tenant, 'counter', `
     import { DurableObject } from 'cloudflare:workers';
     async function call(env, name, op) {
@@ -2520,6 +2526,19 @@ async function durableAdmissionRefusal(cluster) {
           this.releaseHold = undefined;
           return Response.json({ released: true });
         }
+        if (pathname === '/background-timer') {
+          setTimeout(() => { void this.ctx.storage.put('timer', 'timer committed'); }, 5000);
+          return Response.json({ scheduled: true });
+        }
+        if (pathname === '/background-promise') {
+          void this.env.DELAY.fetch('http://delay/').then(reply => reply.text())
+            .then(value => this.ctx.storage.put('promise', value));
+          return Response.json({ scheduled: true });
+        }
+        if (pathname === '/background-result') {
+          const value = await this.ctx.storage.get(searchParams.get('kind'));
+          return Response.json({ value: value ?? null });
+        }
         if (pathname === '/relay') return call(this.env, searchParams.get('target'), searchParams.get('op'));
         return Response.json({ count: (await this.ctx.storage.get('count')) ?? 0, attempts: this.attempts });
       }
@@ -2544,6 +2563,7 @@ async function durableAdmissionRefusal(cluster) {
     durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] },
     migrations: [{ tag: 'v1', new_sqlite_classes: ['Counter'] }],
     d1_databases: [{ binding: 'DB', database_name: db.name }],
+    services: [{ binding: 'DELAY', service: 'admission-delay' }],
   } });
   const { namespaceId, shards } = await cluster.api(`${tenant.path}/workers/counter/namespaces/Counter`, { token: tenant.token });
   const names = node => Array.from({ length: 64 }, (_, i) => `counter-${i}`).filter(name => {
@@ -2633,6 +2653,30 @@ async function durableAdmissionRefusal(cluster) {
   });
   for (const reply of await Promise.all([read(objectOwner, target), read(objectOwner, target)])) {
     assert.deepEqual(json(reply, 200, 'target after idle reopen'), { count: 4, attempts: 0 });
+  }
+  for (const kind of ['timer', 'promise']) {
+    const background = await call(objectOwner, { target, op: 'background-' + kind });
+    assert.deepEqual(json(background, 200, 'scheduled ' + kind), { scheduled: true });
+    if (kind === 'timer') {
+      await eventually('the scheduling request finished before its timer', async () => {
+        const current = await durableGeneration(cluster, objectOwner);
+        assert.equal(current.inFlight, 0);
+        assert.equal(current.lifecycle.durableAdmission.running, 0);
+      }, { timeout: 3000 });
+    }
+    const competing = json(await read(objectOwner, blocker), 503, 'retirement protects ' + kind);
+    assertDurableCapacityRefusal(competing);
+    const result = () => call(objectOwner, { target, op: 'background-result?kind=' + kind });
+    const expected = { value: kind + ' committed' };
+    await eventually(kind + ' wrote after the scheduling response', async () => {
+      assert.deepEqual(json(await result(), 200, 'background result'), expected);
+    });
+    await eventually('the finished ' + kind + ' releases the root for admission', async () => {
+      assert.deepEqual(json(await read(objectOwner, blocker), 200, 'admitted after ' + kind), zero);
+    });
+    await eventually('the ' + kind + ' value persists across reopen', async () => {
+      assert.deepEqual(json(await result(), 200, 'background result after reopen'), expected);
+    });
   }
   assert.equal((await durableGeneration(cluster, objectOwner)).pid, initial.pid);
 

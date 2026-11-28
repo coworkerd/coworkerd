@@ -376,7 +376,8 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name in {'0177-retire-idle-databases-at-admission.patch',
                                    '0180-fix-database-admission-accounting.patch',
-                                   '0188-retire-idle-objects-at-admission.patch'} and path in {
+                                   '0188-retire-idle-objects-at-admission.patch',
+                                   '0190-harden-ordinary-object-admission.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name == '0189-test-busy-objects-with-stale-idle-observations.patch' and path ==

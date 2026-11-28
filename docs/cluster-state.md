@@ -667,6 +667,9 @@ of a 90,672-byte WAL took 0.250 ms.
   least recently used eligible idle tree. It refuses before execution when no tree can make room. The upstream
   backend retires idle trees after crossing the target. Both protect active work, close facets before their root,
   and hibernate eligible WebSockets so that the next message wakes the object.
+  The threaded process reports each loaded home in `durableAdmission.copies`, including its copy instance ID,
+  resident root count, V8 heap bytes, external bytes and reset state. `treeResets` counts roots marked for
+  reset since the child started.
 
 On glibc the daemon fixes the mmap/trim thresholds at 128 KiB with no top padding and trims free pages at most once a minute after one minute without own or peer log appends. `memory.daemon.containers` reports retained entries and available payload byte counts: unsealed records are pruned after seal/manifest publication, peer buffers after owner trim/drop, histories at their fixed caps, and usage/auth state at flush/expiry; request-log links without a live invocation lease expire after ten quiet minutes and counter windows after sixty seconds even when idle, while epoch exclusions and known-object/tenant metadata follow their documented lifecycle rather than a fixed entry cap.
 

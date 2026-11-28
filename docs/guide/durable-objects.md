@@ -182,19 +182,28 @@ An acknowledged alarm whose hint or owner marker has not published before its no
 | Limit | Default and scope |
 | --- | --- |
 | CPU | 200 ms per fetch, RPC method, alarm or delivered WebSocket message; Worker / tenant limits can override it |
-| Memory | 128 MiB per version isolate in each durable process, shared by its objects and classes |
+| Memory | 128 MiB by default per version isolate copy. Objects and classes on a copy share that budget |
 | Resident objects | 4,096 resident object trees per durable process by default. `durableObjects.residentObjects: 0` removes the configured process-wide count limit |
 | Object bytes | 10 GiB (10,737,418,240 bytes), configurable with `durableObjects.objectBytes`; root and facet database sizes are measured at checkpoints / open / close, not exact pending transaction sizes |
 | Tenant namespaces | 16 by default (`durableObjectNamespaces`), counting DO class namespaces, D1 databases and deleting namespaces |
 | Tenant bytes | 10 GiB by default (`durableObjectBytes`), using lagging per-node summaries; deleting namespaces / databases stop counting |
 | Logs | 256 KiB per event before truncation; the tenant's line rate, line size and buffer limits also apply |
 
-When a new ordinary object needs a place in a threaded durable process, it waits for the least recently used
-eligible idle tree to retire. The tree follows the same facet teardown and WebSocket hibernation rules as idle
-retirement. Queued calls, active events, pending work and unfinished handoffs keep their tree in place.
-When all eligible places are busy, the call receives `OVERLOADED` with `dispatched: false` and
-`retryable: true`. A retry can proceed once a place becomes available. Per-copy placement, memory and
-descriptor limits also apply. With the upstream backend, active trees can temporarily exceed the target.
+By default, a threaded durable process has four homes. Each version isolate copy can
+hold up to 1,024 object trees. A memory reset of a copy discards the in-memory instances
+of every tree it holds. Their confirmed SQLite state is available on reopen.
+
+When a new ordinary object needs a place in a threaded durable process, it waits for an
+eligible idle tree to retire. The router prefers homes ready to run retirement and chooses
+by least recent use among them. This selection is process-wide. A new object can retire
+another tenant's idle object, which then reloads from confirmed storage on its next call.
+When a working set exceeds the available places, objects can retire and reopen repeatedly.
+
+Retirement follows the existing facet and WebSocket hibernation rules. Queued calls, active
+events, tracked pending work and unfinished handoffs keep their tree in place. When no
+eligible tree can make room, the call receives `OVERLOADED` with `dispatched: false` and
+`retryable: true`. Per-copy placement, memory and descriptor limits also apply. With the
+upstream backend, active trees can temporarily exceed the resident target.
 
 An ordinary class exception leaves the instance available; fetch returns `500 EXECUTION_FAILED` with its message. CPU or memory termination invalidates the version's isolate in that durable process: all its objects there are constructed again on their next event, recovering storage subject to the limitations in section 7. A durable slot does not move a suspect tenant into quarantine.
 
