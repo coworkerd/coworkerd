@@ -320,6 +320,9 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/util/sqlite.c++',
                               'src/workerd/util/sqlite.h'} or
+                          name == '0124-bound-threaded-wal-home-notifications.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
                           name == '0185-measure-isolate-busy-time.patch' and path in {
                               'src/workerd/jsg/jsg.c++',
                               'src/workerd/jsg/observer.h',
