@@ -26,8 +26,8 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 await writeFile(report, '', { flag: 'wx' });
 const record = (metric, fields) => appendFile(report, JSON.stringify({ metric, at: new Date().toISOString(), ...fields }) + '\n');
 const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-durable-idle-')), kernel, controller.signal, {
-  singleNode: true, threadedNodes: ['node-1'],
-  configureNode: () => ({ durableObjects: { processes: 1, peers: 0, threadedStorage: true } }),
+  singleNode: true, durableFixtureNodes: ['node-1'],
+  configureNode: () => ({ durableObjects: { processes: 1, peers: 0 } }),
 });
 const [node] = cluster.nodes;
 

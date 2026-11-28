@@ -93,8 +93,6 @@ struct ProcessPoolConfig {
   std::string ordinaryServer = "threaded";
   std::string threadedExecutable;
   bool threadedDurableTestStorage = false;
-  bool threadedDurableStorage = false;
-  bool threadedDurable() const { return threadedDurableTestStorage || threadedDurableStorage; }
   // Experimental per-tenant calls per native process; disabled unless explicitly configured.
   uint32_t tenantInFlightLimit = 0;
   uint32_t tenantAdmissionWaitMs = 1000;

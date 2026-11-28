@@ -90,8 +90,8 @@ inline const char* durableNotSentCode(bool secretDictionary) {
 }
 
 // The persistent threaded owner must reserve and validate its own alarm token.
-inline bool acceptsForwardedAlarm(bool threadedDurableStorage, uint64_t alarmAtUnixMs) {
-  return !threadedDurableStorage || alarmAtUnixMs == 0;
+inline bool acceptsForwardedAlarm(uint64_t alarmAtUnixMs) {
+  return alarmAtUnixMs == 0;
 }
 
 }  // namespace coworkerd

@@ -110,11 +110,11 @@ function exchange(ws, message, ping = false) {
   return reply.then(([data]) => data.toString());
 }
 
-async function measure(backend, kernelHashes) {
-  const threaded = backend === 'threaded';
+async function measure(kernelHashes) {
+  const backend = 'threaded';
   const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-durable-wake-')), kernel, controller.signal, {
-    singleNode: true, binariesDirectory: binaries, threadedNodes: threaded ? ['node-1'] : [],
-    configureNode: () => ({ durableObjects: { processes: 1, peers: 0, threadedStorage: threaded } }),
+    singleNode: true, binariesDirectory: binaries, durableFixtureNodes: ['node-1'],
+    configureNode: () => ({ durableObjects: { processes: 1, peers: 0 } }),
   });
   const [node] = cluster.nodes;
   const sockets = [];
@@ -139,8 +139,7 @@ async function measure(backend, kernelHashes) {
       assert.equal(phase, 'ready');
       assert.equal(sandbox.durableServer, backend);
       assert.equal(binarySha256, kernelHashes[backend]);
-      const resident = threaded ? lifecycle?.durableAdmission : state.durableLog.resident
-        .find(row => row.processId === processId + '-' + generation);
+      const resident = lifecycle?.durableAdmission;
       assert.ok(resident, 'the durable process reported residency');
       return { child: { processId, pid, generation, binarySha256 },
         sandboxMode: sandbox.mode, cpuLimitMs: sandbox.defaultCpuLimitMs, resident,
@@ -178,18 +177,8 @@ async function measure(backend, kernelHashes) {
     await record('warm-copies', { backend, moduleIds: [...warmCopies] });
 
     const constructorLog = async () => {
-      let messages;
-      if (threaded) {
-        // The threaded child writes these console lines to its process log.
-        const log = await cluster.compose(['exec', '-T', node, 'cat', '/var/lib/coworkerd/logs/workerd.log']);
-        messages = log.split('\n');
-      } else {
-        const logs = await cluster.api(`${tenant.path}/workers/objects/logs?limit=1000`, { token: tenant.token });
-        assert.equal(logs.nodes.length, 1);
-        assert.equal(logs.nodes[0].problem, undefined);
-        assert.equal(logs.nodes[0].droppedLines, 0);
-        messages = logs.lines.map(line => line.message ?? '');
-      }
+      const log = await cluster.compose(['exec', '-T', node, 'cat', '/var/lib/coworkerd/logs/workerd.log']);
+      const messages = log.split('\n');
       const constructors = messages.flatMap(line => {
         const match = line.match(/wake-constructor ([a-f0-9]{64}) ([a-f0-9-]{36})/);
         return match ? [{ socketId: match[1], actorId: match[2] }] : [];
@@ -199,13 +188,9 @@ async function measure(backend, kernelHashes) {
     const expected = sockets.map(({ id, warm }) => ({ socketId: id, actorId: warm.actorId }));
     const before = await eventually('all trees are retired and connections hibernating', async () => {
       const state = await onSameChild();
-      if (threaded) {
-        assert.equal(state.resident.residentRoots, 0);
-        assert.equal(state.resident.homeSessions, 0);
-        assert.equal(state.webSockets.parked, sockets.length);
-      } else {
-        assert.equal(state.resident.objects, 0);
-      }
+      assert.equal(state.resident.residentRoots, 0);
+      assert.equal(state.resident.homeSessions, 0);
+      assert.equal(state.webSockets.parked, sockets.length);
       return state;
     }, { timeout: 30000 });
     const beforeConstructors = await eventually('externally visible constructor logs', async () => {
@@ -221,16 +206,11 @@ async function measure(backend, kernelHashes) {
       assert.equal(await exchange(ws, 'auto'), 'automatic');
     }
     const afterControls = await onSameChild();
-    if (threaded) {
-      assert.equal(afterControls.resident.residentRoots, 0);
-      assert.equal(afterControls.resident.homeSessions, 0);
-      assert.equal(afterControls.resident.idleRetirements, before.resident.idleRetirements);
-      assert.equal(afterControls.webSockets.parked, sockets.length);
-      assert.equal(afterControls.webSockets.socketWakes, before.webSockets.socketWakes);
-    } else {
-      assert.equal(afterControls.resident.objects, 0);
-      assert.equal(afterControls.resident.woken, before.resident.woken);
-    }
+    assert.equal(afterControls.resident.residentRoots, 0);
+    assert.equal(afterControls.resident.homeSessions, 0);
+    assert.equal(afterControls.resident.idleRetirements, before.resident.idleRetirements);
+    assert.equal(afterControls.webSockets.parked, sockets.length);
+    assert.equal(afterControls.webSockets.socketWakes, before.webSockets.socketWakes);
     assert.deepEqual(await constructorLog(), beforeConstructors);
     await record('automatic-traffic', { backend, pingPong: sockets.length, automaticReplies: sockets.length,
       constructors: beforeConstructors.length, ...afterControls });
@@ -317,26 +297,9 @@ await record('provenance', {
   compose: await exec('docker', ['compose', 'version']), node: process.version,
   workload: { samplesPerPath, nodes: 1, durableProcesses: 1, selectedPeers: 0, offeredConcurrency: 1 },
 });
-const results = {};
-for (const backend of ['upstream', 'threaded']) {
-  await hostSample(backend + '-before-cluster');
-  try {
-    results[backend] = await measure(backend, kernelHashes);
-  } catch (error) {
-    console.error(error);
-    process.exitCode = 1;
-  }
-  await hostSample(backend + '-after-cluster');
-}
-if (results.upstream && results.threaded) {
-  const comparison = Object.fromEntries(['http', 'webSocket'].map(path => {
-    const upstream = results.upstream[path];
-    const threaded = results.threaded[path];
-    const p50DeltaMs = threaded.p50Ms - upstream.p50Ms;
-    const p99DeltaMs = threaded.p99Ms - upstream.p99Ms;
-    return [path, { upstream, threaded, p50DeltaMs, p99DeltaMs, pass: p50DeltaMs <= 5 && p99DeltaMs <= 5 }];
-  }));
-  await record('comparison', comparison);
-  console.log(JSON.stringify(comparison, null, 2));
-  if (Object.values(comparison).some(row => !row.pass)) process.exitCode = 1;
+await hostSample('threaded-before-cluster');
+try {
+  console.log(JSON.stringify(await measure(kernelHashes), null, 2));
+} finally {
+  await hostSample('threaded-after-cluster');
 }

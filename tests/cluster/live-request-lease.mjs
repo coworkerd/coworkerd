@@ -624,8 +624,8 @@ export async function silentRequestLease(cluster) {
   }
 }
 
-export async function actorRequestLease(cluster) {
-  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-timers', cluster.threadedNodes.size === 0);
+export async function actorRequestLease(cluster, withD1) {
+  const { base, path } = await prepareLeaseWorker(cluster, 'live-request-timers', withD1);
   const call = (event, actor, timeout = 5000) => request(base, `${path}/${event}?actor=${actor}`, { timeout });
   const executions = async () => (await Promise.all(cluster.nodes.map(node => cluster.state(node))))
     .flatMap(state => state.executions).filter(event => event.target === 'live-request-timers/lease-stream@v1');
@@ -654,20 +654,6 @@ export async function alarmRequestLease(cluster) {
   await cluster.deploy(tenant, 'alarm', `
     import { DurableObject } from 'cloudflare:workers';
     export class Clock extends DurableObject {
-      constructor(ctx, env) {
-        super(ctx, env);
-        const bridge = Object.getPrototypeOf(this);
-        if (Object.hasOwn(bridge, '__coworkerdAlarm')) {
-          try {
-            Object.defineProperty(bridge, '__coworkerdAlarm', { value: async function (_time, retryCount) {
-              await this.alarm({ retryCount });
-              return { outcome: 'fired', atUnixMs: 0 };
-            } });
-          } catch (error) {
-            if (!(error instanceof TypeError)) throw error;
-          }
-        }
-      }
       async alarm(info) {
         if (info.retryCount) {
           await this.ctx.storage.put('retried', true);
