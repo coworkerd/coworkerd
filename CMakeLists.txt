@@ -249,6 +249,7 @@ target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
 add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
 add_test(NAME durable-threaded-channel COMMAND coworkerd-durable-channel-test threaded-channel)
+add_test(NAME durable-threaded-channel-eof COMMAND coworkerd-durable-channel-test threaded-channel-eof)
 add_test(NAME durable-parked-websocket COMMAND coworkerd-durable-channel-test parked-websocket)
 add_test(NAME durable-websocket-frame-budget COMMAND coworkerd-durable-channel-test websocket-frame-budget)
 add_test(NAME durable-websocket-upload-budget COMMAND coworkerd-durable-channel-test websocket-upload-budget)

@@ -1522,6 +1522,65 @@ struct DurableLogChannelTest {
     }
   }
 
+  static void threadedChannelEof() {
+    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-threaded-eof-XXXXXX").string();
+    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
+    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
+    auto io = kj::setupAsyncIo();
+    auto& timer = io.provider->getTimer();
+    kj::HttpHeaderTable::Builder builder;
+    auto ifNoneMatch = builder.add("If-None-Match");
+    auto table = builder.build();
+    HeldStore store(*table, ifNoneMatch);
+    auto listener = io.provider->getNetwork().parseAddress("127.0.0.1", 0).wait(io.waitScope)->listen();
+    kj::HttpServer server(timer, *table, store);
+    auto listening = server.listenHttp(*listener).eagerlyEvaluate(nullptr);
+    ObjectStoreConfig config;
+    config.bucket = "b";
+    config.endpoint = "http://127.0.0.1:" + std::to_string(listener->getPort());
+    config.accessKey = "test-only";
+    config.secretKey = "test-only";
+    MembershipView membership;
+    membership.heldEpochs.insert("1");
+    size_t closeCalls = 0;
+    DurableLog::Hooks hooks;
+    hooks.closeObjects = [&](std::string) -> kj::Promise<void> { ++closeCalls; co_return; };
+    DurableLog log({"node", "instance", temp, {}}, config, io.provider->getNetwork(), timer,
+        *io.lowLevelProvider, membership, std::move(hooks));
+    log.setNodeEpoch(1).wait(io.waitScope);
+
+    const std::string ns(64, '1'), id(64, '2');
+    store.objects[shardEpochKey(ns, 0, 1)] =
+        shardEpochJson({ns, "node", "first", "instance", "nonce", "", 0, 1, 1, 1, 1});
+    const auto name = durableHostName(ns, id, 1);
+    auto& object = log.objects[name];
+    log.locate(object, ns, id, 1);
+    object.objectName = name;
+    object.tenant = "tenant";
+    object.state = DurableLog::ObjectState::LOCAL;
+    object.shardEpoch = object.openEpoch = object.openGeneration = 1;
+
+    const int peer = log.openChannel("d0-7", 7);
+    KJ_REQUIRE(peer >= 0);
+    auto& channel = log.channels.at("d0-7");
+    object.dispatchedChannel = channel.processId;
+    auto& facet = object.facets[0];
+    facet.processId = channel.processId;
+    facet.open = true;
+    channel.openFacets[name + "/0"] = {{object.openEpoch, object.openGeneration}, 1};
+    ::close(peer);
+    timer.timeoutAfter(5 * kj::SECONDS, kj::mv(channel.reader)).wait(io.waitScope);
+
+    KJ_REQUIRE(!channel.open && channel.openFacets.empty() && !facet.open,
+        "EOF must close the facet registration");
+    KJ_REQUIRE(object.state == DurableLog::ObjectState::REPAIR,
+        "EOF with an open facet must mark the local image for repair");
+    log.closeChannel("d0-7");  // The pool has reaped the old generation.
+    timer.timeoutAfter(5 * kj::SECONDS, log.rebuild(name, "repair after threaded EOF", false)).wait(io.waitScope);
+    KJ_REQUIRE(object.state == DurableLog::ObjectState::LOCAL && closeCalls == 0,
+        "repair after the generation exits must preserve the other durable processes");
+  }
+
   static void threadedChannel() {
     auto temp = (std::filesystem::temp_directory_path() / "coworkerd-threaded-channel-XXXXXX").string();
     KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
@@ -2774,6 +2833,7 @@ int main(int argc, char* argv[]) {
   else if (mode == "refused-owner") coworkerd::DurableLogChannelTest::refusedOwner(argc == 3 ? argv[2] : "");
   else if (mode == "earlier-segment") coworkerd::DurableLogChannelTest::earlierSegment();
   else if (mode == "threaded-channel") coworkerd::DurableLogChannelTest::threadedChannel();
+  else if (mode == "threaded-channel-eof") coworkerd::DurableLogChannelTest::threadedChannelEof();
   else if (mode == "parked-websocket") coworkerd::DurableLogChannelTest::parkedWebSocket();
   else if (mode == "websocket-frame-budget") coworkerd::DurableLogChannelTest::webSocketFrameBudget();
   else if (mode == "websocket-upload-budget") coworkerd::DurableLogChannelTest::webSocketUploadBudget();
