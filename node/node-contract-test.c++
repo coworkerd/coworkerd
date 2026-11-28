@@ -45,34 +45,6 @@ void write(const std::filesystem::path& path, const std::string& bytes) {
   KJ_REQUIRE(bool(file << bytes), path.c_str());
 }
 
-void compactInvocationJson() {
-  capnp::MallocMessageBuilder message;
-  auto fields = message.initRoot<capnp::JsonValue>().initObject(5);
-  fields[0].setName("lease");
-  fields[0].initValue().setNumber(1234.56789012345);
-  fields[1].setName("bindings");
-  auto values = fields[1].initValue().initArray(4);
-  values[0].setBoolean(false);
-  values[1].setNull();
-  values[2].initObject(0);
-  values[3].initArray(0);
-  constexpr auto label = "line\"\\\t\n\r\f\b\001";
-  fields[2].setName(label);
-  std::string text(label);
-  text += "résumé";
-  text.append(1, '\0');
-  text += std::string(2048, 'x');
-  fields[2].initValue().setString(kj::StringPtr(text.data(), text.size()));
-  fields[3].setName("bool");
-  fields[3].initValue().setBoolean(true);
-  fields[4].setName("negative");
-  fields[4].initValue().setNumber(-1e-24);
-  const auto value = message.getRoot<capnp::JsonValue>().asReader();
-  const auto expected = capnp::JsonCodec().encodeRaw(value);
-  const auto actual = json::encodeCompact(value);
-  KJ_REQUIRE(actual == std::string_view(expected.begin(), expected.size()));
-}
-
 void nodeCpuUse() {
   TempDir directory;
   const auto root = std::filesystem::path(directory.path);
@@ -841,6 +813,34 @@ void cacheCapacity() {
   KJ_REQUIRE(number(cache.json(), "bytes") == 3 && number(cache.json(), "evictions") == 2);
 }
 
+void compactInvocationJson() {
+  capnp::MallocMessageBuilder message;
+  auto fields = message.initRoot<capnp::JsonValue>().initObject(5);
+  fields[0].setName("lease");
+  fields[0].initValue().setNumber(1234.56789012345);
+  fields[1].setName("bindings");
+  auto values = fields[1].initValue().initArray(4);
+  values[0].setBoolean(false);
+  values[1].setNull();
+  values[2].initObject(0);
+  values[3].initArray(0);
+  constexpr auto label = "line\"\\\t\n\r\f\b\001";
+  fields[2].setName(label);
+  std::string text(label);
+  text += "résumé";
+  text.append(1, '\0');
+  text += std::string(2048, 'x');
+  fields[2].initValue().setString(kj::StringPtr(text.data(), text.size()));
+  fields[3].setName("bool");
+  fields[3].initValue().setBoolean(true);
+  fields[4].setName("negative");
+  fields[4].initValue().setNumber(-1e-24);
+  const auto value = message.getRoot<capnp::JsonValue>().asReader();
+  const auto expected = capnp::JsonCodec().encodeRaw(value);
+  const auto actual = json::encodeCompact(value);
+  KJ_REQUIRE(actual == std::string_view(expected.begin(), expected.size()));
+}
+
 void rejectedManifest() {
   class EmptyStore final: public kj::HttpService {
   public:
@@ -902,7 +902,6 @@ int main(int argc, char* argv[]) {
   const std::string_view name(argv[1]);
   if (name == "native-config") nativeConfig();
   else if (name == "ingress-descriptor-plan") ingressDescriptorPlan();
-  else if (name == "compact-invocation-json") compactInvocationJson();
   else if (name == "tenant-execution") tenantExecution();
   else if (name == "deadlines") deadlines();
   else if (name == "event-loop") eventLoopProgress();
@@ -930,5 +929,6 @@ int main(int argc, char* argv[]) {
   else if (name == "cache-capacity") cacheCapacity();
   else if (name == "cache-single-flight") cacheSingleFlight();
   else if (name == "rejected-manifest") rejectedManifest();
+  else if (name == "compact-invocation-json") compactInvocationJson();
   else KJ_FAIL_REQUIRE("unknown contract test", argv[1]);
 }
