@@ -179,6 +179,7 @@ async function fillWorkers() {
         const resources = [...new Set(receipts.map(receipt => receipt.resource))];
         refusalBatch = { offered, batchSize: batch.length, accepted: participants.size,
           refusals: receipts, resources };
+        await record('refusal-observed', refusalBatch);
       }
       if (performance.now() >= nextRead || refusalBatch) {
         // Background work protects each home without leaving an ordinary Worker
@@ -196,7 +197,10 @@ async function fillWorkers() {
         const state = current.lifecycle.durableAdmission;
         assert.equal(state.residentRoots, participants.size);
         assert.equal(state.homes, participants.size);
-        assert.equal(state.homeRetirements, 0);
+        assert.equal(state.workerThreads, participants.size);
+        // A refused cold event can leave an unused copy to reclaim. Every
+        // accepted copy has just been verified by instance at the boundary.
+        assert.ok(state.homeRetirements <= (refusalBatch?.refusals.length ?? 0));
         assert.equal(state.idleRetirements, 0);
         return current;
       }, { timeout: 3500, interval: 25 });
