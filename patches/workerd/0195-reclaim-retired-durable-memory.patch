@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sat, 28 Nov 2026 11:39:57 +0800
+Date: Sat, 28 Nov 2026 11:57:56 +0800
 Subject: [PATCH] Reclaim memory after durable object retirement
 
 Collect retired actor handles once the home drains. Return free allocator pages once the durable process drains.
@@ -27,10 +27,10 @@ index b2d1c524acd9ca2f1aaddbde51c2ebda230add16..5649a4bbc463a5fee35eefbf8c90bc47
  
  wd_cc_library(
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 37b1e2c9be4859eb2adafee54c865d433b527140..7d9828f2380e1c717cc699922137463de9af6f5f 100644
+index 37b1e2c9be4859eb2adafee54c865d433b527140..c896145750c5adbae4b73ac360d66dc9b7af0b57 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -2535,6 +2535,125 @@ KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing th
+@@ -2535,6 +2535,126 @@ KJ_TEST("a thread home cancels actor tasks and closes SQLite before releasing th
    KJ_EXPECT(events.asPtr() == expected.asPtr());
  }
  
@@ -108,15 +108,16 @@ index 37b1e2c9be4859eb2adafee54c865d433b527140..7d9828f2380e1c717cc699922137463d
 +      }, v8::WeakCallbackType::kParameter);
 +      return static_cast<jsg::Lock&>(lock).v8Ref(object);
 +    });
-+    state.durableRoots.emplace(tree->tree, ThreadState::DurableRoot{
-+      .actor = kj::mv(actor.value).attachToThisReference(kj::mv(owned)),
-+      .tree = tree,
-+      .hooks = actor.hooks,
-+      .idle = tree->idle,
-+      .facetsBusy = [](bool) { return false; },
-+      .facetHasOrdinaryWebSocket = [] { return false; },
-+      .stopFacets = [](const kj::Exception*) {},
-+    });
++    state.durableRoots.emplace(tree->tree,
++        ThreadState::DurableRoot{
++          .actor = kj::mv(actor.value).attachToThisReference(kj::mv(owned)),
++          .tree = tree,
++          .hooks = actor.hooks,
++          .idle = tree->idle,
++          .facetsBusy = [](bool) { return false; },
++          .facetHasOrdinaryWebSocket = [] { return false; },
++          .stopFacets = [](const kj::Exception*) {},
++        });
 +    server.publishDurableRoot(1, tree->tree);
 +    if (!keepEventActive) {
 +      KJ_REQUIRE(admission.complete(*ticket, 1));
@@ -157,20 +158,26 @@ index 37b1e2c9be4859eb2adafee54c865d433b527140..7d9828f2380e1c717cc699922137463d
    initializeV8();
    auto budget = std::make_shared<ResourceBudget>(2ull << 30, 4, 1);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff86122843e7c6f28 100644
+index cfe75f0372931bccee40b3b3e45a2c80df8eb321..bc973f6f68440dcbd103627674edc31cbf7976f5 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -40,6 +40,9 @@
+@@ -40,6 +40,7 @@
  #include <workerd/util/sqlite-metering.h>
  #include <workerd/util/stream-utils.h>
  
 +#include <absl/time/time.h>
-+#include <tcmalloc/malloc_extension.h>
-+
  #include <arpa/inet.h>
  #include <fcntl.h>
  #include <limits.h>
-@@ -2039,6 +2042,7 @@ struct ThreadState {
+@@ -57,6 +58,7 @@
+ #include <sys/stat.h>
+ #include <sys/syscall.h>
+ #include <sys/un.h>
++#include <tcmalloc/malloc_extension.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
+@@ -2039,6 +2041,7 @@ struct ThreadState {
    };
    std::map<Worker::Actor *, uint64_t> durableActorTrees;
    std::map<uint64_t, DurableRoot> durableRoots;
@@ -178,7 +185,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff8612284
    kj::TaskSet tasks{errors};
  
    ~ThreadState() noexcept(false) {
-@@ -2793,6 +2797,7 @@ struct ThreadedServer {
+@@ -2793,6 +2796,7 @@ struct ThreadedServer {
    const int parent;
    std::mutex budgetReleaseMutex;
    std::deque<uint64_t> budgetReleases;
@@ -186,7 +193,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff8612284
    std::atomic<bool> ready{false};
    std::atomic<uint32_t> liveThreads{0};
    std::atomic<uint64_t> growthFailures{0};
-@@ -3124,10 +3129,38 @@ struct ThreadedServer {
+@@ -3124,10 +3128,38 @@ struct ThreadedServer {
      budgetReleases.push_back(ticket);
      if (needsWake) wake(managerWake);
    }
@@ -229,7 +236,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff8612284
      size_t offset = 0;
      for (;;) {
        bool pending;
-@@ -3153,6 +3186,10 @@ struct ThreadedServer {
+@@ -3153,6 +3185,10 @@ struct ThreadedServer {
          }
          pending = !budgetReleases.empty();
        }
@@ -240,7 +247,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff8612284
        // Keep a partially sent ticket at the front until the parent receives it.
        if (retry) {
          (void)poll(nullptr, 0, 10);
-@@ -3160,8 +3197,9 @@ struct ThreadedServer {
+@@ -3160,8 +3196,9 @@ struct ThreadedServer {
        }
        pollfd waits[] = {{managerWake, POLLIN, 0}, {parent, short(pending ? POLLOUT : 0), 0}};
        int result;
@@ -251,17 +258,17 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff8612284
        } while (result < 0 && errno == EINTR);
        if (result >= 0 && (waits[1].revents & POLLHUP)) return;
        if (result < 0 || (waits[1].revents & (POLLERR | POLLNVAL))) (void)poll(nullptr, 0, 10);
-@@ -3578,7 +3616,8 @@ struct ThreadedServer {
+@@ -3578,7 +3615,8 @@ struct ThreadedServer {
      return home.resident.empty();
    }
  
 -  void retireIdleDurableRoots(ThreadState &state) {
 +  void retireIdleDurableRoots(
-+      ThreadState& state, server::DurableIdleLifecycle::Time now = durableIdleNow()) {
++      ThreadState &state, server::DurableIdleLifecycle::Time now = durableIdleNow()) {
      const auto homeId = state.durableHome;
      const auto victim = [&]() -> std::optional<DatabaseRetirement> {
        std::lock_guard lock(durableRoutingMutex);
-@@ -3597,7 +3636,6 @@ struct ThreadedServer {
+@@ -3597,7 +3635,6 @@ struct ThreadedServer {
        }
      });
      if (!state.durableSlot) return;
@@ -269,7 +276,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff8612284
      auto &memory = *state.durableSlot->limits->memory;
      const auto accounted = [&] { return memory.heap.load() + memory.external.load(); };
      const auto placementLimit = kj::min(durablePlacement.placementBytes, memory.maximum * 3 / 4);
-@@ -3707,6 +3745,9 @@ struct ThreadedServer {
+@@ -3707,6 +3744,9 @@ struct ThreadedServer {
          }
        }
        if (current->second.resetting && memory.durableProcessPressure.load()) reclaimed = true;
@@ -279,7 +286,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff8612284
        current->second.stopFacets(nullptr);
        actor.shutdown(0);
        state.durableRoots.erase(current);
-@@ -3716,7 +3757,14 @@ struct ThreadedServer {
+@@ -3716,7 +3756,14 @@ struct ThreadedServer {
            state.durableSlot->lastUseNs.store(nowNs());
        }
      }
@@ -295,7 +302,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff8612284
        // Actor teardown outside the isolate lock defers JSG handle destruction.
        // Take the Worker lock to drop those roots before collecting their memory.
        auto &worker = *KJ_REQUIRE_NONNULL(state.durableSlot->worker);
-@@ -3778,6 +3826,12 @@ struct ThreadedServer {
+@@ -3778,6 +3825,12 @@ struct ThreadedServer {
          durableIsolateResets.fetch_add(1);
        }
      }
@@ -308,7 +315,7 @@ index cfe75f0372931bccee40b3b3e45a2c80df8eb321..780bae737dff2f9752ffa14ff8612284
    }
  
    void trackDurableTurn(uint64_t homeId, bool entering, uint64_t memory = 0) {
-@@ -3874,7 +3928,7 @@ struct ThreadedServer {
+@@ -3874,7 +3927,7 @@ struct ThreadedServer {
      for (auto &item: threads)
        while (item->descriptor.load(std::memory_order_acquire) != -1) usleep(1000);
      ready.store(true, std::memory_order_release);
