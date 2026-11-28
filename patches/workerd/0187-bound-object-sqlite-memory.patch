@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sat, 28 Nov 2026 09:54:22 +0800
+Date: Sat, 28 Nov 2026 13:03:04 +0800
 Subject: [PATCH] Budget SQLite heap for threaded Durable Objects
 
 Charge live ordinary object connections to the durable process, enforce the per-connection cap in tenant SQL, and preserve the confirmation contract when a refusal rolls back pending writes.
@@ -425,7 +425,7 @@ index 7ed3e940c34e4a80dfbe99a7fd95d5d0166a6de7..6ca675465a476625d2a1f0493df6eac0
  
  kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 974470feb6085ee0f537f33022c5fd492097f987..4ec6a3727f4eebe079da57c187ce97b486f13824 100644
+index 103aa3d4912434595e6fbdb5534c284d72c084eb..3883832796e8dd4d29770ed24eea5fd7d7021841 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -4,6 +4,7 @@
@@ -436,7 +436,7 @@ index 974470feb6085ee0f537f33022c5fd492097f987..4ec6a3727f4eebe079da57c187ce97b4
  #include <workerd/server/factory/coworkerd-wal-wire.h>
  
  #include <spawn.h>
-@@ -754,6 +755,154 @@ KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and re
+@@ -773,6 +774,154 @@ KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and re
    KJ_EXPECT(budget->memoryReserved.load() == beforeOpen);
  }
  
@@ -592,10 +592,10 @@ index 974470feb6085ee0f537f33022c5fd492097f987..4ec6a3727f4eebe079da57c187ce97b4
    constexpr auto MiB = ResourceBudget::MiB;
    auto budget = std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 9656855c948c66daf2ea8a93aa05e484324a8723..83909e7e5fc8ab03e6d4c76701a4078eef84b6d8 100644
+index 7a90f0d6ea1ab14a2ae691710d2c42a30561c1e4..9cc7b531151fa8351e72e35ef5765822aeb2e116 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
-@@ -1967,6 +1967,7 @@ server::DurableIdleLifecycle::Time durableIdleNow() {
+@@ -1978,6 +1978,7 @@ server::DurableIdleLifecycle::Time durableIdleNow() {
  }
  
  struct DurableTreeContext;
@@ -603,7 +603,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..83909e7e5fc8ab03e6d4c76701a4078e
  class DurableActorHooks;
  
  struct ThreadState {
-@@ -2028,6 +2029,7 @@ struct ThreadState {
+@@ -2039,6 +2040,7 @@ struct ThreadState {
      bool idleClosing = false;
      bool cancelExpiredWork = false;
      bool admissionClosing = false;
@@ -611,7 +611,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..83909e7e5fc8ab03e6d4c76701a4078e
      std::shared_ptr<class DurableNodeSockets> nodeSockets;
      kj::Function<bool()> hasLocalSockets;
      kj::Function<kj::Promise<SocketParkResult>()> parkSockets;
-@@ -2730,6 +2732,7 @@ struct ThreadedServer {
+@@ -2749,6 +2751,7 @@ struct ThreadedServer {
    std::vector<kj::Own<kj::CrossThreadPromiseFulfiller<DatabaseReplacement>>> databaseCapacityWaiters;
    std::atomic<uint64_t> durableHomeSessions{0};
    std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
@@ -619,7 +619,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..83909e7e5fc8ab03e6d4c76701a4078e
    std::atomic<uint64_t> durableAdmissionRetirements{0};
    std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
    std::atomic<uint64_t> nextDurableActor{0};
-@@ -3637,7 +3640,15 @@ struct ThreadedServer {
+@@ -3658,7 +3661,15 @@ struct ThreadedServer {
          else if (root.cancelExpiredWork)
            decision = Decision::CANCEL_PENDING;
        }
@@ -636,7 +636,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..83909e7e5fc8ab03e6d4c76701a4078e
        const bool cancelPending = decision == Decision::CANCEL_PENDING;
        const bool closeSocketSessions = !root.sockets.empty() && !root.resetting && !root.idleClosing;
        if (root.resetting || root.idleClosing) root.stopFacets(nullptr);
-@@ -3830,6 +3841,7 @@ struct ThreadedServer {
+@@ -3851,6 +3862,7 @@ struct ThreadedServer {
          ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
          ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
          ",\"sqliteHeapReservedBytes\":" + std::to_string(resources->sqliteMemoryReserved.load()) +
@@ -644,7 +644,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..83909e7e5fc8ab03e6d4c76701a4078e
          ",\"copyMemoryReservedBytes\":" + std::to_string(resources->memoryReserved.load()) +
          ",\"copyMemoryMaximum\":" + std::to_string(resources->memoryMaximum) +
          ",\"overloaded\":" + std::to_string(state.overloads) +
-@@ -6345,6 +6357,7 @@ struct DurableTreeContext {
+@@ -6366,6 +6378,7 @@ struct DurableTreeContext {
    kj::Own<server::FacetTreeIndex> index;
    std::shared_ptr<server::DurableIdleLifecycle> idle;
    std::map<uint, server::DurableLogShipper*> shippers;
@@ -652,7 +652,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..83909e7e5fc8ab03e6d4c76701a4078e
    uint liveFacets = 0;
    std::shared_ptr<DurableNodeSockets> nodeSockets;
    std::map<uint, SocketManager> socketManagers;
-@@ -6370,6 +6383,10 @@ struct DurableTreeContext {
+@@ -6391,6 +6404,10 @@ struct DurableTreeContext {
    }
  };
  
@@ -663,7 +663,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..83909e7e5fc8ab03e6d4c76701a4078e
  void beginDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation) {
    KJ_ASSERT(tree.socketUpgradeInvocations.emplace(invocation.begin(), invocation.end()).second);
  }
-@@ -7199,19 +7216,22 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7220,19 +7237,22 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
    auto *borrowedObserver = observer.get();
    if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
    auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName),
@@ -692,7 +692,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..83909e7e5fc8ab03e6d4c76701a4078e
        sqliteProcessBudget = slot->reservation;
      }
      KJ_ASSERT(tree->server.durableLog.get() == nullptr || prepared != kj::none,
-@@ -7226,6 +7246,15 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7247,6 +7267,15 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      }
      auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet,
          sqlWalFrameLimitBytes, memoryLimit, std::move(sqliteProcessBudget));

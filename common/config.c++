@@ -294,6 +294,11 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.drainTimeoutMs = root.getDrainTimeoutMs();
   result.loadCheck = root.getLoadCheck();
   result.webSocketsPerNode = root.getIngress().getWebSocketsPerNode();
+  const auto keepalive = root.getIngress().getTcpKeepalive().asReader();
+  KJ_REQUIRE(keepalive.getIdleSeconds() > 0 && keepalive.getIdleSeconds() <= 32767 &&
+      keepalive.getIntervalSeconds() > 0 && keepalive.getIntervalSeconds() <= 32767 &&
+      keepalive.getProbes() > 0 && keepalive.getProbes() <= 127, "invalid ingress.tcpKeepalive settings");
+  result.ingressKeepalive = {keepalive.getIdleSeconds(), keepalive.getIntervalSeconds(), keepalive.getProbes()};
   auto rotation = root.getRotation();
   result.processPool.rotationDrainTimeoutMs = rotation.getDrainTimeoutMs();
   result.processPool.rotationTermGraceMs = rotation.getTermGraceMs();
@@ -522,8 +527,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   KJ_REQUIRE(e.mode == "on" || e.mode == "off", "egress.mode must be on or off", e.mode.c_str());
   KJ_REQUIRE(e.defaultPolicy == "public" || e.defaultPolicy == "deny", "egress.defaultPolicy must be public or deny",
       e.defaultPolicy.c_str());
-  KJ_REQUIRE(e.timeoutMs > 0 && e.concurrency > 0 && e.requestsPerSecond > 0,
-      "egress.timeoutMs, egress.concurrency and egress.requestsPerSecond must be positive");
+  KJ_REQUIRE(e.timeoutMs > 0, "egress.timeoutMs must be positive");
   // The peer listener's authentication.
   result.peerAuth = {root.getPeerAuth().getKeyFile().cStr(), root.getPeerAuth().getWindowMs()};
   KJ_REQUIRE(result.peerAuth.windowMs >= 1000 && result.peerAuth.windowMs <= 600000, "peerAuth.windowMs must be 1000 to 600000");

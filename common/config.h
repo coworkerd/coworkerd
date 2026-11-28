@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -27,6 +28,7 @@ struct ProcessPoolConfig {
   bool watchdog = true;
   uint32_t pausedAdmissionWaitMs = 1000;
   uint32_t cpuLimitMs = 30000;
+  std::optional<uint64_t> alarmWallMsForTest;
   uint32_t durableCpuLimitMs = 200;
   uint32_t memoryLimitMiB = 128;
   uint32_t quarantineProcesses = 2;  // sharded by tenant, and the trial loads' processes
@@ -197,8 +199,8 @@ struct EgressConfig {
   std::string defaultPolicy = "public";
   std::vector<uint16_t> publicPorts = {80, 443};
   uint32_t timeoutMs = 30000;
-  uint32_t concurrency = 32;
-  uint32_t requestsPerSecond = 100;
+  uint32_t concurrency = 0;
+  uint32_t requestsPerSecond = 0;
   uint32_t dnsCacheMs = 10000;
   std::string caFile;
   bool systemTrustStore = true;
@@ -297,6 +299,11 @@ struct ServerConfig {
   bool loadCheck = true;
   // A ceiling for all ingress WebSockets on this node. 0 uses the default, capped by the hard descriptor limit.
   uint32_t webSocketsPerNode = 0;
+  struct TcpKeepalive {
+    int idleSeconds = 30;
+    int intervalSeconds = 10;
+    int probes = 3;
+  } ingressKeepalive;
   // durableObjects: how the node replicates and stores its objects' data (processes is in processPool).
   DurableLogConfig durableLog;
   uint64_t durableSocketFrameBytesPerNode = 128ull << 20;

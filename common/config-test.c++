@@ -104,6 +104,22 @@ void webSocketConfiguration(Fixture& fixture) {
   }
 }
 
+void egressConfiguration(Fixture& fixture) {
+  const auto defaults = fixture.load("{}").egress;
+  KJ_REQUIRE(defaults.concurrency == 0 && defaults.requestsPerSecond == 0);
+  const auto disabled = fixture.load(R"({"egress":{"concurrency":0,"requestsPerSecond":0}})").egress;
+  KJ_REQUIRE(disabled.concurrency == 0 && disabled.requestsPerSecond == 0);
+  const auto explicitLimits = fixture.load(R"({"egress":{"concurrency":32,"requestsPerSecond":100,
+    "tenants":[{"tenant":"shop","concurrency":64,"requestsPerSecond":200}]}})").egress;
+  KJ_REQUIRE(explicitLimits.concurrency == 32 && explicitLimits.requestsPerSecond == 100);
+  const auto& shop = explicitLimits.tenants.at("shop");
+  KJ_REQUIRE(shop.concurrency == 64 && shop.requestsPerSecond == 200);
+  std::string refusal;
+  try { fixture.load(R"({"egress":{"timeoutMs":0}})"); }
+  catch (const kj::Exception& error) { refusal = error.getDescription().cStr(); }
+  KJ_REQUIRE(refusal.find("egress.timeoutMs") != std::string::npos);
+}
+
 // With the object store's membership the grace must exceed the heartbeat interval by more than 1,150 ms; the
 // refusal names every value. The defaults (15 s, 5 s, 10 s) and the small test configuration (5 s, 1 s, 3 s) start.
 void livenessGraceConfiguration(Fixture& fixture) {
@@ -159,6 +175,7 @@ int main(int argc, char** argv) {
     else if (label == "memory") memoryConfiguration(fixture);
     else if (label == "tenant-borrow") tenantBorrowConfiguration(fixture);
     else if (label == "websocket") webSocketConfiguration(fixture);
+    else if (label == "egress") egressConfiguration(fixture);
     else if (label == "liveness-grace") livenessGraceConfiguration(fixture);
     else KJ_FAIL_REQUIRE("unknown configuration test case", argv[1]);
   } catch (const kj::Exception& error) {

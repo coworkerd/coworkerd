@@ -52,6 +52,16 @@ Each case that holds peer acknowledgements starts a fresh Compose project. `dura
 Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
+To measure the transport cost of 10,000 idle, open HTTP requests across two execution nodes:
+
+```sh
+node tests/cluster/run.mjs "$kernel" live-request-lease-capacity
+```
+
+Run the capacity case explicitly on a Linux Docker host that can sustain 5,000 concurrent invocations on each
+execution node. It verifies both the forwarded and executing counts, then compares peer RPC messages per second
+and Linux main-thread CPU for each node before and during the held requests.
+
 ### Threaded admission refusal
 
 `durable-threaded-admission-refusal` uses a single resident object slot on one owner and a one-event database
@@ -63,6 +73,22 @@ retries once and the stored counter or row confirms one write per retry.
 after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` each confirm that the write
 did not start and that one retry applies it once. A Durable Object exception after writing and a SQL
 constraint failure retain their ordinary error results.
+
+### Single-node waiting-call baseline
+
+The fixture enables ingress placement and sends fixed batches of 8, 16 and 24 stateless Worker
+requests to a private HTTP upstream with a two-second delay. It verifies the actual upstream
+overlap and completed replies. The JSONL records RSS, threads and open descriptors per process
+before, during, after drain and after recovery.
+
+```sh
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-capacity.jsonl
+```
+
+Use a new output path for each run. The fixture removes its disposable cluster and upstream.
+
+Run `node tests/cluster/run.mjs "$kernel" egress-limits` to check a private HTTP upstream under the
+default egress settings, a concurrency limit on its own and a request rate limit on its own.
 
 ### Stateless Worker ingress placement
 
@@ -94,6 +120,14 @@ fills the three root slots with sleeping requests to verify the hard concurrency
 The default suite also runs `ingress-placement-live-saturation` with the pinned kernel to
 test the production reader without overrides. It warms an isolate on the Worker home,
 runs one CPU-bound request there, and checks that a subsequent probe executes on a peer.
+
+The separate [hot Worker placement measurement](../../docs/hot-worker-placement.md) uses ordinary
+ingress near twice the measured single-isolate rate and compares another tenant's light-request p99
+with adjacent quiet windows. Its driver runs on demand on a quiet test machine.
+
+The same driver measures [one Worker above three-node capacity](../../docs/hot-worker-overload.md).
+The `overload` mode calibrates the live cluster before and after the fixed-rate control and
+overload windows. It records client replies through drain, per-node root slots, and placement counters.
 
 ### Threaded SQL deadline and disconnect
 
@@ -430,7 +464,16 @@ get those files and the cluster runner's combined output in `cluster.log`.
 | Case | Product behavior whose regression fails the case |
 | --- | --- |
 | `deployment` | A new Worker version never reaches one of the three nodes, or an ingress continues to serve the previous version. |
-| `websocket-admission` | The fixture starts with a soft descriptor limit of 1,024 and sets one ingress to two places. Two tenants fill it, and a third upgrade gets a retryable `503 WEBSOCKET_NODE_CAPACITY` before dispatch. A clean close, disconnect after upgrade and a declined handshake release places. An abandoned handshake releases its place when the Worker answers. Ordinary HTTP and another ingress keep serving. |
+| `websocket-admission` | The fixture starts with a soft descriptor limit of 1,024 and sets one ingress to two places. Two tenants fill it, and a third upgrade gets a retryable `503 WEBSOCKET_NODE_CAPACITY` before dispatch. A clean close, disconnect after upgrade and a declined handshake release places. A FIN during a pending upgrade returns its place promptly. Ordinary HTTP and another ingress keep serving. |
+| `live-request-lease` | A fully connected HTTP client receives the complete 120-second stream, including results from a Service Binding, a nested Durable Object and a retained RPC target. Total measured tenant CPU stays under 150 ms. |
+| `disconnected-request-lease` | A reset cancels foreground work when no `waitUntil` is registered, notifies `request.signal` before headers, and cancels a response body after headers. Registered work can still make a child call inside the single drain window. No work can produce a write after the cutoff. |
+| `graceful-close-request-lease` | A FIN on a silent request with complete headers triggers `request.signal` promptly. Registered work can write inside the shared drain and is canceled at its cutoff. |
+| `response-drain-request-lease` | The streamed body reaches EOF while root and child background work remain live. Both can write near the deadline and both settle at the same ingress cutoff. |
+| `bounded-child-request-leases` | Three batches release their HTTP, JavaScript RPC, and Durable Object leases across nodes while the root stays live. Each batch also covers a thrown RPC, a canceled response and a fixture failure before dispatch. |
+| `peer-partition-request-lease` | A paused peer with an open TCP connection produces `RESULT_UNCERTAIN` within the watchdog window. The resumed callee releases its old call and cannot write. |
+| `silent-request-lease` | A client isolated at the network layer is released by the configured TCP keepalive. |
+| `actor-request-lease`, `threaded-actor-request-lease` | An object timer between events can fetch and start a fresh object call tree. The upstream role also exercises D1. A callback taken over by a newer event uses that event's lease. |
+| `alarm-wall-time`, `threaded-alarm-wall-time` | Both Durable Object backends end and retry an alarm at the test-shortened wall limit. The legacy case also attempts to replace the private alarm method. |
 | `sql-atomicity` | A successful SQL batch loses a write, or a write from a failed batch is visible after the duplicate-key error. |
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
 | `process-replacement` | Killing an ordinary workerd process marks a tenant without evidence, leaves its slot unavailable, or prevents the replacement from serving the next Worker request. |
