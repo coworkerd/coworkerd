@@ -2676,7 +2676,6 @@ public:
     }
     if (p->durable && p->threaded) {
       childEnvironment.push_back("COWORKERD_DO_MAX_HOMES=" + std::to_string(config.durableMaxHomes));
-      childEnvironment.push_back("COWORKERD_DO_HOME_THREADS=" + std::to_string(config.durableHomeThreadBudget));
       for (const auto* name : {"COWORKERD_DO_TEST_TREES_PER_COPY",
                "COWORKERD_DO_TEST_PLACEMENT_BYTES", "COWORKERD_DO_TEST_BUSY_MS",
                "COWORKERD_DO_TEST_MAILBOX_EVENTS", "COWORKERD_DO_TEST_MAILBOX_BYTES",
@@ -4402,7 +4401,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"idleDestroyIntervalMs\":" << impl->config.idleDestroyIntervalMs
       << ",\"quarantineProcesses\":" << impl->config.quarantineProcesses
       << ",\"durableProcesses\":" << impl->config.durableProcesses
-      << ",\"durableHomeThreadBudget\":" << impl->config.durableHomeThreadBudget
+      << ",\"durableMaxHomes\":" << impl->config.durableMaxHomes
       << ",\"inFlightLimit\":" << impl->config.inFlightLimit << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
       << ",\"probeOverdueMs\":" << impl->config.probeOverdueMs << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
       << ",\"watchdog\":" << (impl->config.watchdog ? "true" : "false") << ",\"restartBackoffMs\":" << impl->config.restartBackoffMs

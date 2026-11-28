@@ -145,7 +145,7 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `node-threaded-durable-cpu-events` (Linux only) | Both kernel binaries, for actual per-event CPU attribution during interleaved HTTP awaits and cumulative CPU enforcement on the original event |
 | `node-threaded-durable-launch` (Linux only) | Both kernel binaries, for durable test-role negotiation and storage refusal |
 | `node-threaded-durable-home-reservation` (Linux only) | Both kernel binaries, for home reservation before acknowledgement, refusal with all homes occupied, and credit return on cancellation |
-| `node-threaded-durable-home-resource` (Linux only) | Both kernel binaries, for dynamic growth to six busy homes at the default ceiling, descriptor refusal, and return of threads and descriptor reservations |
+| `node-threaded-durable-home-resource` (Linux only) | Both kernel binaries, for dynamic growth to six busy homes at the default ceiling, descriptor refusal, return of call reservations, and reuse of the home threads |
 | `node-threaded-durable-warm-copies` (Linux only) | Both kernel binaries, for reusing matching warm copies after idle retirement in reverse definition order while preserving stored state |
 | `node-threaded-durable-load-cancel` (Linux only) | Both kernel binaries, for a cold load whose only caller's lease runs out: the load ends, and a different definition placed on that home runs its own code |
 | `node-threaded-durable-http` (Linux only) | Both kernel binaries, for HTTP writes/reads, brief idle re-entry, and first requests after three idle retirement/wake cycles |

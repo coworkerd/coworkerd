@@ -79,8 +79,7 @@ void ProcessPoolConfig::validate() const {
       "processPool.threadedResidentLimit must be between 1 and 1840");
   KJ_REQUIRE(quarantineProcesses <= 256, "invalid quarantine process capacity");
   KJ_REQUIRE(durableProcesses <= 64, "durableObjects.processes is at most 64");
-  KJ_REQUIRE(durableMaxHomes > 0 && durableMaxHomes <= 16384,
-      "durableObjects.maxHomes is between 1 and 16384");
+  KJ_REQUIRE(durableMaxHomes <= 16384, "durableObjects.maxHomes is between 0 and 16384");
   KJ_REQUIRE(sqlCpuLimitMs > 0 && sqlCpuLimitMs <= 60000,
       "processPool.sqlCpuLimitMs is between 1 and 60000");
   KJ_REQUIRE(sqlWallLimitMs > 0 && sqlWallLimitMs <= 60000,

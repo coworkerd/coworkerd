@@ -18,17 +18,17 @@ by `durableObjectBytes` (10 GiB by default).
 A Linux shard owner with [`durableObjects.threadedStorage`](install.md#durable-objects-and-local-storage)
 enabled serves both D1 bindings and HTTP SQL. Each open database has its own isolate copy and
 home. Memory, native threads and descriptors determine how many stay open in each durable
-process. The node accounts for host and cgroup thread headroom before dividing it across the
-durable processes and a replacement generation. The home reserves a thread, five descriptors
-and 256 KiB for the native loop. Its root reserves four descriptors and 16 KiB for routing. The isolate and SQLite allocations also
-count toward the process's memory share. The safety ceiling `durableObjects.maxHomes`
-defaults to 16,384 and starts home threads on demand.
+process. The node includes the home ceiling in its host task-limit check. The home reserves
+one thread, five descriptors and 256 KiB for the native loop. Its root reserves four
+descriptors and 16 KiB for routing. The isolate and SQLite allocations also count toward
+the process's memory share. The safety ceiling `durableObjects.maxHomes` defaults to one home
+per MiB of the process budget, from 512 to 16,384.
 
 When a new database needs a home, the process can reuse the least recently used eligible
 idle home. An active call, queued call, or pending storage confirmation keeps its home in
 place. A later call reopens a retired database with its confirmed data.
 An eligible idle database releases its copy about 10 seconds after its last request.
-Once the close settles, the home thread exits and returns its reservations.
+The home thread stays available for another database or Worker.
 An explicit admission refusal returns HTTP `503 OVERLOADED` with `dispatched: false`
 and `retryable: true`.
 [Admission measurements and commands](../database-home-benchmark.md#database-admission-at-the-ceiling)

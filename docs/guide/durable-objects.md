@@ -192,13 +192,12 @@ An acknowledged alarm whose hint or owner marker has not published before its no
 A threaded durable process starts home threads as placements need them. Each home owns
 one version isolate copy, which can hold up to 1,024 object trees. Available process memory,
 native threads and file descriptors bound how many homes the process can run. Each home
-reserves one thread, five file descriptors and 256 KiB for its native loop. The node divides
-the host and cgroup thread headroom after accounting for existing tasks, the other process roles
-and a spare durable generation. When a home releases its last copy and its calls have settled,
-the loop exits and returns its reservations. The isolate's heap, SQLite and other allocations
-also count toward process memory. Each root reserves
-four descriptors and 16 KiB for routing. The safety ceiling `durableObjects.maxHomes`
-defaults to 16,384 and reserves no resources at startup.
+reserves one thread, five file descriptors and 256 KiB for its native loop. The node includes
+the home ceiling in its host task-limit check. The isolate's heap, SQLite and other
+allocations also count toward process memory. Each root reserves four descriptors and
+16 KiB for routing. The safety ceiling `durableObjects.maxHomes` defaults to one home per MiB
+of the process budget, with a minimum of 512 and a maximum of 16,384. A created thread stays
+available for reuse after its copy retires.
 
 Placement first looks for a compatible copy. An eligible idle tree can give up its place
 when a compatible copy or the process's resident-object budget is full. When an incoming

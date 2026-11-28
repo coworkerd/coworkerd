@@ -83,30 +83,15 @@ node tests/cluster/durable-idle-measure.mjs "$kernel" build/durable-residency.js
 
 ### Threaded durable home capacity
 
-The capacity driver starts one durable process and runs the default home policy under 2 GiB and
-6 GiB node cgroup memory limits. The Worker workload puts a tracked background operation on
-each resident copy and periodically checks that the same copies still serve. The database
-workload holds peer acknowledgements for writes, so each admitted SQLite home stays in use
-through the first refusal. Both workloads record the refusal, its process resource, the
-number of resident homes, and the child's RSS, threads and descriptors.
+The driver starts one durable process with the default home policy. It gives Workers of
+different tenants one object apiece, keeps each accepted object busy through a tracked
+background operation, and reads it periodically to check that its copy stays resident.
+It records the first pre-execution capacity refusal, the exhausted resource and the
+number of homes serving when it occurred.
 
 ```sh
-for size in small large; do
-  node tests/cluster/durable-home-capacity-measure.mjs "$kernel" "build/worker-homes-$size.jsonl" workers "$size"
-  node tests/cluster/durable-home-capacity-measure.mjs "$kernel" "build/database-homes-$size.jsonl" databases "$size"
-done
-node tests/cluster/durable-home-capacity-measure.mjs "$kernel" build/idle-low.jsonl idle small 4
-node tests/cluster/durable-home-capacity-measure.mjs "$kernel" build/idle-default.jsonl idle small
-node tests/cluster/durable-home-capacity-measure.mjs "$prior_kernel" build/idle-prior.jsonl idle small
-node tests/cluster/durable-home-capacity-measure.mjs "$kernel" build/home-reuse.jsonl reuse small
-node tests/cluster/durable-cpu-isolation-measure.mjs "$kernel" build/home-cpu.jsonl --oversubscribed
+node tests/cluster/durable-home-capacity-measure.mjs "$kernel" build/worker-homes.jsonl
 ```
-
-The idle runs compare the process RSS, anonymous RSS, thread and descriptor counts, and its
-cgroup's memory readings. The reuse run pairs the first call into a free home with the first
-call that takes it from an idle Worker. The CPU run starts one more busy home than the node
-has available CPUs and records the latency, errors and missed offers of two other Workers.
-Run each fixture with its own output path on an otherwise quiet Linux host.
 
 ### Single-node waiting-call baseline
 

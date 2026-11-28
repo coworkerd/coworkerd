@@ -530,7 +530,11 @@ try {
   const stack = join(scratch, paths[0]);
   const socketPath = join(stack, 'run', processInfo.socket);
   const empty = await readAdmission(socketPath);
-  assert.equal(empty.maxHomes, maxHomes ?? 16384);
+  const memoryBudget = Number(environment.find(value =>
+    value.startsWith('COWORKERD_THREADED_MEMORY_BYTES='))?.split('=')[1]);
+  assert.ok(Number.isSafeInteger(memoryBudget) && memoryBudget > 0);
+  const defaultCeiling = Math.max(512, Math.min(16384, Math.floor(memoryBudget / 1048576)));
+  assert.equal(empty.maxHomes, maxHomes ?? defaultCeiling);
   assert.equal(empty.workerThreads, 0);
   assert.equal(empty.homeReservedBytes, 0);
   assert.equal(empty.homeReservedDescriptors, 0);
@@ -601,9 +605,8 @@ try {
       return rows.filter(([name]) => name === 'cwkd-home').map(([, tid]) => tid).sort((a, b) => a - b);
     };
     const homes = homeResource ? 6 : 2;
-    await waitForAdmission(socketPath, 0, 0, { workerThreads: 0 });
-    assert.deepEqual(await homeThreads(), []);
-    const baseline = await readProcessResources(processInfo.pid);
+    await waitForAdmission(socketPath, 0, 0, { workerThreads: 1 });
+    const [firstHome] = await homeThreads();
     const keep = [];
     const claim = async id => {
       const connection = await sendPreface(socketPath,
@@ -624,6 +627,7 @@ try {
       assert.equal(occupied.homes, homes);
       originalThreads = await homeThreads();
       assert.equal(originalThreads.length, homes);
+      assert.ok(originalThreads.includes(firstHome));
       assert.equal(occupied.homeReservedDescriptors, homes * 5);
       assert.equal(occupied.homeReservedBytes, homes * 256 * 1024);
       const refused = await claim(homes + 1);
@@ -638,27 +642,24 @@ try {
       assert.deepEqual(await homeThreads(), originalThreads, 'refusal must not create another home thread');
       assert.equal(bounded.lastHomeRefusal, homeResource ? 'home-descriptors' : 'home-ceiling');
       if (homeResource) {
-        assert.equal(bounded.maxHomes, 16384);
+        assert.equal(bounded.maxHomes, defaultCeiling);
         assert.equal(bounded.descriptorBudget, 65);
       }
     } finally {
       for (const socket of keep) socket.destroy();
     }
-    const drained = await waitForAdmission(socketPath, 0, 0, { workerThreads: 0 });
+    const drained = await waitForAdmission(socketPath, 0, 0, { workerThreads: homes });
     assert.equal(drained.trees, 0);
-    for (const field of ['reservedBytes', 'reservedDescriptors', 'homeReservedBytes', 'homeReservedDescriptors']) {
-      assert.equal(drained[field], 0);
-    }
-    const emptyResources = await readProcessResources(processInfo.pid);
-    assert.equal(emptyResources.descriptors, baseline.descriptors);
-    assert.equal(emptyResources.threads, baseline.threads);
+    assert.equal(drained.reservedBytes, 0);
+    assert.equal(drained.reservedDescriptors, 0);
+    assert.equal(drained.homeReservedDescriptors, homes * 5);
     const retry = await claim(homes + 1);
     try {
       assert.equal(retry.receipt, 'A');
       const reserved = await readAdmission(socketPath);
       assert.equal(reserved.homes, 1, 'the home must already be reserved when acknowledgement arrives');
     } finally { retry.socket.destroy(); }
-    await waitForAdmission(socketPath, 0, 0, { workerThreads: 0 });
+    await waitForAdmission(socketPath, 0);
     const state = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
       headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000),
     }).then(response => response.json());
@@ -666,7 +667,7 @@ try {
     assert.equal(live.pid, processInfo.pid);
     assert.equal(live.generation, processInfo.generation);
     assert.equal(live.state, 'ready');
-    assert.deepEqual(await homeThreads(), []);
+    assert.deepEqual(await homeThreads(), originalThreads);
     console.log(JSON.stringify({event: 'home-reserved-before-ack', homes,
       homeThreadIds: originalThreads, refusedDefinitions: 1, creditsReturned: true}));
   } else if (cpuEvents) {
@@ -1199,7 +1200,7 @@ try {
     } finally {
       for (const socket of keep.splice(0)) socket.destroy();
     }
-    await waitForAdmission(socketPath, 0, 0, { workerThreads: 0 });
+    await waitForAdmission(socketPath, 0);
     const baseline = await readProcessResources(processInfo.pid);
     const start = performance.now();
     let full, reserved;
@@ -1243,7 +1244,7 @@ try {
     } finally {
       for (const socket of keep) socket.destroy();
     }
-    const released = await waitForAdmission(socketPath, 0, 0, { workerThreads: 0 });
+    const released = await waitForAdmission(socketPath, 0);
     assert.equal(released.trees, 0);
     assert.equal(released.reservedDescriptors, 0);
     assert.equal(released.reservedBytes, 0);
@@ -1556,7 +1557,7 @@ try {
       generation: sameChild.generation, admission: counters}));
   }
   assert.deepEqual((await readdir(fixture)).sort(),
-    ['node.json', 'runtime', ...(queueLimit ? ['threaded-fd-limit', 'threaded-fd-limit.target'] : []), 'workers']);
+    ['node.json', 'runtime', ...(queueLimit || homeResource ? ['threaded-fd-limit', 'threaded-fd-limit.target'] : []), 'workers']);
   child.kill('SIGTERM');
   await exited;
   assert.equal(child.exitCode, 0);
