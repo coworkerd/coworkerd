@@ -30,12 +30,12 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(420_000)]);
 const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-ws-frame-memory-')), resolve(kernel), signal, {
-  singleNode: true, threadedNodes: ['node-1'], controlDurableLifecycle: true,
+  singleNode: true, durableFixtureNodes: ['node-1'], controlDurableLifecycle: true,
   nodeComposeResources: { cpus: 2, mem_limit: memoryLimitBytes, memswap_limit: memoryLimitBytes },
   configureNode: () => ({
     processPool: { count: 1, inFlightLimit: 32 }, quarantineProcesses: 0,
     ingress: { webSocketsPerNode: connectionCount },
-    durableObjects: { threadedStorage: true, peers: 0, socketFrameBytesPerNode: reservationBytes },
+    durableObjects: { peers: 0, socketFrameBytesPerNode: reservationBytes },
   }),
 });
 const [node] = cluster.nodes;

@@ -986,6 +986,7 @@ private:
   std::string recoverySchedulerJson(double now) const;
   kj::Promise<void> acquireRebuildSlot(const std::string&, RebuildRun&);
   void releaseRebuildSlot(RebuildRun&);
+  void forgetSettledRebuild(const std::string&);
   kj::Promise<void> rebuild(std::string objectName, std::string reason, bool background);
   void pumpRebuilds();
   void promoteRebuild(const std::string&);

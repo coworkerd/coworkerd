@@ -93,8 +93,6 @@ struct ProcessPoolConfig {
   std::string ordinaryServer = "threaded";
   std::string threadedExecutable;
   bool threadedDurableTestStorage = false;
-  bool threadedDurableStorage = false;
-  bool threadedDurable() const { return threadedDurableTestStorage || threadedDurableStorage; }
   // Experimental per-tenant calls per native process; disabled unless explicitly configured.
   uint32_t tenantInFlightLimit = 0;
   uint32_t tenantAdmissionWaitMs = 1000;
@@ -243,8 +241,7 @@ struct DurableLogConfig {
   uint32_t rebuildConcurrency = 4;
   uint32_t alarmFireConcurrency = 2;
   // Resident tree target per durable process (COWORKERD_DO_RESIDENT_OBJECTS; 0 disables the count limit).
-  // A threaded process at the target retires the least recently used eligible idle tree to admit a new ordinary
-  // object. The upstream backend evicts idle trees after crossing the target.
+  // At the target, retire the least recently used eligible idle tree to admit a new ordinary object.
   uint32_t residentObjects = 4096;
   // How often a node publishes what its objects hold, per tenant, for the durableObjectBytes quota.
   uint32_t usagePublishMs = 3600000;

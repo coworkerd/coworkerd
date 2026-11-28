@@ -141,6 +141,18 @@ void webSocketConfiguration(Fixture& fixture) {
   }
 }
 
+void durableConfiguration(Fixture& fixture) {
+  KJ_REQUIRE(fixture.load("{}").processPool.durableProcesses == 1);
+  KJ_REQUIRE(fixture.load(R"({"durableObjects":{"processes":0}})").processPool.durableProcesses == 0);
+  for (const auto* value : {"true", "false"}) {
+    std::string refusal;
+    try { fixture.load(std::string("{\"durableObjects\":{\"threadedStorage\":") + value + "}}"); }
+    catch (const kj::Exception& error) { refusal = error.getDescription().cStr(); }
+    KJ_REQUIRE(refusal.find("Unknown field") != std::string::npos &&
+        refusal.find("threadedStorage") != std::string::npos, value, refusal.c_str());
+  }
+}
+
 void egressConfiguration(Fixture& fixture) {
   const auto defaults = fixture.load("{}").egress;
   KJ_REQUIRE(defaults.concurrency == 0 && defaults.requestsPerSecond == 0);
@@ -213,6 +225,7 @@ int main(int argc, char** argv) {
     else if (label == "memory") memoryConfiguration(fixture);
     else if (label == "tenant-borrow") tenantBorrowConfiguration(fixture);
     else if (label == "websocket") webSocketConfiguration(fixture);
+    else if (label == "durable") durableConfiguration(fixture);
     else if (label == "egress") egressConfiguration(fixture);
     else if (label == "liveness-grace") livenessGraceConfiguration(fixture);
     else KJ_FAIL_REQUIRE("unknown configuration test case", argv[1]);

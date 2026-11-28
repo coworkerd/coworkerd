@@ -62,8 +62,8 @@ async function digest(file) {
 
 async function measure(label, kernel, round) {
   const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-do-sql-heap-')), kernel,
-    controller.signal, { singleNode: true, threadedNodes: ['node-1'],
-      configureNode: () => ({ durableObjects: { threadedStorage: true, processes: 1, peers: 0 } }) });
+    controller.signal, { singleNode: true, durableFixtureNodes: ['node-1'],
+      configureNode: () => ({ durableObjects: { processes: 1, peers: 0 } }) });
   const [node] = cluster.nodes;
   try {
     await cluster.start();

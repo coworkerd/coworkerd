@@ -23,8 +23,7 @@ const leaseCases = {
   'bounded-child-request-leases': boundedChildRequestLeases,
   'peer-partition-request-lease': peerPartitionRequestLease,
 };
-const actorLeaseCases = { 'actor-request-lease': [], 'threaded-actor-request-lease': ['node-1', 'node-2', 'node-3'] };
-const alarmCases = { 'alarm-wall-time': [], 'threaded-alarm-wall-time': ['node-1', 'node-2', 'node-3'] };
+const actorLeaseCases = { 'actor-request-lease': true, 'threaded-actor-request-lease': false };
 const requestLeaseNode = () => ({
   ingressPlacement: true, placement: { homeProbability: 1, subcalls: 'home' },
   ingress: { tcpKeepalive: { idleSeconds: 1, intervalSeconds: 1, probes: 2 } },
@@ -83,16 +82,12 @@ function defaultSuites() {
     ...Object.entries(durableGatedCases).map(([name, { test, nodes, membership, confirmTimeoutMs, versionDrainTimeoutMs,
       controlDurableLifecycle, delayRecoveryPeers, budgetLifetime, platformFixture, databaseAlarmFixture,
       publishPeerPorts, configureNode, nodeEnvironment, singleNode, holdPeerAcks = true }]) => {
-      const previousProduct = name === 'durable-threaded-database-placement' && process.env.COWORKERD_CLUSTER_PREVIOUS_PRODUCT;
-      const previousKernel = previousProduct && process.env.COWORKERD_CLUSTER_PREVIOUS_KERNEL;
       return {
         selected: [[name, test]],
         options: {
-          threadedNodes: nodes, holdPeerAcks, membership, confirmTimeoutMs, versionDrainTimeoutMs,
+          durableFixtureNodes: nodes, holdPeerAcks, membership, confirmTimeoutMs, versionDrainTimeoutMs,
           controlDurableLifecycle, delayRecoveryPeers, budgetLifetime, platformFixture,
           databaseAlarmFixture, publishPeerPorts, configureNode, nodeEnvironment, singleNode,
-          previousProduct: previousProduct ? resolve(previousProduct) : undefined,
-          previousKernel: previousKernel ? resolve(previousKernel) : undefined,
         },
       };
     }),
@@ -121,17 +116,14 @@ function defaultSuites() {
         }),
       },
     })),
-    ...Object.entries(actorLeaseCases).map(([name, threadedNodes]) => ({
-      selected: [[name, actorRequestLease]],
+    ...Object.entries(actorLeaseCases).map(([name, withD1]) => ({
+      selected: [[name, cluster => actorRequestLease(cluster, withD1)]],
       options: {
-        threadedNodes, configureNode: requestLeaseNode,
+        configureNode: requestLeaseNode,
         budgetLifetime: { tenant: 'live-request-timers', leaseMs: 30_000 },
       },
     })),
-    ...Object.entries(alarmCases).map(([name, threadedNodes]) => ({
-      selected: [[name, alarmRequestLease]],
-      options: { threadedNodes, alarmWallMs: 1000 },
-    })),
+    { selected: [['threaded-alarm-wall-time', alarmRequestLease]], options: { alarmWallMs: 1000 } },
   ];
 }
 

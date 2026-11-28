@@ -379,8 +379,8 @@ async function runMeasurement(output, residencyOnly) {
   const record = (metric, fields) =>
     appendFile(output, JSON.stringify({ metric, at: new Date().toISOString(), ...fields }) + '\n');
   const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-durable-idle-')), kernel, controller.signal, {
-    singleNode: true, threadedNodes: ['node-1'],
-    configureNode: () => ({ durableObjects: { processes: 1, peers: 0, threadedStorage: true } }),
+    singleNode: true, durableFixtureNodes: ['node-1'],
+    configureNode: () => ({ durableObjects: { processes: 1, peers: 0 } }),
   });
   const [node] = cluster.nodes;
   try {

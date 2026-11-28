@@ -90,6 +90,8 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
   singleNode: true,
   productRoot: checkout,
   controlDurableLifecycle: mixedCeiling === 'memory',
+  durableFixtureNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
+  // The imported Cluster from a historical checkout uses the original option.
   threadedNodes: mixedCeiling === 'memory' ? ['node-1'] : [],
   ...((idleWindow || threadedSqlThroughput) && {
     databaseFixtureNodes: ['node-1'],
@@ -109,7 +111,7 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
     }),
       ...(memoryAdmission && { threadedMemoryBytes: 448 * 1024 ** 2 }),
       ...(!defaultAdmission && !idleWindow && { threadedMemoryBytes: 3 * 1024 ** 3 }) },
-    durableObjects: { processes: busyProcesses ?? 1, threadedStorage: true, peers: 0, residentObjects },
+    durableObjects: { processes: busyProcesses ?? 1, peers: 0, residentObjects },
   }),
   nodeEnvironment: () => ({
     ...(!defaultHomes && { COWORKERD_DO_TEST_HOME_COUNT: String(settings.homes) }),

@@ -501,10 +501,10 @@ struct ServerConfig {
     alarmTakeoverConcurrency @21 :UInt32 = 4;
     # Background alarm dispatches per node; ordinary process and tenant admission still applies.
     alarmFireConcurrency @22 :UInt32 = 2;
-    # Select the experimental threaded durable role in a disposable, single-node fixture.
+    # Use disposable storage in a single-node threaded durable fixture.
     threadedTestStorage @23 :Bool = false;
-    # Experimental threaded Worker-object backend with the node's durable log.
-    threadedStorage @24 :Bool = false;
+    # Keep the retired backend switch's ordinal unused.
+    unused24 @24 :Void;
     # When a new definition first waits for a busy tree, bound the remaining drain time.
     versionDrainTimeoutMs @25 :UInt32 = 30000;
     # Threaded platform database: current transaction's WAL plus live SQLite temporary files.

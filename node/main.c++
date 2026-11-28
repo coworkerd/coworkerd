@@ -1936,9 +1936,8 @@ public:
     }
     auto value = durable ? refusal("DO_UNAVAILABLE", "the durable process of this object (" +
         runtime.durableProcessFor(durable->key()) + ") is not ready", 503, root) : processRefusal({runtime.quarantined(worker)}, root);
-    if (!(durable && serverConfig.processPool.threadedDurable()) &&
-        serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker, durable ? durable->key() : "")) {
-      value.category = durable ? "paused-durable" : runtime.quarantined(worker) ? "paused-quarantine" : "paused-ordinary";
+    if (!durable && serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker)) {
+      value.category = runtime.quarantined(worker) ? "paused-quarantine" : "paused-ordinary";
       value.avoidMs = 0;
     }
     if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
@@ -1966,10 +1965,6 @@ public:
   }
 
   uint32_t pausedAdmissionWaitMs() const { return serverConfig.processPool.pausedAdmissionWaitMs; }
-  bool durablePaused(const std::string& worker, const std::string& objectKey) {
-    return !serverConfig.processPool.threadedDurable() &&
-        pausedAdmissionWaitMs() && bool(runtime.pausedAdmission(worker, objectKey));
-  }
   struct Admission {
     std::optional<InvocationRejection> refused;
     std::shared_ptr<AdmissionSlot> slot;
@@ -2104,9 +2099,8 @@ public:
 
   std::string_view admissionTenant(const std::string& worker, const DurableTarget* durable = nullptr) const {
     // Worker identity comes from the selected deployment. Do not use an ingress header.
-    // A scheduled alarm has no ingress caller; its scheduler continues to use the node-wide limits.
-    if (!(serverConfig.tenantRootLimit || serverConfig.tenantNestedLimit) ||
-        (durable && (durable->alarmAtUnixMs || serverConfig.processPool.threadedDurable()))) return {};
+    // The durable process accounts for its own admitted calls.
+    if (durable || !(serverConfig.tenantRootLimit || serverConfig.tenantNestedLimit)) return {};
     auto slash = worker.find('/');
     return slash == std::string::npos ? std::string_view() : std::string_view(worker).substr(0, slash);
   }
@@ -2654,7 +2648,7 @@ public:
     auto owner = desiredState.state().namespaceOwner(namespaceId);
     if (!owner) return std::nullopt;
     if (owner->isDatabase()) {
-      if (owner->active() && serverConfig.processPool.threadedDurableStorage)
+      if (owner->active())
         owner->platformClass = coworkerd::PlatformClassRef{platformDefinitions.product.name, "SqlDatabase"};
     } else if (!owner->platformClass && !platformDefinitions.fixtureClasses.empty()) {
       owner->platformClass = platformDefinitions.fixtureClassFor(*owner);
@@ -3682,22 +3676,15 @@ public:
   coworkerd::WorkerLimits effectiveLimits(const std::string& workerId) const { return runtime.effectiveLimits(workerId); }
   // A trial's process: the tenant's quarantine shard, never an ordinary process.
   std::shared_ptr<coworkerd::ProcessCall> trialProcess(const std::string& worker) { return runtime.selectTrial(worker); }
-  std::shared_ptr<coworkerd::ProcessCall> rootTrialProcess(const std::string& worker) {
-    return runtime.selectDurable("root-trial/" + worker);
-  }
   bool quarantined(const std::string& worker) const { return runtime.quarantined(worker); }
   bool trialsQuarantined() const { return serverConfig.processPool.quarantineProcesses > 0; }
   std::string nextTrialInvocationId() {
     return serverConfig.serverId + "." + epoch() + "-trial-" + std::to_string(nextTrialSequence++);
   }
   OpenEvent openTrial(const VersionDefinition& version, const std::shared_ptr<coworkerd::ProcessCall>& process,
-      const std::string& invocationId, double deadline, bool rootTrial = false) {
+      const std::string& invocationId, double deadline) {
     auto descriptor = encodeDescriptor(version, invocationId, invocationId, 0, 0, 0, deadline,
         std::make_shared<const VersionPins>(), *process, serverConfig.serverId, "", true);
-    if (rootTrial) {
-      std::string encoded(descriptor.cStr()); encoded.pop_back(); encoded += ",\"rootTrial\":true}";
-      descriptor = kj::str(encoded.c_str());
-    }
     process->workerId = version.workerId; process->versionId = version.versionId;
     process->invocationId = invocationId; process->treeId = invocationId;
     return runtime.open(process, descriptor, version.definitionHash);
@@ -5098,7 +5085,7 @@ public:
       return {};
     };
     hooks.ended = [&server, invocation]() { server.releaseLease(invocation); };
-    hooks.propagateAbruptClose = server.placementConfig().processPool.threadedDurableStorage;
+    hooks.propagateAbruptClose = true;
     slot->report(101, "");
     auto pipe = kj::newWebSocketPipe();
     relay = kj::heap<WebSocketRelay>(server.webSockets(), server.clock(), WebSocketRegistry::Role::EXECUTION, std::move(identity),
@@ -7666,8 +7653,7 @@ public:
       log(line, request.target, nullptr, refusal.status, refusal.code, started);
       return Received{refusal};
     };
-    if (!coworkerd::acceptsForwardedAlarm(server.placementConfig().processPool.threadedDurableStorage,
-            request.target.alarmAtUnixMs)) {
+    if (!coworkerd::acceptsForwardedAlarm(request.target.alarmAtUnixMs)) {
       co_return refused(server.refusal("NOT_SUPPORTED", "the threaded durable role only accepts local alarm dispatch", 501));
     }
     std::string code, reason;
@@ -7790,8 +7776,7 @@ private:
       line.workerId = version->workerId;
       line.versionId = version->versionId;
     }
-    if (alarm == nullptr && !coworkerd::acceptsForwardedAlarm(
-            server.placementConfig().processPool.threadedDurableStorage, target.alarmAtUnixMs)) {
+    if (alarm == nullptr && !coworkerd::acceptsForwardedAlarm(target.alarmAtUnixMs)) {
       co_return refused(server.refusal("NOT_SUPPORTED", "the threaded durable role only accepts local alarm dispatch", 501));
     }
     // This machine's files for the object are brought up to date with its replicated history first: a shard taken
@@ -7817,7 +7802,7 @@ private:
     // Recovery may close the durable process to discard refused local frames. Wait for its replacement after
     // rebuilding as well as after an independent restart, before admission or opening the event.
     const auto waitUntil = std::min(deadline, monotonicTimeMs() + DURABLE_WAIT_MS);
-    while (!target.alarmAtUnixMs && !server.durableReady(target.key()) && !server.durablePaused(version->workerId, target.key()) && monotonicTimeMs() < waitUntil)
+    while (!target.alarmAtUnixMs && !server.durableReady(target.key()) && monotonicTimeMs() < waitUntil)
       co_await server.clock().afterDelay(10 * kj::MILLISECONDS);
     auto admitted = co_await server.admit(version->workerId, version->definitionHash, false, deadline, false, false,
         &target, target.alarmAtUnixMs == 0);
@@ -8019,7 +8004,6 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
         ? coworkerd::AlarmOutcome::DELETED : coworkerd::AlarmOutcome::NAMESPACE_WAIT, 0, "alarm namespace is not active yet"};
   auto owner = server.namespaceOwner(alarm.namespaceId);
   KJ_REQUIRE(owner.has_value());
-  const auto threaded = server.placementConfig().processPool.threadedDurableStorage;
   DurableDispatch::Request request;
   request.workerId = owner->isDatabase()
       ? owner->tenant + "/" + coworkerd::DATABASE_WORKER_NAME
@@ -8051,8 +8035,8 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   }
   durableLog.alarmCapacityAvailable(destination);
   auto route = co_await shards.route(alarm.namespaceId, alarm.shard);
-  if (route.kind != coworkerd::ShardRoute::Kind::LOCAL || (threaded &&
-      (route.epoch != alarm.shardEpoch || (alarm.dataEpoch && route.dataEpoch != alarm.dataEpoch))))
+  if (route.kind != coworkerd::ShardRoute::Kind::LOCAL || route.epoch != alarm.shardEpoch ||
+      (alarm.dataEpoch && route.dataEpoch != alarm.dataEpoch))
     co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0, "the alarm is no longer held locally"};
   coworkerd::DurableLog::ObjectIdentity identity{alarm.namespaceId, alarm.objectId, owner->tenant,
       route.dataEpoch, route.epoch, alarm.shard};
@@ -8066,14 +8050,10 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
   }
   CollectedResponse answer;
   try {
-    if (threaded) {
-      request.target.shardEpoch = route.epoch;
-      request.target.dataEpoch = route.dataEpoch;
-      auto dispatched = co_await durable.dispatchLocalEvent(std::move(request), alarm.shard, &alarm);
-      answer = co_await collectObjectResponse(kj::mv(dispatched), factory, headerTable, DURABLE_ALARM_PATH, "{}");
-    } else {
-      answer = co_await askObject(durable, factory, headerTable, std::move(request), DURABLE_ALARM_PATH, "{}");
-    }
+    request.target.shardEpoch = route.epoch;
+    request.target.dataEpoch = route.dataEpoch;
+    auto dispatched = co_await durable.dispatchLocalEvent(std::move(request), alarm.shard, &alarm);
+    answer = co_await collectObjectResponse(kj::mv(dispatched), factory, headerTable, DURABLE_ALARM_PATH, "{}");
   } catch (const kj::Exception& error) {
     co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::UNAVAILABLE, 0,
         std::string(error.getDescription().cStr())};
@@ -8097,8 +8077,8 @@ kj::Promise<coworkerd::AlarmResult> fireDurableAlarm(DurableDispatch& durable, S
     outcome.clear();
   }
   if (outcome == "fired") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FIRED, 0, {}};
-  if (threaded && outcome == "cleared") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::CLEARED, 0, {}};
-  if (threaded && outcome == "stop") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::STOP, 0, {}};
+  if (outcome == "cleared") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::CLEARED, 0, {}};
+  if (outcome == "stop") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::STOP, 0, {}};
   if (outcome == "notDue") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::NOT_DUE, atUnixMs, {}};
   if (outcome == "failed") co_return coworkerd::AlarmResult{coworkerd::AlarmOutcome::FAILED, 0, reason};
   if (code == "DO_ALARM_REBUILDING") {
@@ -8569,7 +8549,6 @@ public:
         durable(durable) {}
 
   kj::Promise<void> socketControl(SocketControlContext context) override {
-    KJ_REQUIRE(server.placementConfig().processPool.threadedDurableStorage);
     context.getResults().setControl(kj::heap<DurableSocketControl>(server, durable));
     return kj::READY_NOW;
   }
@@ -9255,7 +9234,7 @@ private:
       auto pipe = kj::newWebSocketPipe();
       relay = kj::heap<WebSocketRelay>(server.webSockets(), server.clock(), WebSocketRegistry::Role::INGRESS, std::move(identity),
           kj::mv(socket), kj::mv(pipe.ends[1]), WebSocketRelay::Hooks{
-            .propagateAbruptClose = server.placementConfig().processPool.threadedDurableStorage});
+            .propagateAbruptClose = true});
       relayTask = relay->run().then([this]() { complete(); }, [this](kj::Exception&&) { complete(); }).eagerlyEvaluate(nullptr);
       return kj::mv(pipe.ends[0]);
     }
@@ -9457,10 +9436,10 @@ private:
 
   kj::Promise<std::string> probe(const VersionDefinition& version,
       const std::shared_ptr<coworkerd::ProcessCall>& process, const std::string& invocationId,
-      double deadline, bool rootTrial = false) {
+      double deadline) {
     auto opened = [&] {
       try {
-        return server.openTrial(version, process, invocationId, deadline, rootTrial);
+        return server.openTrial(version, process, invocationId, deadline);
       } catch (const ProcessUnavailable& error) {
         // Nothing was sent (the secret dictionary could not take the values): this node's condition, not the code's.
         auto failure = KJ_EXCEPTION(DISCONNECTED, "not sent", error.reason.c_str());
@@ -9566,45 +9545,9 @@ private:
         dispatched = true;
         const auto probeStarted = monotonicTimeMs();
         std::string report, failure, notSent;
-        bool timedOut = false, rootCpuExceeded = false, rootMemoryExceeded = false;
-        auto probeProcess = process;
-        auto probeInvocation = invocationId;
+        bool timedOut = false;
         try {
           report = co_await probe(*version, process, invocationId, deadline);
-          // The second probe exercises the root bridge in runtime.js. The quarantine trial
-          // already validates durable class exports for homes that use the native loader.
-          if (process->threadedServer() && !config.processPool.threadedDurable() &&
-              version->format == "v2" && !version->declaredClasses.empty()) {
-            capnp::MallocMessageBuilder message;
-            auto json = message.initRoot<capnp::JsonValue>();
-            capnp::JsonCodec().decodeRaw(kj::arrayPtr(report.data(), report.size()), json);
-            auto ok = coworkerd::json::field(json, "ok");
-            auto classes = coworkerd::json::field(json, "durableObjectClasses");
-            bool usable = classes.isArray() && classes.getArray().size() == version->declaredClasses.size();
-            if (usable) for (auto entry: classes.getArray()) {
-              auto value = coworkerd::json::field(entry, "usable");
-              if (!value.isBoolean() || !value.getBoolean()) usable = false;
-            }
-            if (ok.isBoolean() && ok.getBoolean() && usable) {
-              auto root = server.rootTrialProcess(version->workerId);
-              if (!root) {
-                verdict = {"UNAVAILABLE", "", "no ready durable process for the root trial"};
-              } else {
-                probeProcess = root; probeInvocation = invocationId + "-root";
-                KJ_DEFER({
-                  rootCpuExceeded = root->cpuLimitExceeded();
-                  rootMemoryExceeded = root->memoryLimitExceeded();
-                  root->finish();
-                });
-                auto rootReport = co_await probe(*version, root, probeInvocation, deadline, true);
-                capnp::MallocMessageBuilder rootMessage;
-                auto rootJson = rootMessage.initRoot<capnp::JsonValue>();
-                capnp::JsonCodec().decodeRaw(kj::arrayPtr(rootReport.data(), rootReport.size()), rootJson);
-                auto rootOk = coworkerd::json::field(rootJson, "ok");
-                if (!rootOk.isBoolean() || !rootOk.getBoolean()) report = std::move(rootReport);
-              }
-            }
-          }
         } catch (const kj::Exception& error) {
           if (error.getDetail(TRIAL_NOT_SENT_DETAIL) != kj::none) notSent = "this node's secret dictionary cannot take the version's secret values now";
           else failure = error.getDescription().cStr();
@@ -9615,15 +9558,14 @@ private:
           // The connection to workerd failed: let the pool observe the exit
           // (it reads the culprit then), bounded.
           std::string ended;
-          try { co_await timer.timeoutAfter(1000 * kj::MILLISECONDS, probeProcess->onExit()); }
+          try { co_await timer.timeoutAfter(1000 * kj::MILLISECONDS, process->onExit()); }
           catch (const kj::Exception& error) { ended = error.getDescription().cStr(); }
           exited = ended.find("exited") != std::string::npos;
-          if (exited) culprit = server.culpritOf(probeInvocation);
+          if (exited) culprit = server.culpritOf(invocationId);
         }
         // The probe ends here, whatever happened: its process call is released,
         // and on a timeout the request into workerd is cancelled.
-        const bool cpuExceeded = rootCpuExceeded || process->cpuLimitExceeded(),
-            memoryExceeded = rootMemoryExceeded || process->memoryLimitExceeded();
+        const bool cpuExceeded = process->cpuLimitExceeded(), memoryExceeded = process->memoryLimitExceeded();
         process->finish();
         probeMs = monotonicTimeMs() - probeStarted;
         if (!notSent.empty()) {
@@ -10568,12 +10510,12 @@ void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& 
   if (const char* keys = std::getenv("COWORKERD_SANDBOX_PROTECTION_KEYS")) pool.protectionKeys = keys;
   KJ_REQUIRE(pool.protectionKeys == "auto" || pool.protectionKeys == "off" || pool.protectionKeys == "required",
       "sandbox.protectionKeys must be auto, off or required", pool.protectionKeys.c_str());
-  if (pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurable()) return;
+  if (pool.count + pool.quarantineProcesses + pool.durableProcesses == 0) return;
   const auto threaded = pool.threadedExecutable.empty()
       ? (fs::path(workerdPath).parent_path() / "coworkerd-threaded").string() : pool.threadedExecutable;
   auto plan = coworkerd::planV8Sandbox(pool.protectionKeys, coworkerd::probeSandboxBuild(threaded),
       coworkerd::probeProtectionKeys(), coworkerd::probeMachine(), pool.threadedResidentLimit,
-      pool.count + (pool.threadedDurable() ? pool.durableProcesses : 0));
+      pool.count + pool.durableProcesses);
   // Only for the fill-until-failure cell: a per-process limit above what the address space holds,
   // so that a process fills until V8's own group creation refuses (the second line).
   if (const char* test = std::getenv("COWORKERD_SANDBOX_RESIDENT_LIMIT_FOR_TEST"); test != nullptr && plan.refusal.empty()) {
@@ -10605,13 +10547,17 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
   auto& pool = config.processPool;
   const auto memoryBudgetBytes = config.memoryBudgetBytes;
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
-  if (std::getenv("COWORKERD_CPU_LIMIT_MS")) pool.durableCpuLimitMs = pool.cpuLimitMs;
-  if (pool.threadedDurable()) pool.durableCpuLimitMs = 30000;
+  pool.durableCpuLimitMs = 30000;
   pool.memoryLimitMiB = static_cast<uint32_t>(environmentUnsigned("COWORKERD_MEMORY_LIMIT_MIB", pool.memoryLimitMiB, UINT32_MAX));
   pool.quarantineProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_QUARANTINE_PROCESSES", pool.quarantineProcesses, 256));
   pool.durableProcesses = static_cast<uint32_t>(environmentUnsigned("COWORKERD_DURABLE_PROCESSES", pool.durableProcesses, 64));
-  KJ_REQUIRE(!pool.threadedDurable() || pool.durableProcesses > 0,
-      "threaded durable storage requires a durable process");
+  // Positional fixtures using file membership cannot own persistent shards.
+  if (config.membership.backend == "file" && !pool.threadedDurableTestStorage) pool.durableProcesses = 0;
+  KJ_REQUIRE(!pool.threadedDurableTestStorage || pool.durableProcesses > 0,
+      "disposable durable storage requires a durable process");
+#ifndef __linux__
+  KJ_REQUIRE(pool.durableProcesses == 0, "durable processes require Linux");
+#endif
   KJ_REQUIRE(pool.count + pool.quarantineProcesses == 0 || pool.cpuLimitMs <= 300000,
       "ordinary cpuLimitMs is at most 300000 milliseconds");
   pool.tenantInFlightLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_TENANT_IN_FLIGHT_LIMIT", pool.tenantInFlightLimit, 16384));
@@ -10619,11 +10565,11 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
   pool.threadedThreadIdleMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_THREAD_IDLE_MS", pool.threadedThreadIdleMs, UINT32_MAX));
   pool.threadedMemoryBytes = environmentUnsigned("COWORKERD_THREADED_MEMORY_BYTES", pool.threadedMemoryBytes, UINT64_MAX);
   planOrdinarySandbox(pool, workerdPath);
-  const auto [nodeBytes, memorySource] = coworkerd::MemoryWatermark::nodeMemory(memoryBudgetBytes);
+  const auto [nodeBytes, memorySource] = coworkerd::MemoryWatermark::nodeMemory(config.memoryBudgetBytes);
   const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
   const auto memoryShare = (nodeBytes - nodeBytes / 5) / generations;
   if (pool.threadedMemoryBytes == 0) pool.threadedMemoryBytes = memoryShare;
-  KJ_REQUIRE((pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurable()) ||
+  KJ_REQUIRE((pool.count + pool.quarantineProcesses + pool.durableProcesses == 0) ||
       (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
   if (pool.count + pool.quarantineProcesses > 0) {
@@ -10717,7 +10663,7 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
   // The memory threshold nobody gave: 70% of this node's memory, so that a process whose memory keeps growing is
   // replaced before the node's memory runs out, whatever else rotates it.
   if (pool.rotationResidentBytesDefault) {
-    const auto [bytes, source] = coworkerd::MemoryWatermark::nodeMemory(memoryBudgetBytes);
+    const auto [bytes, source] = coworkerd::MemoryWatermark::nodeMemory(config.memoryBudgetBytes);
     pool.rotationResidentBytes = bytes / 10 * 7;
     pool.rotationResidentBytesDefault = false;
     pool.rotationResidentBytesSource = "default: 70% of " + source + " (" + std::to_string(bytes) + " bytes)";
@@ -11127,7 +11073,7 @@ int run(Launch launch) {
       membership->view().backend == "objectStore" && runtime.durableProcesses() > 0,
       uint32_t(uint64_t(server.placementConfig().membership.ttlSeconds) * 1000 +
           server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs,
-      server.placementConfig().processPool.threadedDurableStorage},
+      true},
       server.placementConfig().desiredState.objectStore, io.provider->getNetwork(), timer, *io.lowLevelProvider,
       membership->view(),
       {[&peerForwarder, &membership](std::string nodeId, uint64_t ownerEpoch, uint64_t firstSeq) {
@@ -11173,8 +11119,7 @@ int run(Launch launch) {
       [&durableLog](const std::string& processId) { return durableLog.drainChannel(processId); },
       server.placementConfig().durableLog);
   shards.onShardGone([&server, &durableLog](const std::string& namespaceId, uint32_t shard, const std::string& reason) {
-    if (server.placementConfig().processPool.threadedDurableStorage)
-      server.webSockets().goAwayShard(namespaceId, shard);
+    server.webSockets().goAwayShard(namespaceId, shard);
     durableLog.shardGone(namespaceId, shard, reason);
   });
   // The lease of this node's epoch is judged next to every confirmation (node/durable-log.h). Once it ends --
@@ -11287,7 +11232,6 @@ int run(Launch launch) {
   });
   runtime.setRootMaintenance([&server, &durableLog]() {
     auto pending = server.rootMaintenanceRequest();
-    if (!server.placementConfig().processPool.threadedDurableStorage) return pending;
     if (pending && !pending->empty()) {
       server.webSockets().goAwayNamespaces(*pending);
       server.rootsMaintained(durableLog.drainThreadedNamespaces(*pending));

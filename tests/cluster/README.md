@@ -48,8 +48,7 @@ node tests/cluster/run.mjs --list --shard 1/4
 node tests/cluster/run.mjs "$kernel" --shard 1/4
 ```
 
-Each case that holds peer acknowledgements starts a fresh Compose project. `durable-peer-ack` uses upstream durable processes.
-Cases beginning with `durable-threaded-` enable the experimental backend on the nodes specified by the case.
+Each case that holds peer acknowledgements starts a fresh Compose project. Durable slots run the threaded server in every project.
 Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different build directory.
 
 To measure the transport cost of 10,000 idle, open HTTP requests across two execution nodes:
@@ -61,6 +60,10 @@ node tests/cluster/run.mjs "$kernel" live-request-lease-capacity
 Run the capacity case explicitly on a Linux Docker host that can sustain 5,000 concurrent invocations on each
 execution node. It verifies both the forwarded and executing counts, then compares peer RPC messages per second
 and Linux main-thread CPU for each node before and during the held requests.
+
+### Expected failures with threaded durable storage
+
+The list is empty. The runner requires every case to pass.
 
 ### Threaded admission refusal
 
@@ -289,22 +292,10 @@ one-second deadline so the case also verifies that the refusal is counted and th
 `durable-threaded-database-admission-mixed` fills the four default homes and runs a serial SQL scan
 while tenant objects from six definitions compete for the released homes in the same process.
 
-`durable-threaded-database-placement` uses the release daemon on the threaded owner and the upstream
-database backend on the other nodes. It checks HTTP SQL and D1 in both directions, batch rollback, two
-same-tenant databases in separate isolate copies of the same threaded process generation before and after
-idle release, and acknowledged writes recovered at a later shard epoch after either build's owner is killed.
-`durable-threaded-database-release` checks that a public SQL query succeeds through the platform
-database in the threaded owner's release daemon. To run the placement test with an actual older node build,
-point the runner at a checkout containing its built Linux `build/coworkerd` and its original `runtime/runtime.js`.
-
-```sh
-COWORKERD_CLUSTER_PREVIOUS_PRODUCT=/path/to/previous-checkout \
-  node tests/cluster/run.mjs "$kernel" durable-threaded-database-placement
-```
-
-The runner uses the older daemon and runtime on node 2 and records the SHA-256 of both node binaries.
-Set `COWORKERD_CLUSTER_PREVIOUS_KERNEL` to the older build's verified kernel directory when testing
-across a change to the node-to-kernel protocol.
+The database placement case checks HTTP SQL and D1 in both directions, batch rollback, two
+same-tenant databases in separate isolate copies of the same process generation before and after
+idle release, and acknowledged writes recovered at a later shard epoch after either owner is killed.
+The database release case checks public SQL on the release daemon with the default durable backend.
 
 To measure idle WebSocket memory on fresh clusters:
 
@@ -574,19 +565,19 @@ get those files and the cluster runner's combined output in `cluster.log`.
 | `bounded-child-request-leases` | Three batches release their HTTP, JavaScript RPC, and Durable Object leases across nodes while the root stays live. Each batch also covers a thrown RPC, a canceled response and a fixture failure before dispatch. |
 | `peer-partition-request-lease` | A paused peer with an open TCP connection produces `RESULT_UNCERTAIN` within the watchdog window. The resumed callee releases its old call and cannot write. |
 | `silent-request-lease` | A client isolated at the network layer is released by the configured TCP keepalive. |
-| `actor-request-lease`, `threaded-actor-request-lease` | An object timer between events can fetch and start a fresh object call tree. The upstream role also exercises D1. A callback taken over by a newer event uses that event's lease. |
-| `alarm-wall-time`, `threaded-alarm-wall-time` | Both Durable Object backends end and retry an alarm at the test-shortened wall limit. The legacy case also attempts to replace the private alarm method. |
+| `actor-request-lease`, `threaded-actor-request-lease` | An object timer between events can fetch and start a fresh object call tree. The first variant includes a D1 call. A callback taken over by a newer event uses that event's lease. |
+| `threaded-alarm-wall-time` | The threaded dispatcher ends and retries an alarm at the test-shortened wall limit. |
 | `sql-atomicity` | A successful SQL batch loses a write, or a write from a failed batch is visible after the duplicate-key error. |
 | `cpu-isolation` | A CPU-bound Worker escapes the CPU watchdog, returns an error other than `503 CPU_LIMIT_EXCEEDED`, or makes another Worker in the same process wait for it. |
 | `process-replacement` | Killing an ordinary workerd process marks a tenant without evidence, leaves its slot unavailable, or prevents the replacement from serving the next Worker request. |
 | `fatal-attribution` (test kernel) | A confirmed fatal exit fails to route the tenant's next call to quarantine, a peer fails to apply the suspect mark, a repeat exit affects the ordinary process, an unrelated tenant fails to recover, shared-cage exhaustion marks the last allocator, an exit through V8's own API check or one during the load stays unattributed, or V8's diagnostic is missing. |
 | `log-quota` | A node keeps too many log lines per second, discards another tenant's lines, keeps an older line over the tenant's byte budget, or returns a shortened line without `truncated: true`. |
-| `durable-peer-ack` | An HTTP reply or a JS RPC result from a Durable Object escapes while both replication peers hold positive append acknowledgements, or the write fails to return and read back its value after those acknowledgements are released. The run also checks a separate object's read during the hold. |
+| `durable-peer-ack` | An HTTP reply and a JS RPC result wait while both replication peers hold positive append acknowledgements. After the acknowledgements are released, each write completes and reads back its value. A separate object serves reads during the hold. |
 | `durable-takeover` | After the owner is killed during concurrent writes, another live node must take ownership in a later epoch and recover every write for which the client received a complete success response. Writes without such a response may survive or be lost. The case detects premature acknowledgements that lead to lost writes in the run. It measures neither a recovery deadline nor survival after multiple node losses. |
 | `durable-slow-holder` | A TCP relay delays the previous holder's peer replies past the recovery deadline while the holder keeps its lease. The successor reports the waiting object and holder, then reads the confirmed value after the relay releases the replies. |
-| `durable-threaded-mixed` | HTTP and RPC replies on a threaded owner wait for upstream peer acknowledgements while another home serves a read. Rotation waits for a gated write, and clean rotation, a cut WAL socket, and rotation of a stopped child must reopen confirmed data. A due alarm survives the threaded node's drain and fires upstream. The restarted threaded node then confirms a write as a peer and recovers it in a later ownership epoch. |
-| `durable-threaded-database-alarm` | The upstream request and the native threaded event each clear a real alarm on `SqlDatabase`. After the owner's durable process rotates, the database still reads its saved SQL row, holds no alarm and receives no further dispatches for it. The test executable supplies the setup and observation requests. |
-| `durable-threaded-database-accounting` | Public SQL on upstream and threaded owners is attributed to the same database Worker in admitted executions, dispatch logs and native metering. A non-database platform object on the threaded owner uses the same tenant's platform Worker. |
+| `durable-threaded-rotation-recovery` | HTTP and RPC replies on a threaded owner wait for peer acknowledgements while another home serves a read. Rotation waits for a gated write, and clean rotation, a cut WAL socket, and rotation of a stopped child must reopen confirmed data. A due alarm survives its owner's drain and fires on a successor. The restarted threaded node then confirms a write as a peer and recovers it in a later ownership epoch. |
+| `durable-threaded-database-alarm` | Two shard owners each clear a real alarm on `SqlDatabase`. After the owner's durable process rotates, the database still reads its saved SQL row, holds no alarm and receives no further dispatches for it. The test executable supplies the setup and observation requests. |
+| `durable-threaded-database-accounting` | Public SQL on two shard owners is attributed to the same database Worker in admitted executions, dispatch logs and native metering. A non-database platform object on the threaded owner uses the same tenant's platform Worker. |
 | `durable-threaded-takeover` | The owner-loss workload runs on three threaded nodes, with positive peer acknowledgements held at the moment of owner loss. Every fully acknowledged write must survive takeover. |
 | `durable-platform-definition` | A separate node executable installs fixture definitions for two tenants. Ordinary bindings reach the shard owner's build across two builds. Copy tokens show warm reuse within a tenant and isolation across tenants. A platform object runs an alarm, reopens after idle release, and recovers every acknowledged SQL write after owner loss. |
 | `durable-threaded-fence` | A paused old owner has positive acknowledgements withheld until a live node acquires a higher shard epoch. Releasing the acknowledgements before the confirmation deadline must never return success to that old owner's write. The next owner still reads the earlier confirmed value. |
