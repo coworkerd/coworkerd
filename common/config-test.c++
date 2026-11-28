@@ -36,13 +36,12 @@ struct Fixture {
   fs::path directory;
 };
 
-struct IdleCase { const char* name; unsigned threshold, interval; const char* diagnostic; };
+struct IdleCase { const char* name; unsigned threshold; const char* diagnostic; };
 constexpr std::array idleCases{
-  IdleCase{"off", 0, 10, ""},
-  IdleCase{"valid", 101, 10, ""},
-  IdleCase{"equal", 100, 10, "idleEvictMs"},
-  IdleCase{"below", 99, 10, "idleEvictMs"},
-  IdleCase{"interval-zero", 101, 0, "idleDestroyIntervalMs"},
+  IdleCase{"off", 0, ""},
+  IdleCase{"valid", 101, ""},
+  IdleCase{"equal", 100, "idleEvictMs"},
+  IdleCase{"below", 99, "idleEvictMs"},
 };
 
 void idleConfiguration(Fixture& fixture) {
@@ -50,10 +49,9 @@ void idleConfiguration(Fixture& fixture) {
     std::string reason;
     try {
       const auto config = fixture.load("{\"placement\":{\"idleMs\":100},\"idleEvictMs\":" +
-          std::to_string(row.threshold) + ",\"idleDestroyIntervalMs\":" + std::to_string(row.interval) + "}");
+          std::to_string(row.threshold) + "}");
       config.processPool.validate();
-      KJ_REQUIRE(config.processPool.heatIdleMs == 100 && config.processPool.idleEvictMs == row.threshold &&
-          config.processPool.idleDestroyIntervalMs == row.interval, "idle settings not mapped", row.name);
+      KJ_REQUIRE(config.processPool.heatIdleMs == 100 && config.processPool.idleEvictMs == row.threshold, "idle settings not mapped", row.name);
     } catch (const kj::Exception& error) { reason = error.getDescription().cStr(); }
     if (*row.diagnostic) {
       KJ_REQUIRE(reason.find(row.diagnostic) != std::string::npos, "expected a named refusal", row.name, reason.c_str());

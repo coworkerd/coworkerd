@@ -549,13 +549,6 @@ bool tenantLimitRefusal(const InvocationRejection& refusal) {
   return refusal.code == "OVERLOADED" && refusal.category == TENANT_ADMISSION_LIMIT;
 }
 
-bool pausedRefusal(const InvocationRejection& refusal) {
-  return refusal.status == 503 &&
-      ((refusal.code == "PROCESS_UNAVAILABLE" && refusal.category == "paused-ordinary") ||
-       (refusal.code == "QUARANTINE_UNAVAILABLE" && refusal.category == "paused-quarantine") ||
-       (refusal.code == "DO_UNAVAILABLE" && refusal.category == "paused-durable"));
-}
-
 // A load failure is the version's own and the same everywhere -- except a code package
 // this Server could not get or verify, which another Server (another cache) may have.
 using coworkerd::PACKAGE_UNAVAILABLE;
@@ -564,12 +557,6 @@ bool rerouteAfter(const InvocationRejection& refusal) {
     return refusal.status == 503 && refusal.notExecuted && refusal.retryable;
   return refusal.code != "PROCESS_MEMORY_PRESSURE" && coworkerd::placementRetryable(refusal.code, refusal.category);
 }
-
-uint64_t preparationLargeBudget(uint32_t heapMiB) {
-  const auto heap = std::clamp<uint64_t>(heapMiB ? heapMiB : 128, 1, 65536);
-  return std::max<uint64_t>(1, heap * 1024 * 1024 * 21 / 32 / 65536) * 65536;
-}
-constexpr uint64_t MAX_PACKAGE_PREPARATION_BYTES = 84ull * 1024 * 1024;  // 10 MiB code plus a 1 MiB descriptor.
 
 class ServerCore;
 struct AdmissionSlot {
@@ -584,7 +571,6 @@ struct AdmissionSlot {
   ServerCore* server = nullptr;
   bool root = false;
   // Every pre-dispatch recheck shares this slot and the call's one paused-wait budget.
-  double pausedWaitMs = 0;
   double processTenantWaitMs = 0;
   std::string ingressNodeId;
   // A request to a Durable Object (DurableDispatch): its response may become a WebSocket connection too, and its outcome
@@ -1806,7 +1792,6 @@ public:
   }
 
   void observeRefusal(const InvocationRejection& refusal, const std::string& source = "localBinding") {
-    if (pausedRefusal(refusal)) return;  // A scheduling hint, before the call's final outcome.
     ++placementRejections[refusal.code];
     if (refusal.code == "QUARANTINE_UNAVAILABLE") decision("quarantineUnavailable", source == "localIngress" || source == "peerIngress");
     ++placementRejectionReasons[cleanReason(refusal.reason)];
@@ -1814,7 +1799,6 @@ public:
   }
 
   void observeLocalRefusal(const InvocationRejection& refusal, const std::string& source) {
-    if (pausedRefusal(refusal)) return;
     observeCounter("refusal", source, refusal.code);
     std::cout << "[refusal-count] {\"nodeId\":\"" << serverConfig.serverId
               << "\",\"source\":\"" << source << "\",\"code\":\"" << refusal.code
@@ -1919,10 +1903,6 @@ public:
     }
     auto value = durable ? refusal("DO_UNAVAILABLE", "the durable process of this object (" +
         runtime.durableProcessFor(durable->key()) + ") is not ready", 503, root) : processRefusal({runtime.quarantined(worker)}, root);
-    if (!durable && serverConfig.processPool.pausedAdmissionWaitMs && runtime.pausedAdmission(worker)) {
-      value.category = runtime.quarantined(worker) ? "paused-quarantine" : "paused-ordinary";
-      value.avoidMs = 0;
-    }
     if (record) observeRefusal(value, root ? (forwardedRoot ? "peerIngress" : "localIngress") : "localBinding");
     return value;
   }
@@ -1947,7 +1927,6 @@ public:
     return runtime.workerSaturated(worker, coworkerd::plainPlanFingerprint(plan->second), now);
   }
 
-  uint32_t pausedAdmissionWaitMs() const { return serverConfig.processPool.pausedAdmissionWaitMs; }
   struct Admission {
     std::optional<InvocationRejection> refused;
     std::shared_ptr<AdmissionSlot> slot;
@@ -2005,38 +1984,7 @@ public:
       slot->processTenantWaitMs += monotonicTimeMs() - began;
       co_return Admission{std::nullopt, std::move(slot)};
     }
-    if (!wait || !pausedRefusal(*failure)) {
-      if (!wait && pausedRefusal(*failure)) co_return Admission{std::move(failure), {}};
-      co_return reject(std::move(*failure));
-    }
-    auto paused = runtime.pausedAdmission(worker, durable ? durable->key() : "");
-    if (!paused) co_return reject(std::move(*failure));
-    const auto kind = failure->category.substr(7);
-    const auto began = monotonicTimeMs();
-    if (!slot) slot = reserve(root, worker, durable);
-    const auto until = std::min(deadline, began + std::max(0.0, pausedAdmissionWaitMs() - slot->pausedWaitMs));
-    const auto id = beginAdmissionWait(kind);
-    std::string outcome = "canceled";
-    // Keep a reference even when the successful return moves the slot into its result.
-    auto waitingSlot = slot;
-    auto done = kj::defer([&] {
-      waitingSlot->pausedWaitMs += monotonicTimeMs() - began;
-      endAdmissionWait(kind, id, began, outcome);
-    });
-    while (true) {
-      // Admission rechecks every original guard while accounting for this request's own reserved slot.
-      auto current = check();
-      if (current && current->code == "LEASE_EXPIRED") {
-        outcome = "lease";
-        if (record) rejectExpiredLease("lease expired during paused admission");
-        co_return reject(std::move(*current));
-      }
-      if (!paused.alive()) { outcome = "killed"; co_return reject(std::move(*failure)); }
-      if (!current) { outcome = "resumed"; co_return Admission{std::nullopt, std::move(slot)}; }
-      if (!pausedRefusal(*current)) { outcome = "unavailable"; co_return reject(std::move(*current)); }
-      if (monotonicTimeMs() >= until) { outcome = "expired"; co_return reject(std::move(*failure)); }
-      co_await timer.afterDelay(static_cast<int64_t>(std::max(0.0, std::min(10.0, until - monotonicTimeMs())) * 1000) * kj::MICROSECONDS);
-    }
+    co_return reject(std::move(*failure));
   }
 
   uint64_t beginAdmissionWait(const std::string& kind) {
@@ -2061,19 +2009,15 @@ public:
   std::string pausedAdmissionJson() const {
     std::ostringstream out; out << std::setprecision(17) << '{';
     bool first = true;
-    for (const auto* kind : {"ordinary", "quarantine", "durable", "tenant-execution"}) {
+    for (const auto* kind : {"tenant-execution"}) {
       auto found = pausedAdmissionCounts.find(kind);
       const auto count = found == pausedAdmissionCounts.end() ? PausedAdmissionCounts{} : found->second;
       out << (first ? "" : ",") << '"' << kind << "\":{\"count\":" << count.count << ",\"active\":" << count.active
           << ",\"maxActive\":" << count.maxActive << ",\"totalWaitMs\":" << count.totalWaitMs << ",\"maxWaitMs\":" << count.maxWaitMs;
       first = false;
-      for (const auto* outcome : {"resumed", "expired", "killed", "lease", "unavailable", "canceled"}) {
+      for (const auto* outcome : {"resumed", "expired", "unavailable", "canceled", "full"}) {
         auto value = count.outcomes.find(outcome);
         out << ",\"" << outcome << "\":" << (value == count.outcomes.end() ? 0 : value->second);
-      }
-      if (std::string_view(kind) == "tenant-execution") {
-        const auto full = count.outcomes.find("full");
-        out << ",\"full\":" << (full == count.outcomes.end() ? 0 : full->second);
       }
       out << '}';
     }
@@ -5622,52 +5566,7 @@ public:
   }
 
   kj::Promise<InvocationAttempt> openStatic(std::string target, RemoteInvocationData invocation) {
-    auto result = co_await tryOpen(target, invocation);
-    co_return co_await waitRemote(target, std::move(invocation), std::move(result));
-  }
-
-  kj::Promise<InvocationAttempt> waitRemote(const std::string& target, RemoteInvocationData invocation, InvocationAttempt result) {
-    if (!result.failure || !pausedRefusal(*result.failure) || !server.pausedAdmissionWaitMs()) co_return result;
-    const auto original = *result.failure;
-    const auto deadline = invocation.expiresAtMonotonicMs;
-    auto guard = server.admission(invocation.workerId, invocation.definitionHash, invocation.ingressRoot,
-        deadline, false, false, nullptr, false, false, false);
-    if (guard) {
-      server.recordTenantLimitRefusal(invocation.workerId, invocation.ingressRoot, *guard);
-      co_return InvocationAttempt{nullptr, std::move(guard), true};
-    }
-    auto slot = server.reserve(invocation.ingressRoot, invocation.workerId);
-    const auto kind = original.category.substr(7);
-    const auto began = monotonicTimeMs();
-    const auto until = std::min(deadline, began + server.pausedAdmissionWaitMs());
-    const auto id = server.beginAdmissionWait(kind);
-    std::string outcome = "canceled";
-    auto done = kj::defer([&] { server.endAdmissionWait(kind, id, began, outcome); });
-    while (true) {
-      guard = server.admission(invocation.workerId, invocation.definitionHash, invocation.ingressRoot,
-          deadline, false, false, nullptr, true, false, false);
-      if (guard) {
-        server.recordTenantLimitRefusal(invocation.workerId, invocation.ingressRoot, *guard);
-        outcome = guard->code == "LEASE_EXPIRED" ? "lease" : "unavailable";
-        co_return InvocationAttempt{nullptr, std::move(guard), true};
-      }
-      if (monotonicTimeMs() >= until) {
-        outcome = "expired";
-        auto failure = original; failure.category.clear();
-        failure.avoidMs = std::min(server.placementConfig().rejectionAvoidMs, server.placementConfig().avoidMaxMs);
-        co_return InvocationAttempt{nullptr, std::move(failure), true};
-      }
-      co_await timer.afterDelay(static_cast<int64_t>(std::max(0.0, std::min(10.0, until - monotonicTimeMs())) * 1000) * kj::MICROSECONDS);
-      if (monotonicTimeMs() >= until) continue;
-      // Only explicit refusals permit another open; accepted or uncertain commits this attempt.
-      result = co_await tryOpen(target, invocation);
-      if (!result.failure) { outcome = "resumed"; co_return result; }
-      if (!pausedRefusal(*result.failure)) {
-        outcome = result.failure->code == "LEASE_EXPIRED" ? "lease" :
-            (result.failure->code == "PROCESS_UNAVAILABLE" || result.failure->code == "QUARANTINE_UNAVAILABLE") ? "killed" : "unavailable";
-        co_return result;
-      }
-    }
+    co_return co_await tryOpen(target, invocation);
   }
 
   // A Durable Object log stream to one peer: the member's current epoch is addressed, and the stream stays on that
@@ -6110,7 +6009,7 @@ public:
           allocation.pins, pin.definitionHash, allocation.ingressRoot, allocation.ingressServerId, allocation.entrypoint,
           allocation.nativeProps, preferIdle, allocation.requestLease};
     };
-    bool allPaused = true, allTenantLimited = true;
+    bool allTenantLimited = true;
     bool allNotExecuted = true;
     std::optional<InvocationRejection> tenantRefusal;
     size_t finalRefusals = 0;
@@ -6188,7 +6087,6 @@ public:
       } else {
         ++finalRefusals;
         allNotExecuted = allNotExecuted && refusal.notExecuted;
-        allPaused = allPaused && pausedRefusal(refusal);
         packagesUnavailable = packagesUnavailable && refusal.code == "LOAD_FAILED" &&
             refusal.category == PACKAGE_UNAVAILABLE;
         if (tenantLimitRefusal(refusal)) {
@@ -6205,26 +6103,6 @@ public:
         }
       }
       if (i + 1 < firstPassSize + saturated.size()) server.reroute(result.failure->code);
-    }
-    // Every candidate explicitly refused before execution because its eligible processes were paused.
-    // Only now may one candidate wait. The first pass, including immediate reroutes, stays unchanged.
-    if (allPaused && finalRefusals > 0 && finalRefusals == ordered.size() && server.pausedAdmissionWaitMs() &&
-        std::find(ordered.begin(), ordered.end(), config.serverId) != ordered.end()) {
-      const auto target = config.serverId;
-      auto result = co_await attemptHere(true, false);
-      allNotExecuted = allNotExecuted && result.failure && result.failure->notExecuted;
-      server.observeAttempt(target, allocation.ingressRoot, result.failure);
-      if (!result.failure) {
-        avoidance.erase(target);
-        if (forwarded) *forwarded = false;
-        if (placedOn) *placedOn = target;
-        server.decision("localPausedResumed", allocation.ingressRoot);
-        co_return std::move(result.dispatcher);
-      }
-      server.observeRefusal(*result.failure, allocation.ingressRoot ? "localIngress" : "localBinding");
-      if (result.failure->code == "LEASE_EXPIRED" || !result.retryable)
-        co_return rejectedDispatcher(factory, headerTable, *result.failure, allocation.expiresAtMonotonicMs);
-      failures += ",{\"nodeId\":\"" + target + "\",\"failure\":" + result.failure->json() + "}";
     }
     if (allTenantLimited && tenantRefusal)
       co_return rejectedDispatcher(factory, headerTable, *tenantRefusal, allocation.expiresAtMonotonicMs);
@@ -10618,7 +10496,6 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
   }
   config.resolvePlacementLimits();
   for (auto [name, field] : {std::pair{"COWORKERD_IDLE_EVICT_MS", &pool.idleEvictMs},
-                             std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &pool.idleDestroyIntervalMs},
                              std::pair{"COWORKERD_ROTATION_DRAIN_TIMEOUT_MS", &pool.rotationDrainTimeoutMs},
                              std::pair{"COWORKERD_ROTATION_TERM_GRACE_MS", &pool.rotationTermGraceMs},
                              std::pair{"COWORKERD_ROTATION_BINARY_CHECK_MS", &pool.rotationBinaryCheckMs},
@@ -10640,14 +10517,6 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
     pool.rotationResidentBytesDefault = false;
     pool.rotationResidentBytesSource = "default: 70% of " + source + " (" + std::to_string(bytes) + " bytes)";
   }
-  for (auto [name, field] : {std::pair{"COWORKERD_GC_BUDGET_MS", &pool.gcBudgetMs},
-                             std::pair{"COWORKERD_GC_REFILL_MS_PER_S", &pool.gcRefillMsPerSecond},
-                             std::pair{"COWORKERD_GC_LONG_PAUSE_MS", &pool.gcLongPauseMs},
-                             std::pair{"COWORKERD_IDLE_GC_MS", &pool.gcIdleCollectAfterMs},
-                             std::pair{"COWORKERD_IDLE_GC_MIN_MIB", &pool.gcIdleCollectMinGrowthMiB},
-                             std::pair{"COWORKERD_GC_INITIAL_OLD_SPACE_MIB", &pool.gcInitialOldSpaceMiB},
-                             std::pair{"COWORKERD_STATIC_HEAP_MIB", &pool.gcRuntimeHeapMiB}})
-    *field = static_cast<uint32_t>(environmentUnsigned(name, *field, UINT32_MAX));
   if (const char* mode = std::getenv("COWORKERD_SANDBOX_MODE")) pool.sandboxMode = mode;
   if (const char* mode = std::getenv("COWORKERD_SANDBOX_SYSCALLS")) pool.syscallsMode = mode;
   if (const char* path = std::getenv("COWORKERD_SANDBOX_ALLOWLIST")) pool.allowlistPath = path;
@@ -10667,15 +10536,6 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
   // The steady-state table of the same build, beside it as well.
   if (pool.steadyAllowlistPath.empty()) pool.steadyAllowlistPath = (executableDirectory() / "coworkerd-syscalls-steady.txt").string();
   pool.validate();
-  if (pool.durableProcesses > 0) {
-    const auto preparationBudget = preparationLargeBudget(pool.gcRuntimeHeapMiB);
-    std::cout << "[server] {\"event\":\"preparation-memory\",\"runtimeHeapMiB\":" << pool.gcRuntimeHeapMiB
-              << ",\"largeBudgetBytes\":" << preparationBudget << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
-              << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << (preparationBudget >= MAX_PACKAGE_PREPARATION_BYTES ? "true" : "false");
-    if (preparationBudget < MAX_PACKAGE_PREPARATION_BYTES)
-      std::cout << ",\"warning\":\"COWORKERD_STATIC_HEAP_MIB cannot reserve a maximum 10 MiB package with a 1 MiB descriptor; larger packages fail LOAD_FAILED without retry; increase the runtime heap\"";
-    std::cout << '}' << std::endl;
-  }
 }
 
 // Budget the active and replacement generations, other ingress traffic, and the open WebSockets together.
@@ -10746,22 +10606,14 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       << "},\"hostCheck\":{\"intervalMs\":" << c.hostCheck.intervalMs << ",\"sampleMiB\":" << c.hostCheck.sampleMiB
       << "},\"processPool\":{\"count\":" << p.count << ",\"quarantineProcesses\":" << p.quarantineProcesses
       << ",\"inFlightLimit\":" << p.inFlightLimit << ",\"durableInFlightLimit\":" << p.durableInFlightLimit()
-      << ",\"threadedMemoryBytes\":" << p.threadedMemoryBytes << ",\"probeIntervalMs\":" << p.probeIntervalMs << ",\"probeOverdueMs\":" << p.probeOverdueMs
+      << ",\"threadedMemoryBytes\":" << p.threadedMemoryBytes << ",\"probeIntervalMs\":" << p.probeIntervalMs
       << ",\"stuckTimeoutMs\":" << p.stuckTimeoutMs << ",\"restartBackoffMs\":" << p.restartBackoffMs << ",\"restartMaxMs\":" << p.restartMaxMs
-      << ",\"pausedAdmissionWaitMs\":" << p.pausedAdmissionWaitMs
-      << ",\"watchdog\":" << b(p.watchdog) << ",\"idleEvictMs\":" << p.idleEvictMs << ",\"idleDestroyIntervalMs\":" << p.idleDestroyIntervalMs
+      << ",\"watchdog\":" << b(p.watchdog) << ",\"idleEvictMs\":" << p.idleEvictMs
       << "},\"limits\":{\"cpuLimitMs\":" << p.cpuLimitMs << ",\"memoryLimitMiB\":" << p.memoryLimitMiB
       << "},\"rotation\":{\"drainTimeoutMs\":" << p.rotationDrainTimeoutMs << ",\"termGraceMs\":" << p.rotationTermGraceMs
       << ",\"binaryCheckMs\":" << p.rotationBinaryCheckMs << ",\"maxAgeMs\":" << p.rotationMaxAgeMs << ",\"maxRequests\":" << p.rotationMaxRequests
       << ",\"residentBytes\":" << p.rotationResidentBytes << ",\"residentBytesSource\":" << q(p.rotationResidentBytesSource)
       << ",\"retryMs\":" << p.rotationRetryMs
-      << "},\"gc\":{\"budgetMs\":" << p.gcBudgetMs << ",\"refillMsPerSecond\":" << p.gcRefillMsPerSecond
-      << ",\"longPauseMs\":" << p.gcLongPauseMs << ",\"idleCollectAfterMs\":" << p.gcIdleCollectAfterMs
-      << ",\"idleCollectMinGrowthMiB\":" << p.gcIdleCollectMinGrowthMiB << ",\"initialOldSpaceMiB\":" << p.gcInitialOldSpaceMiB
-      << ",\"runtimeHeapMiB\":" << p.gcRuntimeHeapMiB
-      << ",\"preparationLargeBudgetBytes\":" << preparationLargeBudget(p.gcRuntimeHeapMiB)
-      << ",\"maximumPackagePreparationBytes\":" << MAX_PACKAGE_PREPARATION_BYTES
-      << ",\"maximumPackageCheckDescriptorBytes\":1048576,\"maximumPackageFits\":" << b(preparationLargeBudget(p.gcRuntimeHeapMiB) >= MAX_PACKAGE_PREPARATION_BYTES)
       << "},\"sandbox\":{\"mode\":" << q(p.sandboxMode) << ",\"launcherPath\":" << q(p.launcherPath)
       << ",\"protectionKeys\":" << q(p.protectionKeys)
       << ",\"v8Sandbox\":" << (p.sandboxPlanJson.empty() ? std::string("null") : p.sandboxPlanJson)

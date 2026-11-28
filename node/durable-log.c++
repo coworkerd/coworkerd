@@ -7211,13 +7211,13 @@ void DurableLog::pumpAlarmFires() {
       return fireAlarm(key, token).attach(kj::mv(lease));
     }));
   }
-  if (!alarmActiveNamespaces.empty() || (fireRoom() && (!alarmReadyTenants.empty() ||
-      (!alarmPreparationQueue.empty() && activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT)))) scheduleAlarmPump();
+  if (!alarmActiveNamespaces.empty() || !alarmReadyTenants.empty() ||
+      (!alarmPreparationQueue.empty() && activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT)) scheduleAlarmPump();
   double next = 0;auto deadline = [&next](double at) { if (!next || at < next) next = at; };
   if (!alarmRetryDeadlines.empty()) deadline(alarmRetryDeadlines.begin()->first);
   if (!alarmNamespaceDeadlines.empty()) deadline(std::max(alarmNamespaceDeadlines.begin()->first, alarmNamespaceBatchAt));
   for (const auto& [key, gate]: alarmCapacityGates) if (!gate.open && !gate.probing && !gate.blocked.empty()) deadline(gate.next);
-  if (next) armAlarmTimer(!fireRoom() && next <= now ? now + 200 : next);
+  if (next) armAlarmTimer(next);
 }
 
 bool DurableLog::alarmFireIsCurrent(const DurableAlarm& alarm) const {

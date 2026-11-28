@@ -1074,7 +1074,7 @@ struct ProcessGeneration {
   // closing (connections closed, SIGTERM sent); and whether the exit was the rotation's own doing.
   bool rotation = false, retiring = false, closing = false, plannedExit = false;
   std::string exitStatus;
-  double spawnedAt = mono(), readyAt = 0, nextProbeAt = 0, probeStartedAt = 0, exitedAt = 0;
+  double spawnedAt = mono(), readyAt = 0, nextProbeAt = 0, exitedAt = 0;
   uint64_t spawnedAtUnixMs = wall(), readyAtUnixMs = 0, exitedAtUnixMs = 0;
   uint32_t inFlight = 0;
   std::shared_ptr<TenantExecutionState> tenantExecution;
@@ -1111,7 +1111,6 @@ struct ProcessGeneration {
   // rest is read up to the end of the pipe.
   struct LimitEvent {
     std::string event, isolate, workerId; uint32_t memoryLimitMiB; uint64_t peakUsedBytes;
-    uint64_t pauseNs = 0; std::string row;  // gc-pause rows: the pause, and the row itself
   };
   bool eventChannel = false, eventsFinal = false, eventsEnded = false;
   int eventFd = -1;
@@ -1378,7 +1377,7 @@ struct ProcessGeneration {
           }
         }
         // A tenant's CPU: the rows of its executions; a trial load's or a load check's are the platform's. The collection
-        // CPU the limit did not charge (gc.budgetMs) is the tenant's CPU all the same. A request that lasts reports its CPU
+        // A request that lasts reports its CPU
         // so far in cpu-progress rows (at most once a second, at its events), each counted for what it adds, and its
         // completed row the rest.
         if ((event == "completed" || event == "cpu-progress") && cpuUsage &&
@@ -1408,8 +1407,7 @@ struct ProcessGeneration {
         if (event == "memory-culprit") oomCulpritRow = row;
         fatalEvidence.record(event, row);
         unappliedEvents.push_back({event, report.getIsolate().cStr(), report.getWorkerId().cStr(),
-            report.getMemoryLimitMiB(), report.getPeakUsedBytes(), report.getPauseNs(),
-            event == "gc-pause" ? row : std::string()});
+            report.getMemoryLimitMiB(), report.getPeakUsedBytes()});
       } catch (const kj::Exception& error) {
         ++rejectedRows;
         std::cerr << "[process-pool] CPU report rejected: " << error.getDescription().cStr() << std::endl;
@@ -1531,9 +1529,6 @@ public:
     std::string lastReason;
     uint64_t cpuTerminatedRequests = 0, cpuInvalidatedIsolates = 0, cpuReloadedIsolates = 0;
     uint64_t memoryTerminatedRequests = 0, memoryInvalidatedIsolates = 0, memoryReloadedIsolates = 0;
-    // The long collections of every generation (gc-pause rows, gc.longPauseMs): how many, and the longest one's row.
-    uint64_t gcLongPauses = 0, gcLongestPauseNs = 0;
-    std::string gcLongestPause;
     // Launches that failed before workerd ran (the launcher's `failed` record, or no `exec` one).
     uint64_t launchFailures = 0;
     std::string lastLaunchFailure = "null";
@@ -1596,8 +1591,6 @@ public:
   std::deque<std::string> kills;
   std::deque<std::string> memoryCrashes;
   std::deque<std::string> fatalExits;
-  // The latest gc-pause rows of any generation (gc.longPauseMs).
-  std::deque<std::string> recentGcPauses;
   // The limit event channel of the last exited generations: what the Server read, to the end.
   std::deque<std::string> channelExits;
   // The cgroup's OOM kills (memoryEventsPath): the counter as last read, and the increments no exit has taken yet, each
@@ -1752,7 +1745,6 @@ public:
                                std::pair{"COWORKERD_TENANT_IN_FLIGHT_LIMIT", &this->config.tenantInFlightLimit},
                                std::pair{"COWORKERD_THREADED_RESIDENT_LIMIT", &this->config.threadedResidentLimit},
                                std::pair{"COWORKERD_THREADED_THREAD_IDLE_MS", &this->config.threadedThreadIdleMs},
-                               std::pair{"COWORKERD_IDLE_DESTROY_INTERVAL_MS", &this->config.idleDestroyIntervalMs},
                                std::pair{"COWORKERD_ROTATION_DRAIN_TIMEOUT_MS", &this->config.rotationDrainTimeoutMs},
                                std::pair{"COWORKERD_ROTATION_TERM_GRACE_MS", &this->config.rotationTermGraceMs},
                                std::pair{"COWORKERD_ROTATION_BINARY_CHECK_MS", &this->config.rotationBinaryCheckMs},
@@ -1760,19 +1752,6 @@ public:
       if (auto* text = std::getenv(setting.first)) {
         char* end = nullptr; auto value = std::strtoull(text, &end, 10);
         KJ_REQUIRE(*text && *text != '-' && end && !*end && value <= UINT32_MAX, "invalid process pool override", setting.first);
-        *setting.second = static_cast<uint32_t>(value);
-      }
-    }
-    for (const auto& setting : {std::pair{"COWORKERD_GC_BUDGET_MS", &this->config.gcBudgetMs},
-                               std::pair{"COWORKERD_GC_REFILL_MS_PER_S", &this->config.gcRefillMsPerSecond},
-                               std::pair{"COWORKERD_GC_LONG_PAUSE_MS", &this->config.gcLongPauseMs},
-                               std::pair{"COWORKERD_IDLE_GC_MS", &this->config.gcIdleCollectAfterMs},
-                               std::pair{"COWORKERD_IDLE_GC_MIN_MIB", &this->config.gcIdleCollectMinGrowthMiB},
-                               std::pair{"COWORKERD_GC_INITIAL_OLD_SPACE_MIB", &this->config.gcInitialOldSpaceMiB},
-                               std::pair{"COWORKERD_STATIC_HEAP_MIB", &this->config.gcRuntimeHeapMiB}}) {
-      if (auto* text = std::getenv(setting.first)) {
-        char* end = nullptr; auto value = std::strtoull(text, &end, 10);
-        KJ_REQUIRE(*text && *text != '-' && end && !*end && value <= UINT32_MAX, "invalid gc override", setting.first);
         *setting.second = static_cast<uint32_t>(value);
       }
     }
@@ -2539,8 +2518,6 @@ public:
     }
     childEnvironment.push_back("COWORKERD_CPU_LIMIT_MS=" + std::to_string(p->durable ? config.durableCpuLimitMs : config.cpuLimitMs));
     childEnvironment.push_back("COWORKERD_MEMORY_LIMIT_MIB=" + std::to_string(config.memoryLimitMiB));
-    childEnvironment.push_back("COWORKERD_SQL_CPU_LIMIT_MS=" + std::to_string(config.sqlCpuLimitMs));
-    childEnvironment.push_back("COWORKERD_SQL_WALL_LIMIT_MS=" + std::to_string(config.sqlWallLimitMs));
     childEnvironment.push_back("COWORKERD_EVENT_FD=" + std::to_string(EVENT_FD));
     childEnvironment.push_back("COWORKERD_LIFECYCLE_FD=" + std::to_string(LIFECYCLE_FD));
     childEnvironment.push_back("COWORKERD_PARENT_FD=" + std::to_string(PARENT_FD));
@@ -2548,8 +2525,6 @@ public:
       childEnvironment.push_back("COWORKERD_INTERNAL_TEST_ALARM_WALL_MS=" +
           std::to_string(*config.alarmWallMsForTest));
     }
-    childEnvironment.push_back("COWORKERD_IDLE_EVICT_MS=" + std::to_string(config.idleEvictMs));
-    childEnvironment.push_back("COWORKERD_IDLE_DESTROY_INTERVAL_MS=" + std::to_string(config.idleDestroyIntervalMs));
     if (bandFd >= 0) childEnvironment.push_back("COWORKERD_MEMORY_BAND_FD=" + std::to_string(BAND_FD));
     // The Durable Object log (workerd's patch coworkerd-wal-shipper.h): where to ship the frames, how long a commit
     // waits for the node's answer, and when to checkpoint.
@@ -2580,14 +2555,6 @@ public:
       childEnvironment.push_back("COWORKERD_DO_SQL_PROCESS_SPILL_BYTES=" +
           std::to_string(durableLog.sqlProcessSpillBytes));
     }
-    // V8's collections (gc.*; workerd's patch coworkerd-gc.h): the budget the CPU limit does not charge, the long
-    // pauses it names, the idle collection, and the runtime's heap.
-    childEnvironment.push_back("COWORKERD_GC_BUDGET_MS=" + std::to_string(config.gcBudgetMs));
-    childEnvironment.push_back("COWORKERD_GC_REFILL_MS_PER_S=" + std::to_string(config.gcRefillMsPerSecond));
-    childEnvironment.push_back("COWORKERD_GC_LONG_PAUSE_MS=" + std::to_string(config.gcLongPauseMs));
-    childEnvironment.push_back("COWORKERD_IDLE_GC_MS=" + std::to_string(config.gcIdleCollectAfterMs));
-    childEnvironment.push_back("COWORKERD_IDLE_GC_MIN_MIB=" + std::to_string(config.gcIdleCollectMinGrowthMiB));
-    childEnvironment.push_back("COWORKERD_STATIC_HEAP_MIB=" + std::to_string(config.gcRuntimeHeapMiB));
 #ifdef __linux__
     // What only the process itself can do, once it serves (coworkerd-steady.h): narrow its system calls
     // to the steady table, and make itself non-dumpable again -- the launcher sets that bit before the
@@ -2878,22 +2845,18 @@ public:
       if (p->pid == 0 || p->state == "killed" || p->closing) co_return;
       if (p->probeDelays.size() == 1024) p->probeDelays.pop_front();
       p->probeDelays.push_back(mono() - p->probeAttemptAt);
-      if (p->state == "paused") event(*p, "resume");
       // A draining generation answers probes but never becomes selectable again.
-      p->state = p->retiring ? "draining" : "ready"; p->probeStartedAt = 0; p->nextProbeAt = mono() + config.probeIntervalMs;
+      p->state = p->retiring ? "draining" : "ready"; p->nextProbeAt = mono() + config.probeIntervalMs;
     } catch (const kj::Exception&) {
-      // The supervisor makes the overdue/kill decision using the original start time.
-      if (p->pid > 0 && p->probeStartedAt == 0) p->probeStartedAt = mono();
       ++p->probeFailures;
       p->nextProbeAt = mono() + config.probeIntervalMs;
     }
   }
   void maybeProbe(const std::shared_ptr<ProcessGeneration>& p) {
     if (!config.watchdog || !p || p->closing || p->probePending || mono() < p->nextProbeAt) return;
-    if (p->state != "ready" && p->state != "paused" && p->state != "draining") return;
+    if (p->state != "ready" && p->state != "draining") return;
     p->probePending = true; p->probeAttemptAt = mono();
-    if (p->probeStartedAt == 0) p->probeStartedAt = p->probeAttemptAt;
-    tasks.add(probe(p));
+      tasks.add(probe(p));
   }
   void maybeMaintainRoots() {
     const auto now = mono();
@@ -2922,11 +2885,6 @@ public:
         ++s.memoryTerminatedRequests;
         if (s.memoryInvalidated.insert(e.isolate).second) ++s.memoryInvalidatedIsolates;
         if (!e.workerId.empty()) ++workerMemoryStats[e.workerId].terminated;
-      } else if (e.event == "gc-pause") {
-        ++s.gcLongPauses;
-        if (e.pauseNs > s.gcLongestPauseNs) { s.gcLongestPauseNs = e.pauseNs; s.gcLongestPause = e.row; }
-        if (recentGcPauses.size() == 32) recentGcPauses.pop_front();
-        recentGcPauses.push_back(e.row);
       }
     }
     p.unappliedEvents.clear();
@@ -3082,12 +3040,6 @@ public:
         << "\",\"generation\":" << p.generation << ",\"pid\":" << p.pid << ",\"reason\":\"" << escape(reason)
         << "\",\"stuckDurationMs\":" << duration << ",\"observedAtUnixMs\":" << wall() << ",\"inFlight\":" << p.inFlightJson();
     auto offender = culprit(p);
-    if (reason == "watchdog timeout" && offender != "null") {
-      capnp::MallocMessageBuilder message;
-      auto report = message.initRoot<v1::rpc::CpuReport>();
-      capnp::JsonCodec().decode(kj::StringPtr(offender.c_str()), report);
-      suspects.confirm(report.getWorkerId().cStr(), p.id, p.generation, report.getInvocationId().cStr());
-    }
     out << ",\"culprit\":" << offender << ",\"culpritStatus\":\""
         << (offender == "null" ? "undetermined" : "confirmed") << "\"}";
     if (kills.size() == 32) kills.pop_front();
@@ -3154,7 +3106,7 @@ public:
     } else if (syscallDenied) {
       recordSyscallDenial(s, *p);
     } else if (!p->plannedExit) {
-      s.lastExitCategory = p->lastReason == "watchdog timeout" ? "cpu-watchdog" : "other";
+      s.lastExitCategory = "other";
       if (p->lastReason.empty() && !(config.memoryLimitMiB && memoryExit(s, *p, status)) && !p->durable)
         fatalExit(s, *p, status);
     }
@@ -3179,7 +3131,7 @@ public:
     s.restartAt = mono() + delay;
   }
   // Process state for dispatch decisions; no file is opened or read here except at an exit. One request asks
-  // several times in one turn of the event loop (available, select, pausedAdmission, ...); nothing this reads
+  // several times in one turn of the event loop (available, select, ...); nothing this reads
   // changes for the dispatch within that turn, so the first call of a turn refreshes and the others reuse it.
   coworkerd::OncePerTurn refreshTurn{tasks};
   void refresh() {
@@ -3394,7 +3346,7 @@ public:
       r.contextsAtSwitch = old->openContexts.size();
       r.backgroundAtSwitch = old->backgroundContexts();
       old->retiring = true;
-      if (old->state == "ready" || old->state == "paused") old->state = "draining";
+      if (old->state == "ready") old->state = "draining";
       s.retiring.push_back(old);
       event(*old, "drain", r.reason);
       if (retiring) r.webSocketsClosed = retiring(old->id, old->generation);
@@ -3610,27 +3562,6 @@ public:
         << "\",\"sandbox\":" << generationSandboxJson(*p) << "}";
     return out.str();
   }
-  // A slot's collections: the long ones of every generation (their gc-pause rows) and the current generation's own
-  // counts from its lifecycle snapshot -- full, minor and idle collections, the longest pause of any kind.
-  std::string gcJson(const Slot& s, const std::shared_ptr<ProcessGeneration>& p) const {
-    std::string generation = "null";
-    if (p) {
-      auto row = p->lifecycle.read();
-      if (!row.empty() && row.front() == '{') try {
-        capnp::MallocMessageBuilder message;
-        auto value = message.initRoot<capnp::JsonValue>();
-        capnp::JsonCodec().decodeRaw(kj::arrayPtr(row.data(), row.size()), value);
-        auto gc = json::field(value, "gc");
-        if (gc.isObject()) generation = capnp::JsonCodec().encodeRaw(gc).cStr();
-      } catch (const kj::Exception&) {}
-    }
-    std::ostringstream out;
-    out << std::setprecision(17) << "{\"longPauseMs\":" << config.gcLongPauseMs << ",\"longPauses\":" << s.gcLongPauses
-        << ",\"longestPauseMs\":" << double(s.gcLongestPauseNs) / 1e6
-        << ",\"longestPause\":" << (s.gcLongestPause.empty() ? std::string("null") : s.gcLongestPause)
-        << ",\"generation\":" << generation << "}";
-    return out.str();
-  }
   // The state endpoint carries the latest records; /__coworkerd/rotation carries the whole history.
   std::string rotationStateJson(size_t recentLimit = ROTATION_HISTORY) const {
     std::ostringstream out;
@@ -3726,28 +3657,6 @@ std::optional<ProcessPool::TenantExecutionLimit> ProcessPool::tenantExecutionLim
     }
   }
   if (result.states.empty()) return std::nullopt;
-  return result;
-}
-bool ProcessPool::PausedAdmission::alive() const {
-  for (const auto& p : processes)
-    if (p->pid > 0 && (p->state == "paused" || p->state == "ready") && p->runtime &&
-        !p->closing && !p->retiring) return true;
-  return false;
-}
-ProcessPool::PausedAdmission ProcessPool::pausedAdmission(const std::string& worker, const std::string& objectKey) {
-  impl->refresh();
-  PausedAdmission result;
-  if (impl->closingAll || (!objectKey.empty() && impl->durableClosed)) return result;
-  const auto quarantine = quarantined(worker);
-  const auto durableId = objectKey.empty() ? std::string() : impl->durableSlotFor(objectKey);
-  for (const auto& s : impl->slots) {
-    if (objectKey.empty() ? (s.durable || s.quarantine != quarantine) : (!s.durable || s.id != durableId)) continue;
-    const auto& p = s.current;
-    if (!p) continue;
-    if (impl->admitted(*p)) return {};
-    if (p->state == "paused" && p->pid > 0 && p->runtime &&
-        !p->closing && !p->retiring && p->inFlight < impl->config.processInFlightLimit(p->durable)) result.processes.push_back(p);
-  }
   return result;
 }
 uint32_t ProcessPool::durableProcesses() const { return impl->config.durableProcesses; }
@@ -4144,19 +4053,14 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"threadedThreadIdleMs\":" << impl->config.threadedThreadIdleMs
       << ",\"wasmMemoryCapMiB\":" << impl->wasmMemoryCapMiB()
       << ",\"idleEvictMs\":" << impl->config.idleEvictMs
-      << ",\"idleDestroyIntervalMs\":" << impl->config.idleDestroyIntervalMs
       << ",\"quarantineProcesses\":" << impl->config.quarantineProcesses
       << ",\"durableProcesses\":" << impl->config.durableProcesses
       << ",\"inFlightLimit\":" << impl->config.inFlightLimit
       << ",\"durableInFlightLimit\":" << impl->config.durableInFlightLimit() << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
-      << ",\"probeOverdueMs\":" << impl->config.probeOverdueMs << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
+      << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
       << ",\"watchdog\":" << (impl->config.watchdog ? "true" : "false") << ",\"restartBackoffMs\":" << impl->config.restartBackoffMs
       << ",\"restartMaxMs\":" << impl->config.restartMaxMs
-      << ",\"gc\":{\"budgetMs\":" << impl->config.gcBudgetMs << ",\"refillMsPerSecond\":" << impl->config.gcRefillMsPerSecond
-      << ",\"longPauseMs\":" << impl->config.gcLongPauseMs << ",\"idleCollectAfterMs\":" << impl->config.gcIdleCollectAfterMs
-      << ",\"idleCollectMinGrowthMiB\":" << impl->config.gcIdleCollectMinGrowthMiB
-      << ",\"initialOldSpaceMiB\":" << impl->config.gcInitialOldSpaceMiB << ",\"runtimeHeapMiB\":" << impl->config.gcRuntimeHeapMiB
-      << "},\"v8Sandbox\":" << (impl->config.sandboxPlanJson.empty() ? std::string("null") : impl->config.sandboxPlanJson)
+      << ",\"v8Sandbox\":" << (impl->config.sandboxPlanJson.empty() ? std::string("null") : impl->config.sandboxPlanJson)
       << "},\"entries\":[";
   size_t i = 0;
   for (const auto& s : impl->slots) {
@@ -4169,7 +4073,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
         << ",\"residentBytes\":" << residentBytes(p ? p->pid : 0)
         << ",\"state\":\"" << (p ? p->state : "starting") << "\",\"restartCount\":" << s.restarts << ",\"exitCount\":" << s.exits
         << ",\"cpuTerminatedRequests\":" << s.cpuTerminatedRequests << ",\"cpuInvalidatedIsolates\":" << s.cpuInvalidatedIsolates
-        << ",\"cpuReloadedIsolates\":" << s.cpuReloadedIsolates << ",\"gc\":" << impl->gcJson(s, p)
+        << ",\"cpuReloadedIsolates\":" << s.cpuReloadedIsolates
         << ",\"probeAttempts\":" << (p ? p->probeAttempts : 0)
         << ",\"probeFailures\":" << (p ? p->probeFailures : 0)
         << ",\"lastExitedGeneration\":" << s.lastExitedGeneration << ",\"lastExitAtUnixMs\":" << s.lastExitAtUnixMs
@@ -4223,8 +4127,6 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"matches\":" << sampled.resident.matches << ",\"mismatches\":" << sampled.resident.mismatches
       << "},\"recentKills\":[";
   for (size_t j = 0; j < impl->kills.size(); ++j) { if (j) out << ','; out << impl->kills[j]; }
-  out << "],\"recentGcPauses\":[";
-  for (size_t j = 0; j < impl->recentGcPauses.size(); ++j) { if (j) out << ','; out << impl->recentGcPauses[j]; }
   out << "],\"workerCpuStats\":[";
   size_t workerIndex = 0;
   for (const auto& [worker, stats] : impl->workerCpuStats) {
@@ -4544,7 +4446,6 @@ std::string ProcessPool::memoryJson() const {
   };
   strings("kills", impl->kills);  // Latest 32 CPU kill records.
   strings("memoryCrashes", impl->memoryCrashes);  // Latest 32 memory crash records.
-  strings("recentGcPauses", impl->recentGcPauses);  // Latest 32 long-GC records.
   strings("channelExits", impl->channelExits);  // Latest 32 exited limit channel records.
   strings("recentLaunchFailures", impl->recentLaunchFailures);  // Latest 32 failed launches.
   strings("recentDenials", impl->sandbox.syscalls.recentDenials);  // Latest 32 syscall denials.

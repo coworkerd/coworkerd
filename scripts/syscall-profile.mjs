@@ -103,8 +103,7 @@ try {
   if (run === "main") {
     const workers = { ordinary: w.ordinary, "bytes-heavy": w.bytesHeavy, probe: w.sandboxProbe, "cpu-tenant": w.cpuTenant,
       "mem-ab": w.memoryTenant("mem-ab", ["arraybuffer"]), "mem-wasm": w.memoryTenant("mem-wasm", ["wasm"]),
-      caller: { source: w.bindingCaller, bindings: [{ name: "TARGET", workerId: "callee" }] }, callee: w.bindingCallee,
-      "gc-tenant": w.gcTenant };
+      caller: { source: w.bindingCaller, bindings: [{ name: "TARGET", workerId: "callee" }] }, callee: w.bindingCallee };
     for (const id of w.isolateIds(20)) workers[id] = w.ordinary;
     Object.assign(data, await h.setup({ sandbox: "off", workers, env: environment, trace: true,
       workerdPath: `${wrappers}/workerd`, config: { cpuLimitMs: 200 } }));
@@ -128,27 +127,6 @@ try {
       return { status: r.status, body: (r.body ?? r.error ?? "").slice(0, 300) };
     });
     await window("after-oom", () => repeat("/ordinary", 5));
-    // The idle collection: requests that each leave 2 MiB more in the old generation, then idle time; the
-    // process reports its idle collections in its lifecycle snapshot (gc.idleCollections).
-    await window("idle-gc", async () => {
-      const idleCollections = async () => {
-        const values = (await h.state()).processes.entries
-          .filter(e => e.processClass === "ordinary")
-          .map(e => e.gc?.generation?.idleCollections);
-        return values.length && values.every(value => typeof value === "number")
-          ? values.reduce((sum, value) => sum + value, 0) : null;
-      };
-      const before = await idleCollections();
-      const statuses = [];
-      for (let n = 0; n < 6; n++) { statuses.push((await h.request("/gc-tenant?keep=2")).status); await h.delay(300); }
-      if (before === null) {
-        await h.delay(1000);
-        return { statuses, idleCollectionObserved: false,
-          reason: "the threaded lifecycle does not expose the legacy idleCollections counter" };
-      }
-      const waited = await h.waitFor(async () => (await idleCollections()) > before, "an idle collection", 15000, 200);
-      return { statuses, idleCollectionsBefore: before, idleCollectionsAfter: await idleCollections(), waitedMs: waited.elapsedMs };
-    });
     // The generation change: every slot rotated, each slot's next generation starting while requests run.
     await window("rotation", async () => {
       const before = await h.state();

@@ -361,7 +361,7 @@ struct ServerConfig {
   # rendezvous hash, and trial loads run here too.
   quarantineProcesses @14 :UInt32 = 2;
   idleEvictMs @17 :UInt32 = 300000;
-  idleDestroyIntervalMs @18 :UInt32 = 10;
+  unused18 @18 :Void;
   memoryWatermarkEnabled @19 :Bool = true;
   memoryBudgetBytes @20 :UInt64 = 0;
   memoryLimitMiB @21 :UInt32 = 128;
@@ -429,10 +429,7 @@ struct ServerConfig {
   # The cluster's secrets key: secrets' values are sealed with it in the tenants' manifests on the object store (AES-256-GCM).
   # The control plane and every node with the objectStore desired state need it.
   secrets @40 :SecretsConfig;
-  # V8's garbage collection in the workerd processes (docs/process-isolation.md, section 4): the CPU limit leaves a full
-  # collection out of the request it ran in, as far as its Worker's budget goes; long pauses are named; an idle
-  # Worker's isolate is collected between its requests; the runtime's heap is sized for its working set.
-  gc @41 :GcConfig;
+  unused41 @41 :Void;
   # The ingress's inbound WebSocket connections (docs/compatibility.md, section 7).
   ingress @42 :IngressConfig;
   # Durable Objects (docs/compatibility.md, section 7): the workerd processes that run them on this node.
@@ -738,17 +735,15 @@ struct ProcessPoolConfig {
   # Server, in the stack's run directory, and has no TCP port.
   basePort @2 :UInt32 = 9000;
   probeIntervalMs @3 :UInt32 = 50;
-  probeOverdueMs @4 :UInt32 = 400;
+  unused4 @4 :Void;
   stuckTimeoutMs @5 :UInt32 = 3000;
   restartBackoffMs @6 :UInt32 = 100;
   restartMaxMs @7 :UInt32 = 2000;
   watchdog @8 :Bool = true;
-  # Wait only for a live paused process, within the call's lease. 0 keeps immediate refusal.
-  pausedAdmissionWaitMs @9 :UInt32 = 1000;
-  # Process-wide cumulative SQL CPU and active-SQL wall limits per event. Independent of tenant CPU limits.
-  sqlCpuLimitMs @10 :UInt32 = 200;
-  sqlWallLimitMs @11 :UInt32 = 800;
-  # Backend for ordinary and quarantine processes. Durable processes stay upstream.
+  unused9 @9 :Void;
+  unused10 @10 :Void;
+  unused11 @11 :Void;
+  # The only accepted value for this setting is "threaded".
   ordinaryServer @12 :Text = "threaded";
   # Empty: coworkerd-threaded beside workerdPath.
   threadedExecutable @13 :Text;
@@ -780,27 +775,6 @@ struct RotationConfig {
   residentBytes @5 :UInt64 = 0;
   # First retry after a failed automatic rotation (then doubling).
   retryMs @6 :UInt32 = 5000;
-}
-
-struct GcConfig {
-  # A Worker's budget, in each process, of collection CPU the CPU limit does not charge to the request it ran in: a
-  # token bucket of budgetMs refilled at refillMsPerSecond (a tenant that allocates on purpose gets at most that much,
-  # one core's tenth by default); a collection beyond it is charged as before. 0 charges every collection.
-  budgetMs @0 :UInt32 = 2000;
-  refillMsPerSecond @1 :UInt32 = 100;
-  # A collection that pauses its process at least this long writes one gc-pause row (workerd.log's [cpu-limit] lines):
-  # which isolate, how long, in whose request, what kind; the state endpoint counts them per process. 0: no rows.
-  longPauseMs @2 :UInt32 = 100;
-  # A Worker's isolate idle at least idleCollectAfterMs, whose old generation grew at least idleCollectMinGrowthMiB since
-  # its last full collection, is collected between its requests -- never while other work is queued. 0 turns it off.
-  idleCollectAfterMs @3 :UInt32 = 50;
-  idleCollectMinGrowthMiB @4 :UInt32 = 4;
-  # V8's initial old generation, for every isolate of a process (--initial-old-space-size): a smaller first full
-  # collection. 0 leaves V8's own.
-  initialOldSpaceMiB @5 :UInt32 = 8;
-  # The runtime's heap (the isolate every call passes through), which V8 otherwise sizes from the machine. 0 leaves
-  # V8's own; otherwise at least 16.
-  runtimeHeapMiB @6 :UInt32 = 128;
 }
 
 # Written by workerd resource enforcement, then matched against live invocations.

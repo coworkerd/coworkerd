@@ -97,24 +97,14 @@ void ProcessPoolConfig::validate() const {
       "processPool.threadedResidentLimit must be between 1 and 1840");
   KJ_REQUIRE(quarantineProcesses <= 256, "invalid quarantine process capacity");
   KJ_REQUIRE(durableProcesses <= 64, "durableObjects.processes is at most 64");
-  KJ_REQUIRE(sqlCpuLimitMs > 0 && sqlCpuLimitMs <= 60000,
-      "processPool.sqlCpuLimitMs is between 1 and 60000");
-  KJ_REQUIRE(sqlWallLimitMs > 0 && sqlWallLimitMs <= 60000,
-      "processPool.sqlWallLimitMs is between 1 and 60000");
   // One spare port beyond the slots: a rotation's next generation listens there while the
   // previous one drains on its own port.
   KJ_REQUIRE(basePort > 0 && uint64_t(basePort) + count + quarantineProcesses + 1 <= 65536, "invalid process port range");
-  KJ_REQUIRE(probeIntervalMs > 0 && probeOverdueMs > probeIntervalMs && stuckTimeoutMs > probeOverdueMs,
-      "probe interval < overdue threshold < stuck timeout is required");
-  KJ_REQUIRE(pausedAdmissionWaitMs < stuckTimeoutMs,
-      "processPool.pausedAdmissionWaitMs must be less than stuckTimeoutMs (0 disables waiting)");
+  KJ_REQUIRE(probeIntervalMs > 0 && stuckTimeoutMs > probeIntervalMs,
+      "probe interval must be below the probe timeout");
   KJ_REQUIRE(restartBackoffMs > 0 && restartMaxMs >= restartBackoffMs, "invalid restart backoff");
-  KJ_REQUIRE(idleDestroyIntervalMs > 0, "idleDestroyIntervalMs must be positive");
   KJ_REQUIRE(idleEvictMs == 0 || idleEvictMs > heatIdleMs, "idleEvictMs must exceed placement.idleMs");
   KJ_REQUIRE(rotationDrainTimeoutMs > 0 && rotationTermGraceMs > 0 && rotationRetryMs > 0, "rotation periods must be positive");
-  KJ_REQUIRE(gcRuntimeHeapMiB == 0 || (gcRuntimeHeapMiB >= 16 && gcRuntimeHeapMiB <= 65536),
-      "gc.runtimeHeapMiB must be 0 (V8's own) or 16 to 65536");
-  KJ_REQUIRE(gcInitialOldSpaceMiB <= 65536 && gcIdleCollectMinGrowthMiB <= 65536, "gc sizes are at most 65536 MiB");
   KJ_REQUIRE(sandboxMode == "off" || sandboxMode == "launcher" || sandboxMode == "auto",
       "sandbox.mode must be off, launcher or auto", sandboxMode.c_str());
   KJ_REQUIRE(protectionKeys == "auto" || protectionKeys == "off" || protectionKeys == "required",
@@ -246,12 +236,9 @@ ServerConfig ServerConfig::load(const fs::path& path) {
       "invalid loadBandForTest");
   auto pool = root.getProcessPool();
   result.processPool = {pool.getCount(), pool.getInFlightLimit(), pool.getBasePort(),
-    pool.getProbeIntervalMs(), pool.getProbeOverdueMs(), pool.getStuckTimeoutMs(),
+    pool.getProbeIntervalMs(), pool.getStuckTimeoutMs(),
     pool.getRestartBackoffMs(), pool.getRestartMaxMs(), pool.getWatchdog()};
   result.processPool.inFlightLimitGiven = given({"processPool", "inFlightLimit"}).has_value();
-  result.processPool.pausedAdmissionWaitMs = pool.getPausedAdmissionWaitMs();
-  result.processPool.sqlCpuLimitMs = pool.getSqlCpuLimitMs();
-  result.processPool.sqlWallLimitMs = pool.getSqlWallLimitMs();
   result.processPool.ordinaryServer = pool.getOrdinaryServer().cStr();
   result.processPool.threadedExecutable = pool.getThreadedExecutable().cStr();
   if (given({"processPool", "tenantInFlightLimit"})) result.processPool.tenantInFlightLimit = pool.getTenantInFlightLimit();
@@ -304,7 +291,6 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.durableLog.alarmDiscoveryIntervalMs = durable.getAlarmDiscoveryIntervalMs();
   result.durableLog.alarmTakeoverConcurrency = durable.getAlarmTakeoverConcurrency();
   result.processPool.idleEvictMs = root.getIdleEvictMs();
-  result.processPool.idleDestroyIntervalMs = root.getIdleDestroyIntervalMs();
   result.processPool.heatIdleMs = result.idleMs;
   result.suspectBaseMs = root.getSuspectBaseMs();
   result.suspectMaxMs = root.getSuspectMaxMs();
@@ -326,14 +312,6 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool.rotationResidentBytes = rotation.getResidentBytes();
   result.processPool.rotationResidentBytesDefault = !given({"rotation", "residentBytes"}).has_value();
   result.processPool.rotationRetryMs = rotation.getRetryMs();
-  auto gc = root.getGc();
-  result.processPool.gcBudgetMs = gc.getBudgetMs();
-  result.processPool.gcRefillMsPerSecond = gc.getRefillMsPerSecond();
-  result.processPool.gcLongPauseMs = gc.getLongPauseMs();
-  result.processPool.gcIdleCollectAfterMs = gc.getIdleCollectAfterMs();
-  result.processPool.gcIdleCollectMinGrowthMiB = gc.getIdleCollectMinGrowthMiB();
-  result.processPool.gcInitialOldSpaceMiB = gc.getInitialOldSpaceMiB();
-  result.processPool.gcRuntimeHeapMiB = gc.getRuntimeHeapMiB();
   auto sandbox = root.getSandbox();
   result.processPool.sandboxMode = sandbox.getMode().cStr();
   result.processPool.launcherPath = sandbox.getLauncherPath().cStr();

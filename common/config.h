@@ -21,12 +21,10 @@ struct ProcessPoolConfig {
   uint32_t inFlightLimit = 512;
   uint32_t basePort = 9000;  // ignored (workerd listens on an inherited Unix socket)
   uint32_t probeIntervalMs = 50;
-  uint32_t probeOverdueMs = 400;
   uint32_t stuckTimeoutMs = 3000;
   uint32_t restartBackoffMs = 100;
   uint32_t restartMaxMs = 2000;
   bool watchdog = true;
-  uint32_t pausedAdmissionWaitMs = 1000;
   uint32_t cpuLimitMs = 30000;
   std::optional<uint64_t> alarmWallMsForTest;
   uint32_t durableCpuLimitMs = 200;
@@ -35,10 +33,7 @@ struct ProcessPoolConfig {
   // The durable processes d0, d1, ... (durableObjects.processes): each object runs in one of them, by its id. They are
   // not replaced with age or with requests; a rotation of one drains it before its next generation starts.
   uint32_t durableProcesses = 1;
-  uint32_t sqlCpuLimitMs = 200;
-  uint32_t sqlWallLimitMs = 800;
   uint32_t idleEvictMs = 300000;
-  uint32_t idleDestroyIntervalMs = 10;
   uint32_t heatIdleMs = 30000;
   // The memory band's shared memory (MemoryWatermark), passed to every workerd; -1 when off.
   int memoryBandFd = -1;
@@ -56,13 +51,6 @@ struct ProcessPoolConfig {
   bool rotationResidentBytesDefault = true;
   std::string rotationResidentBytesSource = "configuration";
   uint32_t rotationRetryMs = 5000;          // first retry after a failed automatic rotation (then doubling)
-  // V8's garbage collection in each workerd (ServerConfig.gc, the schema's comments; COWORKERD_GC_BUDGET_MS,
-  // COWORKERD_GC_REFILL_MS_PER_S, COWORKERD_GC_LONG_PAUSE_MS, COWORKERD_IDLE_GC_MS, COWORKERD_IDLE_GC_MIN_MIB,
-  // COWORKERD_GC_INITIAL_OLD_SPACE_MIB and COWORKERD_STATIC_HEAP_MIB override them). spawn() hands them to workerd
-  // (its patch coworkerd-gc.h) and the initial old space as a V8 flag.
-  uint32_t gcBudgetMs = 2000, gcRefillMsPerSecond = 100, gcLongPauseMs = 100;
-  uint32_t gcIdleCollectAfterMs = 50, gcIdleCollectMinGrowthMiB = 4;
-  uint32_t gcInitialOldSpaceMiB = 8, gcRuntimeHeapMiB = 128;
   // The sandbox: each workerd started through coworkerd-launcher in its least-privilege environment
   // (launcher/PROTOCOL.md). "off" starts workerd directly; "launcher" through the launcher, and the
   // pool refuses to start when the launcher's check fails here; "auto" through the launcher when its check
