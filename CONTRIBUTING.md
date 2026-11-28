@@ -84,7 +84,9 @@ On both Linux architectures the hosted build runs the factory and threaded Bazel
 extended by our patches. The tests reuse the release build's outputs. A test failure stops that architecture job
 before packaging. The build summary records the elapsed time of the Bazel test invocation. The hosted build also
 builds `coworkerd-threaded-fatal-test` for the `fatal-attribution` cluster case. This executable is used only by
-that case. The archive and the regular cluster suite use the production binaries.
+that case. The required PR check runs the production cluster suite on the pinned x86-64 archive. Set
+`full_cluster` when dispatching a release build to run that suite on both architectures. See the
+[hosted archive build notes](patches/README.md#hosted-linux-archive-builds) for timing and reuse.
 
 Use the series tag printed by `package-kernel.py` for a local publication. When adding an architecture to a
 local release, update `SHA256SUMS` to include every published archive. For hosted builds, record the published

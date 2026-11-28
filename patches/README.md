@@ -187,6 +187,57 @@ pins in `patches/workerd/artifacts.json`. Follow the [publishing steps](../CONTR
 from the tag in `UPSTREAM` by exactly the series, and each patch stays within its permitted paths. All four
 operations validate the series before mutating a checkout or exporting files.
 
+### Hosted Linux archive builds
+
+[Build Linux kernel archives][kernel-build] uses the standard `ubuntu-24.04` and
+`ubuntu-24.04-arm` runners. A push to `main` that changes the kernel series or its
+build recipe seeds Bazel's action cache. A check every 12 hours also seeds a new
+runner image or refreshes a seed due to expire within a day. Either trigger can
+upload one architecture's seed as soon as its compilation completes. Each seed is
+an Actions artifact kept for seven days. These jobs upload only Bazel action
+records and content-addressed blobs. Bazel starts with a restricted environment
+that excludes Actions credentials.
+
+A manual archive build can restore a seed from one of those `main` runs with the
+same architecture, runner image, upstream pin and kernel build recipe. After an
+image update a candidate may have to build cold until the next scheduled check
+and seed build finish. GitHub scheduling or build failures can extend that window.
+Use `cold` to omit the restore. The job summary identifies any seed used.
+
+These are complete architecture job times on the standard hosted runners,
+including cache transfer, verification and uploads. The cold job also exported
+the benchmark seed. The small-change run edited `actor-id-impl.c++` and
+`schema-file.c++` and restored that seed.
+
+| Runner | [Cold][kernel-cold] | [Same source with reuse][kernel-warm] | [Two changed files with reuse][kernel-small-change] |
+| --- | ---: | ---: | ---: |
+| `ubuntu-24.04-arm` | 1h 43m 37s | 19m 35s | 20m 20s |
+| `ubuntu-24.04` | 2h 08m 54s | 19m 31s | 17m 42s |
+
+Bazel matches each action against its command, declared environment, toolchain and
+input digests. Changing a few source files can reuse unrelated compile actions
+while recompiling and relinking affected outputs. Each archive build uses a fresh
+source checkout, reapplies the patch series, runs the kernel tests, and generates
+syscall profiles from its resulting binaries. The archive records its source commit,
+workerd tree, patch series, toolchain declarations and GitHub Actions run.
+The same-source comparison matched both executables and both syscall lists byte
+for byte on each architecture. GitHub run metadata and freshly sampled profiling
+evidence account for the differences in the archive checksums.
+Independent cold x86-64 builds of the same workerd tree have shown eight bytes of
+register-allocation variation in KJ's `readRequestHeaders()` and different GNU
+build IDs. [Prior pin comparison][kernel-pin-comparison]
+
+Archive builds run the instrumented `fatal-attribution` fixture. The required PR
+check runs all production cluster cases across four shards on the x86-64 archive
+named by the PR's pin. For release verification, dispatch the archive build with
+`full_cluster` to also run the production suite on both architectures.
+
+[kernel-build]: https://github.com/coworkerd/coworkerd/actions/workflows/kernel-build.yml
+[kernel-cold]: https://github.com/coworkerd/coworkerd/actions/runs/46100545409
+[kernel-warm]: https://github.com/coworkerd/coworkerd/actions/runs/46110659813
+[kernel-small-change]: https://github.com/coworkerd/coworkerd/actions/runs/46112230625
+[kernel-pin-comparison]: https://github.com/coworkerd/coworkerd/pull/144#issuecomment-7234726541
+
 ## Verifying a kernel pull request
 
 Follow [Sending a kernel change](../CONTRIBUTING.md#sending-a-kernel-change) to choose the fork base from
