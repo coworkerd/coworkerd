@@ -209,16 +209,25 @@ function sendPreface(path, preface) {
 
 function readThreaded(socketPath) {
   return new Promise((resolve, reject) => {
-    get({ socketPath, path: '/__coworkerd/threaded' }, async response => {
+    const socket = createConnection(socketPath, () => {
+      socket.write('GET /__coworkerd/threaded HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+    });
+    const chunks = [];
+    socket.on('data', chunk => chunks.push(chunk));
+    socket.once('error', reject);
+    // The test also counts the child's open descriptors. The response body can
+    // arrive before the child closes the probe's own descriptor.
+    socket.once('end', () => {
       try {
-        assert.equal(response.statusCode, 200);
-        const chunks = [];
-        for await (const chunk of response) chunks.push(chunk);
-        resolve(JSON.parse(Buffer.concat(chunks).toString()));
+        const response = Buffer.concat(chunks).toString();
+        assert.match(response, /^HTTP\/1\.1 200 /);
+        const headersEnd = response.indexOf('\r\n\r\n');
+        assert.ok(headersEnd > 0);
+        resolve(JSON.parse(response.slice(headersEnd + 4)));
       } catch (error) {
         reject(error);
       }
-    }).once('error', reject);
+    });
   });
 }
 
