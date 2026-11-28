@@ -197,11 +197,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.peerTimeoutMs = root.getPeerTimeoutMs();
   result.clockOffsetMsForTest = root.getClockOffsetMsForTest();
   auto placement = root.getPlacement();
-  const bool rootLimitGiven = given({"placement", "rootLimit"}).has_value();
-  const bool nestedLimitGiven = given({"placement", "nestedLimit"}).has_value();
-  result.rootLimit = !rootLimitGiven && nestedLimitGiven ? 128 : placement.getRootLimit();
-  result.nestedLimit = rootLimitGiven && !nestedLimitGiven ? 384 : placement.getNestedLimit();
-  result.placementLimitsExplicit = rootLimitGiven || nestedLimitGiven;
+  result.rootLimit = placement.getRootLimit();
+  result.nestedLimit = placement.getNestedLimit();
   result.tenantRootLimit = placement.getTenantRootLimit();
   result.tenantNestedLimit = placement.getTenantNestedLimit();
   result.tenantBorrowBelowPercent = placement.getTenantBorrowBelowPercent();
@@ -232,7 +229,6 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool = {pool.getCount(), pool.getInFlightLimit(), pool.getBasePort(),
     pool.getProbeIntervalMs(), pool.getProbeOverdueMs(), pool.getStuckTimeoutMs(),
     pool.getRestartBackoffMs(), pool.getRestartMaxMs(), pool.getWatchdog()};
-  result.processPool.inFlightLimitExplicit = given({"processPool", "inFlightLimit"}).has_value();
   result.processPool.pausedAdmissionWaitMs = pool.getPausedAdmissionWaitMs();
   result.processPool.sqlCpuLimitMs = pool.getSqlCpuLimitMs();
   result.processPool.sqlWallLimitMs = pool.getSqlWallLimitMs();

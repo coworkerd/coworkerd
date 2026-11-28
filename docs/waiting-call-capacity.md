@@ -12,14 +12,13 @@ enabled. The Worker could reach the private upstream, and the per-tenant outboun
 concurrency limits were off. The client and upstream had separate network namespaces and cgroups.
 Each had a 768 MiB memory cap, a two-CPU quota, a 128-task limit and a 32,768-descriptor soft limit.
 The node had 16 GiB and 40,000 tasks for the original and raised-default comparisons. The upper
-capacity probes used 20 GiB and up to 50,000 tasks. [Fixture](../tests/cluster/README.md#single-node-waiting-calls)
+capacity probes used 20 GiB and up to 50,000 tasks. [Fixture](../tests/cluster/README.md#single-node-waiting-calls) · [Published ARM64 kernel](https://github.com/coworkerd/coworkerd/releases/tag/kernel-v1.20261114.1-ae0129282c9c-run-46081583762-1)
 
 ## Two-second waits
 
 | Node settings | Offered | Verified replies | True upstream peak | Time at peak |
 | --- | ---: | ---: | ---: | ---: |
 | Original defaults | 2,000 × 2 | 128 each | 128 each | 1.977 s, 1.976 s |
-| Initial capacity candidate | 2,000 × 3 | 2,000 each | 2,000 each | 1.343 s, 1.520 s, 1.524 s |
 | 6,000 roots, 6,256 process slots | 2,000 × 2 | 2,000 each | 2,000 each | 1.392 s, 1.524 s |
 | 6,000 roots, 6,256 process slots | 4,500 | 4,500 | 4,500 | 0.753 s |
 | 6,000 roots, 6,256 process slots | 6,000 | 6,000 | 3,483 | 1.592 s |
@@ -29,11 +28,8 @@ capacity probes used 20 GiB and up to 50,000 tasks. [Fixture](../tests/cluster/R
 
 The original root limit was 128. Each 2,000-call batch produced 1,872 client-visible
 `PLACEMENT_EXHAUSTED` responses, matching the node's `OVERLOADED` count, and every admitted call
-waited two seconds. The initial capacity candidate used product `b1c0828`, the same kernel and all three
-node and process admission settings omitted. The node reported 8,192 slots for each and answered
-all 6,000 offers successfully. Client p99 was 2.197–2.333 s. The final default reserves 1,024
-of those slots for nested calls, with new roots admitted up to 7,168. The raised
-limits produced no refusals in the completed rows. The client took
+waited two seconds. With the experimental limits, both 2,000-call batches finished with
+zero refusals. Client p99 was 2.198–2.315 s. The client took
 4.309 s to offer the first 6,000-call batch and 8.144 s for the 9,000-call batch. At 10,000 offered
 the original 16 s collection deadline expired with 7,001 settled client results. This ended that
 two-second probe before every offer was accounted for.
@@ -76,35 +72,31 @@ process stayed on the same generation.
 Node cgroup memory is a container-wide reading. RSS rows describe individual processes. The client
 and upstream cgroups separately used 230,301,696 and 176,107,520 bytes during this sample. The
 three cgroups had no recorded OOM or task-limit events, and no listener overflows appeared at
-the sample. The numbers describe this Worker and its HTTP connections. Startup also reserves
-headroom for quarantine and replacement generations, so the live cost is only one part of
-node sizing. [Installation guide](guide/install.md#waiting-call-capacity)
+the sample. The numbers describe this Worker and its HTTP connections. Separately from the live
+measurements, the released kernel reserves 68 MiB plus 256 KiB per configured native call slot
+against the process memory budget at startup. That reservation reduces the budget available
+to resident Workers, including when the pool is idle. The daemon also sizes task and descriptor
+headroom for quarantine and replacement generations. [Installation guide](guide/install.md#waiting-call-capacity)
 
 ## Reproduction
 
 Build the daemons and launcher for the host Linux architecture and fetch the checkout's pinned
-published kernel. Run each command with a new output path. For the main comparison, run the
-fixture with the original binaries and set `COWORKERD_CLUSTER_PRODUCT_COMMIT=e972a74` along with
-`COWORKERD_CLUSTER_BIN_DIR` pointing to those binaries. The fixture records binary SHA-256
-digests, the effective configuration, kernel provenance, raw timestamps and resource samples.
+published kernel. Run each command with a new output path. To use the original binaries, set
+`COWORKERD_CLUSTER_PRODUCT_COMMIT=e972a74` and point `COWORKERD_CLUSTER_BIN_DIR` to that build.
+The fixture records binary SHA-256 digests, the effective configuration, kernel provenance, raw
+timestamps and resource samples.
 
 ```sh
 kernel=$(python3 scripts/fetch-kernel.py)
 node tests/cluster/waiting-call-capacity.mjs "$kernel" build/original.jsonl \
   --batches 128,512,2000,2000 --ramp-ms 300
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/two-second-acceptance-probe.jsonl \
+  --root-limit 6000 --nested-limit 6256 --process-limit 6256 \
+  --batches 2000,2000 --ramp-ms 300 --expect-full
 node tests/cluster/waiting-call-capacity.mjs "$kernel" build/fixed-two-seconds.jsonl \
   --root-limit 10500 --nested-limit 10756 --process-limit 10756 \
   --node-memory-gib 20 --node-tasks 46000 --batches 6000,7500,9000,10000 --ramp-ms 300
 node tests/cluster/waiting-call-capacity.mjs "$kernel" build/long-hold.jsonl \
   --root-limit 11400 --nested-limit 11401 --process-limit 11400 \
   --node-memory-gib 20 --node-tasks 50000 --batches 11250,11500 --wait-ms 12000 --ramp-ms 4000
-```
-
-With the new binaries built from this change, clear the original binary and revision overrides
-and run the acceptance case with all admission settings omitted.
-
-```sh
-unset COWORKERD_CLUSTER_BIN_DIR COWORKERD_CLUSTER_PRODUCT_COMMIT
-node tests/cluster/waiting-call-capacity.mjs "$kernel" build/new-defaults.jsonl \
-  --batches 2000,2000,2000 --ramp-ms 300 --expect-full
 ```

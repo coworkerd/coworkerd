@@ -471,7 +471,6 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `management.token` | required | The management token (see section 8); the environment variable `COWORKERD_MANAGEMENT_TOKEN` takes precedence. A node without one refuses to start |
 | `management.allowWithoutToken` | `false` | `true` lets a development node start without a token: its management endpoints are then open to whoever reaches its ingress or peer port, and it warns at startup |
 | `processPool.count` | `1` | The number of ordinary workerd processes |
-| `processPool.inFlightLimit` | Up to `8192` | Concurrent calls per process. This setting sizes the native call-thread pool for ordinary and quarantine processes and caps admission to a durable process. If omitted, the node may lower it to fit its startup resource budget. |
 | `processPool.ordinaryServer` | `threaded` | C++ backend for ordinary and quarantine processes: HTTP, JS RPC, outbound calls, logs, bindings, object stubs, CPU and memory limits, eviction and generation draining. `upstream` is refused for this setting. Durable processes use the Rust backend |
 | `processPool.threadedExecutable` | `coworkerd-threaded` beside `workerdPath` | Executable used when the ordinary backend is `threaded`. Build it with `//src/workerd/threaded:coworkerd-threaded` in the matching workerd fork |
 | `processPool.threadedMemoryBytes` | `0` | Native process memory budget in bytes. `0` divides 80% of the node's actual memory budget among ordinary, quarantine and durable processes plus one replacement generation. An explicit value cannot exceed this share |
@@ -511,8 +510,6 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `membership.clockSkewToleranceMs` / `membership.createSettleMs` | `2000` / `1000` | How far this machine's clock may be from the store's `Date` (more refuses the start, and is only warned of while running); how long a new epoch's registration settles before it is read back |
 | `membership.backend` / `desiredState.backend` | `objectStore` with the `storage` block | Where the members and the desired state are kept: a node started with `--config` requires `objectStore` for both, and `file` is only the command line's test form (a 0.3 `etcd` backend is refused, section 9) |
 | `desiredState.pollIntervalMs` | `5000` | How often the node reads the tenant index's hint, and what changed (50 to 3600000) |
-| `placement.rootLimit` | Up to `7168` | Refuse a new root call once the node has this many roots and nested calls in flight. |
-| `placement.nestedLimit` | Up to `8192` | Refuse a new nested call once the node has this many roots and nested calls in flight. It must exceed the root limit. |
 | `placement.tenantRootLimit` | `0` | Per-tenant share for concurrent root calls on this node. `0` disables this check; the node-wide `rootLimit` still applies. |
 | `placement.tenantNestedLimit` | `0` | Per-tenant share for concurrent nested calls on this node. `0` disables this check; the node-wide `nestedLimit` still applies. |
 | `placement.tenantBorrowBelowPercent` | `0` | Integer between `0` and `100`. `0` keeps enabled per-tenant limits hard. Otherwise, a tenant beyond its share can borrow while total node occupancy (roots plus nested calls) is strictly below this percentage of `rootLimit` for a root or `nestedLimit` for a nested call. At or above that threshold, new calls beyond a tenant’s share get the existing retryable `503 OVERLOADED` tenant refusal. Calls already admitted may finish. Node state at `placement.tenantAdmission` shows current `borrowed` occupancy and cumulative `busyRejections` by tenant and call type. |
@@ -552,32 +549,23 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 
 ### Waiting-call capacity
 
-When the node and process limits are omitted, the node starts from an 8,192-slot budget for
-root and nested calls. This leaves about 27% below the 11,250-call run in which every request
-overlapped and completed. The node stops accepting new roots at 7,168 and reserves 1,024 slots
-for nested calls of trees already admitted. That reserve is one eighth of the budget and
-corresponds to about 486 MiB at the measured waiting-call cost. If memory, tasks or descriptors
-reduce the budget, the node keeps the same proportion, with at least one nested slot.
-The effective counts appear in the startup configuration and in `placement` and
-`processes.configuration` in node state.
+The default placement thresholds are 128 calls in flight for new roots and 384 for nested calls.
+The default per-process limit is 512. In two batches of 2,000 ordinary calls with a two-second
+upstream wait, each batch completed 128 calls and refused 1,872 at the node's root threshold.
+With explicit experimental node and process limits on the same published ARM64 kernel,
+two batches completed all 2,000 calls. The full waits overlapped for 1.392 s and 1.524 s.
 
-A configuration that specifies only one placement limit keeps the previous default for the
-other (`128` roots or `384` total at nested admission).
+A separate 12-second probe on the same eight-vCPU Linux VM and a 20 GiB node container completed
+11,250 calls with full overlap for 8.062 s. A larger batch briefly reached the configured
+11,400-call ceiling. Each wait added about one native thread, four daemon descriptors, five
+ordinary-process descriptors and 486 KiB of node cgroup memory at the 11,250-call sample.
+At startup the same node budget accepted 11,516 configured process slots and refused 11,517
+because the ordinary-process memory share could no longer fund an active Worker.
 
-With one ordinary process, two quarantine processes and one durable process, the full 8,192-slot
-default needs about 14.4 GiB of node memory, 32,916 tasks of startup headroom and a hard descriptor
-limit of at least 169,088 with the default 2,048 ingress WebSocket upgrades. These are startup
-budgets for the pool and a replacement
-generation. [Inbound WebSocket capacity](#inbound-websocket-capacity)
-
-On the ARM64 measurement node, each waiting call added about one native thread, four daemon
-descriptors, five ordinary-process descriptors and 486 KiB of node cgroup memory between idle and
-the 11,250-call sample. A 20 GiB node container passed the startup memory check at 11,516
-configured process slots and failed it at 11,517. [Single-node measurements](../waiting-call-capacity.md)
-
-The same per-process ceiling governs durable routing across objects on one process. A higher
-ceiling allows the node to admit more calls there while the per-object mailbox and durable
-process memory limits still apply. [Durable admission](durable-objects.md#threaded-object-admission)
+The threaded kernel reserves memory for configured slots at startup. Reserving more slots
+reduces the memory available for Worker isolates even when the node is idle. The measured
+live-call cost and the startup reservation both enter capacity planning.
+[Readings, resource budgets and reproduction commands](../waiting-call-capacity.md)
 
 ### Invocation budgets
 

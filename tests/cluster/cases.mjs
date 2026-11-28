@@ -110,13 +110,7 @@ async function webSocketAdmission(cluster) {
     const otherState = await cluster.state(otherNode);
     assert.equal(otherState.webSockets.limitPerNode, 2048);
     const descriptors = await cluster.compose(['exec', '-T', otherNode, 'cat', `/proc/${otherState.server.pid}/limits`]);
-    const { count, quarantineProcesses, durableProcesses, inFlightLimit } = otherState.processes.configuration;
-    const generations = count + quarantineProcesses + durableProcesses + 1;
-    const processDescriptors = Math.max(inFlightLimit * 8 + 256, 256 + generations * (inFlightLimit * 4 + 128));
-    const minimum = processDescriptors + 256 + 2 * otherState.webSockets.limitPerNode;
-    const limits = descriptors.match(/^Max open files\s+(\d+)\s+524288\s/m);
-    assert.ok(limits, 'node descriptor limits');
-    assert.equal(Number(limits[1]), minimum);
+    assert.match(descriptors, /^Max open files\s+15488\s+524288\s/m);
     const a = await open(node, first);
     const b = await open(node, second);
     const full = await state();

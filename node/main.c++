@@ -10333,21 +10333,8 @@ void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& 
   if (plan.mode == "guard-regions") pool.sandboxWasmCapMiB = 1024;
 }
 
-uint64_t nodeHardDescriptorLimit(rlim_t inheritedHardLimit) {
-  auto hard = inheritedHardLimit == RLIM_INFINITY ? UINT64_MAX : uint64_t(inheritedHardLimit);
-#ifdef __APPLE__
-  int maxFilesPerProcess;
-  size_t size = sizeof(maxFilesPerProcess);
-  KJ_SYSCALL(sysctlbyname("kern.maxfilesperproc", &maxFilesPerProcess, &size, nullptr, 0));
-  KJ_REQUIRE(maxFilesPerProcess > 0, "invalid kern.maxfilesperproc", maxFilesPerProcess);
-  hard = std::min(hard, static_cast<uint64_t>(maxFilesPerProcess));
-#endif
-  return hard;
-}
-
-void applyProcessPoolEnvironment(ServerConfig& config, const std::string& workerdPath) {
-  auto& pool = config.processPool;
-  const auto memoryBudgetBytes = config.memoryBudgetBytes;
+void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t memoryBudgetBytes,
+    const std::string& workerdPath) {
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
   if (std::getenv("COWORKERD_CPU_LIMIT_MS")) pool.durableCpuLimitMs = pool.cpuLimitMs;
   if (pool.threadedDurable()) pool.durableCpuLimitMs = 30000;
@@ -10371,9 +10358,8 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
       (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
   if (pool.count + pool.quarantineProcesses > 0) {
-    const auto nativeGenerations = uint64_t(pool.count) + pool.quarantineProcesses + 1;
-    const auto fixedThreads = 32 + nativeGenerations * 27 + uint64_t(pool.durableProcesses) * 8;
-    const auto remaining = [](uint64_t budget, uint64_t reserve) { return budget - std::min(budget, reserve); };
+    const auto threadsRequired = 32 + (uint64_t(pool.count) + pool.quarantineProcesses + 1) *
+        (uint64_t(pool.inFlightLimit) + 27) + uint64_t(pool.durableProcesses) * 8;
     uint64_t uidThreads = 0;
 #ifdef __linux__
     // RLIMIT_NPROC counts every existing thread of the real UID, including
@@ -10390,11 +10376,15 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
       if (uid == getuid()) uidThreads += threads;
     }
 #endif
+    const auto uidRequired = uidThreads + threadsRequired;
     rlimit processLimit;
     KJ_REQUIRE(getrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot read thread configuration");
-    const auto uidHeadroom = processLimit.rlim_max == RLIM_INFINITY ? UINT64_MAX :
-        remaining(uint64_t(processLimit.rlim_max), uidThreads);
-    uint64_t cgroupHeadroom = UINT64_MAX, cgroupBound = 0, cgroupCurrent = 0;
+    KJ_REQUIRE(processLimit.rlim_max == RLIM_INFINITY || processLimit.rlim_max >= uidRequired,
+        "insufficient host thread hard limit", threadsRequired, uidThreads, processLimit.rlim_max);
+    if (processLimit.rlim_cur < uidRequired) {
+      processLimit.rlim_cur = uidRequired;
+      KJ_REQUIRE(setrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot set thread soft limit", uidRequired);
+    }
 #ifdef __linux__
     auto cgroup = fs::path("/sys/fs/cgroup");
     std::ifstream membership("/proc/self/cgroup"); std::string member;
@@ -10406,57 +10396,13 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
       std::ifstream maximumFile(directory / "pids.max"), currentFile(directory / "pids.current");
       std::string maximum; uint64_t current = 0;
       if (maximumFile >> maximum && maximum != "max" && currentFile >> current) {
-        uint64_t bound = 0;
-        auto parsed = std::from_chars(maximum.data(), maximum.data() + maximum.size(), bound);
-        KJ_REQUIRE(parsed.ec == std::errc(), "invalid cgroup task limit", maximum.c_str());
-        if (const auto headroom = remaining(bound, current); headroom < cgroupHeadroom) {
-          cgroupHeadroom = headroom;
-          cgroupBound = bound;
-          cgroupCurrent = current;
-        }
+        uint64_t bound = 0; auto parsed = std::from_chars(maximum.data(), maximum.data()+maximum.size(), bound);
+        KJ_REQUIRE(parsed.ec == std::errc() && current <= bound && threadsRequired <= bound-current,
+            "insufficient cgroup thread headroom", threadsRequired, current, bound);
       }
     }
 #endif
-    constexpr uint64_t fixedProcessMemory = 70ull << 20;
-    constexpr uint64_t memoryPerThread = 256ull << 10;
-    if (!pool.inFlightLimitExplicit) {
-      const auto byThreads = remaining(std::min(uidHeadroom, cgroupHeadroom), fixedThreads) / nativeGenerations;
-      // Keep the same fixed memory and per-thread allowance as the startup check below, plus ten percent for recovery.
-      const auto memoryAvailable = remaining(pool.threadedMemoryBytes, pool.threadedMemoryBytes / 10);
-      const auto byMemory = remaining(memoryAvailable, fixedProcessMemory + 1) / memoryPerThread;
-      rlimit descriptorLimit;
-      KJ_SYSCALL(getrlimit(RLIMIT_NOFILE, &descriptorLimit));
-      const auto hardDescriptors = nodeHardDescriptorLimit(descriptorLimit.rlim_max);
-      // Retain the upgrade budget the previous process default could serve on this host.
-      const auto legacyPoolDescriptors = std::max<uint64_t>(512 * 8 + 256, 256 + generations * (512 * 4 + 128));
-      const auto legacyIngress = coworkerd::planIngressDescriptors(0, hardDescriptors, legacyPoolDescriptors,
-          config.webSocketsPerNode);
-      const auto upgradeSlots = std::max<uint64_t>(legacyIngress.webSockets, 1);
-      const auto descriptorBudget = remaining(hardDescriptors,
-          coworkerd::OTHER_INGRESS_DESCRIPTORS + upgradeSlots * coworkerd::DESCRIPTORS_PER_WEBSOCKET);
-      const auto childSlots = remaining(descriptorBudget, 256) / 8;
-      const auto nodeSlots = remaining(descriptorBudget, 256 + generations * 128) / (generations * 4);
-      pool.inFlightLimit = std::min({uint64_t(pool.inFlightLimit), byThreads, byMemory, childSlots, nodeSlots});
-      KJ_REQUIRE(pool.inFlightLimit > 0, "insufficient host resources for one call slot",
-          byThreads, byMemory, childSlots, nodeSlots);
-      if (!config.placementLimitsExplicit) {
-        KJ_REQUIRE(pool.inFlightLimit > 1, "insufficient host resources for both root and nested call slots");
-        config.nestedLimit = pool.inFlightLimit;
-        // Reserve one eighth of the measured budget for nested calls from already admitted roots.
-        config.rootLimit = config.nestedLimit - std::max(1u, config.nestedLimit / 8);
-      }
-    }
-    const auto threadsRequired = fixedThreads + nativeGenerations * pool.inFlightLimit;
-    KJ_REQUIRE(threadsRequired <= uidHeadroom,
-        "insufficient host thread hard limit", threadsRequired, uidThreads, processLimit.rlim_max);
-    KJ_REQUIRE(threadsRequired <= cgroupHeadroom,
-        "insufficient cgroup thread headroom", threadsRequired, cgroupCurrent, cgroupBound);
-    const auto uidRequired = uidThreads + threadsRequired;
-    if (processLimit.rlim_cur < uidRequired) {
-      processLimit.rlim_cur = uidRequired;
-      KJ_REQUIRE(setrlimit(RLIMIT_NPROC, &processLimit) == 0, "cannot set thread soft limit", uidRequired);
-    }
-    const auto minimumMemory = fixedProcessMemory + uint64_t(pool.inFlightLimit) * memoryPerThread;
+    const auto minimumMemory = (64ull << 20) + (uint64_t(pool.inFlightLimit) + 16) * (256ull << 10) + (2ull << 20);
     KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, std::max<uint64_t>(8ull << 20, uint64_t(pool.inFlightLimit) << 20)) > minimumMemory,
         "native process memory budget leaves no active Worker", minimumMemory, pool.threadedMemoryBytes);
   }
@@ -10530,8 +10476,16 @@ void applyNodeDescriptorLimit(ServerConfig& config) {
   const auto poolDescriptors = std::max(childRequired, nodeRequired);
   rlimit limits;
   KJ_SYSCALL(getrlimit(RLIMIT_NOFILE, &limits));
-  const auto hard = nodeHardDescriptorLimit(limits.rlim_max);
-  const auto soft = std::min(hard, limits.rlim_cur == RLIM_INFINITY ? UINT64_MAX : uint64_t(limits.rlim_cur));
+  auto soft = limits.rlim_cur == RLIM_INFINITY ? UINT64_MAX : uint64_t(limits.rlim_cur);
+  auto hard = limits.rlim_max == RLIM_INFINITY ? UINT64_MAX : uint64_t(limits.rlim_max);
+#ifdef __APPLE__
+  int maxFilesPerProcess;
+  size_t size = sizeof(maxFilesPerProcess);
+  KJ_SYSCALL(sysctlbyname("kern.maxfilesperproc", &maxFilesPerProcess, &size, nullptr, 0));
+  KJ_REQUIRE(maxFilesPerProcess > 0, "invalid kern.maxfilesperproc", maxFilesPerProcess);
+  hard = std::min(hard, static_cast<uint64_t>(maxFilesPerProcess));
+  soft = std::min(soft, hard);
+#endif
   const auto plan = coworkerd::planIngressDescriptors(soft, hard, poolDescriptors, config.webSocketsPerNode);
   KJ_REQUIRE(plan.webSockets > 0, "insufficient host descriptor hard limit for the node and one ingress WebSocket",
       "required", poolDescriptors + coworkerd::OTHER_INGRESS_DESCRIPTORS + coworkerd::DESCRIPTORS_PER_WEBSOCKET,
@@ -10714,7 +10668,7 @@ int run(Launch launch) {
     KJ_REQUIRE(std::string(enabled) == "0" || std::string(enabled) == "1", "invalid memory watermark override");
     serverConfig.memoryWatermarkEnabled = std::string(enabled) == "1";
   }
-  applyProcessPoolEnvironment(serverConfig, launch.workerd);
+  applyProcessPoolEnvironment(serverConfig.processPool, serverConfig.memoryBudgetBytes, launch.workerd);
   applyNodeDescriptorLimit(serverConfig);
   // Outbound requests and the peer key, as the file says or these override; the rules are checked here.
   if (const char* mode = std::getenv("COWORKERD_EGRESS_MODE"); mode != nullptr && *mode) serverConfig.egress.mode = mode;
@@ -11166,7 +11120,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
     launch = serveLaunch(options, false);
     const char* runtimeFile = std::getenv("COWORKERD_RUNTIME_FILE");
     if (runtimeFile) launch->runtime = fs::absolute(runtimeFile).string();
-    applyProcessPoolEnvironment(launch->config, launch->workerd);
+    applyProcessPoolEnvironment(launch->config.processPool, launch->config.memoryBudgetBytes, launch->workerd);
     applyNodeDescriptorLimit(launch->config);
     report("configuration", true, ",\"configFile\":\"" + jsonEscape(launch->configFile.string()) + "\",\"nodeId\":\"" +
         jsonEscape(launch->config.serverId) + "\",\"webSocketsPerNode\":" + std::to_string(launch->config.webSocketsPerNode));

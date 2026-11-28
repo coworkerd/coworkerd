@@ -81,19 +81,6 @@ void memoryConfiguration(Fixture& fixture) {
 void tenantBorrowConfiguration(Fixture& fixture) {
   const auto defaults = fixture.load("{}");
   KJ_REQUIRE(defaults.tenantRootLimit == 0 && defaults.tenantNestedLimit == 0 && defaults.tenantBorrowBelowPercent == 0);
-  KJ_REQUIRE(defaults.rootLimit == 7168 && defaults.nestedLimit == 8192 && !defaults.placementLimitsExplicit);
-  KJ_REQUIRE(defaults.processPool.inFlightLimit == 8192 && !defaults.processPool.inFlightLimitExplicit);
-  const auto explicitLimits = fixture.load(R"({"placement":{"rootLimit":700,"nestedLimit":800}})");
-  KJ_REQUIRE(explicitLimits.rootLimit == 700 && explicitLimits.nestedLimit == 800 && explicitLimits.placementLimitsExplicit);
-  std::string equalLimitRefusal;
-  try { fixture.load(R"({"placement":{"rootLimit":800,"nestedLimit":800}})"); }
-  catch (const kj::Exception& error) { equalLimitRefusal = error.getDescription().cStr(); }
-  KJ_REQUIRE(equalLimitRefusal.find("nestedLimit must exceed rootLimit") != std::string::npos);
-  const auto oldRootOnly = fixture.load(R"({"placement":{"rootLimit":200},"processPool":{"inFlightLimit":600}})");
-  KJ_REQUIRE(oldRootOnly.rootLimit == 200 && oldRootOnly.nestedLimit == 384);
-  KJ_REQUIRE(oldRootOnly.processPool.inFlightLimit == 600 && oldRootOnly.processPool.inFlightLimitExplicit);
-  const auto oldNestedOnly = fixture.load(R"({"placement":{"nestedLimit":300}})");
-  KJ_REQUIRE(oldNestedOnly.rootLimit == 128 && oldNestedOnly.nestedLimit == 300);
   const auto explicitConfig = fixture.load(R"({"placement":{"tenantRootLimit":16,"tenantNestedLimit":16,"tenantBorrowBelowPercent":88}})");
   KJ_REQUIRE(explicitConfig.tenantRootLimit == 16 && explicitConfig.tenantNestedLimit == 16 && explicitConfig.tenantBorrowBelowPercent == 88);
   KJ_REQUIRE(fixture.load(R"({"placement":{"tenantBorrowBelowPercent":100}})").tenantBorrowBelowPercent == 100);
