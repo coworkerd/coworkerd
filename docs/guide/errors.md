@@ -261,7 +261,7 @@ An attempted fetch that reaches the node's egress service and gets `EGRESS_DENIE
 | `EGRESS_DENIED: default-deny` | The cluster's default policy is `deny`, and the tenant's `allow` does not have this destination | The administrator allows it |
 | `EGRESS_DENIED: egress-off` | The node runs with `egress.mode` `off`: tenant code has no outgoing network | The administrator turns egress on |
 | `EGRESS_DENIED: tenant-deny` | The tenant's `deny` rules | -- |
-| `EGRESS_DENIED: concurrency-limit`, `rate-limit` | This tenant's outgoing concurrency (default 32) or requests per second (default 100) on this node are full | Retry a little later, or ask the administrator to raise them |
+| `EGRESS_DENIED: concurrency-limit`, `rate-limit` | This tenant reached its configured limit on outgoing requests in flight or request starts per second on this node. Both limits default to off | Retry a little later, or ask the administrator to raise the limit |
 | `EGRESS_DENIED: scheme`, `url` | A destination the policy point cannot take: not `http`/`https`, or an invalid URL, such as one without a host. A scheme other than `http`/`https` usually never reaches the node -- `fetch` throws `TypeError: Fetch API cannot load` itself --, and a user name and password in the URL are dropped by `fetch`, so the request goes out without them | -- |
 | `EGRESS_FAILED: dns` | The node cannot resolve this name | Check the name |
 | `EGRESS_FAILED: connect`, `tls`, `timeout`, `protocol` | Cannot connect, the TLS handshake or the certificate check failed, a timeout (30 seconds by default), the other side's answer is not valid HTTP | Check the destination; certificates are verified by the node against the system's root certificates |
