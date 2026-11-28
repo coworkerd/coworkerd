@@ -168,6 +168,7 @@ jobs:
           mkdir -p build
           tar -xf "$RUNNER_TEMP/cluster-inputs.tar" -C build
       - name: Run cluster integration tests
+        id: cluster-tests
         timeout-minutes: 30
         env:
           SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
@@ -180,6 +181,13 @@ jobs:
           docker version --format 'Docker Engine {{.Server.Version}}'
           docker compose version
           node tests/cluster/run.mjs "$PWD/build" --shard "$SHARD"
+      - name: Upload cluster failure diagnostics
+        if: failure() && steps.cluster-tests.outcome == 'failure' && hashFiles('build/cluster-diagnostics/**') != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cluster-failure-shard-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: build/cluster-diagnostics/
+          if-no-files-found: error
 
   linux-required:
     # This name is the required status check in the main ruleset.
