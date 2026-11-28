@@ -191,6 +191,8 @@ async function measure(cluster, node, record, residencyOnly) {
     return reading;
   });
   await record('initial', initial);
+  assert.ok(Number.isSafeInteger(initial.admission.admissionWalTimeouts),
+    'the kernel must publish the admission WAL timeout counter');
   const onSameChild = async () => {
     const reading = await state();
     assert.deepEqual(reading.child, initial.child);
@@ -278,9 +280,10 @@ async function measure(cluster, node, record, residencyOnly) {
       const residency = [];
       const started = performance.now();
       const sampleResidency = async () => {
-        const { residentRoots, homes, idleRetirements, admissionRetirements } = await onSameChild();
+        const { residentRoots, homes, idleRetirements, admissionRetirements, admissionWalTimeouts } =
+          await onSameChild();
         residency.push({ elapsedMs: performance.now() - started, residentRoots, homes,
-          idleRetirements, admissionRetirements });
+          idleRetirements, admissionRetirements, admissionWalTimeouts });
       };
       await sampleResidency();
       const stopSampling = new AbortController();
@@ -334,7 +337,9 @@ async function measure(cluster, node, record, residencyOnly) {
       const peakResidentRoots = Math.max(...residency.map(sample => sample.residentRoots));
       const keptWarmCopies = [...observedCopies].every(copy => warmCopies.has(copy)) &&
         residency.every(sample => sample.homes === expectedCopies);
-      const result = { ...summary(samples), peakResidentRoots, keptWarmCopies };
+      const { admissionWalTimeouts } = residency.at(-1);
+      const result = { ...summary(samples), peakResidentRoots, keptWarmCopies, admissionWalTimeouts,
+        admissionWalTimeoutsDelta: admissionWalTimeouts - residency[0].admissionWalTimeouts };
       if (result.successes !== cohortSize) workloadPassed = false;
       await record('pass-residency', { cohort, phase, child: initial.child, observedCopies: [...observedCopies],
         peakResidentRoots, samples: residency });
@@ -361,8 +366,9 @@ async function measure(cluster, node, record, residencyOnly) {
     finish.every(phase => phase.keptWarmCopies && phase.samples.every(sample => sample.keptWarmCopies));
   const pass = gateEligible && workloadPassed && warmCopiesComparable &&
     comparisons.every(comparison => comparison.pass);
+  const { admissionWalTimeouts } = await onSameChild();
   const result = { baselineStable, rssVariationKiB, gateEligible, workloadPassed,
-    warmCopiesComparable, comparisons, pass };
+    warmCopiesComparable, admissionWalTimeouts, comparisons, pass };
   await record('gate-summary', { child: initial.child, ...result });
   console.log(JSON.stringify(result));
 }

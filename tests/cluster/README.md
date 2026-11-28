@@ -70,6 +70,10 @@ binding. The child records the refusals without dispatching the writes. Closing 
 retries once and the stored counter or row confirms one write per retry. The object slot also
 stays occupied while a timer and an unawaited scheduler promise finish their writes.
 The case checks that both stored values survive subsequent admission retirement and reopen.
+It then holds peer WAL acknowledgements for a write issued after the response. The oldest
+resident object has no running event and keeps its slot until confirmation. Admission then
+retires it and a reopen verifies the committed value. The case requires zero
+`admissionWalTimeouts`.
 
 `durable-threaded-copy-reservation-refusal` consumes a one-shot marker at the cold-copy reservation step
 after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` each confirm that the write
@@ -86,6 +90,8 @@ reservations, process limits, reset counters and refused probes. The run require
 copy to retain its instance and all tree and isolate reset counts to stay at zero.
 Use `--sequential` to run only the sequential seed and reopen passes. The hosted idle job runs both
 workloads in separate clusters and uploads `idle.jsonl` and `idle-residency.jsonl`.
+The sequential report includes the cumulative `admissionWalTimeouts` and the change in each
+5,000-call seed or reopen pass.
 
 ```sh
 node tests/cluster/durable-idle-measure.mjs "$kernel" build/durable-residency.jsonl --residency
