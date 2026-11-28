@@ -93,6 +93,21 @@ For a Worker without a static placement -- an ingress request while ingress plac
 
 The fields in the call answers that refer to a node are called `nodeId`; `/v1`'s deployment answers name the node that ran the trial load in the trial record's `server` fields (`versions[].server`, `attempts[].server`) and as `nodeId` in its verdict, and a `LOAD_FAILED` answer also as a top-level `nodeId`.
 
+### SQLite errors inside a threaded Durable Object
+
+`ctx.storage.sql` throws these JavaScript errors inside the object. The fields describe the SQL
+operation. Catch the error in the object to choose what the handler returns.
+
+| `error.code` | Meaning | Outcome |
+| --- | --- | --- |
+| `SQL_MEMORY_LIMIT_EXCEEDED` | The connection reached its 32 MiB SQLite heap limit | The active transaction rolled back. Reduce the memory needed by the statement. |
+| `OVERLOADED` | The durable process could not reserve more SQLite heap | The active transaction rolled back. The SQL error has `dispatched: false` and `retryable: true`. Retry the transaction when process headroom returns. |
+
+A rollback that affects earlier writes or pending alarm changes fails responses waiting for
+confirmation with HTTP 503. Subsequent calls reopen the last confirmed storage. A rollback
+confined to the failing statement or to an isolated explicit transaction can leave the same
+connection available.
+
 ## 2. The control plane (`/v1` and `cowctl`)
 
 When `cowctl` fails it prints one sentence plus the reason the control plane gave, and exits with 1 (2 for a usage mistake, 130 when interrupted); for a refused credential it prints the code and where to check: `COWCTL_TOKEN`, or the token file `cowctl.json` names. Every `/v1/` request needs `Authorization: Bearer <credential>`:
