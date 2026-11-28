@@ -84,7 +84,9 @@ On both Linux architectures the hosted build runs the factory and threaded Bazel
 extended by our patches. The tests reuse the release build's outputs. A test failure stops that architecture job
 before packaging. The build summary records the elapsed time of the Bazel test invocation. The hosted build also
 builds `coworkerd-threaded-fatal-test` for the `fatal-attribution` cluster case. This executable is used only by
-that case. The archive and the regular cluster suite use the production binaries.
+that case. The required PR check runs the production cluster suite on the pinned x86-64 archive. Set
+`full_cluster` when dispatching a release build to run that suite on both architectures. See the
+[hosted archive build notes](patches/README.md#hosted-linux-archive-builds) for timing and reuse.
 
 Use the series tag printed by `package-kernel.py` for a local publication. When adding an architecture to a
 local release, update `SHA256SUMS` to include every published archive. For hosted builds, record the published
@@ -146,7 +148,7 @@ Linux CI caches the archive by its pinned SHA-256 and verifies it before registe
 | `node-threaded-durable-launch` (Linux only) | Both kernel binaries, for durable test-role negotiation and storage refusal |
 | `node-threaded-durable-home-reservation` (Linux only) | Both kernel binaries, for home reservation before acknowledgement, refusal with all homes occupied, and credit return on cancellation |
 | `node-threaded-durable-warm-copies` (Linux only) | Both kernel binaries, for reusing matching warm copies after idle retirement in reverse definition order while preserving stored state |
-| `node-threaded-durable-load-cancel` (Linux only) | Both kernel binaries, for a cold load whose only caller's lease runs out: the load ends, and a different definition placed on that home runs its own code |
+| `node-threaded-durable-load-cancel` (Linux only) | Both kernel binaries, for a cold load whose only HTTP caller disconnects: the load ends, and a different definition placed on that home runs its own code |
 | `node-threaded-durable-http` (Linux only) | Both kernel binaries, for HTTP writes/reads, brief idle re-entry, and first requests after three idle retirement/wake cycles |
 | `node-threaded-durable-rpc-events` (Linux only) | Both kernel binaries, for an independent RPC held by the actor input gate, nested calls to and from a peer during an await, and admission credit return |
 | `node-threaded-durable-rpc-output-gate` (Linux only) | Both kernel binaries, for an RPC result held while a disposable SQLite write awaits confirmation and a separate read of the saved value |

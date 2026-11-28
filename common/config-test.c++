@@ -63,6 +63,43 @@ void idleConfiguration(Fixture& fixture) {
   }
 }
 
+void admissionConfiguration(Fixture& fixture) {
+  struct Case { const char* json; uint32_t ordinary, durable, roots, nested; };
+  constexpr Case cases[] = {
+    {R"({})", 3200, 512, 2400, 3200},
+    {R"({"placement":{"rootLimit":64}})", 3200, 512, 64, 3200},
+    {R"({"placement":{"nestedLimit":256}})", 3200, 512, 192, 256},
+    {R"({"placement":{"rootLimit":64,"nestedLimit":256}})", 3200, 512, 64, 256},
+    {R"({"processPool":{"inFlightLimit":400}})", 400, 400, 300, 400},
+    {R"({"processPool":{"inFlightLimit":400},"placement":{"rootLimit":64}})", 400, 400, 64, 400},
+    {R"({"processPool":{"inFlightLimit":400},"placement":{"nestedLimit":800}})", 400, 400, 300, 800},
+    {R"({"processPool":{"inFlightLimit":400},"placement":{"rootLimit":500,"nestedLimit":800}})", 400, 400, 500, 800},
+    {R"({"processPool":{"count":2,"inFlightLimit":400}})", 400, 400, 600, 800},
+  };
+  for (const auto& row : cases) {
+    auto config = fixture.load(row.json);
+    if (!config.processPool.inFlightLimitGiven) config.processPool.inFlightLimit = 3200;
+    config.resolvePlacementLimits();
+    KJ_REQUIRE(config.rootLimit == row.roots && config.nestedLimit == row.nested, row.json, config.rootLimit, config.nestedLimit);
+    KJ_REQUIRE(config.processPool.inFlightLimit == row.ordinary && config.processPool.durableInFlightLimit() == row.durable,
+        row.json, config.processPool.inFlightLimit, config.processPool.durableInFlightLimit());
+  }
+  for (const auto& [json, diagnostic] : std::array{
+      std::pair{R"({"placement":{"rootLimit":10,"nestedLimit":10,"equalLimitsForTest":true}})", "nestedLimit"},
+      std::pair{R"({"processPool":{"inFlightLimit":100},"placement":{"rootLimit":100}})", "nestedLimit"},
+      std::pair{R"({"processPool":{"inFlightLimit":100},"placement":{"tenantNestedLimit":101}})", "per-tenant placement"},
+      std::pair{R"({"placement":{"tenantRootLimit":76}})", "per-tenant placement"},
+      std::pair{R"({"placement":{"rootLimit":0}})", "rootLimit"}}) {
+    std::string refused;
+    try {
+      auto config = fixture.load(json);
+      if (!config.processPool.inFlightLimitGiven) config.processPool.inFlightLimit = 100;
+      config.resolvePlacementLimits();
+    } catch (const kj::Exception& error) { refused = error.getDescription().cStr(); }
+    KJ_REQUIRE(refused.find(diagnostic) != std::string::npos, json, refused.c_str());
+  }
+}
+
 void memoryConfiguration(Fixture& fixture) {
   const auto config = fixture.load(R"({"memoryWatermarkEnabled":true,"memoryBudgetBytes":2147483648,"processPool":{"count":4}})");
   KJ_REQUIRE(config.memoryWatermarkEnabled && config.memoryBudgetBytes == 2147483648ULL && config.processPool.count == 4,
@@ -102,6 +139,22 @@ void webSocketConfiguration(Fixture& fixture) {
     KJ_REQUIRE(refusal.find("ingress.webSocketsPerTenant was removed") != std::string::npos &&
         refusal.find("ingress.webSocketsPerNode") != std::string::npos, refusal.c_str());
   }
+}
+
+void egressConfiguration(Fixture& fixture) {
+  const auto defaults = fixture.load("{}").egress;
+  KJ_REQUIRE(defaults.concurrency == 0 && defaults.requestsPerSecond == 0);
+  const auto disabled = fixture.load(R"({"egress":{"concurrency":0,"requestsPerSecond":0}})").egress;
+  KJ_REQUIRE(disabled.concurrency == 0 && disabled.requestsPerSecond == 0);
+  const auto explicitLimits = fixture.load(R"({"egress":{"concurrency":32,"requestsPerSecond":100,
+    "tenants":[{"tenant":"shop","concurrency":64,"requestsPerSecond":200}]}})").egress;
+  KJ_REQUIRE(explicitLimits.concurrency == 32 && explicitLimits.requestsPerSecond == 100);
+  const auto& shop = explicitLimits.tenants.at("shop");
+  KJ_REQUIRE(shop.concurrency == 64 && shop.requestsPerSecond == 200);
+  std::string refusal;
+  try { fixture.load(R"({"egress":{"timeoutMs":0}})"); }
+  catch (const kj::Exception& error) { refusal = error.getDescription().cStr(); }
+  KJ_REQUIRE(refusal.find("egress.timeoutMs") != std::string::npos);
 }
 
 // With the object store's membership the grace must exceed the heartbeat interval by more than 1,150 ms; the
@@ -156,9 +209,11 @@ int main(int argc, char** argv) {
     Fixture fixture;
     const std::string_view label = argv[1];
     if (label == "idle") idleConfiguration(fixture);
+    else if (label == "admission") admissionConfiguration(fixture);
     else if (label == "memory") memoryConfiguration(fixture);
     else if (label == "tenant-borrow") tenantBorrowConfiguration(fixture);
     else if (label == "websocket") webSocketConfiguration(fixture);
+    else if (label == "egress") egressConfiguration(fixture);
     else if (label == "liveness-grace") livenessGraceConfiguration(fixture);
     else KJ_FAIL_REQUIRE("unknown configuration test case", argv[1]);
   } catch (const kj::Exception& error) {

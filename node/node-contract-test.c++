@@ -2,7 +2,9 @@
 #include "config.h"
 #include "code-package.h"
 #include "invocation-contract.h"
-#include "ingress-descriptors.h"
+#include "peer-liveness.h"
+#include "request-lease.h"
+#include "eager-call-admission.h"
 #include "event-loop.h"
 #include "memory-events.h"
 #include "tenant-line.h"
@@ -17,15 +19,18 @@
 #include "process-culprit.h"
 #include "manifests.h"
 
+#include <array>
 #include <bit>
 #include <capnp/message.h>
 #include <cmath>
 #include <fstream>
 #include <kj/async-io.h>
+#include <kj/compat/http.h>
 #include <limits>
 #include <sstream>
 #include <string_view>
 #include <unistd.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #ifdef __linux__
 #include <sched.h>
@@ -40,6 +45,181 @@ struct TempDir {
   ~TempDir() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
   std::filesystem::path operator/(const char* file) const { return std::filesystem::path(path) / file; }
 };
+
+void eagerCallAdmission() {
+  constexpr uint64_t MiB = 1ull << 20;
+  const auto plan = [](uint64_t memory, uint64_t tasks = UINT64_MAX, uint64_t descriptors = UINT64_MAX) {
+    return planEagerCalls(memory, tasks, descriptors, 4, 1, 512, 0);
+  };
+  const auto small = plan(327 * MiB);
+  const auto standard = plan(2621 * MiB);
+  const auto large = plan(10485 * MiB);
+  KJ_REQUIRE(small.slots == 512 && standard.slots == 2621 && large.slots == 10485);
+  KJ_REQUIRE(plan(22000 * MiB).slots == 16384);
+  const auto taskLimited = plan(3276 * MiB, 10000);
+  KJ_REQUIRE(taskLimited.slots == 2500 && taskLimited.taskLimited && !taskLimited.descriptorLimited);
+  const auto descriptorLimited = plan(3276 * MiB, UINT64_MAX, 49152);
+  KJ_REQUIRE(descriptorLimited.slots == 2616 && descriptorLimited.descriptorLimited && !descriptorLimited.taskLimited,
+      descriptorLimited.slots);
+  const auto tied = plan(3276 * MiB, 4 * 2616, 49152);
+  KJ_REQUIRE(tied.taskLimited && tied.descriptorLimited);
+  const auto legacyWebSockets = planIngressDescriptors(0, 49152, poolDescriptors(4, 1, 512, 512), 0);
+  const auto effectiveWebSockets = planIngressDescriptors(0, 49152, poolDescriptors(4, 1, descriptorLimited.slots, 512), 0);
+  KJ_REQUIRE(legacyWebSockets.webSockets == effectiveWebSockets.webSockets);
+  KJ_REQUIRE(plan(3276 * MiB, 3).slots == 0 && plan(3276 * MiB, UINT64_MAX, 256).slots == 0);
+}
+
+void peerHalfClose() {
+  auto io = kj::setupAsyncIo();
+  int fds[2];
+  KJ_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+  auto server = io.lowLevelProvider->wrapSocketFd(fds[0], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+  auto client = io.lowLevelProvider->wrapSocketFd(fds[1], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+
+  auto halfClosed = server->whenPeerClosedWrite();
+  kj::byte request = 'q';
+  client->write(kj::arrayPtr(&request, 1)).wait(io.waitScope);
+  KJ_REQUIRE(!halfClosed.poll(io.waitScope), "readable data alone is not a half-close");
+  client->shutdownWrite();
+  io.provider->getTimer().timeoutAfter(2 * kj::SECONDS, kj::mv(halfClosed)).wait(io.waitScope);
+
+  kj::byte received = 0;
+  KJ_REQUIRE(server->tryRead(&received, 1, 1).wait(io.waitScope) == 1 && received == request,
+      "half-close notification must preserve unread input");
+  KJ_REQUIRE(server->whenPeerClosedWrite().poll(io.waitScope), "an observed half-close must stay visible");
+
+  kj::byte response = 'a';
+  server->write(kj::arrayPtr(&response, 1)).wait(io.waitScope);
+  KJ_REQUIRE(client->tryRead(&received, 1, 1).wait(io.waitScope) == 1 && received == response,
+      "the peer can still read after shutting down its writes");
+}
+
+void httpReadBeforeFin() {
+  struct SilentService final: kj::HttpService {
+    kj::PromiseFulfillerPair<void> started = kj::newPromiseAndFulfiller<void>();
+    kj::PromiseFulfillerPair<void> read = kj::newPromiseAndFulfiller<void>();
+    std::array<char, 4> received{};
+    kj::Promise<void> request(kj::HttpMethod, kj::StringPtr, const kj::HttpHeaders&,
+        kj::AsyncInputStream& body, Response&) override {
+      started.fulfiller->fulfill();
+      co_await read.promise;
+      co_await body.tryRead(received.data(), received.size(), received.size());
+      co_await kj::Promise<void>(kj::NEVER_DONE);
+    }
+  } service;
+  auto io = kj::setupAsyncIo();
+  auto& timer = io.provider->getTimer();
+  auto table = kj::HttpHeaderTable::Builder().build();
+  kj::HttpServer server(timer, *table, service, {.cancelHttpOnClientDisconnect = true});
+  int fds[2];
+  KJ_REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+  auto served = server.listenHttp(io.lowLevelProvider->wrapSocketFd(fds[0], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP));
+  auto client = io.lowLevelProvider->wrapSocketFd(fds[1], kj::LowLevelAsyncIoProvider::TAKE_OWNERSHIP);
+  client->write(kj::StringPtr("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nbody").asBytes())
+      .wait(io.waitScope);
+  client->shutdownWrite();
+  timer.timeoutAfter(2 * kj::SECONDS, kj::mv(service.started.promise)).wait(io.waitScope);
+  KJ_REQUIRE(!served.poll(io.waitScope), "a FIN must leave the buffered request body available");
+  service.read.fulfiller->fulfill();
+  timer.timeoutAfter(2 * kj::SECONDS, kj::mv(served)).wait(io.waitScope);
+  KJ_REQUIRE(std::string_view(service.received.data(), service.received.size()) == "body",
+      "the parser delivered all request bytes before cancellation");
+}
+
+void peerSessionLiveness() {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  const auto start = kj::origin<kj::TimePoint>();
+  for (const bool stall : {false, true}) {
+    kj::TimerImpl timer(start);
+    PeerLivenessClock clock(timer);
+    PeerReceiveLiveness receiver(clock);
+    auto expired = receiver.whenExpired();
+    const auto advance = [&](kj::Duration elapsed) {
+      const auto target = start + elapsed;
+      while (timer.now() < target) {
+        timer.advanceTo(kj::min(target, timer.now() + 250 * kj::MILLISECONDS));
+        waitScope.poll();
+      }
+    };
+    unsigned sent = 0;
+    bool timedOut = false;
+    auto unanswered = kj::newPromiseAndFulfiller<void>();
+    auto inFlight = runPeerKeepalive(clock, [&]() -> kj::Promise<void> {
+      ++sent;
+      if (sent == 1) {
+        receiver.receivedPing();
+        return kj::READY_NOW;
+      }
+      if (sent == 2) return kj::mv(unanswered.promise);
+      return kj::NEVER_DONE;
+    }).catch_([&](kj::Exception&&) { timedOut = true; });
+    advance(1999 * kj::MILLISECONDS);
+    KJ_REQUIRE(sent == 0);
+    advance(2 * kj::SECONDS);
+    KJ_REQUIRE(sent == 1);
+    advance(4 * kj::SECONDS);
+    KJ_REQUIRE(sent == 2);
+    auto lastAcknowledgement = 2 * kj::SECONDS;
+
+    if (stall) {
+      // Let the ready timer events run first on resume. The ping and its
+      // reply are still buffered in the transport at this point.
+      timer.advanceTo(start + 10 * kj::SECONDS);
+      waitScope.poll();
+      KJ_REQUIRE(!expired.poll(waitScope) && !inFlight.poll(waitScope),
+          "a local stall must not expire the session before the loop reads queued traffic");
+      auto queued = kj::evalLater([&]() {
+        receiver.receivedPing();
+        unanswered.fulfiller->fulfill();
+      });
+      queued.wait(waitScope);
+      waitScope.poll();
+      KJ_REQUIRE(!expired.poll(waitScope) && !inFlight.poll(waitScope));
+      lastAcknowledgement = 10 * kj::SECONDS;
+    }
+
+    const auto cutoff = lastAcknowledgement + PEER_KEEPALIVE_TIMEOUT;
+    advance(cutoff - kj::MILLISECONDS);
+    KJ_REQUIRE(!expired.poll(waitScope) && !inFlight.poll(waitScope));
+    advance(cutoff);
+    KJ_REQUIRE(expired.poll(waitScope), "the receiving session expires five seconds after the last ping");
+    KJ_REQUIRE(inFlight.poll(waitScope), "the outgoing session expires five seconds after the last acknowledgement");
+    inFlight.wait(waitScope);
+    KJ_REQUIRE(timedOut && !unanswered.fulfiller->isWaiting());
+    KJ_REQUIRE(kj::runCatchingExceptions([&]() { receiver.receivedPing(); }) != kj::none,
+        "a late ping cannot reopen a session");
+  }
+}
+
+void liveRequestLease() {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  const auto start = kj::origin<kj::TimePoint>();
+  kj::TimerImpl clock(start);
+  RequestLease root(clock);
+  auto closing = root.whenClosing();
+  auto closed = root.whenClosed();
+  clock.advanceTo(start + 120 * kj::SECONDS);
+  KJ_REQUIRE(!closing.poll(waitScope) && !closed.poll(waitScope) && std::isinf(root.remainingMs()));
+  root.beginDrain();
+  KJ_REQUIRE(closing.poll(waitScope) && root.remainingMs() == 30'000);
+  clock.advanceTo(start + 140 * kj::SECONDS);
+  root.beginDrain();
+  KJ_REQUIRE(root.remainingMs() == 10'000, "a duplicate drain must keep the original deadline");
+  clock.advanceTo(start + 149999 * kj::MILLISECONDS);
+  KJ_REQUIRE(!closed.poll(waitScope));
+  clock.advanceTo(start + 150 * kj::SECONDS);
+  KJ_REQUIRE(closed.poll(waitScope) && root.isClosed() && root.remainingMs() == 0);
+
+  RequestLease alarm(clock);
+  alarm.startFixed(15 * kj::MINUTES);
+  alarm.beginDrain();
+  KJ_REQUIRE(alarm.remainingMs() == 900'000, "an alarm has a fixed wall limit");
+  alarm.close();
+  KJ_REQUIRE(alarm.whenClosing().poll(waitScope) && alarm.whenClosed().poll(waitScope));
+}
+
 void write(const std::filesystem::path& path, const std::string& bytes) {
   std::ofstream file(path, std::ios::binary);
   KJ_REQUIRE(bool(file << bytes), path.c_str());
@@ -111,6 +291,8 @@ void nativeConfig() {
   for (const auto* config : {&direct, &decoded}) {
     KJ_REQUIRE(config->processPool.ordinaryServer == "threaded");
     KJ_REQUIRE(config->processPool.tenantInFlightLimit == 0);
+    KJ_REQUIRE(config->ingressKeepalive.idleSeconds == 30 && config->ingressKeepalive.intervalSeconds == 10 &&
+        config->ingressKeepalive.probes == 3);
     KJ_REQUIRE(config->processPool.tenantAdmissionWaitMs == 1000);
     KJ_REQUIRE(config->processPool.cpuLimitMs == 30000 && config->processPool.durableCpuLimitMs == 200);
   }
@@ -118,6 +300,11 @@ void nativeConfig() {
   const auto overridden = ServerConfig::load(directory / "limits.json");
   KJ_REQUIRE(overridden.processPool.cpuLimitMs == 200 && overridden.processPool.durableCpuLimitMs == 200 &&
       overridden.processPool.memoryLimitMiB == 64);
+  write(directory / "keepalive.json", R"({"ingress":{"tcpKeepalive":{"idleSeconds":2,"intervalSeconds":1,"probes":2}}})");
+  const auto keepalive = ServerConfig::load(directory / "keepalive.json").ingressKeepalive;
+  KJ_REQUIRE(keepalive.idleSeconds == 2 && keepalive.intervalSeconds == 1 && keepalive.probes == 2);
+  write(directory / "keepalive-invalid.json", R"({"ingress":{"tcpKeepalive":{"probes":0}}})");
+  KJ_REQUIRE(kj::runCatchingExceptions([&] { ServerConfig::load(directory / "keepalive-invalid.json"); }) != kj::none);
   write(directory / "disabled.json", "{\"processPool\":{\"tenantInFlightLimit\":0,\"tenantAdmissionWaitMs\":25}}");
   const auto disabled = ServerConfig::load(directory / "disabled.json");
   KJ_REQUIRE(disabled.processPool.tenantInFlightLimit == 0 && disabled.processPool.tenantAdmissionWaitMs == 25);
@@ -813,6 +1000,34 @@ void cacheCapacity() {
   KJ_REQUIRE(number(cache.json(), "bytes") == 3 && number(cache.json(), "evictions") == 2);
 }
 
+void compactInvocationJson() {
+  capnp::MallocMessageBuilder message;
+  auto fields = message.initRoot<capnp::JsonValue>().initObject(5);
+  fields[0].setName("lease");
+  fields[0].initValue().setNumber(1234.56789012345);
+  fields[1].setName("bindings");
+  auto values = fields[1].initValue().initArray(4);
+  values[0].setBoolean(false);
+  values[1].setNull();
+  values[2].initObject(0);
+  values[3].initArray(0);
+  constexpr auto label = "line\"\\\t\n\r\f\b\001";
+  fields[2].setName(label);
+  std::string text(label);
+  text += "résumé";
+  text.append(1, '\0');
+  text += std::string(2048, 'x');
+  fields[2].initValue().setString(kj::StringPtr(text.data(), text.size()));
+  fields[3].setName("bool");
+  fields[3].initValue().setBoolean(true);
+  fields[4].setName("negative");
+  fields[4].initValue().setNumber(-1e-24);
+  const auto value = message.getRoot<capnp::JsonValue>().asReader();
+  const auto expected = capnp::JsonCodec().encodeRaw(value);
+  const auto actual = json::encodeCompact(value);
+  KJ_REQUIRE(actual == std::string_view(expected.begin(), expected.size()));
+}
+
 void rejectedManifest() {
   class EmptyStore final: public kj::HttpService {
   public:
@@ -873,7 +1088,11 @@ int main(int argc, char* argv[]) {
   KJ_REQUIRE(argc == 2);
   const std::string_view name(argv[1]);
   if (name == "native-config") nativeConfig();
+  else if (name == "eager-call-admission") eagerCallAdmission();
   else if (name == "ingress-descriptor-plan") ingressDescriptorPlan();
+  else if (name == "peer-half-close") { peerHalfClose(); httpReadBeforeFin(); }
+  else if (name == "peer-session-liveness") peerSessionLiveness();
+  else if (name == "live-request-lease") liveRequestLease();
   else if (name == "tenant-execution") tenantExecution();
   else if (name == "deadlines") deadlines();
   else if (name == "event-loop") eventLoopProgress();
@@ -901,5 +1120,6 @@ int main(int argc, char* argv[]) {
   else if (name == "cache-capacity") cacheCapacity();
   else if (name == "cache-single-flight") cacheSingleFlight();
   else if (name == "rejected-manifest") rejectedManifest();
+  else if (name == "compact-invocation-json") compactInvocationJson();
   else KJ_FAIL_REQUIRE("unknown contract test", argv[1]);
 }

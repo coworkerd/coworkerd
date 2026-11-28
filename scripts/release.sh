@@ -101,7 +101,7 @@ command -v node >/dev/null && command -v npm >/dev/null || { echo "node and npm 
 COMMIT=$(git -C "$ROOT" rev-parse --short=12 HEAD)
 # Uncommitted changes to what the binary is built from: the hash of their diff, untracked files included.
 SOURCE_INPUTS=(common node apiserver launcher runtime CMakeLists.txt
-  patches/kj-http-abort.diff patches/capnp-http-upload.diff)
+  patches/kj-http-abort.diff patches/capnp-http-upload.diff patches/kj-peer-half-close.diff)
 DIRTY=$(cd "$ROOT" && {
   git diff --full-index HEAD -- "${SOURCE_INPUTS[@]}"
   git ls-files --others --exclude-standard -- "${SOURCE_INPUTS[@]}" | LC_ALL=C sort | while IFS= read -r file; do

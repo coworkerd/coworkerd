@@ -26,9 +26,11 @@ struct PlatformDefinitions {
   const PlatformDefinition product;
   std::optional<PlatformDefinition> fixture;
   std::map<std::pair<std::string, std::string>, PlatformClassRef> fixtureClasses;
+  std::string failChildOpenForTest;
 };
 
 PlatformDefinitions loadPlatformDefinitions();
+std::optional<uint64_t> alarmWallOverrideForTest(uint64_t maximum);
 const std::string& sqlDatabaseSource();
 inline constexpr std::string_view PLATFORM_WORKER_SUFFIX = "/:platform";
 std::optional<PlatformClassRef> platformClassFor(const DeploymentState::NamespaceOwner& owner,

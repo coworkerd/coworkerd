@@ -18,10 +18,10 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(capnproto)
 
-# Patch KJ's HTTP writes to propagate aborts and the Cap'n Proto HTTP adapter
-# to hold borrowed request data through upload acknowledgment.
+# Patch KJ's HTTP disconnect handling and the Cap'n Proto HTTP adapter's
+# ownership of borrowed request data through upload acknowledgment.
 find_package(Git REQUIRED)
-foreach(patch IN ITEMS kj-http-abort.diff capnp-http-upload.diff)
+foreach(patch IN ITEMS kj-http-abort.diff capnp-http-upload.diff kj-peer-half-close.diff)
   set(patch_file "${CMAKE_CURRENT_SOURCE_DIR}/patches/${patch}")
   execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${patch_file}"
     WORKING_DIRECTORY "${capnproto_SOURCE_DIR}" RESULT_VARIABLE patch_check
@@ -288,7 +288,11 @@ foreach(case native-config tenant-execution deadlines event-loop shutdown-signal
     cache-unavailable cache-deadline cache-capacity cache-single-flight cpu-culprit-current-behavior memory-culprit rejected-manifest)
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()
+add_test(NAME node-eager-call-admission COMMAND coworkerd-node-contract-test eager-call-admission)
 add_test(NAME node-ingress-descriptor-plan COMMAND coworkerd-node-contract-test ingress-descriptor-plan)
+add_test(NAME node-peer-half-close COMMAND coworkerd-node-contract-test peer-half-close)
+add_test(NAME node-peer-session-liveness COMMAND coworkerd-node-contract-test peer-session-liveness)
+add_test(NAME node-live-request-lease COMMAND coworkerd-node-contract-test live-request-lease)
 # The object store client's kept-alive connections, against a loopback store of the test's own.
 add_executable(coworkerd-object-store-test EXCLUDE_FROM_ALL common/object-store-test.c++)
 target_link_libraries(coworkerd-object-store-test PRIVATE common)
@@ -300,9 +304,11 @@ set_tests_properties(object-store-reuse object-store-broken object-store-retry-r
 add_executable(coworkerd-config-test EXCLUDE_FROM_ALL common/config-test.c++)
 target_link_libraries(coworkerd-config-test PRIVATE common)
 add_test(NAME node-config-idle COMMAND coworkerd-config-test idle)
+add_test(NAME node-config-call-admission COMMAND coworkerd-config-test admission)
 add_test(NAME node-config-memory COMMAND coworkerd-config-test memory)
 add_test(NAME node-config-tenant-borrow COMMAND coworkerd-config-test tenant-borrow)
 add_test(NAME node-config-websocket COMMAND coworkerd-config-test websocket)
+add_test(NAME node-config-egress COMMAND coworkerd-config-test egress)
 add_test(NAME node-config-liveness-grace COMMAND coworkerd-config-test liveness-grace)
 add_executable(coworkerd-v8-sandbox-test EXCLUDE_FROM_ALL node/v8-sandbox-test.c++ node/v8-sandbox.c++)
 target_include_directories(coworkerd-v8-sandbox-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/node")
@@ -438,6 +444,11 @@ foreach(case export import migrations project-config)
   add_test(NAME cli-${case} COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/cli/test/${case}.test.mjs")
 endforeach()
 add_test(NAME node-error-contract COMMAND "${COWORKERD_TEST_NODE}" --test "${CMAKE_CURRENT_SOURCE_DIR}/node/error-contract.test.mjs")
+add_test(NAME node-compact-invocation-json COMMAND coworkerd-node-contract-test compact-invocation-json)
+
+add_executable(coworkerd-bench-http-forwarder EXCLUDE_FROM_ALL
+  tests/cluster/main-thread-profile/http-forwarder.c++)
+target_link_libraries(coworkerd-bench-http-forwarder PRIVATE kj-http)
 
 set(COWORKERD_NATIVE_TEST_LOG "" CACHE FILEPATH "Output of the native KJ contract test")
 set(COWORKERD_NATIVE_TEST_RECEIPT "" CACHE FILEPATH "Native test source and result receipt")

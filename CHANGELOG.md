@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Behavior change.** Omitted ordinary-process call ceilings follow the process memory share and host task and descriptor budgets. Omitted node ceilings follow the ordinary pool and leave room for nested calls. The durable process default remains 512. See [waiting-call capacity](docs/guide/install.md#waiting-call-capacity).
+
+- **Behavior change.** Per-tenant outbound concurrency and rate limits are off by default. Set `egress.concurrency` to `32` and `egress.requestsPerSecond` to `100` to keep the previous defaults. Existing explicit settings keep their values.
+
 - **Diagnostic and profiling renames.** Update environment settings to use the new names. The old names are removed.
 
   | Old environment variable | New environment variable |

@@ -12,6 +12,7 @@ namespace coworkerd {
 namespace json {
 using Json = capnp::JsonValue;
 std::string quote(const std::string& value);
+std::string encodeCompact(Json::Reader value);
 // The field's value, or a null value when the object has no such field. Throws when `object` is not an object.
 Json::Reader field(Json::Reader object, const char* name);
 // A string field; throws (naming the field) when it is missing or not a string.

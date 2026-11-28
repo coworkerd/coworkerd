@@ -471,6 +471,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `management.token` | required | The management token (see section 8); the environment variable `COWORKERD_MANAGEMENT_TOKEN` takes precedence. A node without one refuses to start |
 | `management.allowWithoutToken` | `false` | `true` lets a development node start without a token: its management endpoints are then open to whoever reaches its ingress or peer port, and it warns at startup |
 | `processPool.count` | `1` | The number of ordinary workerd processes |
+| `processPool.inFlightLimit` | derived for ordinary and quarantine processes; 512 for durable processes | An explicit value sets the ceiling on each process. See [waiting-call capacity](#waiting-call-capacity). |
 | `processPool.ordinaryServer` | `threaded` | C++ backend for ordinary and quarantine processes: HTTP, JS RPC, outbound calls, logs, bindings, object stubs, CPU and memory limits, eviction and generation draining. `upstream` is refused for this setting. Durable processes use the Rust backend |
 | `processPool.threadedExecutable` | `coworkerd-threaded` beside `workerdPath` | Executable used when the ordinary backend is `threaded`. Build it with `//src/workerd/threaded:coworkerd-threaded` in the matching workerd fork |
 | `processPool.threadedMemoryBytes` | `0` | Native process memory budget in bytes. `0` divides 80% of the node's actual memory budget among ordinary, quarantine and durable processes plus one replacement generation. An explicit value cannot exceed this share |
@@ -487,6 +488,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `hostCheck.sampleMiB` | `16` | Fresh anonymous memory touched per round, `1` to `4096` MiB; larger samples increase both detection probability and cost. A failed helper is reported in `state.host` and retried at the next interval; service continues |
 | `idleEvictMs` | `300000` | How long a Worker may stay idle before it is evicted |
 | `drainTimeoutMs` | `30000` | How long to wait for in-flight calls when exiting; `0` turns the drain off (a drain closes the node's WebSocket connections with `1001` at its start) |
+| `ingress.tcpKeepalive.idleSeconds`, `intervalSeconds`, `probes` | `30`, `10`, `3` | TCP keepalive for accepted ingress connections. With the defaults, an unresponsive TCP endpoint is detected in about 60 seconds even while the response is silent. A socket error or a client FIN after the Worker reads the body starts the drain promptly. If an unread body hides the FIN, a reset or keepalive detects the disconnect. |
 | `ingress.webSocketsPerNode` | `0` (use the default) | Ceiling shared by all tenants on this ingress node, capped by the available descriptors. See [inbound WebSocket capacity](#inbound-websocket-capacity) |
 | `durableObjects.socketFrameBytesPerNode` | `134217728` (128 MiB) | Budget shared by all tenants for text and binary payloads in transit to threaded homes on this node. Each message reserves twice its payload size. `0` refuses all nonempty data messages that need home delivery. See [Durable Object WebSockets](durable-objects.md#4-websockets-and-hibernation) |
 | `rotation.*` | see the schema | Process rotation, which replaces a process by a new generation with in-flight requests completing in the old one: `binaryCheckMs` (rotate when the workerd file changes, default 1000), `residentBytes` (rotate a process whose resident memory reaches it; left out, 70% of the node's memory -- its container's `memory.max`, else `memoryBudgetBytes`, else the machine's), `maxAgeMs` (default `0`, off; a value replaces every process after that long, as releases before 0.4.1 did every hour), `maxRequests`, `drainTimeoutMs` and others |
@@ -503,7 +505,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `egress.defaultPolicy` / `egress.publicPorts` | `public` / `[80, 443]` | What a tenant may reach of the public addresses its own `allow` rules do not name: `public`, these ports of them; `deny`, none. The environment variable `COWORKERD_EGRESS_DEFAULT_POLICY` overrides it |
 | `egress.tenants[]` | none | Each tenant's rules: `tenant` (the tenant name), `allow`, `deny`, `allowInternal` (internal destinations the administrator allows), `concurrency`, `requestsPerSecond` (section 11) |
 | `egress.clusterAddresses` | none | Cluster addresses the node cannot see itself (load balancers, the nodes' other networks): `HOST[:PORT]`, an address or a CIDR; like object storage, the members and the control planes that announce themselves, tenants may not reach them |
-| `egress.timeoutMs` / `concurrency` / `requestsPerSecond` | `30000` / `32` / `100` | The timeout of each outgoing request; each tenant's outgoing concurrency and requests per second on each node |
+| `egress.timeoutMs` / `concurrency` / `requestsPerSecond` | `30000` / `0` / `0` | The timeout of each outgoing request, and the per-tenant limits on outgoing concurrency and request starts per second on each node. Each limit is off at `0` |
 | `egress.dnsCacheMs` / `caFile` / `systemTrustStore` | `10000` / none / `true` | How long a resolution result may be reused at most (`0`: resolve every time); extra PEM certificates trusted for HTTPS destinations; whether the system's root certificates are trusted |
 | `peerAuth.keyFile` / `peerAuth.windowMs` | none / `30000` | The cluster key file (section 12): when set, peer connections are signed and only signed ones accepted; the time window. The environment variable `COWORKERD_PEER_KEY_FILE` overrides it |
 | `membership.ttlSeconds` / `membership.heartbeatIntervalMs` / `membership.listIntervalMs` / `membership.livenessGraceMs` | `15` / `5000` / `10000` / `10000` | Membership on the object store: a heartbeat every interval (less than half the TTL), a listing of the members every interval, and a member whose heartbeat is older than the TTL plus the grace is dropped; the grace must be more than the heartbeat interval plus 1,150 ms (a node refuses to start otherwise and names the values); a node that wrote none for the TTL considers its epoch expired and confirms no Durable Object write of it from then on (cluster-state section 3); after this node could not list the store for longer than the TTL, the members whose heartbeat objects still exist are kept for the TTL plus the grace from its first listing again. **Every node must use the same TTL, interval and grace**: nothing checks this across nodes |
@@ -520,8 +522,9 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 With dynamic ingress placement, a candidate can decline a new stateless root at 90% isolate busy
 time or 95% of available node CPU over about 3 s. The isolate reading requires a threaded kernel
 with busy-time reporting. Linux cgroup v2 CPU usage covers the node's own cgroup and its
-descendants. When the first pass finds no candidate, ingress can retry soft refusals while
-enforcing the usual limits. [Cluster placement](../cluster-state.md#7-placement)
+descendants. When the first pass finds no candidate, ingress can retry soft refusals, preferring
+fewer in-flight calls for that Worker among equally healthy nodes. For a CPU saturation refusal it
+uses the node-wide count. The usual limits still apply. [Cluster placement](../cluster-state.md#7-placement)
 
 The experimental `processPool.tenantInFlightLimit` is disabled by default (`0`). When omitted, it creates no tenant execution counters or waiters and imposes no per-tenant call limit. It is not recommended for use; CPU-share fairness remains under evaluation. Explicit nonzero settings retain the experimental borrowable limit and `tenantAdmissionWaitMs` wait setting for development only. Per-request CPU and memory limits, process memory admission, node watermarks, and total process safety limits still apply.
 
@@ -536,7 +539,7 @@ All fields are in `ServerConfig` of the source `common/schema/coworkerd.capnp`. 
 `COWORKERD_GC_BUDGET_MS`, `COWORKERD_GC_REFILL_MS_PER_S`, `COWORKERD_GC_LONG_PAUSE_MS`, `COWORKERD_IDLE_GC_MS`, `COWORKERD_IDLE_GC_MIN_MIB`, `COWORKERD_GC_INITIAL_OLD_SPACE_MIB`, `COWORKERD_STATIC_HEAP_MIB` (the `gc` fields, in that order),
 `COWORKERD_SANDBOX_MODE`, `COWORKERD_SANDBOX_SYSCALLS`, `COWORKERD_SANDBOX_ALLOWLIST`, `COWORKERD_SANDBOX_SYSCALLS_STEADY`, `COWORKERD_SANDBOX_STEADY_ALLOWLIST`, `COWORKERD_EGRESS_MODE`, `COWORKERD_EGRESS_DEFAULT_POLICY`,
 and for the Workers' logs `COWORKERD_TENANT_LOG_BUFFER_BYTES`, `COWORKERD_WORKER_LOG_TOTAL_BYTES`, `COWORKERD_WORKER_LOG_LINES_PER_SECOND`, `COWORKERD_WORKER_LOG_MAX_LINE_BYTES`, `COWORKERD_WORKERD_LOG_MAX_BYTES`, `COWORKERD_WORKERD_LOG_FILES`.
-Some settings have no field in the file and are set only this way: the call lease's `COWORKERD_LEASE_TTL_MS` (default `30000`) and the legacy overrides described under [invocation budgets](#invocation-budgets);
+Some settings have no field in the file and are set only this way: `COWORKERD_LEASE_TTL_MS` for preparation, WebSocket message leases and bounded actor-originated trees (default `30000`) and the legacy overrides described under [invocation budgets](#invocation-budgets);
 the limits on a package's assets, `COWORKERD_ASSET_MAX_COUNT` (`20000`), `COWORKERD_ASSET_MAX_FILE_BYTES` (25 MiB) and `COWORKERD_ASSET_MAX_TOTAL_BYTES` (100 MiB); and the log buffers `COWORKERD_LOG_BUFFER_BYTES` and `COWORKERD_WORKERD_LOG_BUFFER_BYTES` (4 MiB each).
 Names ending in `_FOR_TEST` are for tests only.
 
@@ -546,6 +549,22 @@ Names ending in `_FOR_TEST` are for tests only.
 `COWORKERD_PEER_KEY_FILE` (by default `cluster-key.json` there, used when present), `COWORKERD_PEER_ADDRESS`, `COWORKERD_LISTEN_ADDRESS`, `COWORKERD_PEER_LISTEN_ADDRESS`,
 `COWORKERD_PROCESS_COUNT`, `COWORKERD_STACK_DIR`, and `COWORKERD_CONTROL_ADDRESS` (the control plane's address, written into `egress.clusterAddresses`, default `apiserver:8940`);
 with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give the same configuration. The secrets directory is `COWORKERD_SECRETS_DIR` (default `/var/lib/coworkerd-secrets`); either way the management token, `COWORKERD_MANAGEMENT_TOKEN` or else the secrets directory's `management-token`, reaches the node through its environment, so it takes precedence over a file's `management.token`.
+
+### Waiting-call capacity
+
+The node's call ceilings are an overload fuse, with new roots stopped before nested calls so
+that admitted trees can continue. An ordinary or quarantine process defaults to one slot
+per MiB of its assigned memory, between 512 and 16,384 before any task or descriptor reduction,
+and the node defaults to all ordinary slots for nested calls and three quarters for roots.
+A Worker that waits on an upstream for a long time can reach the fuse first on a small node, and
+operators can raise it by adding memory and OS capacity or explicitly setting
+`processPool.inFlightLimit` after checking the budgets.
+
+An explicit setting is taken as given. An omitted placement ceiling stays within the
+ordinary slots, and an omitted root ceiling leaves room below an explicit nested ceiling.
+A one-slot ordinary pool needs both placement limits set explicitly. Durable processes
+keep a default of 512 calls per process. [Historical readings and reproduction](../waiting-call-capacity.md)
+
 
 ### Invocation budgets
 
@@ -563,6 +582,12 @@ cowctl tenant update T --default-subrequests 50 --default-d1-queries 50
 `defaultLimits.subrequests` accepts 1 through 10,000. `defaultLimits.d1Queries` accepts 1 through 1,000 and applies across the tenant's database bindings. Each invocation gets its own D1 allowance. A query, a `batch()`, or an `exec()` spends a single D1 request and one subrequest. The administrator sets the full `defaultLimits` object in one update. Include any CPU and memory defaults you want to keep.
 
 Existing Worker versions inherit the tenant or node default. `COWORKERD_SUBREQUEST_BUDGET` still supplies the node's fallback in lieu of 10,000. An existing `COWORKERD_SUBREQUEST_GRANT` setting is accepted with a startup warning. Each callee resolves its own limit. Upgrade the nodes, control plane and kernel together before deploying versions with `limits.subrequests`. See [the call lease](../architecture.md#3-the-path-of-one-call) for counted operations and [error codes](errors.md) for quota refusals.
+
+A Durable Object's outgoing `fetch()` between incoming events has no invocation budget to debit. Its egress policy and any configured rate limits still apply.
+
+### Inbound HTTP capacity
+
+A connected Worker request holds a concurrent root slot on its execution node for the duration of the response, including idle streaming time. The node refuses new roots when its combined root and nested occupancy reaches `placement.rootLimit`. Set `placement.tenantRootLimit` to reserve room for other tenants. A new root that reaches either limit receives `503 OVERLOADED` before dispatch.
 
 ### Inbound WebSocket capacity
 
@@ -746,6 +771,7 @@ Changing the token: edit `.env` (or the environment file), then start the nodes 
 
 Clusters using Durable Objects or D1 require a new installation for 0.5.6; see [Upgrading to 0.5.6](#upgrading-to-056) below.
 Clusters using neither Durable Objects nor D1 can replace packages one node at a time: stop one node, replace its complete package, then start it and wait until it is ready before proceeding to the next.
+Peer protocol revisions 1 and 2 refuse each other before dispatch. Stateless placement can try a different node on the same revision. A Durable Object whose shard owner has the other revision is unavailable from that node until the upgrade restores compatible peers.
 
 - **One node exits**: `SIGTERM` (`docker compose stop`, `systemctl stop`) or `coworkerd-apiserver tool drain --server http://<ingress> --wait`
   (with the token). The node first announces its exit (readiness turns 503, its drain marker appears in the object store, and the other nodes stop placing new calls on it at their next listing), waits for the in-flight calls to complete (at most `drainTimeoutMs`), closes workerd,
@@ -859,8 +885,13 @@ Each entry is a name (`api.example.com`), a wildcard (`*.example.com`), an addre
 **Names are resolved on the node**: **every** address a resolution yields has to pass the check, and connections go only to the checked addresses; a result is reused for at most `egress.dnsCacheMs` (10 seconds by default; the system resolver
 reports no TTL, so this is the bound), so after a name is pointed at an internal address the next resolution is refused, and requests within the reuse period still go only to the addresses checked back then.
 
-**Limits and accounting**: each tenant has an outgoing concurrency limit (`concurrency`, default 32) and a requests-per-second limit (`requestsPerSecond`, default 100, a token bucket) on each node; beyond them it gets
-`EGRESS_DENIED: concurrency-limit` / `rate-limit`, without affecting other tenants; each request has a timeout (`egress.timeoutMs`, until the response headers arrive, and between two reads of the body).
+Each node can limit a tenant's outgoing requests in flight (`egress.concurrency`) and request starts per second
+(`egress.requestsPerSecond`, a token bucket). Both default to `0`. Set either to a positive value to enable
+that limit on its own. A positive value in `egress.tenants[]` overrides the corresponding node setting for
+that tenant. An omitted or zero tenant value inherits it. Keep explicit values of `32` and `100` to retain
+the previous defaults.
+Exceeding a limit returns `EGRESS_DENIED: concurrency-limit` or `EGRESS_DENIED: rate-limit` for that tenant.
+Each request has a timeout (`egress.timeoutMs`, until the response headers arrive and between body reads).
 The bytes of request and response bodies (for WebSocket, the bytes of the messages) count into the tenant's usage: the state endpoint's `egress.tenants.<tenant>` has `requestBytes`, `responseBytes` and their sum
 `egressBytes` (the same bytes count hourly into the tenant's usage rows, the egress bytes of `cowctl usage`), plus `requests`, `allowed`, `denied` (by rule), `failed` (by category) and `inFlight`.
 Each request has a line `[egress] {...}` in the node log (not counted against the tenant's log quota), except that limit refusals are logged at most once a second per tenant, with the count of the lines left out; the state endpoint's `egress.cluster` lists the single addresses currently treated as the cluster's own (the first 64) and counts the CIDR ranges.

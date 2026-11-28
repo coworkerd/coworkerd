@@ -5,57 +5,60 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
+import { checksumFor } from './hot-worker-checksum.mjs';
 
 const [mode, productArg, kernelArg, reportArg, iterationsArg, hotRateArg, option, ...extra] = process.argv.slice(2);
 const iterations = Number(iterationsArg);
 const hotRate = Number(hotRateArg);
 const calibrate = mode === 'calibrate';
+const overload = mode === 'overload';
+const sustained = mode === 'sustained';
+const singleNode = sustained && hotRateArg === '--one-node';
 const longRun = option === '--long';
-assert.ok(['dynamic', 'pinned', 'calibrate'].includes(mode) && productArg && kernelArg && reportArg &&
+assert.ok(['dynamic', 'pinned', 'calibrate', 'overload', 'sustained'].includes(mode) && productArg && kernelArg && reportArg &&
   Number.isSafeInteger(iterations) && iterations > 0 && iterations <= 500_000_000 && !extra.length &&
-  (option === undefined || (!calibrate && longRun)) &&
-  (calibrate ? hotRateArg === undefined : Number.isInteger(hotRate) && hotRate > 0 && hotRate <= 100),
-  'Usage: node tests/cluster/hot-worker-placement.mjs <dynamic|pinned|calibrate> <product-checkout> ' +
-  '<verified-kernel-directory> <new-report.jsonl> <iterations> [hot-requests-per-second [--long]]');
+  (calibrate || overload || sustained ? (hotRateArg === undefined || singleNode) && option === undefined :
+    (option === undefined || longRun) && Number.isInteger(hotRate) && hotRate > 0 && hotRate <= 100),
+  'Usage: node tests/cluster/hot-worker-placement.mjs <dynamic|pinned|calibrate|overload|sustained> <product-checkout> ' +
+  '<verified-kernel-directory> <new-report.jsonl> <iterations> [hot-requests-per-second [--long] | --one-node]');
 
 const productRoot = resolve(productArg);
 const kernel = resolve(kernelArg);
 const report = resolve(reportArg);
-const pinned = mode !== 'dynamic';
-const home = 'node-3';
+const pinned = calibrate || mode === 'pinned';
+const home = singleNode ? 'node-1' : 'node-3';
 const hot = 'hot-placement/compute';
-const light = 'hot-neighbor/light';
+const light = overload || sustained ? null : 'hot-neighbor/light';
 const clientImage = 'node:22-trixie';
+const warmupTimeoutMs = 600_000;
 const controller = new AbortController();
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => controller.abort(new Error(`Interrupted by ${signal}`)));
 }
 
-function checksum() {
-  let value = 1234;
-  for (let i = 0; i < iterations; ++i) value = (Math.imul(value ^ i, 1664525) + 1013904223) | 0;
-  return value;
-}
+const checksum = checksumFor(iterations);
 
 await writeFile(report, '', { flag: 'wx' });
 const record = value => appendFile(report, JSON.stringify(value) + '\n');
 const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-hot-placement-')), kernel, controller.signal, {
   productRoot,
+  singleNode,
   configureNode: () => ({
-    ingressPlacement: true,
-    // This enables per-tenant slot accounting. The fixture sends only roots and the
-    // tenant ceiling for nested calls is the same as the node-wide nested ceiling.
-    placement: { homeProbability: 1, ...(longRun && { tenantNestedLimit: 384 }) },
+    ingressPlacement: !singleNode,
+    // Keep the ceilings from the recorded comparison. The optional tenant ceiling
+    // enables slot accounting for the long run, whose traffic consists of roots.
+    placement: { rootLimit: 128, nestedLimit: 384, homeProbability: 1, ...(longRun && { tenantNestedLimit: 384 }) },
     ...(pinned && { placements: [{ workerId: hot, nodeId: home }] }),
   }),
 });
 
 async function waitForHomes() {
-  await eventually('all ingresses agree that both Workers have the same home', async () => {
+  const workers = light ? [hot, light] : [hot];
+  await eventually('all ingresses agree on the Worker homes and candidates', async () => {
     for (const node of cluster.nodes) {
-      const path = `/__coworkerd/placement?workers=${hot},${light}`;
+      const path = `/__coworkerd/placement?workers=${workers.join(',')}`;
       const rows = json(await request(cluster.urls[node], path, { token: cluster.management }), 200, 'Worker homes');
-      assert.equal(rows.length, 2);
+      assert.equal(rows.length, workers.length);
       for (const row of rows) {
         assert.equal(row.home, home);
         assert.deepEqual([...row.candidates].sort(), cluster.nodes);
@@ -74,16 +77,16 @@ async function measure() {
   const kernelHashes = Object.fromEntries(await Promise.all(kernels.map(async name => [name, await sha256(join(kernel, name))])));
   for (const name of kernels) assert.equal(kernelHashes[name], manifest.files[name]);
   const binaries = resolve(process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(productRoot, 'build'));
-  await record({ metric: 'provenance', mode, longRun, iterations, hotRate: calibrate ? null : hotRate, home,
+  await record({ metric: 'provenance', mode, longRun, iterations, hotRate: calibrate || overload || sustained ? null : hotRate, home,
     commit: await cluster.command('git', ['rev-parse', 'HEAD'], { cwd: productRoot }),
     cliVersion: JSON.parse(await readFile(join(productRoot, 'cli/package.json'), 'utf8')).version,
     productBinarySha256: await sha256(join(binaries, 'coworkerd')),
     kernelRelease: pins.releaseTag, archiveSha256: pins.archives[manifest.architecture], kernelHashes,
     architecture: manifest.architecture, patchSeriesSha256: pins.patchSeriesSha256 });
   await cluster.start();
-  await waitForHomes();
+  if (!singleNode) await waitForHomes();
   const hotTenant = await cluster.tenant('hot-placement');
-  const lightTenant = await cluster.tenant('hot-neighbor');
+  const lightTenant = light ? await cluster.tenant('hot-neighbor') : null;
   await cluster.deploy(hotTenant, 'compute', `
     const iterations = ${iterations};
     ${checksum.toString()}
@@ -92,9 +95,11 @@ async function measure() {
       return Response.json({ nodeId: request.cf.nodeId, id, checksum: checksum() });
     } };
   `);
-  await cluster.deploy(lightTenant, 'light', `export default { fetch(request) {
-    return Response.json({ nodeId: request.cf.nodeId });
-  } };`);
+  if (lightTenant) {
+    await cluster.deploy(lightTenant, 'light', `export default { fetch(request) {
+      return Response.json({ nodeId: request.cf.nodeId });
+    } };`);
+  }
 
   const cpu = Object.fromEntries(await Promise.all(cluster.nodes.map(async node => {
     const details = await cluster.compose(['exec', '-T', node, 'sh', '-ec',
@@ -106,18 +111,23 @@ async function measure() {
   const daemonVersion = await cluster.compose(['exec', '-T', home, 'coworkerd', '--version']);
   await record({ metric: 'daemon-version', lines: daemonVersion.split('\n') });
   const input = join(cluster.directory, 'placement-measure.json');
-  await writeFile(input, JSON.stringify({ home, hot, light, hotRate: calibrate ? null : hotRate, calibrate, longRun, checksum: checksum(),
-    nodes: cluster.nodes, management: cluster.management }), { mode: 0o600 });
+  await writeFile(input, JSON.stringify({ home, hot, light, hotRate, pinned, calibrate, overload, sustained, longRun,
+    warmupTimeoutMs, checksum: checksum(), nodes: cluster.nodes, management: cluster.management }), { mode: 0o600 });
   const client = fileURLToPath(new URL('./hot-worker-placement-client.mjs', import.meta.url));
+  const timeout = sustained ? 720_000 : warmupTimeoutMs + (overload ? 540_000 : 420_000);
   const result = await cluster.command('docker', ['run', '--rm', '--network', `${cluster.project}_frontend`,
     '-v', `${input}:/measure.json:ro`, '-v', `${client}:/client.mjs:ro`, clientImage, 'node', '/client.mjs'],
-  { timeout: 420000, maxBuffer: 8 * 1024 * 1024 });
+  { timeout, maxBuffer: 8 * 1024 * 1024 });
   for (const line of result.split('\n')) {
     const row = JSON.parse(line);
     await record(row);
     delete row.hot;
     delete row.light;
+    if (sustained) delete row.roots;
     console.log(JSON.stringify(row));
+    if (row.metric === 'sustained') {
+      assert.deepEqual(row.hotSummary.codes, {}, 'all sustained calls must return valid replies');
+    }
   }
 }
 

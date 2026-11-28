@@ -147,6 +147,18 @@ def allowed_path(name, path):
     rust_path = (path.startswith(("src/workerd/server/server/", "src/workerd/server/cli/")) and
                  path in RUST_PATHS.get(name, frozenset()))
     return canonical and ((server_path and not path.endswith(".rs")) or rust_path or
+                          name == '0160-alarm-wall-limit.patch' and path in {
+                              'src/workerd/threaded/BUILD.bazel',
+                              'src/workerd/threaded/threaded-server.c++'} or
+                          name == '0161-threaded-request-lease-drain.patch' and path in {
+                              'src/workerd/threaded/protocol.capnp',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
+                          name in {'0162-alarm-limit-visibility.patch', '0163-drain-promise-branch.patch',
+                                   '0164-own-drain-continuation.patch', '0165-finish-http-before-drain.patch'} and
+                              path == 'src/workerd/threaded/threaded-server.c++' or
+                          name == '0167-update-isolate-busy-test-invocation.patch' and
+                              path == 'src/workerd/threaded/threaded-server-test.c++' or
                           name == '0042-threaded-server-s1a.patch' and path in {
                               'src/workerd/threaded/BUILD.bazel',
                               'src/workerd/threaded/threaded-server.c++',
@@ -320,6 +332,9 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/util/sqlite.c++',
                               'src/workerd/util/sqlite.h'} or
+                          name == '0124-bound-threaded-wal-home-notifications.patch' and path in {
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++'} or
                           name == '0185-measure-isolate-busy-time.patch' and path in {
                               'src/workerd/jsg/jsg.c++',
                               'src/workerd/jsg/observer.h',
@@ -398,6 +413,18 @@ def allowed_path(name, path):
                               'src/workerd/util/sqlite.h'} or
                           name == '0184-charge-database-sqlite-heap-to-process.patch' and path in {
                               'src/workerd/api/actor-state.c++',
+                              'src/workerd/threaded/threaded-server.c++',
+                              'src/workerd/threaded/threaded-server-test.c++',
+                              'src/workerd/util/sqlite-metering.c++',
+                              'src/workerd/util/sqlite-metering.h',
+                              'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h'} or
+                          name == '0187-bound-object-sqlite-memory.patch' and path in {
+                              'src/workerd/api/actor-state.c++',
+                              'src/workerd/api/sql.c++', 'src/workerd/api/sql.h',
+                              'src/workerd/io/actor-sqlite.c++', 'src/workerd/io/actor-sqlite.h',
+                              'src/workerd/jsg/BUILD.bazel',
+                              'src/workerd/jsg/coworkerd-rpc-code.c++',
+                              'src/workerd/jsg/coworkerd-rpc-code.h',
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++',
                               'src/workerd/util/sqlite-metering.c++',
