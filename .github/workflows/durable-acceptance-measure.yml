@@ -46,7 +46,7 @@ jobs:
           printf 'KERNEL_DIR=%s\n' "$kernel" >> "$GITHUB_ENV"
           mkdir -p build/durable-acceptance
           clang-19 --version > build/durable-acceptance/compiler.txt
-      - name: Measure upstream and threaded in sequence
+      - name: Measure threaded wake and hibernation
         if: inputs.scope == 'all' || inputs.scope == 'wake'
         run: |
           node tests/cluster/durable-wake-measure.mjs "$KERNEL_DIR" build/durable-acceptance/wake.jsonl \

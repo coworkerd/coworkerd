@@ -303,7 +303,6 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.durableLog.alarmFireConcurrency = durable.getAlarmFireConcurrency();
   result.durableLog.residentObjects = durable.getResidentObjects();
   result.processPool.threadedDurableTestStorage = durable.getThreadedTestStorage();
-  result.processPool.threadedDurableStorage = durable.getThreadedStorage();
   result.durableLog.usagePublishMs = durable.getUsagePublishMs();
   result.durableLog.alarmDiscoveryIntervalMs = durable.getAlarmDiscoveryIntervalMs();
   result.durableLog.alarmTakeoverConcurrency = durable.getAlarmTakeoverConcurrency();
@@ -402,8 +401,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.runtimePath = root.getRuntimePath().cStr();
   result.listenAddress = root.getListenAddress().cStr();
   if (result.processPool.threadedDurableTestStorage) {
-    KJ_REQUIRE(!result.processPool.threadedDurableStorage &&
-        !given({"storage"}) && !given({"desiredState", "objectStore"}) &&
+    KJ_REQUIRE(!given({"storage"}) && !given({"desiredState", "objectStore"}) &&
         result.membership.backend == "file" && result.desiredState.backend == "file" &&
         result.peers.empty() && !result.servePathsGiven(),
         "durableObjects.threadedTestStorage requires the positional single-node fixture and disposable local storage");
@@ -469,13 +467,6 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   {
     const auto& m = result.membership;
     KJ_REQUIRE(m.backend == "file" || m.backend == "objectStore", "membership.backend must be file or objectStore", m.backend.c_str());
-    if (result.processPool.threadedDurableStorage) {
-#ifdef __linux__
-      KJ_REQUIRE(m.backend == "objectStore", "durableObjects.threadedStorage requires object-store membership");
-#else
-      KJ_FAIL_REQUIRE("durableObjects.threadedStorage requires Linux");
-#endif
-    }
     if (m.backend == "objectStore") {
       KJ_REQUIRE(result.desiredState.objectStore.backend == "s3" && !result.desiredState.objectStore.endpoint.empty(),
           "membership.backend objectStore keeps the members in the object store: it needs the storage block (or "

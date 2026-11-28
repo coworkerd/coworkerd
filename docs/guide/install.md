@@ -26,9 +26,9 @@ The package:
 
 | Entry | Contents |
 | --- | --- |
-| `bin/` | `coworkerd` (the node daemon; `coworkerd check` is its self-check, `coworkerd check storage` the object store's), `coworkerd-apiserver` (the control plane, and the operations tool `coworkerd-apiserver tool`), `coworkerd-launcher` (starts workerd in a least-privilege environment, see "Sandbox" in section 4), `workerd`, `coworkerd-threaded` (the server for ordinary Worker processes), `cowctl` (the command line; it runs `lib/cowctl` with the machine's Node.js), and `coworkerd-syscalls-startup.txt`, `coworkerd-syscalls-steady.txt` and `coworkerd-syscalls.json` (the system call allowlist of this workerd and the record of how it was generated, see "System call allowlist" in section 4) |
+| `bin/` | `coworkerd` (the node daemon; `coworkerd check` is its self-check, `coworkerd check storage` the object store's), `coworkerd-apiserver` (the control plane, and the operations tool `coworkerd-apiserver tool`), `coworkerd-launcher` (starts workerd in a least-privilege environment, see "Sandbox" in section 4), `workerd`, `coworkerd-threaded` (the server for ordinary, quarantine and durable processes), `cowctl` (the command line; it runs `lib/cowctl` with the machine's Node.js), and `coworkerd-syscalls-startup.txt`, `coworkerd-syscalls-steady.txt` and `coworkerd-syscalls.json` (the system call allowlist of this workerd and the record of how it was generated, see "System call allowlist" in section 4) |
 | `lib/` | `lib/cowctl/`: `cowctl` and the wrangler adapter with their dependencies |
-| `runtime/` | `runtime.js`, the runtime bridge every workerd process loads |
+| `runtime/` | `runtime.js`, used to assemble the durable process configuration |
 | `docker/` | The compose file `docker-compose.yml`, `docker-compose.sandbox.yml` (section 3), `entrypoint.sh` for the Coworkerd services, `storage-entrypoint.sh` for storage, the `Dockerfile`, `.env.example`, and `examples/hello/`: the example project the compose `tool` service mounts by default |
 | `examples/` | `hello-world`, `durable-counter` (the quickstart's Durable Object counter with one D1 query, section 9 of the quickstart) and two official Cloudflare templates |
 | `docs/` | This document, the quickstart, the compatibility scope, the error codes, the databases guide and the Durable Objects guide |
@@ -464,7 +464,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `storage.cacheDirectory` / `storage.cacheMaxBytes` | `<stack directory>/cache` / 64 MiB | The local caches of code (bundles, `packages/`, `modules/`), each of the three bounded by `cacheMaxBytes` |
 | `stackDirectory` | `/var/lib/coworkerd` | The stack directory: `logs/`, `run/` (the Unix sockets shared with workerd, mode 0700; a stack directory whose path is too long for those sockets stops the start), `cache/`, `processes/`, and on Linux with the sandbox not `off` `sandbox/` (0700) |
 | `workerdPath` | `workerd` in the directory of `coworkerd` | The workerd executable |
-| `runtimePath` | `../runtime/runtime.js` (relative to the directory of `coworkerd`) | The durable processes' runtime script. Ordinary and quarantine processes do not load it |
+| `runtimePath` | `../runtime/runtime.js` (relative to the directory of `coworkerd`) | Runtime module included in the node package for the durable process configuration |
 | `listenAddress` | `0.0.0.0:8930` | The ingress (also the management endpoints) |
 | `peerListenAddress` | `0.0.0.0:8934` | The peer listener (calls from other nodes, trial loads during deployment) |
 | `advertisedAddress` | `<hostname>:<peer port>` | The address other nodes use to reach this node; they must be able to connect to it |
@@ -472,18 +472,16 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `management.allowWithoutToken` | `false` | `true` lets a development node start without a token: its management endpoints are then open to whoever reaches its ingress or peer port, and it warns at startup |
 | `processPool.count` | `1` | The number of ordinary workerd processes |
 | `processPool.inFlightLimit` | derived for ordinary and quarantine processes; 512 for durable processes | An explicit value sets the ceiling on each process. See [waiting-call capacity](#waiting-call-capacity). |
-| `processPool.ordinaryServer` | `threaded` | C++ backend for ordinary and quarantine processes: HTTP, JS RPC, outbound calls, logs, bindings, object stubs, CPU and memory limits, eviction and generation draining. `upstream` is refused for this setting. Durable processes use the Rust backend |
-| `processPool.threadedExecutable` | `coworkerd-threaded` beside `workerdPath` | Executable used when the ordinary backend is `threaded`. Build it with `//src/workerd/threaded:coworkerd-threaded` in the matching workerd fork |
+| `processPool.ordinaryServer` | `threaded` | C++ backend for ordinary and quarantine processes: HTTP, JS RPC, outbound calls, logs, bindings, object stubs, CPU and memory limits, eviction and generation draining. `upstream` is refused for this setting. Durable processes also run on the threaded server |
+| `processPool.threadedExecutable` | `coworkerd-threaded` beside `workerdPath` | Executable for ordinary, quarantine and durable processes. Build it with `//src/workerd/threaded:coworkerd-threaded` in the matching workerd fork |
 | `processPool.threadedMemoryBytes` | `0` | Native process memory budget in bytes. `0` divides 80% of the node's actual memory budget among ordinary, quarantine and durable processes plus one replacement generation. An explicit value cannot exceed this share |
 | `processPool.threadedResidentLimit` | `1840` | Maximum resident Worker versions in a native process, from `1` to `1840` for this shared pointer-space build. Memory and address budgets can refuse earlier. Idle versions are evicted before a new version is admitted |
 | `processPool.threadedThreadIdleMs` | `60000` | Native call threads above the warm pool of 32 are released after this idle interval. `0` keeps them. The pool grows up to `inFlightLimit`; eight separate control loops maintain state and return pre-execution refusals |
-| `processPool.sqlCpuLimitMs` | `200` | Cumulative native SQL CPU per object event, shared by statements, batches and ingest segments. Short segments use a random sample estimate; long segments are measured. Integer from `1` to `60000` |
-| `processPool.sqlWallLimitMs` | `800` | Cumulative active SQL wall time as a fallback, excluding time outside SQL. Integer from `1` to `60000`. The 3000 ms process watchdog remains the fallback for operations without SQLite progress callbacks |
 | `processPool.pausedAdmissionWaitMs` | `1000` | Admission wait for a live paused process when no ready process or candidate node can take the call; bounded by the lease and concurrency limits. `0` disables it; must be less than `processPool.stuckTimeoutMs` |
 | `quarantineProcesses` | `2` | The number of quarantine processes. A **tenant** identified as the culprit (all its Workers) is kept here for an observation period, assigned to one of them by the tenant's hash, so that a tenant crashing a quarantine process does not affect the tenants in another shard; deployment **trial loads** run here too (in the target tenant's shard), so that a new version crashing a process does not take the in-flight requests of the ordinary processes with it. `0`: no quarantine processes; suspects and trial loads both fall back to the ordinary processes (not recommended) |
 | `suspectBaseMs` / `suspectMaxMs` | `600000` / `3600000` | Initial and maximum suspicion periods. Another offense while suspected or in local probation doubles the previous duration, capped by the maximum |
 | `suspectProbation` | `true` | After the deadline, keep stateless calls in quarantine until one invocation dispatched there after expiry fully completes without killing or crashing the process. Each node releases independently; probation is local and lost on restart. `false` restores release at expiry; no effect with `quarantineProcesses: 0`. See [process isolation](../process-isolation.md), section 7 |
-| `cpuLimitMs` / `memoryLimitMiB` | `30000` / `128` | CPU milliseconds per ordinary request and memory MiB per isolate; Worker or tenant limits take precedence. CPU limits can be configured up to `300000` ms (5 minutes). Durable processes retain a 200 ms CPU default; an explicitly configured node CPU limit applies to both backends |
+| `cpuLimitMs` / `memoryLimitMiB` | `30000` / `128` | CPU milliseconds per ordinary request and memory MiB per isolate; Worker or tenant limits take precedence. CPU limits can be configured up to `300000` ms (5 minutes). Durable events default to 30,000 ms and use the Worker and tenant limits |
 | `hostCheck.intervalMs` | `60000` | Independent first-touch check at startup and once per interval; `0` disables it, otherwise `1000` to `86400000` ms. A yellow or red memory band skips the round. No measurement process or sample mapping remains between rounds |
 | `hostCheck.sampleMiB` | `16` | Fresh anonymous memory touched per round, `1` to `4096` MiB; larger samples increase both detection probability and cost. A failed helper is reported in `state.host` and retried at the next interval; service continues |
 | `idleEvictMs` | `300000` | How long a Worker may stay idle before it is evicted |
@@ -512,8 +510,8 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `membership.clockSkewToleranceMs` / `membership.createSettleMs` | `2000` / `1000` | How far this machine's clock may be from the store's `Date` (more refuses the start, and is only warned of while running); how long a new epoch's registration settles before it is read back |
 | `membership.backend` / `desiredState.backend` | `objectStore` with the `storage` block | Where the members and the desired state are kept: a node started with `--config` requires `objectStore` for both, and `file` is only the command line's test form (a 0.3 `etcd` backend is refused, section 9) |
 | `desiredState.pollIntervalMs` | `5000` | How often the node reads the tenant index's hint, and what changed (50 to 3600000) |
-| `placement.tenantRootLimit` | `0` | Per-tenant share for concurrent root calls on this node. `0` disables this check; the node-wide `rootLimit` still applies. |
-| `placement.tenantNestedLimit` | `0` | Per-tenant share for concurrent nested calls on this node. `0` disables this check; the node-wide `nestedLimit` still applies. |
+| `placement.tenantRootLimit` | `0` | Per-tenant share for concurrent root calls on this node, excluding Durable Object and database calls. At `0` only the node-wide `rootLimit` applies. |
+| `placement.tenantNestedLimit` | `0` | Per-tenant share for concurrent nested calls on this node, excluding Durable Object and database calls. At `0` only the node-wide `nestedLimit` applies. |
 | `placement.tenantBorrowBelowPercent` | `0` | Integer between `0` and `100`. `0` keeps enabled per-tenant limits hard. Otherwise, a tenant beyond its share can borrow while total node occupancy (roots plus nested calls) is strictly below this percentage of `rootLimit` for a root or `nestedLimit` for a nested call. At or above that threshold, new calls beyond a tenant’s share get the existing retryable `503 OVERLOADED` tenant refusal. Calls already admitted may finish. Node state at `placement.tenantAdmission` shows current `borrowed` occupancy and cumulative `busyRejections` by tenant and call type. |
 | `placement.subcalls` | `local` | Stateless Service Binding fetch / method placement: `local` tries the caller's node first and falls back to the normal warm/home policy on refusal. Select `home` to use that policy directly for memory-first deployments or large caller fan-out. Object calls follow their shard owner |
 | `placement.*`, `membership.*`, `desiredState.*` | see the schema | Detailed parameters of placement, membership and the desired state; `storage` is the shorthand of `desiredState.objectStore` (they cannot both be given) and puts the desired state and the membership on the object store, which a node requires. Entries in `placements` use `nodeId`, and Workers their full name `tenant/Worker` |
@@ -607,12 +605,11 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 
 ### Durable Objects and local storage
 
-`durableObjects.processes` defaults to `1` (`d0`), accepts `0`–`64`, and is independent of `processPool.count`. At `0` a node still receives and forwards object / database calls but acquires no shards. Its membership advertises that count. The durable settings below belong in the JSON configuration (`COWORKERD_CONFIG` uses that file directly).
+`durableObjects.processes` defaults to `1` (`d0`), accepts `0`–`64`, and is independent of `processPool.count`. At `0` a node still receives and forwards object / database calls but acquires no shards. Its membership advertises that count. Durable slots run the threaded server on Linux with object-store membership. The same server runs Worker object calls and [HTTP SQL and D1](databases.md#threaded-database-capacity) on the shard owner. The durable settings below belong in the JSON configuration (`COWORKERD_CONFIG` uses that file directly).
 
 | `durableObjects` key | Default | Meaning |
 | --- | --- | --- |
 | `processes` | `1` | Number of durable workerd slots, not per tenant |
-| `threadedStorage` | `false` | Experimental Linux opt-in with object-store membership. Serves Worker Durable Object HTTP requests and JavaScript RPC. When this node owns a database shard, it serves [HTTP SQL and D1](databases.md#threaded-database-capacity) on the threaded backend. Persistent facet cloning is refused as `NOT_SUPPORTED`. Keep the default upstream backend for product deployments. |
 | `peers` | `2` | Reachable peers that hold committed frames in memory; at most 8; fewer reachable peers reduce K; an empty selected list uses a local flush, but an entirely unreachable nonempty list waits / times out |
 | `confirmTimeoutMs` | `5000` | Confirmation deadline; range 100–29000 ms |
 | `recoverTimeoutMs` | `30000` | How long an object request waits for recovery; at least 1000 ms |
@@ -630,12 +627,11 @@ Before upgrading, remove `ingress.webSocketsPerTenant` from any configuration fi
 | `rebuildConcurrency` | `4` | Concurrent rebuilds doing work per node, range 1–64. Foreground and alarm recoveries share the slots. Collecting evidence or waiting for a holder releases the rebuild slot |
 | `alarmDiscoveryIntervalMs` | `60000` | How often a node with durable processes looks for shards of stopped members that have pending alarms (it also looks at each membership change); at least 200 |
 | `alarmTakeoverConcurrency` | `4` | Such shards a node takes over at once; range 1–4 |
-| `alarmFireConcurrency` | `2` | Dispatching or executing background alarms per upstream node; range 1–512. Queued cold rebuilds wait separately, and ordinary admission remains in force |
 | `versionDrainTimeoutMs` | `30000` | Time from the first refused request for the new definition to a targeted reset of the old threaded tree. The node can replace an unresponsive durable process after a further `confirmTimeoutMs` |
 | `residentObjects` | `4096` | Target idle object-tree eviction per durable process; `0` unlimited; active trees can exceed the target |
 | `usagePublishMs` | `3600000` | Publish this node's estimated tenant object bytes every hour |
 
-See [threaded object admission](durable-objects.md#threaded-object-admission) for the experimental
+See [threaded object admission](durable-objects.md#threaded-object-admission) for the
 backend's per-object waiting limits.
 
 A single encoded WAL record is limited to `min(64 MiB, 256 MiB, peerBufferBytes, UInt32 message limit) - 4 KiB`

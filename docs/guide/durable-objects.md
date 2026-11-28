@@ -1,6 +1,6 @@
 # Durable Objects
 
-> For release 0.5.6. A Durable Object is a named instance of a class with SQLite storage. Its shard has one owner in the cluster; a call through any ingress reaches that owner. Start with the [durable-counter example](../../examples/durable-counter), or follow the [quickstart](quickstart.md).
+> A Durable Object is a named instance of a class with SQLite storage. Its shard has one owner in the cluster; a call through any ingress reaches that owner. Start with the [durable-counter example](../../examples/durable-counter), or follow the [quickstart](quickstart.md).
 
 ## 1. Write a class
 
@@ -33,19 +33,13 @@ export default {
 
 `ctx.storage.sql` exposes workerd's SQLite API. Key-value methods such as `get`, `put`, `delete` and `list`, and storage transactions, use the same database and durability path. The object's env contains the version's variables, secrets, Durable Object bindings and D1 bindings; Service Bindings are not installed in it. Facets have separate databases but belong to the root object's storage, eviction and recovery tree; `ctx.facets.clone()` is refused.
 
-Native SQL has a separate process-wide limit: by default, an object's event may spend 200 ms of cumulative SQL CPU, with an 800 ms active SQL wall-time fallback. Requests, alarms, delivered WebSocket messages, calls into RPC targets the object handed out, and messages on outbound WebSockets it accepted receive new budgets at the existing event boundaries. Uninterrupted synchronous execution does not replace the budget. Statements share the budget across timers, subrequests and storage awaits. Each native compilation or row step is sampled randomly with probability 1/16. A sampled segment without a SQLite progress callback contributes its first 250 microseconds of CPU multiplied by 16, plus any excess at its actual value. Segments invoking the progress callback are measured directly. Configure `processPool.sqlCpuLimitMs` and `processPool.sqlWallLimitMs` in the [node configuration](install.md).
+SQLite execution in a tenant object's event draws from that event's CPU budget. The home tracks the budget
+across awaits and checks it while SQLite runs. An event that uses up its CPU budget receives
+`503 CPU_LIMIT_EXCEEDED` and the home resets its object tree. A subsequent event reopens the confirmed
+state. SQL interruption is cooperative, so native work can run until its next progress check.
+The platform's [D1 and HTTP SQL queries](databases.md#sql-deadlines) have their own wall deadline.
 
-A statement exceeding the budget throws `SQL_LIMIT_EXCEEDED`; later SQL in that event is refused. Transaction behavior follows SQLite:
-
-| Interrupted statement | `transactionSync` outcome | Object outcome |
-| --- | --- | --- |
-| A write that has changed pages | SQLite rolls back the transaction; catching the error cannot commit it | The existing storage failure path resets the object |
-| A read whose error leaves the callback | `transactionSync` rolls back | The tenant object remains available |
-| A read whose error is caught inside the callback | Earlier completed statements may commit if the callback returns normally; later SQL in the event is refused | The tenant object remains available; the next event has a fresh budget |
-
-An uncaught read error normally returns 500; a reset after an interrupted write returns 503. User error text or a user-set `code` does not create the platform's database error code. A smaller tenant CPU allowance does not take effect inside a running native SQL statement. With a 50 ms tenant CPU allowance and the default 200 ms SQL budget, a long SQL test returned `503 CPU_LIMIT_EXCEEDED` after about 220 ms, once native execution returned. Interruption is cooperative: a costly function or blocking I/O without progress callbacks can run past the SQL limit. A sequence of callback-free segments each taking more than 250 microseconds is undercounted by the sampled estimate, increasingly so as the segments become more expensive. The process watchdog, normally 3000 ms, remains its fallback.
-
-On the experimental threaded backend, each SQLite connection has a 32 MiB heap budget for
+Each SQLite connection has a 32 MiB heap budget for
 `ctx.storage.sql`. The budget covers SQLite's live allocations, including prepared statements, page caches and
 query working memory. Each facet uses its own connection. The durable process reserves the heap
 in 64 KiB steps alongside its other memory use. The connection retains one step across small
@@ -69,7 +63,7 @@ budget and process count. At 128 KiB per idle connection, 4,096 root objects res
 live heaps also draw from this budget. Current default placement holds up to 256 ordinary
 object trees per process.
 
-After a declared secret or binding changes, the object's next request selects the updated definition. On the experimental threaded host, this uses the same bounded drain as a code update. Other objects reopen on their own next requests. Stateless Workers keep their loaded values until their isolates are evicted.
+After a declared secret or binding changes, the object's next request selects the updated definition. This uses the same bounded drain as a code update. Other objects reopen on their own next requests. Stateless Workers keep their loaded values until their isolates are evicted.
 
 ## 2. Declare the namespace
 
@@ -86,7 +80,7 @@ Add to the Worker project's Wrangler configuration:
 
 `cowctl deploy` builds the project and the migrations declare the class. Each class gets a random namespace id recorded in the tenant manifest. `new_classes` also declares a SQLite class; `renamed_classes` preserves its namespace id, `deleted_classes` marks it deleting, and migration tags are applied in order. A binding may name only a class of this Worker (`script_name`, if given, must name itself); `transferred_classes` is refused. An active object request uses the Worker's currently active version, so redeployment changes the class code on the same namespace and data. Keep schema changes compatible with that data.
 
-On the experimental threaded host, a running request keeps its code version during the drain. The first new-definition request refused with `503 DO_VERSION_DRAINING` starts the `durableObjects.versionDrainTimeoutMs` clock, which defaults to 30 seconds. At the deadline, the home resets the old tree and ends any sessions still holding it, including retained RPC capabilities. The new definition opens on the same confirmed storage. The node can replace the whole durable process if the home fails to acknowledge the close within `durableObjects.confirmTimeoutMs` after the deadline.
+A running request keeps its code version during the drain. The first new-definition request refused with `503 DO_VERSION_DRAINING` starts the `durableObjects.versionDrainTimeoutMs` clock, which defaults to 30 seconds. At the deadline, the home resets the old tree and ends any sessions still holding it, including retained RPC capabilities. The new definition opens on the same confirmed storage. The node can replace the whole durable process if the home fails to acknowledge the close within `durableObjects.confirmTimeoutMs` after the deadline.
 
 A call still waiting for response headers can receive `503 DO_CODE_UPDATED` with an uncertain result. Its writes may already have committed, and the platform never replays that call. A response body already streaming ends early. A class rename preserves object IDs and the existing databases. After the node applies a class deletion, it refuses old-generation opens for that namespace.
 
@@ -130,9 +124,9 @@ webSocketError(ws, error) { console.error(String(error)); }
 
 Use `ctx.getWebSockets(tag?)`, `ctx.getTags(ws)` and `ctx.setWebSocketAutoResponse()` to manage accepted connections. An idle object's eviction leaves hibernatable connections open; the next delivered message constructs the object again with those connections and the same storage. Reconstruct in-memory state from storage in the constructor. Calling `ws.accept()` instead uses the ordinary WebSocket API and does not opt into this hibernation path.
 
-The upstream host keeps connections in its durable process. Process rotation, node drain and node exit end those connections. Incoming messages are at most 32 MiB. Inbound upgrades use the [WebSocket ceiling shared by all tenants on the ingress node](install.md#inbound-websocket-capacity). Compression is disabled. CPU is charged as message handlers execute.
+Inbound upgrades use the [WebSocket ceiling shared by all tenants on the ingress node](install.md#inbound-websocket-capacity). Compression is disabled. CPU is charged as message handlers execute.
 
-On the experimental threaded host, an eligible tree retires after about ten seconds from its last event or the end of its last blocker. An otherwise idle tree with a standard `ws.accept()` connection has a deadline between 70 and 140 seconds. An I/O or wait-until operation can protect the tree for up to 15 minutes from that operation's start. The home checks for queued and live requests before retiring a tree and closes its idle standard sockets on retirement.
+An eligible tree retires after about ten seconds from its last event or the end of its last blocker. An otherwise idle tree with a standard `ws.accept()` connection has a deadline between 70 and 140 seconds. An I/O or wait-until operation can protect the tree for up to 15 minutes from that operation's start. The home checks for queued and live requests before retiring a tree and closes its idle standard sockets on retirement.
 
 When a threaded tree retires, the node parks the upgraded hibernatable WebSockets accepted by its root and facets. The home transfers them before canceling expired work or closing ordinary sockets. While parking is in progress, changes to hibernatable sockets such as `send()`, `close()`, `serializeAttachment()` and `ctx.setWebSocketAutoResponse()` throw `InvalidStateError`. The node answers WebSocket pings and matching auto-responses while the tree sleeps. An application message or a close requiring a handler opens the tree on its current shard owner and reaches the root or facet that accepted the socket. Each actor gets its sockets, tags, serialized attachments and automatic response configuration before its constructor runs.
 
@@ -170,13 +164,12 @@ async alarm({ retryCount, isRetry }) {
 
 `setAlarm`, `getAlarm` and `deleteAlarm` store the time in the object's database, replicated and recovered with it. The shard owner schedules due alarms and invokes `alarm(alarmInfo)` as an event. A successful handler's unchanged alarm is deleted; setting another time preserves that new alarm. A throwing handler is retried with backoff; a class without a handler has its alarm removed.
 
-On the experimental threaded host, each object runs one alarm handler at a time. A failed handler gets up to six retries on the firing owner, with delays of about 2, 4, 8, 16, 32 and 64 seconds. Capacity and recovery deferrals leave the retry count unchanged. When the handler opts out of retries or reaches the final failed retry, the owner clears that schedule through the same confirmation path as other storage writes. A new owner starts its own retry count, so handlers must tolerate repeated delivery across takeover. Threaded alarms share ordinary request admission without a reserved share per tenant. Many slow alarms from one tenant can occupy the node. Recovery preparation remains bounded. The `alarmFireConcurrency` setting applies to the upstream host.
+Each object runs one alarm handler at a time. A failed handler gets up to six retries on the firing owner, with delays of about 2, 4, 8, 16, 32 and 64 seconds. Capacity and recovery deferrals leave the retry count unchanged. When the handler opts out of retries or reaches the final failed retry, the owner clears that schedule through the same confirmation path as other storage writes. A new owner starts its own retry count, so handlers must tolerate repeated delivery across takeover. Threaded alarms share ordinary request admission without a reserved share per tenant. Many slow alarms from one tenant can occupy the node. Recovery preparation remains bounded.
 
 After an owner node stops, the surviving nodes with durable processes find its shards that have pending alarms, and each such shard's next owner takes it without waiting for a request: at each membership change and every `durableObjects.alarmDiscoveryIntervalMs` (60 s), at most `durableObjects.alarmTakeoverConcurrency` (4) takeovers at a time on a node. An object is opened only when its alarm is due. A shard without pending alarms gets its new owner when a request reaches it. This needs the node storage permissions on `alarm-wake/by-owner/` (see the [installation guide](install.md)); without them alarms fire after the shard's next request.
 
 Tenants take turns, and eligible alarms within a tenant run in due-time order. An unavailable durable process or a full node closes that destination's gate. One alarm probes it every 200 ms, and a cancelled probe releases the gate for another probe.
 
-On the upstream host, `durableObjects.alarmFireConcurrency` defaults to two background alarms per node. Each completed alarm makes room for the next. With two slots, another alarm can progress while one waits on an external request. A tenant can occupy both slots with slow handlers. Higher concurrency puts more background work ahead of user requests on the upstream event loop.
 
 A cold alarm queues its rebuild and releases its firing slot. Completion wakes the schedule, and a failed rebuild retains the one-second platform retry delay. Cold dispatches admit at most 256 alarms preparing or waiting for rebuild. A hot dispatch can also discover that its object needs to be rebuilt. Additional cold alarms wait for preparation capacity in the scheduler. This queue rotates between tenants independently of the hot ready queue and follows due-time order within a tenant. With rebuild width `B >= 3`, background alarms have a target of two rebuild slots and foreground requests have a target of `B - 2`. Either class borrows idle capacity. At `B = 1` and `B = 2`, the two queues alternate. A user request joining an object still queued for background rebuild promotes it to the foreground queue.
 
@@ -195,7 +188,7 @@ Measured recovery of 24 small objects whose alarms were already due, with two su
 
 Each node had a 1 CPU cgroup quota and 1,536 MiB memory, with one durable process. Eight clients each made ten hot-object requests per second, and two more continuously read other objects. Every measured alarm fired once and user requests had no failures. The member path took about 24.30 seconds to detect the loss; the patrol path added about 31.10 seconds between detection and its first metadata read. A rebuild occupied a slot for about 25.2 seconds, and the median object waited another 25.4 seconds in the rebuild queue. This per-object wait explains the additional time over the earlier examples. The measured drain rate was about 0.318 objects/second, close to the capacity estimate of `8 / 25 = 0.32`. Adding measured discovery overhead to the formula estimates about 350 / 379 seconds for 100 objects and 3,150 / 3,179 seconds for 1,000, for the member / patrol paths respectively. Those larger counts are projections.
 
-In a separate live-owner test with 2,010 alarms, the same per-node CPU and memory quotas, eight hot clients and two continuously requesting stateless clients, concurrency 2 drained the alarms in 14.73 seconds; concurrency 1 took 17.15 seconds. Hot-request p99 was 57.5 / 79.1 ms in each run's preceding static window and 165.5 / 133.9 ms during drain, respectively. Node 3 was already CPU-quota saturated before firing began, so these measurements include quota contention. Evaluate latency on the deployment's own hardware with fixed-rate traffic and CPU headroom before increasing the setting.
+With the former alarm dispatch budget, a live-owner test with 2,010 alarms used the same per-node CPU and memory quotas, eight hot clients and two continuously requesting stateless clients. Concurrency 2 drained the alarms in 14.73 seconds and concurrency 1 took 17.15 seconds. Hot-request p99 was 57.5 / 79.1 ms in each run's preceding static window and 165.5 / 133.9 ms during drain, respectively. Node 3 was already CPU-quota saturated before firing began, so these measurements include quota contention. The threaded server uses request admission for alarms, and `durableObjects.alarmFireConcurrency` has no effect.
 
 Object-store hints identify which objects the next shard owner should wake, but the database decides whether an alarm is due. A stale hint can cause a harmless wake; a missing hint delays discovery until the object is opened again. Treat delivery as retryable, with no exactly-once side-effect guarantee.
 
@@ -205,22 +198,21 @@ An acknowledged alarm whose hint or owner marker has not published before its no
 
 | Limit | Default and scope |
 | --- | --- |
-| CPU | 200 ms per fetch, RPC method, alarm or delivered WebSocket message; Worker / tenant limits can override it |
-| Memory | 128 MiB per version isolate in each durable process, shared by its objects and classes |
+| CPU | 30,000 ms per fetch, RPC method, alarm or delivered WebSocket message; Worker / tenant limits can override it |
+| Memory | 128 MiB per isolate copy by default, with a shared process budget |
 | Resident objects | A target of 4096 object trees per durable process; idle trees leave in LRU order, facets before their root, with hibernation. Active trees are protected and may exceed the target. `0` removes the target |
 | Object bytes | 10 GiB (10,737,418,240 bytes), configurable with `durableObjects.objectBytes`; root and facet database sizes are measured at checkpoints / open / close, not exact pending transaction sizes |
 | Tenant namespaces | 16 by default (`durableObjectNamespaces`), counting DO class namespaces, D1 databases and deleting namespaces |
 | Tenant bytes | 10 GiB by default (`durableObjectBytes`), using lagging per-node summaries; deleting namespaces / databases stop counting |
 | Logs | 256 KiB per event before truncation; the tenant's line rate, line size and buffer limits also apply |
 
-An ordinary class exception leaves the instance available; fetch returns `500 EXECUTION_FAILED` with its message. CPU or memory termination invalidates the version's isolate in that durable process: all its objects there are constructed again on their next event, recovering storage subject to the limitations in section 7. A durable slot does not move a suspect tenant into quarantine.
+An ordinary class exception leaves the instance available; fetch returns `500 EXECUTION_FAILED` with its message. CPU or memory termination resets the affected object tree, which is reconstructed on its next event. A durable slot does not move a suspect tenant into quarantine.
 
 A write past the object or tenant cap is refused at confirmation with `413 DO_OBJECT_TOO_LARGE` or `422 QUOTA_EXCEEDED`; reads and transactions that do not grow the database remain possible, including deleting rows. The size estimate can lag. A refusal immediately marks the object for repair; later requests wait for one consistent recovered history. The SQL statement may already have executed locally. A failed response alone does not prove rollback: records without a persistent exclusion remain possible writes. See [error codes](errors.md).
 
 ### Threaded object admission
 
-On a node running the experimental `durableObjects.threadedStorage` backend, while one event is
-executing, up to **512 events** can wait in the object's mailbox, each bounded by its existing request
+While one event is executing, up to **512 events** can wait in the object's mailbox, each bounded by its existing request
 deadline. The root and its facets share that capacity. The home frees an entry when it begins delivery,
 or when the queued event expires or is canceled. Events already delivered, including events suspended
 at an `await`, are outside the waiting count.
@@ -232,11 +224,10 @@ has room if it cannot reserve memory or descriptors from the shared budget, it c
 tree, or the assigned home is resetting. Node admission limits can refuse a call before it reaches
 the child.
 
-The node leaves `threadedStorage` off by default. The cluster suite exercises these mailbox limits
+The cluster suite exercises these mailbox limits
 with separate bursts of 128 concurrent single-row reads through public HTTP SQL and a Worker D1
 binding to one threaded database. The Worker runs on a peer of the database owner. Worker roots
 and local binding calls share the node's root admission threshold when they run on the same node.
-The test uses the experimental database placement executable.
 The hosted Linux x86-64 and ARM64 clusters each served all 128 reads on both routes at the
 compiled defaults.
 [Cluster test](../../tests/cluster/README.md#threaded-sql-default-mailbox) ·
@@ -292,6 +283,6 @@ upgrade: use new data directories and a new bucket, and move data at the applica
 
 ## 8. Checked differences from Cloudflare
 
-Coworkerd runs the Worker's own SQLite classes, with different ID derivation, no jurisdiction or cross-Worker classes, and no facet clone. `locationHint` is ignored. Class env has no Service Bindings. A limit resets the shared version isolate's objects in that durable process, rather than only the offending object. Fetch exceptions return the platform's HTTP error shape; method exceptions use workerd's RPC exception transport. DO-to-DO calls start independent trees bounded by eight hops. Durability, takeover and alarm discovery have the limits above, including the loss of an unuploaded tail when no surviving copy remains (section 7). The [compatibility table](../compatibility.md), section 7, records the verified differences; [databases](databases.md) describes D1's supported subset.
+Coworkerd runs the Worker's own SQLite classes, with different ID derivation, no jurisdiction or cross-Worker classes, and no facet clone. `locationHint` is ignored. Class env has no Service Bindings. An invocation limit can reset its object tree. Fetch exceptions return the platform's HTTP error shape; method exceptions use workerd's RPC exception transport. DO-to-DO calls start independent trees bounded by eight hops. Durability, takeover and alarm discovery have the limits above, including the loss of an unuploaded tail when no surviving copy remains (section 7). The [compatibility table](../compatibility.md), section 7, records the verified differences; [databases](databases.md) describes D1's supported subset.
 
 Only root objects can set alarms; calling `setAlarm()` in a child facet throws `Facets currently cannot set alarms.`

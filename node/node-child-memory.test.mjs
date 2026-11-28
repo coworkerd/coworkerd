@@ -68,6 +68,7 @@ for (const [label, options, override, expected] of cases) {
     assert.ok(view, `${label}: no ready workerd child: ${diagnostic}`);
     assert.equal(view.memoryLimitMiB, expected, label);
     assert.equal(view.processes.configuration.memoryLimitMiB, expected, label);
+    assert.equal(view.processes.configuration.durableProcesses, 0, 'file membership has no persistent durable children');
     const regular = view.processes.entries.filter(p => p.state === 'ready' && p.pid > 0);
     assert.ok(regular.length > 0, label);
     for (const {pid} of regular) {

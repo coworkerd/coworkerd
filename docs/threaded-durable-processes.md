@@ -5,7 +5,7 @@ The source and baseline use main at `dfc8803731a33feaaf8796313a0053d403f5ba8a`.
 The node continues to own placement and durable history. The threaded child hosts object events and native database
 operations. Billing and separation by trust level are outside this design.
 
-## Current execution and the proposed boundary
+## Original baseline and proposed boundary
 
 `ProcessPool` in [node/process-pool.c++](../node/process-pool.c++) maps an object key to a durable slot, explicitly
 selects threaded execution only for non-durable slots, and gives the old durable child a generation-scoped log FD
@@ -18,7 +18,7 @@ registry for the actual call. A tenant Worker version shares an isolate across i
 `SqlDatabase` in that same runtime implements the SQL side of the D1 binding and the HTTP API using one shared
 runtime isolate. Durable processes share the upstream event loop even across different isolates.
 
-The current kernel already has an idle path below the 4,096 limit. Upstream `ActorContainer::inactive`
+The upstream kernel at the design baseline had an idle path below the 4,096 limit. Upstream `ActorContainer::inactive`
 arms a 10 s shutdown for an evictable namespace. Patch 0020 registers shipped root namespaces with
 `evictable: true` and adapts their retirement. Separately, its `ResidencyCoordinator` runs the process-wide
 LRU pass introduced by patch 0014. The proposal replaces the old idle path with explicit blocker deadlines,
@@ -76,8 +76,7 @@ still needs room under the tenant's `maxWorkerCpuMs`, which defaults to 30,000 m
 ### Per-object admission mailbox
 
 The threaded durable child keeps one FIFO of waiting events per root object tree, shared by the
-root and its facets for events admitted through the child. When the experimental
-`durableObjects.threadedStorage` backend is enabled, a tree can hold **512 waiting events**
+root and its facets for events admitted through the child. A tree can hold **512 waiting events**
 (`mailboxDepth`) and **2 MiB of declared waiting bytes** (`mailboxBytes`). Waiting events remain
 subject to their original request deadlines. Admission refuses an event when the count is already
 full or its addition would exceed the byte limit.
@@ -318,9 +317,7 @@ log, confirmation, takeover, alarm and idle-release paths remain the common path
 ### Database placement
 
 The owner can map a database namespace to the `SqlDatabase` export of `coworkerd:platform`.
-Both backends use the same SQL module and address the stored data by the same namespace,
-object ID and data epoch. On the threaded host the platform copy key also binds the validated
-namespace and object IDs. Two open databases therefore have separate isolate copies even
+The platform SQL copy key binds the validated namespace and object IDs. Two open databases therefore have separate isolate copies even
 when their tenant, package and limits match. The product definition enables the experimental
 SQLite methods used by the SQL class. Tenant Workers keep their existing compatibility flags.
 
@@ -332,8 +329,7 @@ allocations. A SQL transaction that cannot get the next step rolls back and retu
 HTTP 422 `SQL_MEMORY_LIMIT_EXCEEDED`. Opening, recovery and maintenance account for their heap
 as well. SQLite returns whole steps as its live heap shrinks and releases the remaining step on close.
 
-A release node uses the threaded database mapping when it owns the shard and explicitly enables
-`durableObjects.threadedStorage`. An upstream owner serves its database through the runtime.
+The shard owner runs the threaded platform database class.
 [Release acceptance (#81)](https://github.com/coworkerd/coworkerd/issues/81) ·
 [Database guide](guide/databases.md#threaded-database-capacity)
 
