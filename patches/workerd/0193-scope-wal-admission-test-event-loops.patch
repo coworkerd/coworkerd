@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sat, 28 Nov 2026 14:07:16 +0800
+Subject: [PATCH] Keep one Tokio event loop per WAL admission test phase
+
+
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 7133f7fcace3dbdb2f20c63edbffd25bec1eb07c..c3cf00ccbd9049dc730a0de76077561e4140266e 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -665,37 +665,48 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
+   KJ_REQUIRE(server.objectVictim.has_value());
+   const auto stalled = *server.objectVictim;
+   KJ_REQUIRE(stalled.tree == oldest.tree);
+-  ThreadState firstHome;
+-  firstHome.durableHome = stalled.home;
+-  firstHome.durableSlot = std::make_shared<Slot>();
+-  auto retained = std::make_shared<DurableTreeContext>(DurableTreeContext{
+-    .state = firstHome, .server = server, .tree = stalled.tree,
+-  });
+-  retained->shippers.emplace(0, nullptr);
+-
++  ObjectAdmissionFixture::Time deadline;
++  // Each synthetic home has its own KJ event loop. Use them in separate scopes.
+   {
+-    std::lock_guard lock(server.durableRoutingMutex);
+-    KJ_REQUIRE(server.stopObjectAdmissionVictim(stalled, test.now));
+-  }
+-  server.waitForAdmissionWal(firstHome, stalled.tree, retained, test.now);
+-  KJ_REQUIRE(server.objectVictim.has_value());
+-  const auto deadline = server.objectVictim->deadline;
+-  const auto beforeDeadline = deadline - std::chrono::milliseconds(1);
+-  server.expireDurableAdmissions(beforeDeadline);
+-  KJ_EXPECT(server.queueDurable(incoming, 0, test.lease, beforeDeadline).status == Status::RETIRING);
+-  KJ_EXPECT(table.homeFor(stalled.tree) == stalled.home);
+-  KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 0);
++    ThreadState firstHome;
++    firstHome.durableHome = stalled.home;
++    firstHome.durableSlot = std::make_shared<Slot>();
++    auto retained = std::make_shared<DurableTreeContext>(DurableTreeContext{
++      .state = firstHome, .server = server, .tree = stalled.tree,
++    });
++    retained->shippers.emplace(0, nullptr);
+ 
+-  // The accept loop advances without any further pass by the first home.
+-  server.expireDurableAdmissions(deadline);
+-  KJ_EXPECT(!table.homeFor(stalled.tree));
+-  KJ_EXPECT(server.threads[stalled.home - 1]->home->walFull.load());
+-  KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 1);
+-  KJ_REQUIRE(server.queueDurable(incoming, 0, test.lease, deadline).status == Status::RETIRING);
++    {
++      std::lock_guard lock(server.durableRoutingMutex);
++      KJ_REQUIRE(server.stopObjectAdmissionVictim(stalled, test.now));
++    }
++    server.waitForAdmissionWal(firstHome, stalled.tree, retained, test.now);
++    KJ_REQUIRE(server.objectVictim.has_value());
++    deadline = server.objectVictim->deadline;
++    const auto beforeDeadline = deadline - std::chrono::milliseconds(1);
++    server.expireDurableAdmissions(beforeDeadline);
++    KJ_EXPECT(server.queueDurable(incoming, 0, test.lease, beforeDeadline).status == Status::RETIRING);
++    KJ_EXPECT(table.homeFor(stalled.tree) == stalled.home);
++    KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 0);
++
++    // The accept loop advances without any further pass by the first home.
++    server.expireDurableAdmissions(deadline);
++    KJ_EXPECT(!table.homeFor(stalled.tree));
++    KJ_EXPECT(server.threads[stalled.home - 1]->home->walFull.load());
++    KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 1);
++    KJ_REQUIRE(server.queueDurable(incoming, 0, test.lease, deadline).status == Status::RETIRING);
++    KJ_REQUIRE(server.objectVictim.has_value());
++    const auto& nextVictim = *server.objectVictim;
++    KJ_EXPECT(nextVictim.tree == next.tree);
++    KJ_EXPECT(nextVictim.home != stalled.home);
++
++    // The delayed home drops its bookkeeping without releasing the credit again.
++    server.releaseClosedAdmissionTrees(firstHome, deadline);
++    KJ_EXPECT(firstHome.admissionWalClosing.empty());
++    KJ_EXPECT(!retained->shippers.empty());
++  }
+   KJ_REQUIRE(server.objectVictim.has_value());
+   const auto nextVictim = *server.objectVictim;
+-  KJ_EXPECT(nextVictim.tree == next.tree);
+-  KJ_EXPECT(nextVictim.home != stalled.home);
+ 
+   ThreadState nextHome;
+   nextHome.durableHome = nextVictim.home;
+@@ -714,10 +725,6 @@ KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registrat
+   KJ_REQUIRE(retry.has_value());
+   KJ_EXPECT(table.homeFor(retry->tree) == nextVictim.home);
+ 
+-  // The delayed home drops its bookkeeping without releasing the credit again.
+-  server.releaseClosedAdmissionTrees(firstHome, deadline);
+-  KJ_EXPECT(firstHome.admissionWalClosing.empty());
+-  KJ_EXPECT(!retained->shippers.empty());
+   KJ_EXPECT(server.durableAdmissionRetirements.load() == 2);
+   KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 1);
+ }

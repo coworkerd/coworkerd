@@ -67,15 +67,38 @@ The list is empty. The runner requires every case to pass.
 
 ### Threaded admission refusal
 
-`durable-threaded-admission-refusal` uses a single resident object slot on one owner and a one-event database
+`durable-threaded-admission-refusal` holds the single resident object slot busy on one owner and uses a one-event database
 mailbox on another. It checks Worker and object calls through fetch and RPC, plus public HTTP SQL and the D1
-binding. The child records the refusals without dispatching the writes. After capacity returns, each caller
-retries once and the stored counter or row confirms one write per retry.
+binding. The child records the refusals without dispatching the writes. Closing the held invocation lets admission retire the idle tree. Once capacity returns, each caller
+retries once and the stored counter or row confirms one write per retry. The object slot also
+stays occupied while a timer and an unawaited scheduler promise finish their writes.
+The case checks that both stored values survive subsequent admission retirement and reopen.
+It then holds peer WAL acknowledgements for a write issued after the response. The oldest
+resident object has no running event and keeps its slot until confirmation. Admission then
+retires it and a reopen verifies the committed value. The case requires zero
+`admissionWalTimeouts`.
 
 `durable-threaded-copy-reservation-refusal` consumes a one-shot marker at the cold-copy reservation step
 after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` each confirm that the write
 did not start and that one retry applies it once. A Durable Object exception after writing and a SQL
 constraint failure retain their ordinary error results.
+
+### Threaded object residency
+
+Run the acceptance fixture in residency mode with a verified kernel that reports
+`objectSqliteConnections`. It probes 4,096 ordinary roots with bounded concurrency and
+checks the resident count and open SQLite count in the same publication from one child.
+The JSONL records each resident copy's V8 heap, external bytes and instance ID, plus SQLite
+reservations, process limits, reset counters and refused probes. The run requires every
+copy to retain its instance and all tree and isolate reset counts to stay at zero.
+Use `--sequential` to run only the sequential seed and reopen passes. The hosted idle job runs both
+workloads in separate clusters and uploads `idle.jsonl` and `idle-residency.jsonl`.
+The sequential report includes the cumulative `admissionWalTimeouts` and the change in each
+5,000-call seed or reopen pass.
+
+```sh
+node tests/cluster/durable-idle-measure.mjs "$kernel" build/durable-residency.jsonl --residency
+```
 
 ### Threaded unconfirmed close recovery
 

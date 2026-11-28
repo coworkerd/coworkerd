@@ -2,14 +2,16 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { appendFile, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, parse, resolve } from 'node:path';
 import { setInterval as interval, setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
 
-const [kernelArg, reportArg, ...extra] = process.argv.slice(2);
-assert.ok(kernelArg && reportArg && extra.length === 0,
-  'Usage: node tests/cluster/durable-idle-measure.mjs <verified-kernel-directory> <new-report.jsonl>');
+const [kernelArg, reportArg, mode, ...extra] = process.argv.slice(2);
+assert.ok(kernelArg && reportArg && [undefined, '--sequential', '--residency'].includes(mode) && !extra.length,
+  'Usage: node tests/cluster/durable-idle-measure.mjs <verified-kernel-directory> <new-report.jsonl> [--sequential|--residency]');
+const residentTarget = 4096;
+const residencyConcurrency = 48;
 assert.equal(process.platform, 'linux');
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const kernel = resolve(kernelArg);
@@ -23,14 +25,6 @@ const controller = new AbortController();
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => controller.abort(new Error(`Interrupted by ${signal}`)));
 }
-await writeFile(report, '', { flag: 'wx' });
-const record = (metric, fields) => appendFile(report, JSON.stringify({ metric, at: new Date().toISOString(), ...fields }) + '\n');
-const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-durable-idle-')), kernel, controller.signal, {
-  singleNode: true, durableFixtureNodes: ['node-1'],
-  configureNode: () => ({ durableObjects: { processes: 1, peers: 0 } }),
-});
-const [node] = cluster.nodes;
-
 const worker = `
   import { DurableObject } from 'cloudflare:workers';
   let moduleId;
@@ -55,7 +49,103 @@ function summary(rows) {
     p99Ms: times[Math.ceil(0.99 * times.length) - 1] ?? null };
 }
 
-async function measure() {
+async function measureResidency(cluster, node, record, call, onSameChild, child) {
+  const initial = await onSameChild();
+  assert.ok(Number.isSafeInteger(initial.objectSqliteConnections),
+    'the kernel must publish the ordinary SQLite connection count');
+  assert.ok(Number.isSafeInteger(initial.treeResets) && Array.isArray(initial.copies),
+    'the kernel must publish tree resets and per-copy heap');
+  const copyInstances = new Map();
+  const samples = [];
+  let peak;
+  const started = performance.now();
+  const sample = async () => {
+    const admission = await onSameChild();
+    for (const copy of admission.copies) {
+      if (!copyInstances.has(copy.home)) copyInstances.set(copy.home, new Set());
+      copyInstances.get(copy.home).add(copy.instance);
+    }
+    const row = { elapsedMs: performance.now() - started, ...admission };
+    samples.push(row);
+    const simultaneous = Math.min(row.residentRoots, row.objectSqliteConnections);
+    if (!peak || simultaneous > Math.min(peak.residentRoots, peak.objectSqliteConnections)) {
+      peak = row;
+    }
+  };
+  await sample();
+  const stopSampling = new AbortController();
+  const sampling = (async () => {
+    try {
+      for await (const _ of interval(residencyPollMs, undefined, { signal: stopSampling.signal })) {
+        await sample();
+      }
+    } catch (error) {
+      if (error.name !== 'AbortError') throw error;
+    }
+  })();
+  // Mark the rejection handled while the requests settle. The finally block still observes it.
+  void sampling.catch(() => {});
+  const rounds = [];
+  const errors = [];
+  const copies = new Set();
+  try {
+    // A bounded rolling load keeps earlier opens within the normal idle timeout. A successful
+    // run needs a single publication with both full counts, regardless of total replies.
+    for (let round = 1; round <= 3; ++round) {
+      let next = 0;
+      let successes = 0;
+      const roundStarted = performance.now();
+      await Promise.all(Array.from({ length: residencyConcurrency }, async () => {
+        for (;;) {
+          controller.signal.throwIfAborted();
+          const index = next++;
+          if (index >= residentTarget) return;
+          try {
+            const result = await call(index);
+            assert.match(result.actorId, /^[a-f0-9-]{36}$/);
+            copies.add(result.moduleId);
+            ++successes;
+          } catch (error) {
+            errors.push({ round, index, error: error.message });
+          }
+        }
+      }));
+      rounds.push({ round, successes, errors: residentTarget - successes,
+        elapsedMs: performance.now() - roundStarted });
+      await sample();
+      if (peak.residentRoots === residentTarget && peak.objectSqliteConnections === residentTarget) break;
+    }
+  } finally {
+    stopSampling.abort();
+    await sampling;
+  }
+  const limits = await cluster.compose(['exec', '-T', '--user', '0', node, 'cat', `/proc/${child.pid}/limits`]);
+  const resets = {
+    actor: peak.actorResets - initial.actorResets,
+    tree: peak.treeResets - initial.treeResets,
+    isolate: peak.isolateResets - initial.isolateResets,
+    observedAfterBaseline: samples.some(row => row.actorResets !== initial.actorResets ||
+      row.treeResets !== initial.treeResets || row.isolateResets !== initial.isolateResets ||
+      row.resettingHomes !== 0 || row.copies.some(copy => copy.resetting)),
+    replacedCopies: [...copyInstances.values()].filter(instances => instances.size > 1).length,
+  };
+  const result = { child, residentTarget, rounds, observedWorkerCopies: copies.size, peak, limits, resets, errors };
+  await record('simultaneous-residency-samples', { child, samples });
+  await record('simultaneous-residency-summary', result);
+  console.log(JSON.stringify({ ...result, errors: errors.length }));
+  assert.equal(errors.length, 0, 'each offered residency probe succeeded');
+  assert.equal(peak.residentRoots, residentTarget, 'simultaneously resident ordinary root trees');
+  assert.equal(peak.objectSqliteConnections, residentTarget, 'simultaneously open ordinary SQLite connections');
+  assert.ok(peak.sqliteHeapReservedBytes > 0, 'the live SQLite heap was charged');
+  assert.deepEqual([initial.actorResets, initial.treeResets, initial.isolateResets], [0, 0, 0]);
+  assert.equal(resets.observedAfterBaseline, false, 'no actor, tree or isolate reset during the run');
+  assert.equal(resets.replacedCopies, 0, 'each loaded home kept its original isolate');
+  assert.equal(peak.copies.reduce((sum, copy) => sum + copy.residentRoots, 0), residentTarget);
+  assert.ok(peak.copies.every(copy => Number.isSafeInteger(copy.heapBytes) && copy.heapBytes > 0),
+    'the peak reports the live V8 heap of every resident copy');
+}
+
+async function measure(cluster, node, record, residencyOnly) {
   const pins = JSON.parse(await readFile(join(root, 'patches/workerd/artifacts.json'), 'utf8'));
   const manifest = JSON.parse(await readFile(join(kernel, 'kernel.json'), 'utf8'));
   assert.equal(manifest.patchSeriesSha256, pins.patchSeriesSha256);
@@ -65,7 +155,9 @@ async function measure() {
   await record('provenance', { commit: await run('git', ['rev-parse', 'HEAD']),
     kernelRelease: pins.releaseTag, archiveSha256: pins.archives[manifest.architecture],
     architecture: manifest.architecture, binaryHash, os: await run('uname', ['-a']),
-    cpu: await run('lscpu', []), node: process.version, cohorts: 2, cohortSize, batchSize, concurrency: 1, offerPeriodMs,
+    cpu: await run('lscpu', []), node: process.version,
+    ...(residencyOnly ? { residentTarget, concurrency: residencyConcurrency }
+      : { cohorts: 2, cohortSize, batchSize, concurrency: 1, offerPeriodMs }),
     residencyPollMs, placements: 'One durable child, one shard, no peers' });
   await cluster.start();
   const tenant = await cluster.tenant('acceptance-idle');
@@ -99,36 +191,47 @@ async function measure() {
     return reading;
   });
   await record('initial', initial);
+  assert.ok(Number.isSafeInteger(initial.admission.admissionWalTimeouts),
+    'the kernel must publish the admission WAL timeout counter');
   const onSameChild = async () => {
     const reading = await state();
     assert.deepEqual(reading.child, initial.child);
     return reading.admission;
   };
+  if (residencyOnly) {
+    return measureResidency(cluster, node, record, call, onSameChild, initial.child);
+  }
   // Placement packs live trees into an existing copy first. Open read-only
   // warmup IDs outside both measured cohorts to fill every home with this Worker.
   const expectedCopies = initial.admission.workerThreads;
   const warmCopies = new Map([[first.moduleId, 1]]);
   let warmupCalls = 1;
-  const warmupBatchSize = Math.min(8, expectedCopies);
+  let warmupErrors = 0;
+  const warmupBatchSize = residencyConcurrency;
   while (warmCopies.size < expectedCopies && warmupCalls < cohortSize) {
     controller.signal.throwIfAborted();
     const size = Math.min(warmupBatchSize, cohortSize - warmupCalls);
-    const probes = await Promise.all(Array.from({ length: size }, (_, offset) =>
+    const probes = await Promise.allSettled(Array.from({ length: size }, (_, offset) =>
       call(2 * cohortSize + warmupCalls + offset)));
-    for (const { moduleId } of probes) {
+    for (const probe of probes) {
+      if (probe.status === 'rejected') {
+        ++warmupErrors;
+        continue;
+      }
+      const { moduleId } = probe.value;
       warmCopies.set(moduleId, (warmCopies.get(moduleId) ?? 0) + 1);
     }
     warmupCalls += size;
   }
-  assert.equal(warmCopies.size, expectedCopies, 'every home opened a copy of the measured Worker');
-  const warmed = await eventually('all copies appear in the same durable child', async () => {
+  const allCopiesWarmed = warmCopies.size === expectedCopies;
+  const warmed = await eventually('the warmed copies appear in the same durable child', async () => {
     const admission = await onSameChild();
-    assert.equal(admission.homes, expectedCopies);
+    assert.ok(admission.homes >= warmCopies.size);
     assert.ok(admission.residentRoots > 0);
     return admission;
   });
-  await record('warmup', { child: initial.child, calls: warmupCalls,
-    copies: Object.fromEntries(warmCopies), admission: warmed });
+  await record('warmup', { child: initial.child, calls: warmupCalls, errors: warmupErrors,
+    expectedCopies, allCopiesWarmed, copies: Object.fromEntries(warmCopies), admission: warmed });
 
   const idle = async () => {
     const admission = await onSameChild();
@@ -149,15 +252,15 @@ async function measure() {
     const samples = [];
     for (let i = 0; i < 6; ++i) {
       const before = await idle();
-      assert.equal(before.homes, expectedCopies, 'every warmed copy remains present for the RSS sample');
       const status = await cluster.compose(['exec', '-T', '--user', '0', node, 'cat', `/proc/${initial.child.pid}/status`]);
       const fds = await cluster.compose(['exec', '-T', '--user', '0', node, 'ls', '-1', `/proc/${initial.child.pid}/fd`]);
-      assert.equal((await idle()).homes, expectedCopies);
+      const after = await idle();
       const threadMatch = status.match(/^Threads:\s+(\d+)$/m);
       const rssMatch = status.match(/^VmRSS:\s+(\d+) kB$/m);
       assert.ok(threadMatch && rssMatch);
       const values = { threads: Number(threadMatch[1]), rssKiB: Number(rssMatch[1]),
-        descriptors: fds.split('\n').filter(Boolean).length };
+        descriptors: fds.split('\n').filter(Boolean).length,
+        keptWarmCopies: before.homes === expectedCopies && after.homes === expectedCopies };
       samples.push(values);
       await record('resources', { phase, index: i, child: initial.child, admission: before, ...values });
       if (i < 5) await delay(2000);
@@ -177,9 +280,10 @@ async function measure() {
       const residency = [];
       const started = performance.now();
       const sampleResidency = async () => {
-        const { residentRoots, homes, idleRetirements, admissionRetirements } = await onSameChild();
+        const { residentRoots, homes, idleRetirements, admissionRetirements, admissionWalTimeouts } =
+          await onSameChild();
         residency.push({ elapsedMs: performance.now() - started, residentRoots, homes,
-          idleRetirements, admissionRetirements });
+          idleRetirements, admissionRetirements, admissionWalTimeouts });
       };
       await sampleResidency();
       const stopSampling = new AbortController();
@@ -233,13 +337,15 @@ async function measure() {
       const peakResidentRoots = Math.max(...residency.map(sample => sample.residentRoots));
       const keptWarmCopies = [...observedCopies].every(copy => warmCopies.has(copy)) &&
         residency.every(sample => sample.homes === expectedCopies);
-      const result = { ...summary(samples), peakResidentRoots, keptWarmCopies };
-      if (result.successes !== cohortSize || !keptWarmCopies) workloadPassed = false;
+      const { admissionWalTimeouts } = residency.at(-1);
+      const result = { ...summary(samples), peakResidentRoots, keptWarmCopies, admissionWalTimeouts,
+        admissionWalTimeoutsDelta: admissionWalTimeouts - residency[0].admissionWalTimeouts };
+      if (result.successes !== cohortSize) workloadPassed = false;
       await record('pass-residency', { cohort, phase, child: initial.child, observedCopies: [...observedCopies],
         peakResidentRoots, samples: residency });
       await record('workload-summary', { cohort, phase, ...result });
       console.log(JSON.stringify({ cohort, phase, ...result }));
-      finish.push({ cohort, phase, samples: await resources(`cohort-${cohort}-after-${phase}`) });
+      finish.push({ cohort, phase, keptWarmCopies, samples: await resources(`cohort-${cohort}-after-${phase}`) });
     }
   }
 
@@ -256,18 +362,50 @@ async function measure() {
     return { cohort, phase, threadDelta, descriptorDelta, rssDeltaFromBaselineMaxKiB, pass };
   });
   const gateEligible = offerPeriodMs === 0;
-  const pass = gateEligible && workloadPassed && comparisons.every(comparison => comparison.pass);
-  await record('gate-summary', { child: initial.child, baselineStable, rssVariationKiB,
-    gateEligible, workloadPassed, comparisons, pass });
-  console.log(JSON.stringify({ baselineStable, rssVariationKiB, gateEligible, workloadPassed, comparisons, pass }));
+  const warmCopiesComparable = allCopiesWarmed && baseline.every(sample => sample.keptWarmCopies) &&
+    finish.every(phase => phase.keptWarmCopies && phase.samples.every(sample => sample.keptWarmCopies));
+  const pass = gateEligible && workloadPassed && warmCopiesComparable &&
+    comparisons.every(comparison => comparison.pass);
+  const { admissionWalTimeouts } = await onSameChild();
+  const result = { baselineStable, rssVariationKiB, gateEligible, workloadPassed,
+    warmCopiesComparable, admissionWalTimeouts, comparisons, pass };
+  await record('gate-summary', { child: initial.child, ...result });
+  console.log(JSON.stringify(result));
 }
 
-try {
-  await measure();
-} catch (error) {
-  await record('measurement-error', { error: error.stack });
-  await cluster.diagnostics('idle-measurement', error);
-  throw error;
-} finally {
-  await cluster.close();
+async function runMeasurement(output, residencyOnly) {
+  controller.signal.throwIfAborted();
+  await writeFile(output, '', { flag: 'wx' });
+  const record = (metric, fields) =>
+    appendFile(output, JSON.stringify({ metric, at: new Date().toISOString(), ...fields }) + '\n');
+  const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-durable-idle-')), kernel, controller.signal, {
+    singleNode: true, durableFixtureNodes: ['node-1'],
+    configureNode: () => ({ durableObjects: { processes: 1, peers: 0 } }),
+  });
+  const [node] = cluster.nodes;
+  try {
+    await measure(cluster, node, record, residencyOnly);
+  } catch (error) {
+    await record('measurement-error', { error: error.stack });
+    await cluster.diagnostics(residencyOnly ? 'residency-measurement' : 'idle-measurement', error);
+    throw error;
+  } finally {
+    await cluster.close();
+  }
+}
+
+if (mode === undefined) {
+  // The existing hosted idle job invokes both workloads. Each gets a fresh cluster and report.
+  const { dir, name, ext } = parse(report);
+  const failures = [];
+  for (const [output, residencyOnly] of [[report, false], [join(dir, name + '-residency' + ext), true]]) {
+    try {
+      await runMeasurement(output, residencyOnly);
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length) throw new AggregateError(failures, 'Durable Object measurement failed');
+} else {
+  await runMeasurement(report, mode === '--residency');
 }

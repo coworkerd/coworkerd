@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sat, 28 Nov 2026 12:31:00 +0800
+Subject: [PATCH] Bound the ordinary admission wait for WAL capacity
+
+
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 29ab0a258fceb877ecf7ad270872356244a75349..7133f7fcace3dbdb2f20c63edbffd25bec1eb07c 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -617,8 +617,9 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
+     std::lock_guard lock(server.durableRoutingMutex);
+     KJ_REQUIRE(server.stopObjectAdmissionVictim(picked, test.now));
+   }
+-  server.waitForAdmissionWal(state, picked.tree, closing);
+-  server.releaseClosedAdmissionTrees(state);
++  const auto closedAt = test.now + std::chrono::milliseconds(100);
++  server.waitForAdmissionWal(state, picked.tree, closing, closedAt);
++  server.releaseClosedAdmissionTrees(state, closedAt);
+   KJ_EXPECT(table.homeFor(picked.tree) == picked.home);
+   KJ_EXPECT(server.durableAdmissionRetirements.load() == 0);
+ 
+@@ -626,7 +627,7 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
+   // credit waits for the entire tree, while unrelated existing roots can run.
+   closing->shippers.erase(0);
+   server.threads[picked.home - 1]->home->walFull = false;
+-  server.releaseClosedAdmissionTrees(state);
++  server.releaseClosedAdmissionTrees(state, picked.deadline);
+   server.expireDurableAdmissions(picked.deadline);
+   KJ_EXPECT(table.homeFor(picked.tree) == picked.home);
+   KJ_EXPECT(server.queueDurable(incoming, 0, test.lease, picked.deadline).status == Status::RETIRING);
+@@ -634,15 +635,93 @@ KJ_TEST("ordinary admission reclaims one WAL-full tree after its last registrati
+   KJ_EXPECT(server.objectVictim->tree == picked.tree);
+ 
+   closing->shippers.erase(1);
+-  server.releaseClosedAdmissionTrees(state);
++  server.releaseClosedAdmissionTrees(state, picked.deadline);
+   KJ_EXPECT(!table.homeFor(picked.tree));
+   KJ_EXPECT(server.durableAdmissionRetirements.load() == 1);
++  KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 0);
+   const auto retry = server.queueDurable(incoming, 0, test.lease, picked.deadline).ticket;
+   KJ_REQUIRE(retry.has_value());
+   KJ_EXPECT(table.homeFor(retry->tree) == picked.home);
+   KJ_EXPECT(table.homeFor(other.tree) == picked.home);
+ }
+ 
++KJ_TEST("ordinary admission moves on when a retired root keeps its WAL registration") {
++  using Status = ObjectAdmissionFixture::Status;
++  ObjectAdmissionFixture test(0);
++  auto& server = test.server;
++  auto& table = *server.durableAdmission;
++  const auto oldest = test.start(test.route("oldest", "matching"));
++  const auto firstNeighbor = test.start(test.route("first-neighbor", "matching"));
++  const auto next = test.start(test.route("next", "matching"));
++  const auto nextNeighbor = test.start(test.route("next-neighbor", "matching"));
++  test.finish(oldest, test.now - std::chrono::seconds(2));
++  test.finish(next, test.now - std::chrono::seconds(1));
++  test.finish(firstNeighbor, test.now);
++  test.finish(nextNeighbor, test.now);
++  for (auto& thread: server.threads) thread->home->walFull = true;
++
++  const auto incoming = test.route("incoming", "matching");
++  KJ_REQUIRE(test.queue(incoming).status == Status::RETIRING);
++  KJ_REQUIRE(server.objectVictim.has_value());
++  const auto stalled = *server.objectVictim;
++  KJ_REQUIRE(stalled.tree == oldest.tree);
++  ThreadState firstHome;
++  firstHome.durableHome = stalled.home;
++  firstHome.durableSlot = std::make_shared<Slot>();
++  auto retained = std::make_shared<DurableTreeContext>(DurableTreeContext{
++    .state = firstHome, .server = server, .tree = stalled.tree,
++  });
++  retained->shippers.emplace(0, nullptr);
++
++  {
++    std::lock_guard lock(server.durableRoutingMutex);
++    KJ_REQUIRE(server.stopObjectAdmissionVictim(stalled, test.now));
++  }
++  server.waitForAdmissionWal(firstHome, stalled.tree, retained, test.now);
++  KJ_REQUIRE(server.objectVictim.has_value());
++  const auto deadline = server.objectVictim->deadline;
++  const auto beforeDeadline = deadline - std::chrono::milliseconds(1);
++  server.expireDurableAdmissions(beforeDeadline);
++  KJ_EXPECT(server.queueDurable(incoming, 0, test.lease, beforeDeadline).status == Status::RETIRING);
++  KJ_EXPECT(table.homeFor(stalled.tree) == stalled.home);
++  KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 0);
++
++  // The accept loop advances without any further pass by the first home.
++  server.expireDurableAdmissions(deadline);
++  KJ_EXPECT(!table.homeFor(stalled.tree));
++  KJ_EXPECT(server.threads[stalled.home - 1]->home->walFull.load());
++  KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 1);
++  KJ_REQUIRE(server.queueDurable(incoming, 0, test.lease, deadline).status == Status::RETIRING);
++  KJ_REQUIRE(server.objectVictim.has_value());
++  const auto nextVictim = *server.objectVictim;
++  KJ_EXPECT(nextVictim.tree == next.tree);
++  KJ_EXPECT(nextVictim.home != stalled.home);
++
++  ThreadState nextHome;
++  nextHome.durableHome = nextVictim.home;
++  nextHome.durableSlot = std::make_shared<Slot>();
++  {
++    std::lock_guard lock(server.durableRoutingMutex);
++    KJ_REQUIRE(server.stopObjectAdmissionVictim(nextVictim, deadline));
++    server.threads[nextVictim.home - 1]->home->walFull = false;
++  }
++  server.waitForAdmissionWal(nextHome, nextVictim.tree,
++      std::make_shared<DurableTreeContext>(DurableTreeContext{
++        .state = nextHome, .server = server, .tree = nextVictim.tree,
++      }), deadline);
++  server.releaseClosedAdmissionTrees(nextHome, deadline);
++  const auto retry = server.queueDurable(incoming, 0, test.lease, deadline).ticket;
++  KJ_REQUIRE(retry.has_value());
++  KJ_EXPECT(table.homeFor(retry->tree) == nextVictim.home);
++
++  // The delayed home drops its bookkeeping without releasing the credit again.
++  server.releaseClosedAdmissionTrees(firstHome, deadline);
++  KJ_EXPECT(firstHome.admissionWalClosing.empty());
++  KJ_EXPECT(!retained->shippers.empty());
++  KJ_EXPECT(server.durableAdmissionRetirements.load() == 2);
++  KJ_EXPECT(server.durableAdmissionWalTimeouts.load() == 1);
++}
++
+ // Exercise the server's routing and accounting without starting homes or creating actors.
+ struct DatabaseAdmissionFixture {
+   using Admission = server::DurableAdmission;
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 03dc802e94ff0641403f64e463b90b4da7ca3ddf..bf488e29856b8e1b3c45d15b9242abfe136552b5 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2055,7 +2055,11 @@ struct ThreadState {
+   std::map<Worker::Actor *, uint64_t> durableActorTrees;
+   std::map<uint64_t, DurableRoot> durableRoots;
+   // A retired actor can still have a reference held by a settling facet or task.
+-  std::map<uint64_t, std::shared_ptr<DurableTreeContext>> admissionWalClosing;
++  struct AdmissionWalClose {
++    std::shared_ptr<DurableTreeContext> context;
++    server::DurableAdmission::Time deadline;
++  };
++  std::map<uint64_t, AdmissionWalClose> admissionWalClosing;
+   kj::TaskSet tasks{errors};
+ 
+   ~ThreadState() noexcept(false) {
+@@ -2695,6 +2699,8 @@ struct ObjectRetirement {
+   bool operator==(const ObjectRetirement&) const = default;
+ };
+ 
++constexpr auto OBJECT_ADMISSION_WAL_WAIT = std::chrono::seconds(1);
++
+ constexpr auto DATABASE_ADMISSION_GRACE = std::chrono::milliseconds(100);
+ 
+ struct DatabaseRetirement {
+@@ -2768,7 +2774,7 @@ struct ThreadedServer {
+   std::atomic<uint64_t> durableHomeSessions{0};
+   std::atomic<uint64_t> durableIdleRetirements{0}, durablePressureRetirements{0};
+   std::atomic<uint64_t> objectSqliteConnections{0};
+-  std::atomic<uint64_t> durableAdmissionRetirements{0};
++  std::atomic<uint64_t> durableAdmissionRetirements{0}, durableAdmissionWalTimeouts{0};
+   std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
+   std::atomic<uint64_t> durableTreeResets{0};
+   std::atomic<uint64_t> nextDurableActor{0};
+@@ -3306,10 +3312,17 @@ struct ThreadedServer {
+     if (databaseVictim && now >= databaseVictim->deadline) {
+       finishDatabaseRetirement(databaseVictim->outcome(now, false, false), now);
+     }
+-    if (objectVictim && !objectVictim->awaitingWal && now >= objectVictim->deadline) {
+-      // Do not choose the same home again until its loop shows progress.
+-      threads[objectVictim->home - 1]->home->admissionTurnDelayed = true;
+-      objectVictim.reset();
++    if (objectVictim && now >= objectVictim->deadline) {
++      if (objectVictim->awaitingWal) {
++        // The actor has been dropped. Release the routing credit even if a
++        // reference still holds a WAL registration or the home stops polling.
++        durableAdmissionWalTimeouts.fetch_add(1);
++        releaseDurableTree(objectVictim->tree, objectVictim->home, true);
++      } else {
++        // Do not choose the same home again until its loop shows progress.
++        threads[objectVictim->home - 1]->home->admissionTurnDelayed = true;
++        objectVictim.reset();
++      }
+     }
+     return durableAdmission->expire(now);
+   }
+@@ -3681,8 +3694,8 @@ struct ThreadedServer {
+         durableAdmission->stopIdleTree(selected.tree, selected.home);
+   }
+ 
+-  // Called under the routing lock after dropping the actor and, for admission
+-  // retirement, after the home's WAL registrations have been returned.
++  // Called under the routing lock after dropping the actor. Ordinary admission
++  // retirement waits for the home's WAL registrations up to its deadline.
+   bool releaseDurableTree(uint64_t tree, uint64_t homeId, bool admissionClosing) {
+     KJ_ASSERT(durableAdmission->releaseTree(tree, homeId));
+     if (admissionClosing && databaseVictim && databaseVictim->tree == tree &&
+@@ -3703,25 +3716,39 @@ struct ThreadedServer {
+     return home.resident.empty();
+   }
+ 
+-  void waitForAdmissionWal(
+-      ThreadState& state, uint64_t tree, const std::shared_ptr<DurableTreeContext>& context) {
+-    KJ_ASSERT(state.admissionWalClosing.emplace(tree, context).second);
++  void waitForAdmissionWal(ThreadState& state, uint64_t tree,
++      std::shared_ptr<DurableTreeContext> context,
++      server::DurableAdmission::Time now = server::DurableAdmission::Clock::now()) {
++    const auto deadline = now + OBJECT_ADMISSION_WAL_WAIT;
++    KJ_ASSERT(state.admissionWalClosing.emplace(
++        tree, ThreadState::AdmissionWalClose{std::move(context), deadline}).second);
+     std::lock_guard lock(durableRoutingMutex);
+-    if (objectVictim && objectVictim->tree == tree) objectVictim->awaitingWal = true;
++    if (objectVictim && objectVictim->tree == tree) {
++      objectVictim->awaitingWal = true;
++      objectVictim->deadline = deadline;
++    }
+   }
+ 
+-  void releaseClosedAdmissionTrees(ThreadState& state) {
++  void releaseClosedAdmissionTrees(ThreadState& state,
++      server::DurableAdmission::Time now = server::DurableAdmission::Clock::now()) {
+     for (auto it = state.admissionWalClosing.begin(); it != state.admissionWalClosing.end();) {
+       const auto current = it++;
+-      if (hasDurableWalRegistrations(*current->second)) continue;
+       const auto tree = current->first;
+-      state.admissionWalClosing.erase(current);
+-      // The home thread has finished unregistering the shippers and publishing
+-      // walFull before the router can observe the returned tree credit.
+-      std::lock_guard lock(durableRoutingMutex);
+-      if (releaseDurableTree(tree, state.durableHome, true)) {
+-        state.durableSlot->lastUseNs.store(nowNs());
++      const auto& close = current->second;
++      const bool walPending = hasDurableWalRegistrations(*close.context);
++      {
++        std::lock_guard lock(durableRoutingMutex);
++        // The accept loop can release the same tree at the deadline.
++        if (durableAdmission->homeFor(tree) == state.durableHome) {
++          if (walPending && now < close.deadline) continue;
++          if (walPending) durableAdmissionWalTimeouts.fetch_add(1);
++          // On normal close the home published walFull before returning routing credit.
++          if (releaseDurableTree(tree, state.durableHome, true)) {
++            state.durableSlot->lastUseNs.store(nowNs());
++          }
++        }
+       }
++      state.admissionWalClosing.erase(current);
+     }
+   }
+ 
+@@ -3873,9 +3900,9 @@ struct ThreadedServer {
+         continue;
+       }
+       const bool admissionClosing = root.admissionClosing;
+-      if (admissionClosing) {
+-        waitForAdmissionWal(state, tree, root.tree);
+-      } else if (!explicitClose || root.idleClosing) {
++      const bool waitForWal = admissionClosing && !database;
++      auto closingTree = waitForWal ? root.tree : nullptr;
++      if (!admissionClosing && (!explicitClose || root.idleClosing)) {
+         if (pressured && !root.idleClosing) {
+           durablePressureRetirements.fetch_add(1);
+           reclaimed = true;
+@@ -3887,9 +3914,11 @@ struct ThreadedServer {
+       current->second.stopFacets(nullptr);
+       actor.shutdown(0);
+       state.durableRoots.erase(current);
+-      if (!admissionClosing) {
++      if (waitForWal) {
++        waitForAdmissionWal(state, tree, std::move(closingTree));
++      } else {
+         std::lock_guard lock(durableRoutingMutex);
+-        if (releaseDurableTree(tree, homeId, false))
++        if (releaseDurableTree(tree, homeId, admissionClosing))
+           state.durableSlot->lastUseNs.store(nowNs());
+       }
+     }
+@@ -4020,6 +4049,7 @@ struct ThreadedServer {
+         ",\"idleRetirements\":" + std::to_string(durableIdleRetirements.load()) +
+         ",\"pressureRetirements\":" + std::to_string(durablePressureRetirements.load()) +
+         ",\"admissionRetirements\":" + std::to_string(durableAdmissionRetirements.load()) +
++        ",\"admissionWalTimeouts\":" + std::to_string(durableAdmissionWalTimeouts.load()) +
+         ",\"actorResets\":" + std::to_string(durableActorResets.load()) +
+         ",\"treeResets\":" + std::to_string(durableTreeResets.load()) +
+         ",\"isolateResets\":" + std::to_string(durableIsolateResets.load()) +

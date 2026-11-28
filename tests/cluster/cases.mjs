@@ -2882,6 +2882,33 @@ async function durableAdmissionRefusal(cluster) {
           if (await request.text() !== '1') return new Response('missing write body', { status: 400 });
           return Response.json(await this.write());
         }
+        if (pathname === '/hold') {
+          await new Promise(resolve => { this.releaseHold = resolve; });
+          return Response.json({ released: true });
+        }
+        if (pathname === '/held') return Response.json({ held: Boolean(this.releaseHold) });
+        if (pathname === '/release') {
+          this.releaseHold();
+          this.releaseHold = undefined;
+          return Response.json({ released: true });
+        }
+        if (pathname === '/background-timer') {
+          setTimeout(() => { void this.ctx.storage.put('timer', 'timer committed'); }, 5000);
+          return Response.json({ scheduled: true });
+        }
+        if (pathname === '/background-promise') {
+          void scheduler.wait(5000)
+            .then(() => this.ctx.storage.put('promise', 'promise committed'));
+          return Response.json({ scheduled: true });
+        }
+        if (pathname === '/background-wal') {
+          setTimeout(() => { void this.ctx.storage.put('wal', 'confirmed after release'); }, 1000);
+          return Response.json({ scheduled: true });
+        }
+        if (pathname === '/background-result') {
+          const value = await this.ctx.storage.get(searchParams.get('kind'));
+          return Response.json({ value: value ?? null });
+        }
         if (pathname === '/relay') return call(this.env, searchParams.get('target'), searchParams.get('op'));
         return Response.json({ count: (await this.ctx.storage.get('count')) ?? 0, attempts: this.attempts });
       }
@@ -2922,10 +2949,18 @@ async function durableAdmissionRefusal(cluster) {
     assert.deepEqual(json(await read(objectOwner, blocker), 200, 'blocker'), zero);
     assert.deepEqual(json(await read(databaseOwner, caller), 200, 'relay'), zero);
   });
-  const initial = await eventually('the target owner publishes the occupied slot', async () => {
+  const hold = call(objectOwner, { target: blocker, op: 'hold' });
+  void hold.catch(() => {});
+  await eventually('the blocker is waiting for release', async () => {
+    const reply = await call(objectOwner, { target: blocker, op: 'held' });
+    assert.deepEqual(json(reply, 200, 'blocker holding its slot'), { held: true });
+  });
+  const initial = await eventually('the target owner publishes the held invocation', async () => {
     const snapshot = await durableGeneration(cluster, objectOwner);
     assert.equal(snapshot.lifecycle.durableAdmission.residentRoots, 1);
-    assert.equal(snapshot.inFlight, 0);
+    assert.equal(snapshot.inFlight, 1);
+    assert.equal(snapshot.lifecycle.durableAdmission.running, 1);
+    assert.equal(snapshot.lifecycle.durableAdmission.admissionWalTimeouts, 0);
     return snapshot;
   });
   const calls = [
@@ -2934,27 +2969,38 @@ async function durableAdmissionRefusal(cluster) {
     ['object fetch', () => call(databaseOwner, { target, op: 'write', via: caller }), false],
     ['object RPC', () => call(databaseOwner, { target, op: 'rpc', via: caller }), true],
   ];
-  for (const [label, write, rpc] of calls) {
-    const reply = json(await write(), 503, `${label} refused before dispatch`);
-    if (rpc) {
-      assert.equal(reply.code, 'OVERLOADED');
-      assert.match(reply.message, /^OVERLOADED: /);
-      assertDurableCapacityRefusal(JSON.parse(reply.message.slice('OVERLOADED: '.length)));
-    } else assertDurableCapacityRefusal(reply);
+  try {
+    for (const [label, write, rpc] of calls) {
+      const reply = json(await write(), 503, `${label} refused before dispatch`);
+      if (rpc) {
+        assert.equal(reply.code, 'OVERLOADED');
+        assert.match(reply.message, /^OVERLOADED: /);
+        assertDurableCapacityRefusal(JSON.parse(reply.message.slice('OVERLOADED: '.length)));
+      } else assertDurableCapacityRefusal(reply);
+    }
+    await eventually('only the child overload counter changed on the target owner', async () => {
+      const after = await durableGeneration(cluster, objectOwner);
+      assert.equal(after.generation, initial.generation);
+      assert.equal(after.dispatchedCount, initial.dispatchedCount);
+      assert.equal(after.lifecycle.durableAdmission.overloaded, initial.lifecycle.durableAdmission.overloaded + calls.length);
+    });
+  } finally {
+    const release = await call(objectOwner, { target: blocker, op: 'release' });
+    assert.deepEqual(json(release, 200, 'release blocker'), { released: true });
+    assert.deepEqual(json(await hold, 200, 'held invocation completed'), { released: true });
   }
-  await eventually('only the child overload counter changed on the target owner', async () => {
+  await eventually('the held invocation has finished', async () => {
+    const current = await durableGeneration(cluster, objectOwner);
+    assert.equal(current.inFlight, 0);
+    assert.equal(current.lifecycle.durableAdmission.running, 0);
+    assert.equal(current.lifecycle.durableAdmission.residentRoots, 1);
+  });
+  await eventually('the refused object is admitted after the blocker finishes', async () => {
+    assert.deepEqual(json(await read(objectOwner, target), 200, 'target after refusals'), zero);
     const after = await durableGeneration(cluster, objectOwner);
-    assert.equal(after.generation, initial.generation);
-    assert.equal(after.dispatchedCount, initial.dispatchedCount);
-    assert.equal(after.lifecycle.durableAdmission.overloaded, initial.lifecycle.durableAdmission.overloaded + calls.length);
+    assert.equal(after.lifecycle.durableAdmission.admissionRetirements,
+      initial.lifecycle.durableAdmission.admissionRetirements + 1);
   });
-  const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
-  await writeFile(advance, '180000');
-  await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
-  await eventually('the blocker retires and releases capacity', async () => {
-    assert.equal((await durableGeneration(cluster, objectOwner)).lifecycle.durableAdmission.residentRoots, 0);
-  });
-  assert.deepEqual(json(await read(objectOwner, target), 200, 'target after refusals'), zero);
   for (const [index, [label, write]] of calls.entries()) {
     assert.deepEqual(json(await write(), 200, `${label} retried once`), { count: index + 1, attempts: index + 1 });
   }
@@ -2966,6 +3012,7 @@ async function durableAdmissionRefusal(cluster) {
     assert.equal(current.inFlight, 0);
     return current.lifecycle.durableAdmission;
   });
+  const advance = join(cluster.durableLifecycleGate, 'idle-offset-next');
   await writeFile(advance, '360000');
   await rename(advance, join(cluster.durableLifecycleGate, 'idle-offset-ms'));
   await eventually('the written object releases its resident root', async () => {
@@ -2977,7 +3024,86 @@ async function durableAdmissionRefusal(cluster) {
   for (const reply of await Promise.all([read(objectOwner, target), read(objectOwner, target)])) {
     assert.deepEqual(json(reply, 200, 'target after idle reopen'), { count: 4, attempts: 0 });
   }
-  assert.equal((await durableGeneration(cluster, objectOwner)).pid, initial.pid);
+  const backgroundKinds = ['timer', 'promise'];
+  for (const kind of backgroundKinds) {
+    const background = await call(objectOwner, { target, op: 'background-' + kind });
+    assert.deepEqual(json(background, 200, 'scheduled ' + kind), { scheduled: true });
+    if (kind === 'timer') {
+      await eventually('the scheduling request finished before its timer', async () => {
+        const current = await durableGeneration(cluster, objectOwner);
+        assert.equal(current.inFlight, 0);
+        assert.equal(current.lifecycle.durableAdmission.running, 0);
+      }, { timeout: 3000 });
+    }
+    const competing = json(await read(objectOwner, blocker), 503, 'retirement protects ' + kind);
+    assertDurableCapacityRefusal(competing);
+    const result = () => call(objectOwner, { target, op: 'background-result?kind=' + kind });
+    const expected = { value: kind + ' committed' };
+    await eventually(kind + ' wrote after the scheduling response', async () => {
+      assert.deepEqual(json(await result(), 200, 'background result'), expected);
+    });
+    await eventually('the finished ' + kind + ' releases the root for admission', async () => {
+      assert.deepEqual(json(await read(objectOwner, blocker), 200, 'admitted after ' + kind), zero);
+    });
+    await eventually('the ' + kind + ' value persists across reopen', async () => {
+      assert.deepEqual(json(await result(), 200, 'background result after reopen'), expected);
+    });
+  }
+  const objectAdmission = async () => {
+    const current = await durableGeneration(cluster, objectOwner);
+    assert.equal(current.pid, initial.pid);
+    assert.equal(current.generation, initial.generation);
+    assert.equal(current.lifecycle.durableAdmission.admissionWalTimeouts, 0);
+    return current.lifecycle.durableAdmission;
+  };
+  const objectPeers = await waitForWalPeers(cluster, objectOwner);
+  const beforeWal = await eventually('the retirements for both background writes are published', async () => {
+    const admission = await objectAdmission();
+    // Each check admitted the blocker and then reopened the object.
+    assert.equal(admission.admissionRetirements, resident.admissionRetirements + 2 * backgroundKinds.length);
+    assert.equal(admission.pendingCommits, 0);
+    return admission;
+  });
+  const gate = join(cluster.peerAckGate, 'hold');
+  await writeFile(gate, '');
+  try {
+    assert.deepEqual(json(await call(objectOwner, { target, op: 'background-wal' }), 200,
+      'schedule an ordinary write after the response'), { scheduled: true });
+    await eventually('the sole resident object has a WAL commit pending without a running event', async () => {
+      const admission = await objectAdmission();
+      assert.equal(admission.residentRoots, 1);
+      assert.equal(admission.running, 0);
+      assert.equal(admission.waiting, 0);
+      assert.equal(admission.homeSessions, 0);
+      assert.equal(admission.pendingCommits, 1);
+      const states = await Promise.all(objectPeers.map(node => cluster.state(node)));
+      assert.ok(states.every(state => state.durableLog.peers.heldAcksForTest > 0));
+    }, { timeout: 5000, interval: 25 });
+    // The only resident object is the oldest. The pending write is its remaining work.
+    assertDurableCapacityRefusal(json(await read(objectOwner, blocker), 503,
+      'the oldest object is protected while confirming its background write'));
+    const held = await objectAdmission();
+    assert.equal(held.admissionRetirements, beforeWal.admissionRetirements);
+    assert.equal(held.idleRetirements, beforeWal.idleRetirements);
+    assert.equal(held.pendingCommits, 1);
+  } finally {
+    await unlink(gate);
+  }
+  await eventually('the ordinary background write is confirmed', async () => {
+    const admission = await objectAdmission();
+    assert.equal(admission.pendingCommits, 0);
+    assert.equal(admission.residentRoots, 1);
+  });
+  assert.deepEqual(json(await read(objectOwner, blocker), 200, 'admitted after WAL confirmation'), zero);
+  await eventually('confirmation made the object eligible for admission retirement', async () => {
+    const admission = await objectAdmission();
+    assert.equal(admission.admissionRetirements, beforeWal.admissionRetirements + 1);
+    assert.equal(admission.idleRetirements, beforeWal.idleRetirements);
+  });
+  const savedWal = await call(objectOwner, { target, op: 'background-result?kind=wal' });
+  assert.deepEqual(json(savedWal, 200, 'confirmed background write after reopening'),
+    { value: 'confirmed after release' });
+  await objectAdmission();
 
   const sql = (sql, timeout = 10000) => request(cluster.urls.apiserver, `${db.path}/query`, {
     method: 'POST', token: tenant.token, body: { sql }, timeout,
@@ -2990,7 +3116,6 @@ async function durableAdmissionRefusal(cluster) {
   });
   assert.equal(json(await sql('CREATE TABLE ledger(value INTEGER)'), 200, 'create ledger').success, true);
   const peers = await waitForWalPeers(cluster, databaseOwner);
-  const gate = join(cluster.peerAckGate, 'hold');
   await writeFile(gate, '');
   const held = sql('INSERT INTO ledger VALUES (0)');
   void held.catch(() => {});
@@ -3033,6 +3158,7 @@ async function durableAdmissionRefusal(cluster) {
   assert.equal(json(await d1('exec'), 200, 'D1 exec retry').count, 1);
   assert.deepEqual(json(await sql(rows), 200, 'one row per retried insert').results,
     [0, 1, 2, 3].map(value => ({ value })));
+  assert.equal((await durableGeneration(cluster, databaseOwner)).lifecycle.durableAdmission.admissionWalTimeouts, 0);
 }
 
 async function durableCopyReservationRefusal(cluster) {

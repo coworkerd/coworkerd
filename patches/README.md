@@ -134,6 +134,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0187 applies the same heap meter to ordinary threaded Durable Objects. A failed
   allocation in user SQL rolls back the active storage transaction and returns a catchable
   error. The connection continues to use the existing threaded WAL close contract.
+  Patch 0188 extends admission-time idle retirement to ordinary trees. The threaded server selects a tree,
+  and its home rechecks live work before closing it and returning its routing credit. Patch 0189 extends
+  the native test to exercise a new event arriving after the home last reported the object idle.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

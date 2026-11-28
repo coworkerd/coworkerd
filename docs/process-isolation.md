@@ -85,7 +85,11 @@ Idle collections (section 4) run in the same loop of workerd's evictor.
 
 **Idle eviction** is workerd's (a patch): a Worker loaded by the Worker Loader is removed once it has no request in flight -- streaming responses and JS RPC included -- no `waitUntil` work, and has been idle for `idleEvictMs` (5 minutes). A Worker whose load failed is removed at once, so a failure is never permanent. The threshold weighs a cold start, a few milliseconds, against the memory of resident Workers; it must be `0` or longer than `placement.idleMs`.
 
-Durable processes also evict idle object trees when the resident target (`durableObjects.residentObjects`, 4096; `0` disables it) is exceeded. Facets leave before the root; active objects are protected, so this is a target rather than a hard instantaneous count. Hibernatable WebSockets stay connected during this eviction and wake their object on the next message. Evicting a version's Worker tears down its idle object trees first.
+The default resident target is 4,096 object trees per durable process (`durableObjects.residentObjects`;
+`0` disables the count limit). A threaded process retires its least recently used eligible idle tree when a
+new ordinary object needs a place. The upstream backend retires idle trees after crossing the target.
+Retirement closes facets before the root and protects active work. Hibernatable WebSockets stay connected
+and wake the object on the next message. Evicting a version's Worker tears down its idle object trees first.
 
 **The memory watermark** is the node's, on Linux: every 100 ms it reads its cgroup's working set (`memory.current` minus `inactive_file`) against `memory.max`, or against `memoryBudgetBytes` when the container has no limit, and sets a band; with neither, the watermark is off. Red is from 90 %, yellow from 75 %, back to green below 65 %, and red steps down to yellow below 75 %. workerd's evictor reads the band from shared memory.
 

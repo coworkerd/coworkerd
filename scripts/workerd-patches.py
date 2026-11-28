@@ -390,9 +390,16 @@ def allowed_path(name, path):
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name in {'0177-retire-idle-databases-at-admission.patch',
-                                   '0180-fix-database-admission-accounting.patch'} and path in {
+                                   '0180-fix-database-admission-accounting.patch',
+                                   '0188-retire-idle-objects-at-admission.patch',
+                                   '0190-harden-ordinary-object-admission.patch',
+                                   '0191-return-wal-slots-before-admission-tree-credit.patch',
+                                   '0192-bound-admission-wal-return.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
+                          name in {'0189-test-busy-objects-with-stale-idle-observations.patch',
+                                   '0193-scope-wal-admission-test-event-loops.patch'} and path ==
+                              'src/workerd/threaded/threaded-server-test.c++' or
                           name == '0178-keep-platform-databases-open-after-sql-interruption.patch' and path in {
                               'src/workerd/api/actor-state.c++',
                               'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h',

@@ -50,7 +50,7 @@ The fixture can vary the home and mailbox limits with `COWORKERD_DO_TEST_HOME_CO
 descriptor headroom before accounting for the home loops. These settings apply to disposable runs.
 
 On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/coworkerd-threaded" measure 4 64`
-to fill one durable child with four copies of 64 real objects each. The tool checks the next object's refusal
+to fill one durable child with four copies of 64 real objects each. The tool checks the next object's admission after an idle retirement
 and prints baseline and saturated thread count, RSS, descriptors, and admission counters.
 
 The `placement` mode alternates bounded synchronous work on one object with requests to new objects.
@@ -1345,14 +1345,15 @@ try {
       assert.equal(reply.status, 200, payload + '\n' + diagnostics);
       isolates.add(JSON.parse(payload).isolate);
     }
-    const refusal = await query(count, body);
-    const reason = await refusal.text();
-    assert.equal(refusal.status, 502, reason + '\n' + diagnostics);
     assert.equal(isolates.size, homeCount);
     const loaded = await readAdmission(socketPath);
     assert.equal(loaded.homes, homeCount);
     assert.equal(loaded.residentRoots, count);
     const full = await readProcessResources(processInfo.pid);
+    const next = await query(count, body);
+    assert.equal(next.status, 200, await next.text() + '\n' + diagnostics);
+    const after = await readAdmission(socketPath);
+    assert.equal(after.admissionRetirements, loaded.admissionRetirements + 1);
     assert.equal((await query(0, 'still ready')).status, 200);
     console.log(JSON.stringify({ homes: homeCount, treesPerHome, residentRoots: count,
       bodyBytes: body.length, warmupMs: performance.now() - start, baseline, full, admission: loaded }));
