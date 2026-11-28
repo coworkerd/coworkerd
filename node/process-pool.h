@@ -4,6 +4,7 @@
 
 #include "coworkerd.capnp.h"
 #include "config.h"
+#include "egress.h"
 #include "suspects.h"
 #include "tenancy.h"
 #include "tenant-execution.h"
@@ -32,6 +33,7 @@ struct OpenEvent {
 
 struct ProcessGeneration;
 class ProcessPool;
+class RequestLease;
 
 class ProcessCall final {
 public:
@@ -57,6 +59,7 @@ public:
   uint64_t startedAtUnixMs = 0;
   bool dispatched = false;
   PreExecutionRefusal preExecutionRefusal = PreExecutionRefusal::NONE;
+  bool upgradedToWebSocket = false;
   std::function<void()> onCapacityRejected;
 private:
   friend class ProcessPool;
@@ -174,7 +177,8 @@ public:
   OpenEvent open(std::shared_ptr<ProcessCall> call, kj::StringPtr descriptor,
       const std::string& definitionHash,
       std::shared_ptr<capnp::MallocMessageBuilder> nativeProps = {},
-      kj::Maybe<capnp::Capability::Client> budgetLifetime = kj::none, bool threadedSql = false);
+      kj::Maybe<capnp::Capability::Client> budgetLifetime = kj::none, bool threadedSql = false,
+      std::shared_ptr<RequestLease> requestLease = {});
   kj::Promise<std::string> stateJson(uint32_t idleMs, kj::Timer& timer) const;
   std::string culpritRecordsJson() const;
   std::string placementJson(const std::vector<std::string>& workers);
@@ -194,7 +198,7 @@ public:
   // and its own egress token (EGRESS_TOKEN), which the runtime sends with each request and only the runtime holds.
   void enableEgress(std::string address);
   // The live generation (slot id, generation) a token belongs to, if any.
-  std::optional<std::pair<std::string, uint64_t>> egressSource(const std::string& token) const;
+  std::optional<EgressSource> egressSource(const std::string& token) const;
 
   // Server exit. beginShutdown(): no further rotation starts (one in progress
   // finishes). drainState(): the rotation's drain criterion over every live generation, with
