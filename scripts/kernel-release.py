@@ -12,7 +12,7 @@ import tarfile
 import tempfile
 
 from kernel_artifacts import (
-    ALLOWLIST, ARCHITECTURES, BINARIES, archive_name, check_allowlist, check_install,
+    ALLOWLIST, ARCHITECTURES, PROFILED, archive_name, check_allowlist, check_install,
     hosted_release_tag, json_text, metadata, release_tag, run_identity, series_identity, sha256, unpack,
 )
 
@@ -32,11 +32,12 @@ def verify(path, directory, arch, expected):
 
     allowlist = directory / "allowlist"
     summary = json.loads((allowlist / ALLOWLIST[0]).read_text())
-    digests = {files[name] for name in BINARIES}
+    # An archive built while the node still started the upstream binary names and profiles both.
+    digests = {files[name] for name in PROFILED}
     observed = {profile["workerdSha256"] for profile in summary["profiles"]}
-    if observed != digests or set(summary["workerd"]["sha256s"]) != digests:
-        raise ValueError(f"{path.name}: syscall profiles must cover these exact two binaries")
-    check_allowlist(allowlist, files["coworkerd-threaded"], arch)
+    if not digests <= observed or not digests <= set(summary["workerd"]["sha256s"]):
+        raise ValueError(f"{path.name}: syscall profiles must cover the threaded executable")
+    check_allowlist(allowlist, files[PROFILED[0]], arch)
     return record
 
 

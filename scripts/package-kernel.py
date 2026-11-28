@@ -15,7 +15,7 @@ import tarfile
 import tempfile
 
 from kernel_artifacts import (
-    ALLOWLIST, ARCHITECTURES, BINARIES, MODES, RECORD, ROOT, archive_name,
+    ALLOWLIST, ARCHITECTURES, BINARIES, MODES, PROFILED, RECORD, ROOT, archive_name,
     architecture, check_allowlist, check_binary, json_text, release_tag, run_identity, series_identity, sha256,
 )
 
@@ -58,7 +58,7 @@ def package(args):
                 raise ValueError(f"{path} is not a regular file")
             shutil.copyfile(path, stage / name)
         hashes = {name: sha256(stage / name) for name in paths}
-        check_allowlist(stage / "allowlist", hashes["workerd"], arch)
+        check_allowlist(stage / "allowlist", hashes[PROFILED[0]], arch)
         record = json_text({**identity, **provenance, "patchSeries": series, "releaseTag": tag, "architecture": arch,
                             "coworkerdCommit": source, "workerdTree": tree, "files": hashes}).encode()
 

@@ -26,7 +26,7 @@ for profile in "$stage/profiles/"*.json; do
   profiles+=(--profile "$profile")
 done
 python3 "$control/syscall-allowlist.py" \
-  --workerd "$raw/workerd" --workerd "$raw/coworkerd-threaded" --out "$stage/allowlist" "${profiles[@]}"
+  --workerd "$raw/coworkerd-threaded" --out "$stage/allowlist" "${profiles[@]}"
 
 python3 "$control/package-kernel.py" --github-run --toolchain "$RUNNER_TEMP/kernel-toolchain.json" \
   --arch "$KERNEL_ARCH" --source "$PWD" --checkout workerd \

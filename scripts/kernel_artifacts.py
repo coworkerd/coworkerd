@@ -21,6 +21,9 @@ BINARIES = {
     "workerd": "bazel-bin/src/workerd/server/workerd",
     "coworkerd-threaded": "bazel-bin/src/workerd/threaded/coworkerd-threaded",
 }
+# The node starts only the threaded executable, so the profile run can observe only that one, and the
+# system call tables are made from it and name it. The upstream binary stays in the archive for now.
+PROFILED = ("coworkerd-threaded",)
 ALLOWLIST = ("allowlist.json", "coworkerd-syscalls-startup.txt", "coworkerd-syscalls-steady.txt")
 RECORD = "kernel.json"
 FILES = (*BINARIES, *(f"allowlist/{name}" for name in ALLOWLIST))
@@ -156,7 +159,7 @@ def check_install(directory, record, files, arch):
             raise ValueError(f"{directory / name} does not match the verified archive")
     for name in BINARIES:
         check_binary(directory / name, arch)
-    check_allowlist(directory / "allowlist", files["workerd"], arch)
+    check_allowlist(directory / "allowlist", files[PROFILED[0]], arch)
 
 
 def unpack(archive, directory, record):

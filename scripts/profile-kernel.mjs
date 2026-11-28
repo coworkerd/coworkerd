@@ -1,4 +1,4 @@
-// Run the cluster workloads on both instrumented kernel executables. Keep the strace
+// Run the cluster workloads on the instrumented threaded executable, the only one a node starts. Keep the strace
 // process separate so the node still reports the executable's PID in its lifecycle log.
 import { appendFile, chmod, mkdir, mkdtemp, readFile, rename, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 const [kernel, output] = process.argv.slice(2).map(path => resolve(path));
 const { Cluster } = await import(pathToFileURL(resolve('tests/cluster/cluster.mjs')));
 const { cases } = await import(pathToFileURL(resolve('tests/cluster/cases.mjs')));
-const programs = ['workerd', 'coworkerd-threaded'];
+const programs = ['coworkerd-threaded'];
 const wrapper = `#!/bin/sh
 set -eu
 binary=$(basename "$0")
@@ -51,6 +51,12 @@ USER coworkerd:coworkerd
         const configPath = service.volumes[0].source;
         const config = JSON.parse(await readFile(configPath, 'utf8'));
         config.sandbox = { mode: 'off' };
+        // The default call ceiling follows the runner's memory, and a process starts one thread for each
+        // slot. Under strace that takes longer than the readiness check allows. The calls a process makes
+        // do not depend on the number of slots, so the profile names the ceiling unless a case does.
+        if (config.processPool?.inFlightLimit === undefined) {
+          config.processPool = { ...config.processPool, inFlightLimit: 512 };
+        }
         await writeFile(configPath, JSON.stringify(config));
         service.volumes.push({ type: 'bind', source: directory, target: '/profiles' });
       }
