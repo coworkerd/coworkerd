@@ -338,33 +338,15 @@ be used again in this release.
 
 ### SQL deadlines
 
-On a threaded owner, an HTTP SQL query or D1 query has a 30-second wall deadline, including
+An HTTP SQL query or D1 query has a 30-second wall deadline, including
 placement, queueing, storage recovery and SQL work. A whole batch shares one deadline. A deadline
 returns HTTP `503 SQL_LIMIT_EXCEEDED` or D1 `D1_ERROR: SQL_LIMIT_EXCEEDED: …`. A full HTTP SQL
 disconnect also cancels the running statement. In either case, the transaction rolls back and the next
 query can use the same open database. WAL confirmation runs under its own timeout after SQL execution.
 
-On an upstream owner, each database event has a cumulative native SQL CPU budget of 200 ms by default
-and an 800 ms active SQL wall-time fallback. Statements in the event share that budget across awaits.
-Configure `processPool.sqlCpuLimitMs` and `processPool.sqlWallLimitMs` in the [node configuration](install.md).
-Each native compilation or row step is sampled randomly with probability 1/16. A sampled segment without
-a SQLite progress callback contributes its first 250 microseconds of CPU multiplied by 16, plus any
-excess at its actual value. Segments invoking the progress callback are measured directly.
-
-How much work fits in a budget depends on the node's CPU. Split large updates and scans into bounded
-requests, for example by key range. On an upstream owner, a running statement blocks the shared event
-loop. Keep any raised upstream SQL limits below `processPool.stuckTimeoutMs` (3000 ms by default).
-
-An upstream SQL limit ends the current database object and returns `503 SQL_LIMIT_EXCEEDED`, naming
-the cause and configured limit. A batch, one ingest segment, or one migration file including its
-`d1_migrations` row fails as a whole. Earlier confirmed segments and files remain. Concurrent
-`STORAGE_UNAVAILABLE` and `RESULT_UNCERTAIN` retain their confirmation meaning and priority.
-
-For a tenant's own `ctx.storage.sql`, an interrupted write rolls back the transaction even if caught. A read error escaping `transactionSync` rolls back; if caught, earlier complete statements may commit, while later SQL in the event is refused. See [Durable Objects](durable-objects.md). A smaller Worker CPU allowance does not replace the SQL budget inside a native statement. With a 50 ms Worker CPU allowance and the default 200 ms SQL budget, a long SQL test returned `503 CPU_LIMIT_EXCEEDED` after about 220 ms; the Worker allowance took effect when native execution returned.
-
-SQL interruption is cooperative. A costly function or blocking I/O without SQLite progress callbacks
-can exceed the SQL limit. On upstream owners, a sequence of callback-free segments each taking more
-than 250 microseconds is undercounted by the sampled estimate. The process watchdog is the fallback.
+Each ingest segment and migration file uses its own transaction. If a deadline expires, earlier confirmed
+segments or files remain. Concurrent `STORAGE_UNAVAILABLE` and `RESULT_UNCERTAIN` retain their
+confirmation meaning. Split work that can exceed the deadline into smaller key ranges or transactions.
 
 ### Storage and transaction limits
 

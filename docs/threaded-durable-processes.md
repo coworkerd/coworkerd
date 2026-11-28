@@ -5,7 +5,7 @@ The source and baseline use main at `dfc8803731a33feaaf8796313a0053d403f5ba8a`.
 The node continues to own placement and durable history. The threaded child hosts object events and native database
 operations. Billing and separation by trust level are outside this design.
 
-## Current execution and the proposed boundary
+## Original baseline and proposed boundary
 
 `ProcessPool` in [node/process-pool.c++](../node/process-pool.c++) maps an object key to a durable slot, explicitly
 selects threaded execution only for non-durable slots, and gives the old durable child a generation-scoped log FD
@@ -18,7 +18,7 @@ registry for the actual call. A tenant Worker version shares an isolate across i
 `SqlDatabase` in that same runtime implements the SQL side of the D1 binding and the HTTP API using one shared
 runtime isolate. Durable processes share the upstream event loop even across different isolates.
 
-The current kernel already has an idle path below the 4,096 limit. Upstream `ActorContainer::inactive`
+The upstream kernel at the design baseline had an idle path below the 4,096 limit. Upstream `ActorContainer::inactive`
 arms a 10 s shutdown for an evictable namespace. Patch 0020 registers shipped root namespaces with
 `evictable: true` and adapts their retirement. Separately, its `ResidencyCoordinator` runs the process-wide
 LRU pass introduced by patch 0014. The proposal replaces the old idle path with explicit blocker deadlines,

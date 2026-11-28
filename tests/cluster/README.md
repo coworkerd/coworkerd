@@ -61,7 +61,7 @@ Run the capacity case explicitly on a Linux Docker host that can sustain 5,000 c
 execution node. It verifies both the forwarded and executing counts, then compares peer RPC messages per second
 and Linux main-thread CPU for each node before and during the held requests.
 
-## Expected failures with threaded durable storage
+### Expected failures with threaded durable storage
 
 The list is empty. The runner requires every case to pass.
 
