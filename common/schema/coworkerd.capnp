@@ -67,9 +67,11 @@ interface InvocationBudgetLifetime {
 }
 
 interface WorkerdBootstrap @0x878048cda334ade3 {
+  # A node binding bootstrap can wait for a cold Durable Object load. Abandoning
+  # the call must drop the connection that owns the load's waiter.
   startEvent @0 (cfBlobJson :Text, fromPersistentStub :Bool, fromHandoff :Bool,
                  forwardedBy :Text, causedBy :List(Text), budgetLifetime :Capability, budgetTicket :UInt64)
-      -> (dispatcher :EventDispatcher, budgetAccepted :Bool);
+      -> (dispatcher :EventDispatcher, budgetAccepted :Bool) $Cxx.allowCancellation;
 }
 
 # Native ordinary-process loopback props. The wire type and method are private
@@ -149,9 +151,15 @@ interface ThreadedSocketControl @0xdc432f018090bcc4 {
 }
 
 interface ThreadedBootstrap @0xa0c731b2df279451 extends(WorkerdBootstrap) {
-  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer, budgetLifetime :Capability, budgetTicket :UInt64)
-      -> (dispatcher :EventDispatcher, budgetAccepted :Bool);
+  # The native binding bootstrap has the same cancellation contract as startEvent.
+  startNativeEvent @0 (cfBlobJson :Text, coworkerdProps :AnyPointer, budgetLifetime :Capability,
+                       budgetTicket :UInt64, lease :NativeLeaseControl)
+      -> (dispatcher :EventDispatcher, budgetAccepted :Bool) $Cxx.allowCancellation;
   socketControl @1 () -> (control :ThreadedSocketControl);
+}
+
+interface NativeLeaseControl @0xbbb54ed58665162a $Cxx.allowCancellation {
+  whenEnded @0 () -> ();
 }
 
 interface PeerServer @0xab4d6df924ec776f {
@@ -167,6 +175,8 @@ interface PeerServer @0xab4d6df924ec776f {
   # What this node still holds of a previous owner's log for one shard: a new owner asks for it after it has replayed
   # the object store, so that the writes the previous owner answered but did not get into a segment are not lost.
   fetchDurableTail @3 (request :DurableTailRequest) -> (result :DurableTailResult);
+  # One keepalive per authenticated session, regardless of the number of open calls.
+  keepAlive @4 () -> ();
 }
 
 struct DurableLogSession {
@@ -230,6 +240,13 @@ struct InvocationOpenResult {
   }
 }
 
+# The direct caller's side of one open invocation. State is pushed once;
+# session keepalive detects silent partitions independently of invocation count.
+interface CallerLease $Cxx.allowCancellation {
+  waitForDrain @0 () -> (remainingMs :Float64);
+  waitForEnd @1 () -> ();
+}
+
 struct InvocationRejection {
   code @0 :Text;
   reason @1 :Text;
@@ -270,6 +287,7 @@ struct RemoteInvocation {
   # Set by dynamic ingress placement on its first pass. A peer may decline before execution
   # on soft saturation. The ingress can then retry without this preference.
   preferIdle @20 :Bool;
+  callerLease @21 :CallerLease;
 }
 
 # A request to a Durable Object from the node where its caller runs to the node that owns the object's shard. The owner
@@ -314,6 +332,7 @@ struct ObjectInvocation {
   platformClass @24 :Text;
   # SQL wall time left at the sender. Older nodes omit the field.
   sqlRemainingMs @25 :Float64 = -1;
+  callerLease @26 :CallerLease;
 }
 
 struct ServerConfig {
@@ -494,6 +513,13 @@ struct ServerConfig {
   struct IngressConfig {
     # Ceiling for all ingress WebSockets on this node. 0 uses the default, capped by the hard descriptor limit.
     webSocketsPerNode @0 :UInt32;
+    tcpKeepalive @1 :TcpKeepalive;
+
+    struct TcpKeepalive {
+      idleSeconds @0 :UInt16 = 30;
+      intervalSeconds @1 :UInt16 = 10;
+      probes @2 :UInt8 = 3;
+    }
   }
 
   struct SecretsConfig {
@@ -1144,6 +1170,8 @@ struct InvocationDescriptor {
     # How many times its handler has already been tried (alarmInfo.retryCount).
     alarmRetryCount @9 :UInt32;
     alarmFacetId @10 :UInt32 = 1;
+    # The node's wall limit for one alarm attempt on the legacy host.
+    alarmWallMs @11 :UInt32;
   }
 }
 

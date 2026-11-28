@@ -32,6 +32,7 @@ namespace coworkerd {
 struct EgressSource {
   std::string processId;
   uint64_t generation = 0;
+  bool durable = false;
 };
 
 enum class EgressDebit { charged, exhausted, expired };
@@ -45,7 +46,7 @@ public:
   EgressService(const EgressConfig& config, std::string serverId, kj::Network& network, kj::Timer& timer,
       const kj::HttpHeaderTable& headerTable, std::function<std::vector<std::string>()> clusterEndpoints,
       std::function<std::optional<EgressSource>(const std::string&)> source,
-      std::function<EgressDebit(const std::string& invocationId)> charge,
+      std::function<EgressDebit(const std::string& invocationId, bool fromDurableProcess)> charge,
       std::function<void(const std::string& tenant, uint64_t bytes)> metered = {});
   ~EgressService() noexcept(false);
 
