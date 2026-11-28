@@ -514,6 +514,7 @@ struct InvocationRejection {
   uint32_t avoidMs = 0;
   std::string category;  // LOAD_FAILED: package-unavailable, evaluation, limit, secret-missing
   bool notExecuted = false, retryable = false;
+  std::optional<uint32_t> workerInFlight;
 
   std::string json() const {
     std::ostringstream out;
@@ -1894,6 +1895,12 @@ public:
               workerBusy ? "Worker isolate busy" : "node CPU full", 503, root);
           value.avoidMs = 0;
           value.notExecuted = value.retryable = true;
+          if (workerBusy) {
+            const auto count = statelessInFlight.find(worker);
+            const auto inFlight = count == statelessInFlight.end() ? 0 : count->second;
+            KJ_ASSERT(!reserved || inFlight > 0, "reserved admission must belong to the same Worker");
+            value.workerInFlight = inFlight - (reserved ? 1 : 0);
+          }
           if (record) observeRefusal(value, forwardedRoot ? "peerIngress" : "localIngress");
           return value;
         }
@@ -2103,7 +2110,9 @@ public:
       if (tenant == tenantAdmissions.end() || tenant->first != key)
         tenant = tenantAdmissions.try_emplace(tenant, std::string(key));
     }
-    auto slot = std::make_shared<AdmissionSlot>([this, lifetime = std::weak_ptr<int>(executionLifetime), root, tenant]() {
+    auto workerCount = durable ? statelessInFlight.end() : statelessInFlight.try_emplace(worker, 0).first;
+    auto slot = std::make_shared<AdmissionSlot>(
+        [this, lifetime = std::weak_ptr<int>(executionLifetime), root, tenant, workerCount]() {
       if (lifetime.expired()) return;
       auto& count = root ? inFlightRoots : inFlightNested;
       KJ_ASSERT(count > 0, "admission count underflow");
@@ -2114,9 +2123,14 @@ public:
         --active;
         if (tenant->second.empty()) tenantAdmissions.erase(tenant);
       }
+      if (workerCount != statelessInFlight.end()) {
+        KJ_ASSERT(workerCount->second > 0, "Worker admission count underflow");
+        if (--workerCount->second == 0) statelessInFlight.erase(workerCount);
+      }
     });
     if (root) ++inFlightRoots; else ++inFlightNested;
     if (tenant != tenantAdmissions.end()) ++tenant->second.active(root);
+    if (workerCount != statelessInFlight.end()) ++workerCount->second;
     slot->server = this;
     slot->root = root;
     return slot;
@@ -3712,9 +3726,13 @@ private:
       bool loadCheck = false, const std::string& sourceInvocationId = {}, bool coldLoaded = false,
       const DurableTarget* durable = nullptr, const coworkerd::RootDispatch* root = nullptr,
       const std::string& dispatchReceipt = {}, const coworkerd::DurableLog* durableLog = nullptr) const {
-    auto encodeNative = [&](kj::String encoded) {
-      if (!process.threadedServer()) return encoded;
-      std::string value(encoded.cStr()); value.pop_back();
+    auto encodeJson = [&](rpc::InvocationDescriptor::Reader descriptor) {
+      capnp::MallocMessageBuilder message(128);
+      auto json = message.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().encode(descriptor, json);
+      auto value = coworkerd::json::encodeCompact(json.asReader());
+      if (!process.threadedServer()) return value;
+      value.pop_back();
       value += ",\"nativeNamespaces\":[";
       bool first = true;
       for (const auto& className: version.declaredClasses) {
@@ -3724,7 +3742,7 @@ private:
         first = false;
       }
       value += "]}";
-      return kj::str(value.c_str());
+      return value;
     };
     capnp::MallocMessageBuilder message;
     auto descriptor = message.initRoot<rpc::InvocationDescriptor>();
@@ -3805,10 +3823,10 @@ private:
         auto classes = descriptor.initDurableObjectClasses(version.declaredClasses.size());
         for (size_t i = 0; i < version.declaredClasses.size(); ++i) classes.set(i, version.declaredClasses[i].c_str());
       }
-      capnp::JsonCodec json;
       const coworkerd::VersionPins emptyPins;
       const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version, emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
-      auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
+      auto encoded = encodeJson(descriptor.asReader());
+      encoded.pop_back();
       if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
       encoded += '}';
       holdSecrets(plain.plan);
@@ -3862,10 +3880,9 @@ private:
       target.setAlarmFacetId(durable->alarmFacetId);
       if (durable->alarmAtUnixMs) target.setAlarmWallMs(leaseConfig.alarmWallMs);
       descriptor.initBindings(0);
-      capnp::JsonCodec json;
       holdSecrets(root != nullptr ? root->plan : std::string());
       if (root != nullptr) {
-        auto encoded = root->descriptor(encodeNative(json.encode(descriptor.asReader())).cStr());
+        auto encoded = root->descriptor(encodeJson(descriptor.asReader()));
         if (process.threadedDurableRole()) {
           KJ_REQUIRE(!root->fingerprint.empty(), "missing pinned durable definition");
           const auto storage = coworkerd::makeRootStorageRef(durable->namespaceId, durable->objectId, durable->dataEpoch);
@@ -3915,7 +3932,7 @@ private:
         }
         return kj::str(encoded.c_str());
       }
-      return encodeNative(json.encode(descriptor.asReader()));
+      return kj::str(encodeJson(descriptor.asReader()).c_str());
     }
     auto bindingPins = pins;
     if (perCallForTest()) {
@@ -3941,11 +3958,11 @@ private:
       bindings[index].setDefinitionHash(target.definitionHash.c_str());
       bindings[index].setEntrypoint(version.bindings[index].entrypoint.c_str());
     }
-    capnp::JsonCodec json;
     const coworkerd::VersionPins emptyPins;
     const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version,
         bindingPins ? *bindingPins : emptyPins, limits.cpuMs, limits.memoryMiB, &plainPlanCache);
-    auto encoded = std::string(encodeNative(json.encode(descriptor.asReader())).cStr()); encoded.pop_back();
+    auto encoded = encodeJson(descriptor.asReader());
+    encoded.pop_back();
     if (!dispatchReceipt.empty()) encoded += ",\"dispatchReceipt\":\"" + dispatchReceipt + '"';
     encoded += '}';
     holdSecrets(plain.plan);
@@ -4074,6 +4091,7 @@ private:
   uint32_t inFlightRoots = 0;
   uint32_t inFlightNested = 0;
   std::map<std::string, coworkerd::TenantAdmissionCounts, std::less<>> tenantAdmissions;
+  std::map<std::string, uint32_t> statelessInFlight;
   struct PausedAdmissionCounts {
     uint64_t count = 0, active = 0, maxActive = 0;
     double totalWaitMs = 0, maxWaitMs = 0;
@@ -4400,11 +4418,14 @@ void writeRefusal(rpc::InvocationOpenResult::Builder result, const InvocationRej
   refusal.setLimit(value.limit); refusal.setAvoidMs(value.avoidMs); refusal.setStatus(value.status);
   refusal.setNotExecuted(value.notExecuted); refusal.setRetryable(value.retryable);
   if (!value.category.empty()) refusal.setCategory(value.category.c_str());
+  if (value.workerInFlight) refusal.getWorkerLoad().setInFlight(*value.workerInFlight);
 }
 
 InvocationRejection readRefusal(rpc::InvocationRejection::Reader value) {
+  auto workerLoad = value.getWorkerLoad();
   return {value.getStatus(), value.getCode().cStr(), value.getReason().cStr(), value.getLoadBand().cStr(),
-      value.getInFlight(), value.getLimit(), value.getAvoidMs(), value.getCategory().cStr(), value.getNotExecuted(), value.getRetryable()};
+      value.getInFlight(), value.getLimit(), value.getAvoidMs(), value.getCategory().cStr(), value.getNotExecuted(),
+      value.getRetryable(), workerLoad.isInFlight() ? std::optional(workerLoad.getInFlight()) : std::nullopt};
 }
 
 // One relay of an inbound WebSocket connection (WebSocketRegistry): `outer` toward the client -- the client itself at the
@@ -6113,12 +6134,21 @@ public:
     std::optional<InvocationRejection> tenantRefusal;
     size_t finalRefusals = 0;
     const auto firstPassSize = std::min<size_t>(ordered.size(), hops);
-    std::vector<std::string> saturated;
+    std::vector<coworkerd::SaturatedPlacementCandidate> saturated;
     for (size_t i = 0; i < firstPassSize + saturated.size(); ++i) {
       // Revisit only explicit soft refusals from the bounded first pass.
       const bool fallback = i >= firstPassSize;
       if (!fallback) --hops;
-      const auto& id = fallback ? saturated[i - firstPassSize] : ordered[i];
+      else if (i == firstPassSize && saturated.size() > 1) {
+        const auto now = monotonicTimeMs();
+        const bool localLast = server.lastResort();
+        coworkerd::orderSaturationFallbacks(saturated, nextSaturationFallback++, [&](const auto& nodeId) {
+          if (localLast && nodeId == config.serverId) return 2;
+          auto found = avoidance.find(nodeId);
+          return found != avoidance.end() && found->second.until > now ? 1 : 0;
+        });
+      }
+      const auto& id = fallback ? saturated[i - firstPassSize].nodeId : ordered[i];
       const bool preferIdle = !fallback && allocation.ingressRoot && firstPassSize > 1;
       InvocationAttempt result;
       const auto startedAt = wallTimeMsForTest();
@@ -6173,7 +6203,7 @@ public:
       const auto& refusal = *result.failure;
       if (preferIdle && coworkerd::placementSaturationRefusal(refusal.code) && rerouteAfter(refusal)) {
         // Keep the probe in attempt diagnostics. The retry determines the candidate's final refusal.
-        saturated.push_back(id);
+        saturated.push_back({id, refusal.workerInFlight.value_or(refusal.inFlight)});
       } else {
         ++finalRefusals;
         allNotExecuted = allNotExecuted && refusal.notExecuted;
@@ -6245,6 +6275,7 @@ private:
   }
   struct Avoidance { double until = 0; uint32_t failures = 0; };
   std::map<std::string, Avoidance> avoidance;
+  uint64_t nextSaturationFallback = 0;
 
   struct PeerState: coworkerd::PeerConnectionReuse<PeerConnection> {
     kj::Maybe<kj::ForkedPromise<kj::Rc<PeerConnection>>> connecting;

@@ -74,18 +74,32 @@ after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` eac
 did not start and that one retry applies it once. A Durable Object exception after writing and a SQL
 constraint failure retain their ordinary error results.
 
-### Single-node waiting-call baseline
+### Single-node waiting calls
 
-The fixture enables ingress placement and sends fixed batches of 8, 16 and 24 stateless Worker
-requests to a private HTTP upstream with a two-second delay. It verifies the actual upstream
-overlap and completed replies. The JSONL records RSS, threads and open descriptors per process
-before, during, after drain and after recovery.
+The fixture enables ingress placement and sends ordinary stateless Worker requests to a private
+HTTP upstream that waits two seconds per request. The default plan runs fixed batches of 8, 16
+and 24 and checks that all requests wait at once and return the correct reply.
 
 ```sh
-node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-capacity.jsonl
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-baseline.jsonl
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-defaults.jsonl --batches 128,512,2000
 ```
 
-Use a new output path for each run. The fixture removes its disposable cluster and upstream.
+Use a new output path for each run. Custom batches record refusals and partial overlap. Add
+`--expect-full` to require every request in each batch to overlap and succeed. For a controlled
+comparison, set `--root-limit` and `--nested-limit` on the node or `--process-limit` on its sole
+ordinary process. `--ramp-ms` spreads each batch's offers over a fixed interval while the upstream
+delay stays at two seconds. Set `--wait-ms` only for a separate capacity probe with a longer
+hold, which lets larger batches overlap even when they take more than two seconds to reach the
+upstream. Run the fixture with the repository's verified release kernel.
+
+The JSONL includes per-call offers, replies and upstream hold intervals, sampled node occupancy and
+refusals, and per-process RSS, threads and open descriptors. The client and upstream run in separate
+containers on a private network. Cgroup samples record their resource limits and events separately
+from the node. Use the actual peak and its duration to judge overlap. Offers and sampled in-flight
+counts can differ from the exact upstream timeline. The fixture removes its disposable cluster
+and sidecars. Its node container defaults to a 16 GiB memory cap and a 40,000-task cap. Set
+`--node-memory-gib` and `--node-tasks` to repeat the readings with explicit container budgets.
 
 Run `node tests/cluster/run.mjs "$kernel" egress-limits` to check a private HTTP upstream under the
 default egress settings, a concurrency limit on its own and a request rate limit on its own.
@@ -115,7 +129,10 @@ Run `ingress-placement-saturation` and `ingress-placement-all-busy` through the 
 to test deterministic readings at the isolate and CPU thresholds. These cases check that an
 ordinary request skips busy nodes and executes once on the idle candidate, that a lost peer
 open stops placement, and that explicit soft refusals can be revisited. The all-busy case
-fills the three root slots with sleeping requests to verify the hard concurrency limit.
+checks tie rotation and even placement of sleeping roots, then verifies hard refusal when
+both slots on each node are full. The `ingress-placement-unrelated-streams` case checks
+that a second tenant's 24 idle response streams do not steer the hot Worker's overflow
+away from their peer.
 
 The default suite also runs `ingress-placement-live-saturation` with the pinned kernel to
 test the production reader without overrides. It warms an isolate on the Worker home,
@@ -128,6 +145,18 @@ with adjacent quiet windows. Its driver runs on demand on a quiet test machine.
 The same driver measures [one Worker above three-node capacity](../../docs/hot-worker-overload.md).
 The `overload` mode calibrates the live cluster before and after the fixed-rate control and
 overload windows. It records client replies through drain, per-node root slots, and placement counters.
+The placement and overload modes score after each participating execution node has returned 550
+validated warm-up replies from the compute Worker. A pinned calibration warms the home alone.
+
+The `sustained` mode keeps the same Worker busy for ten minutes and counts validated replies per
+minute by execution node. It uses 24 closed-loop lanes on one node with placement disabled and
+72 lanes through a three-node ingress. The sustained readings start after six calls so the score
+captures the change in rate. Run the two fixtures serially on a quiet host.
+
+```sh
+node tests/cluster/hot-worker-placement.mjs sustained "$PWD" "$kernel" build/hot-worker-node.jsonl 150000000 --one-node
+node tests/cluster/hot-worker-placement.mjs sustained "$PWD" "$kernel" build/hot-worker-ingress.jsonl 150000000
+```
 
 ### Threaded SQL deadline and disconnect
 
@@ -264,6 +293,55 @@ The probe sets the ingress ceiling to the requested sample size and raises the n
 to accommodate all its invocation channels. It verifies the ingress and execution relay counts. It compares
 median Linux `smaps_rollup` RSS with 32 and 3,072 idle connections to the same Worker and reports the delta per
 added connection for the daemon and ordinary workerd process on each measured node.
+
+### Threaded WebSocket message memory
+
+Run the two fixed local checks on a Linux Docker engine with cgroup v2. The first measures a
+bounded workload and the second checks the default home mailbox's current behavior.
+
+```sh
+node tests/cluster/websocket-frame-memory.mjs "$kernel"
+node tests/cluster/websocket-frame-memory.mjs "$kernel" --default-mailbox
+```
+
+The measurement opens eight hibernatable connections from one tenant on `node-1`. The fixture
+sends one 512 KiB binary message per connection, two at a time, with a 2 MiB node reservation
+limit. A pong on each of the first two connections confirms that ingress processed the first
+fragment. The reservation remains zero at that point. The existing adoption gate then holds both
+complete messages with exactly 2 MiB reserved. When the gate opens, the handler acknowledges
+the length and selected bytes of each message. Each wave returns the reservation to zero. The
+node container has two CPUs, a 512 MiB memory limit and zero swap. It runs one ordinary and one
+durable workerd child, with 32 in-flight places and no quarantine children.
+
+RSS samples come from `smaps_rollup` for the same daemon and child PIDs throughout the run. The
+sampler sleeps 5 ms between readings in the delivery check. The gated intervals use the maximum
+of five samples each. The release interval ends with the last handler acknowledgement. Short
+handoff transients may fall between samples. The container's `memory.peak` includes its processes,
+file cache and other cgroup charges. It is measured separately from process RSS, which includes
+resident shared pages. The client, control plane, storage and other containers are outside these
+readings. The reservation accounts for message bytes after the managed relay receives them.
+
+Three fresh ARM64 Docker Desktop runs on an Apple M4 used Linux 6.12.76, the release daemon from
+`4b8aa8f` and the verified `ad2ece2dcdd8` kernel series. All values are MiB.
+
+| Run | Daemon, parked baseline | Daemon, first fragments | Daemon, reservation held | Daemon, gate release to acknowledgements | Daemon, drained | Daemon, sampled peak | Container peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 29.98 | 30.49 | 31.08 | 31.54 | 30.75 | 31.76 | 51.39 |
+| 2 | 30.00 | 30.56 | 31.20 | 31.46 | 30.77 | 31.90 | 52.48 |
+| 3 | 29.97 | 30.48 | 31.11 | 31.20 | 30.71 | 32.04 | 51.00 |
+
+The ordinary child peaked at 55.55–56.73 MiB and the durable child at 54.29–54.41 MiB. All
+24 messages were acknowledged with no refusal, process change or cgroup OOM kill. The independent
+`durable-threaded-socket-frame-budget` case checks code 1013 and credit return at an eight-byte limit.
+
+With the default 128 MiB node reservation and default home mailbox, a single 3 MiB message reached
+home admission and was refused with `1013 Durable Object socket wake refused`. The durable child's
+overload counter increased by one, the node frame-budget refusal count stayed at zero, and the
+reservation returned to zero. Daemon RSS went from 29.84 to 32.42 MiB and the container peaked at
+53.13 MiB. A separate 32 MiB pilot through the Worker's forwarded upgrade hit a Cap’n Proto traversal
+limit in ordinary workerd before the managed handoff. These observations cover the fixed local
+workloads above. Maximum-size delivery with default settings remains an acceptance item for
+[#61](https://github.com/coworkerd/coworkerd/issues/61).
 
 The [database home benchmark](../../docs/database-home-benchmark.md) compares the published Object and native
 kernels through stateless Worker bindings. Its driver starts a single-node cluster for each side and records

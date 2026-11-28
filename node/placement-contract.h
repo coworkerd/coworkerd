@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace coworkerd {
@@ -54,6 +55,30 @@ inline constexpr const char* WORKER_SATURATED = "WORKER_SATURATED";
 inline constexpr const char* NODE_CPU_SATURATED = "NODE_CPU_SATURATED";
 inline bool placementSaturationRefusal(std::string_view code) {
   return code == WORKER_SATURATED || code == NODE_CPU_SATURATED;
+}
+
+struct SaturatedPlacementCandidate {
+  std::string nodeId;
+  uint32_t inFlight;
+};
+
+template <typename Priority>
+void orderSaturationFallbacks(std::vector<SaturatedPlacementCandidate>& candidates,
+    uint64_t tieOffset, Priority priority) {
+  auto score = [&](const auto& candidate) {
+    return std::pair{priority(candidate.nodeId), candidate.inFlight};
+  };
+  std::stable_sort(candidates.begin(), candidates.end(), [&](const auto& a, const auto& b) {
+    return score(a) < score(b);
+  });
+  for (auto first = candidates.begin(); first != candidates.end();) {
+    const auto tied = score(*first);
+    auto end = std::find_if(first + 1, candidates.end(), [&](const auto& candidate) {
+      return score(candidate) != tied;
+    });
+    std::rotate(first, first + tieOffset % (end - first), end);
+    first = end;
+  }
 }
 
 inline bool placementRetryable(std::string_view code, std::string_view category) {

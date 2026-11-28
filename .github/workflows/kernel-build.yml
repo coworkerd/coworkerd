@@ -1,6 +1,17 @@
 name: Build Linux kernel archives
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/kernel-build.yml'
+      - 'scripts/build-kernel.sh'
+      - 'scripts/find-kernel-cache.sh'
+      - 'patches/workerd/UPSTREAM'
+      - 'patches/workerd/series'
+      - 'patches/workerd/*.patch'
+  schedule:
+    - cron: '17 3,15 * * *'
   workflow_dispatch:
     inputs:
       pull_request:
@@ -9,13 +20,25 @@ on:
       source_commit:
         description: 'Full source commit SHA. Required for a PR. Defaults to the selected branch head.'
         type: string
+      cold:
+        description: 'Build without reading a previous Bazel action cache.'
+        type: boolean
+      full_cluster:
+        description: 'Also run the production cluster suite on both architectures for release verification.'
+        type: boolean
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && format('kernel-archive-{0}', github.run_id) || 'kernel-action-cache-main' }}
+
 jobs:
   source:
-    if: github.repository == 'coworkerd/coworkerd'
+    if: >-
+      github.repository == 'coworkerd/coworkerd' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -55,6 +78,14 @@ jobs:
     name: Build kernel (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 330
+    permissions:
+      actions: read
+      contents: read
+    env:
+      BAZELISK_ARCH: ${{ matrix.bazelisk }}
+      BAZELISK_SHA256: ${{ matrix.bazelisk-sha256 }}
+      KERNEL_ARCH: ${{ matrix.arch }}
+      KERNEL_COMMIT: ${{ needs.source.outputs.sha }}
     strategy:
       fail-fast: false
       matrix:
@@ -81,20 +112,93 @@ jobs:
           path: source
           persist-credentials: false
       - name: Install Node.js
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           package-manager-cache: false
-      - name: Build, profile and test the kernel archive
+      - name: Identify compatible Bazel action outputs
+        id: cache-key
+        env:
+          SERIES: ${{ hashFiles('source/patches/workerd/series', 'source/patches/workerd/*.patch') }}
+        run: |
+          fingerprint=$({
+            sha256sum control/scripts/build-kernel.sh source/patches/workerd/UPSTREAM
+            printf '%s\n' "$BAZELISK_SHA256"
+          } | sha256sum | cut -c1-24)
+          prefix="bazel-actions-v1-$KERNEL_ARCH-$ImageVersion-$fingerprint-"
+          printf 'prefix=%s\nname=%s%s\n' "$prefix" "$prefix" "$SERIES" >> "$GITHUB_OUTPUT"
+      - name: Find a seed from a verified workflow run
+        id: seed
+        if: inputs.cold != true
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CACHE_PREFIX: ${{ steps.cache-key.outputs.prefix }}
+          CURRENT_CACHE: ${{ steps.cache-key.outputs.name }}
+        run: bash control/scripts/find-kernel-cache.sh
+      - name: Download the Bazel action cache
+        id: download
+        if: steps.seed.outputs.artifact_id != '' && (github.event_name != 'schedule' || steps.seed.outputs.fresh != 'true')
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.seed.outputs.run_id }}
+          artifact-ids: ${{ steps.seed.outputs.artifact_id }}
+          path: ${{ runner.temp }}/kernel-cache-download
+      - name: Restore Bazel action outputs
+        if: steps.download.outcome == 'success'
+        env:
+          SEED_RUN: ${{ steps.seed.outputs.run_id }}
+        run: |
+          cache="$RUNNER_TEMP/kernel-action-cache"
+          mkdir -p "$cache"
+          if tar --zstd --no-same-owner --no-same-permissions \
+              -xf "$RUNNER_TEMP/kernel-cache-download/actions.tar.zst" -C "$cache" ac cas; then
+            printf 'Bazel action cache from [run %s](%s/%s/actions/runs/%s).\n\n' \
+              "$SEED_RUN" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$SEED_RUN" >> "$GITHUB_STEP_SUMMARY"
+          else
+            rm -rf "$cache"
+            echo 'Cache extraction failed. Building without a seed.'
+          fi
+          rm -rf "$RUNNER_TEMP/kernel-cache-download"
+      - name: Build the default-branch seed
+        id: seed-build
+        if: github.event_name == 'push' || (github.event_name == 'schedule' && steps.seed.outputs.fresh != 'true')
         working-directory: source
         env:
-          BAZELISK_ARCH: ${{ matrix.bazelisk }}
-          BAZELISK_SHA256: ${{ matrix.bazelisk-sha256 }}
-          KERNEL_ARCH: ${{ matrix.arch }}
-          KERNEL_COMMIT: ${{ needs.source.outputs.sha }}
+          KERNEL_COMPILE_TESTS_ONLY: 'true'
+        run: |
+          test "$(git rev-parse HEAD)" = "$KERNEL_COMMIT"
+          bash ../control/scripts/measure-kernel-build.sh bash ../control/scripts/build-kernel.sh
+      - name: Build, profile and test the kernel archive
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: source
+        env:
+          FULL_CLUSTER: ${{ inputs.full_cluster }}
         run: |
           test "$(git rev-parse HEAD)" = "$KERNEL_COMMIT"
           bash ../control/scripts/measure-kernel-build.sh bash ../control/scripts/test-hosted-kernel.sh
+      - name: Pack the Bazel action cache
+        id: seed-pack
+        if: steps.seed-build.outcome == 'success'
+        run: |
+          cache="$RUNNER_TEMP/kernel-action-cache"
+          test -z "$(find "$cache/ac" "$cache/cas" ! -type d ! -type f -print -quit)"
+          tar -I 'zstd -T2 -3' -cf "$RUNNER_TEMP/actions.tar.zst" -C "$cache" ac cas
+          du -sh "$RUNNER_TEMP/actions.tar.zst"
+      - name: Upload reusable default-branch action outputs
+        if: steps.seed-pack.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.cache-key.outputs.name }}
+          path: ${{ runner.temp }}/actions.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: true
       - name: Upload cluster failure diagnostics
         if: failure() && hashFiles('source/build/kernel-ci/cluster.log') != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -105,6 +209,7 @@ jobs:
             source/build/cluster-diagnostics/
           if-no-files-found: error
       - name: Upload the verified architecture archive
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: kernel-${{ matrix.arch }}-${{ github.run_attempt }}
@@ -114,6 +219,7 @@ jobs:
 
   assemble:
     needs: [source, build]
+    if: github.event_name == 'workflow_dispatch'
     name: Verify and assemble both archives
     runs-on: ubuntu-24.04
     steps:

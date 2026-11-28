@@ -217,18 +217,80 @@ def controls(directory):
     ] + [["Total residual", *(f"{sum(costs[op].values()):.3f}" for op in OPERATIONS)]])
 
 
+def paired_release(directory):
+    builds = ("baseline", "candidate")
+    modes = ("direct", "forwarded")
+    cells = {(build, op, mode): [] for build in builds for op in OPERATIONS for mode in modes}
+    provenance = {build: [] for build in builds}
+    forwarders = set()
+    confirmed = 0
+    for pair in range(1, 4):
+        for build in builds:
+            path = directory / f"{pair}-{build}.jsonl"
+            source, windows = load_windows(path)
+            provenance[build].append(source)
+            assert source["metric"] == "provenance" and source["profileControl"] == "paired-release", path
+            assert {(row["operation"], row["profileMode"]) for row in windows} == {
+                (op, mode) for op in OPERATIONS for mode in modes
+            } and len(windows) == 8, path
+            for row in windows:
+                cells[build, row["operation"], row["profileMode"]].append(row)
+            for row in map(json.loads, path.read_text().splitlines()):
+                if row["metric"] == "profile-tools":
+                    assert row["perf"] is None
+                    forwarders.add(row["forwarderSha256"])
+                elif row["metric"] == "throughput-confirmation":
+                    assert row["confirmations"] >= row["acknowledged"]
+                    confirmed += row["acknowledged"]
+    assert len(forwarders) == 1 and confirmed > 0
+    reference = provenance["baseline"][0]
+    for build, sources in provenance.items():
+        for source in sources:
+            assert all(source[key] == reference[key] for key in ("runner", "clientHost", "archiveSha256",
+                       "productHashes", "settings", "clientImage"))
+            assert all(source["hashes"][key] == reference["hashes"][key]
+                       for key in ("workerd", "coworkerd-threaded"))
+            assert source["commit"] == sources[0]["commit"]
+            assert source["hashes"] == sources[0]["hashes"]
+    assert reference["hashes"]["coworkerd"] != provenance["candidate"][0]["hashes"]["coworkerd"]
+
+    budgets = {"worker-only": "0.100", "object-noop": "0.200"}
+    totals = []
+    pairs = []
+    for op, label in OPERATIONS.items():
+        base = cells["baseline", op, "direct"]
+        candidate = cells["candidate", op, "direct"]
+        before = cpu_ms_per_reply(base)
+        after = cpu_ms_per_reply(candidate)
+        forwarded = cells["baseline", op, "forwarded"] + cells["candidate", op, "forwarded"]
+        totals.append([label, f"{before:.3f}", f"{after:.3f}", f"{(after / before - 1) * 100:+.1f}%",
+                       budgets.get(op, "—"), f"{cpu_ms_per_reply(forwarded, 'forwarder'):.3f}",
+                       f"{median(base, 'perSecond'):,.0f} / {median(candidate, 'perSecond'):,.0f}"])
+        deltas = [cpu_ms_per_reply([result]) - cpu_ms_per_reply([control])
+                  for control, result in zip(base, candidate)]
+        pairs.append([label, " / ".join(f"{delta:+.3f}" for delta in deltas),
+                      f"{median(base, 'p99Ms'):.2f} / {median(candidate, 'p99Ms'):.2f}"])
+    table(["Workload", "Baseline CPU ms/reply", "Candidate CPU ms/reply", "Change",
+           "Budget ms/reply", "Bare forwarder CPU ms/reply", "Baseline / candidate replies/s"], totals)
+    table(["Workload", "Candidate minus baseline CPU ms/reply by pair", "Baseline / candidate p99 ms"], pairs)
+    print(f"{sum(len(rows) for rows in cells.values())} windows, {confirmed:,} verified inserts with warm-up.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("jsonl", type=Path, nargs="?")
     parser.add_argument("--controls", type=Path, help="directory of Release and traced control recordings")
+    parser.add_argument("--paired-release", type=Path, help="directory of paired dispatch measurements")
     args = parser.parse_args()
-    if args.jsonl is None and args.controls is None:
-        parser.error("choose a recording or --controls")
+    if args.jsonl is None and args.controls is None and args.paired_release is None:
+        parser.error("choose a recording, --controls, or --paired-release")
     if args.jsonl:
         with args.jsonl.open() as source:
             tables([json.loads(line) for line in source])
     if args.controls:
         controls(args.controls)
+    if args.paired_release:
+        paired_release(args.paired_release)
 
 
 if __name__ == "__main__":

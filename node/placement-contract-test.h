@@ -137,5 +137,21 @@ inline void placementContracts() {
     });
     KJ_REQUIRE(bool(order == row.expected), row.name);
   }
+  const std::vector<SaturatedPlacementCandidate> saturated{
+    {"home", 9}, {"peer1", 3}, {"peer2", 3}, {"avoided", 1}, {"local", 0},
+  };
+  for (uint64_t offset = 0; offset < 2; ++offset) {
+    auto candidates = saturated;
+    orderSaturationFallbacks(candidates, offset, [](const auto& nodeId) {
+      if (nodeId == "local") return 2;
+      return nodeId == "avoided" ? 1 : 0;
+    });
+    Nodes actual;
+    for (const auto& candidate : candidates) actual.push_back(candidate.nodeId);
+    Nodes expected{"peer1", "peer2", "home", "avoided", "local"};
+    if (offset) std::swap(expected[0], expected[1]);
+    KJ_REQUIRE(actual == expected,
+        "fallback keeps the health priority, prefers fewer in-flight calls and rotates equal loads");
+  }
 }
 } // namespace coworkerd
