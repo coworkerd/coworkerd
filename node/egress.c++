@@ -420,7 +420,7 @@ struct EgressService::Impl {
   Impl(const EgressConfig& config, std::string serverId, kj::Network& network, kj::Timer& timer,
       const kj::HttpHeaderTable& headerTable, std::function<std::vector<std::string>()> clusterEndpoints,
       std::function<std::optional<EgressSource>(const std::string&)> source,
-      std::function<EgressDebit(const std::string&)> charge,
+      std::function<EgressDebit(const std::string&, bool)> charge,
       std::function<void(const std::string&, uint64_t)> metered)
       : config(config), serverId(std::move(serverId)), network(network), timer(timer), headerTable(headerTable),
         clusterEndpoints(std::move(clusterEndpoints)), source(std::move(source)), charge(std::move(charge)),
@@ -789,6 +789,7 @@ struct EgressService::Impl {
     // Who sent it: the runtime's header, with the token of a live process.
     std::optional<std::string> sourceHeader;
     std::string invocationId;
+    bool fromDurableProcess = false;
     bool repeated = false;
     headers.forEach([&](kj::StringPtr name, kj::StringPtr value) {
       if (!sameText(name, SOURCE_HEADER)) return;
@@ -815,6 +816,7 @@ struct EgressService::Impl {
         if (workerFullName(ex.workerId) && safeName(ex.versionId)) {
           ex.processId = process->processId + ":" + std::to_string(process->generation);
           ex.tenant = tenantOf(ex.workerId);
+          fromDurableProcess = process->durable;
         }
       }
     }
@@ -824,7 +826,7 @@ struct EgressService::Impl {
     }
     auto& counts = tenantCounts[ex.tenant];
     ++counts.requests;
-    switch (charge(invocationId)) {
+    switch (charge(invocationId, fromDurableProcess)) {
       case EgressDebit::charged: break;
       case EgressDebit::exhausted:
         co_return co_await refuse(response, ex, &counts, "SUBREQUEST_BUDGET_EXHAUSTED",
@@ -1066,7 +1068,7 @@ struct EgressService::Impl {
   const kj::HttpHeaderTable& headerTable;
   std::function<std::vector<std::string>()> clusterEndpoints;
   std::function<std::optional<EgressSource>(const std::string&)> source;
-  std::function<EgressDebit(const std::string&)> charge;
+  std::function<EgressDebit(const std::string&, bool)> charge;
   std::function<void(const std::string&, uint64_t)> metered;
   std::map<std::string, TenantRules> tenants;
   std::vector<kj::TlsCertificate> certificates;
@@ -1092,7 +1094,7 @@ struct EgressService::Impl {
 EgressService::EgressService(const EgressConfig& config, std::string serverId, kj::Network& network, kj::Timer& timer,
     const kj::HttpHeaderTable& headerTable, std::function<std::vector<std::string>()> clusterEndpoints,
     std::function<std::optional<EgressSource>(const std::string&)> source,
-    std::function<EgressDebit(const std::string&)> charge,
+    std::function<EgressDebit(const std::string&, bool)> charge,
     std::function<void(const std::string& tenant, uint64_t bytes)> metered)
     : impl(kj::heap<Impl>(config, std::move(serverId), network, timer, headerTable, std::move(clusterEndpoints), std::move(source),
           std::move(charge), std::move(metered))) {}

@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sat, 28 Nov 2026 03:03:33 +0800
+Subject: [PATCH] Accept the shortened alarm limit from the test fixture
+
+
+diff --git a/src/workerd/server/factory/coworkerd-alarm-limit.h b/src/workerd/server/factory/coworkerd-alarm-limit.h
+index b73bb25da064dfbe9d4bfb934cc40ef39a5c969f..c63bfcf248ef14565bb328d25a515e1e63791c69 100644
+--- a/src/workerd/server/factory/coworkerd-alarm-limit.h
++++ b/src/workerd/server/factory/coworkerd-alarm-limit.h
+@@ -14,7 +14,8 @@ namespace workerd {
+ inline kj::Duration coworkerdAlarmLimit() {
+   static const auto limit = []() {
+     constexpr auto MAX_MS = 15 * 60 * 1000;
+-    const auto* setting = std::getenv("COWORKERD_TEST_ALARM_WALL_MS");
++    // Only the node's test fixture passes this trusted child setting.
++    const auto* setting = std::getenv("COWORKERD_INTERNAL_TEST_ALARM_WALL_MS");
+     if (setting == nullptr) return MAX_MS * kj::MILLISECONDS;
+     auto milliseconds = kj::StringPtr(setting).parseAs<unsigned int>();
+     KJ_REQUIRE(milliseconds > 0 && milliseconds <= MAX_MS, "invalid test alarm wall time");

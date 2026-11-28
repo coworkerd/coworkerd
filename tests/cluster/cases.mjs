@@ -131,12 +131,27 @@ async function webSocketAdmission(cluster) {
     assert.equal((await closed)[0], 1000);
     await inUse(1);
 
-    const pending = connect(node, first, '/pending');
-    await inUse(2);
-    assert.equal(pending.readyState, WebSocket.CONNECTING);
-    pending.terminate();
-    assert.equal((await state()).inUse, 2, 'an abandoned handshake holds its place while waiting for the Worker');
-    await inUse(1, 15000);
+    const target = url(node, first, '/pending');
+    const pending = createConnection({ host: target.hostname, port: Number(target.port), allowHalfOpen: true });
+    pending.on('error', () => {});
+    try {
+      await waitFor(pending, 'connect');
+      pending.write([
+        `GET ${target.pathname} HTTP/1.1`, `Host: ${target.host}`,
+        'Connection: Upgrade', 'Upgrade: websocket', 'Sec-WebSocket-Version: 13',
+        `Sec-WebSocket-Key: ${randomBytes(16).toString('base64')}`, '', '',
+      ].join('\r\n'));
+      await inUse(2);
+      // A FIN from a pending upgrade cannot yield a bidirectional relay.
+      const disconnectedAt = performance.now();
+      pending.end();
+      await inUse(1, 1000);
+      const releasedIn = performance.now() - disconnectedAt;
+      assert.ok(releasedIn < 1000, `pending WebSocket place took ${releasedIn.toFixed(1)} ms to return`);
+      console.log(`Pending WebSocket place returned in ${releasedIn.toFixed(1)} ms`);
+    } finally {
+      pending.destroy();
+    }
 
     const declined = await decline();
     declined.on('error', () => {});
@@ -1796,9 +1811,11 @@ async function invocationBudgetLifetime(cluster) {
       if (action === 'late-fetch') {
         await scheduler.wait(waitMs);
         const reply = await env.OBJECT.getByName('past-deadline').fetch('https://object.test/?action=result');
-        const { code } = await reply.json();
-        return Response.json({ ...await spend({}), invocationId: request.cf.invocationId,
-          lateObject: { status: reply.status, code } });
+        const lateObject = { status: reply.status, value: await reply.json() };
+        const first = await (await fetch(origin)).text();
+        let extraFetch;
+        try { await fetch(origin); } catch (error) { extraFetch = error.message; }
+        return Response.json({ first, extraFetch, invocationId: request.cf.invocationId, lateObject });
       }
       const actor = action === 'timer' ? 'timer' :
         action === 'start' || action === 'resume' ? 'background' : 'alarm';
@@ -1826,19 +1843,20 @@ async function invocationBudgetLifetime(cluster) {
   // Exhaust a newer request's allowance while the alarm is waiting, and keep it live until the alarm calls out.
   const [late, interleaved] = await Promise.all([call('late-fetch'), call('interleave')]);
   verify(interleaved);
-  verify(late, false);
-  assert.deepEqual(late.lateObject, { status: 410, code: 'LEASE_EXPIRED' });
+  assert.deepEqual(late.lateObject, { status: 200, value: null });
+  assert.equal(late.first, 'origin');
+  assert.match(late.extraFetch, /^SUBREQUEST_BUDGET_EXHAUSTED:/);
   assert.ok(late.invocationId);
-  await eventually('the completed invocation releases its expired lease record', async () => {
+  await eventually('the completed invocation releases its lease record after the drain', async () => {
     assert.ok((await cluster.state(node)).leases.every(lease => lease.invocationId !== late.invocationId));
-  });
-  await eventually('the alarm uses its budget after the lease expires', async () => {
+  }, { timeout: 35_000 });
+  await eventually('the alarm uses its budget after the HTTP preparation interval', async () => {
     const result = await call('result');
     assert.ok(result);
     verify(result);
   });
   // Read the result out of band so the timer object receives no newer request.
-  const timerResult = await eventually('the timer logs its result after the lease expires', async () => {
+  const timerResult = await eventually('the timer logs its result after the HTTP preparation interval', async () => {
     const { lines } = await cluster.api(`${tenant.path}/workers/budget-lifetime/logs`, { token: tenant.token });
     const marker = lines.find(line => line.message?.startsWith('budget-timer:'));
     assert.ok(marker);
