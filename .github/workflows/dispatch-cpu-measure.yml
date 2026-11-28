@@ -1,0 +1,84 @@
+name: Paired node dispatch CPU
+on:
+  push:
+    branches: [cow-c/95-dispatch-cpu-measure]
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CC: clang-19
+      CXX: clang++-19
+      CMAKE_BUILD_PARALLEL_LEVEL: 4
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - name: Prepare the two revisions and the pinned kernel
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-19 libstdc++-14-dev cmake ninja-build libssl-dev git curl ca-certificates python3
+          baseline=b66d2b4828ed1822d5299ea6cdd2bc74ec419f17
+          candidate=20950e4f73d2d900629c988b263c38fbbc6e616c
+          test "$(git merge-base "$baseline" "$candidate")" = "$baseline"
+          git worktree add --detach "$RUNNER_TEMP/baseline" "$baseline"
+          git worktree add --detach "$RUNNER_TEMP/candidate" "$candidate"
+          cmp "$RUNNER_TEMP/baseline/patches/workerd/artifacts.json" \
+            "$RUNNER_TEMP/candidate/patches/workerd/artifacts.json"
+          candidate_dir="$RUNNER_TEMP/candidate"
+          kernel=$(python3 "$candidate_dir/scripts/fetch-kernel.py" --arch linux-x86_64)
+          printf 'KERNEL_DIR=%s\n' "$kernel" >> "$GITHUB_ENV"
+          mkdir -p reports
+          printf 'baseline %s\ncandidate %s\n' "$baseline" "$candidate" > reports/revisions.txt
+          {
+            uname -a
+            lscpu
+            free -b
+            cat /etc/os-release
+            df -T "$PWD" /var/lib/docker
+            docker version
+            printf 'Runner image %s %s\n' "$ImageOS" "$ImageVersion"
+            clang++-19 --version
+          } > reports/runner.txt
+      - name: Build both Release nodes and a single bare forwarder
+        run: |
+          for variant in baseline candidate; do
+            checkout="$RUNNER_TEMP/$variant"
+            bash "$checkout/scripts/build.sh"
+            cmake --build "$checkout/build" --target coworkerd-launcher
+          done
+          candidate_dir="$RUNNER_TEMP/candidate"
+          cmake --build "$candidate_dir/build" --target coworkerd-bench-http-forwarder coworkerd-node-contract-test
+          ctest --test-dir "$candidate_dir/build" --no-tests=error --output-on-failure -R '^node-compact-invocation-json$'
+          cp "$candidate_dir/build/coworkerd-bench-http-forwarder" "$RUNNER_TEMP/baseline/build/"
+      - name: Alternate the builds on this runner
+        env:
+          COWORKERD_PROFILE_CONTROL: paired-release
+        run: |
+          for pair in 1 2 3; do
+            builds=(baseline candidate)
+            if [[ "$pair" = 2 ]]; then builds=(candidate baseline); fi
+            for variant in "${builds[@]}"; do
+              test -z "$(docker ps -q)"
+              checkout="$RUNNER_TEMP/$variant"
+              COWORKERD_CLUSTER_BIN_DIR="$checkout/build" \
+                node tests/cluster/database-home-benchmark.mjs object "$checkout" "$KERNEL_DIR" \
+                "$PWD/reports/$pair-$variant.jsonl" --main-thread-profile
+            done
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: paired-dispatch-cpu-${{ github.run_attempt }}
+          path: reports/
+          if-no-files-found: error
+          retention-days: 90
