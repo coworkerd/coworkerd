@@ -133,6 +133,7 @@ public:
   // A version executed on a durable process within the placement idle period (the yellow band's test for a cold one).
   bool durableHot(const std::string& hash) const;
   std::string durableProcessFor(const std::string& objectKey) const;
+  bool durableCloseRecoveryPending(const std::string& objectKey) const;
   bool durableAvailable(const std::string& objectKey);
   std::shared_ptr<ProcessCall> selectDurable(const std::string& objectKey);
   // The calls in flight on the durable processes (every live generation).

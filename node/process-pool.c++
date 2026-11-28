@@ -242,11 +242,12 @@ public:
     return fd;
   }
   // The latest snapshot; empty before the first one, or while publications overtake every copy.
-  std::string read() const {
+  // A caller watching for new publications can pass its last successful publication number.
+  std::string read(uint64_t* lastPublication = nullptr) const {
     if (!base) return {};
     for (int attempt = 0; attempt < 8; ++attempt) {
       auto published = __atomic_load_n(reinterpret_cast<const uint64_t*>(base), __ATOMIC_ACQUIRE);
-      if (published == 0) return {};
+      if (published == 0 || (lastPublication && published == *lastPublication)) return {};
       const char* buffer = base + 64 + (published % 2) * (16 + size_t(CAPACITY));
       auto before = __atomic_load_n(reinterpret_cast<const uint64_t*>(buffer), __ATOMIC_ACQUIRE);
       if (before & 1) continue;
@@ -254,7 +255,10 @@ public:
       if (length > CAPACITY) continue;
       std::string copy(buffer + 16, length);
       __atomic_thread_fence(__ATOMIC_ACQUIRE);
-      if (__atomic_load_n(reinterpret_cast<const uint64_t*>(buffer), __ATOMIC_RELAXED) == before) return copy;
+      if (__atomic_load_n(reinterpret_cast<const uint64_t*>(buffer), __ATOMIC_RELAXED) == before) {
+        if (lastPublication) *lastPublication = published;
+        return copy;
+      }
     }
     return {};
   }
@@ -1137,6 +1141,8 @@ struct ProcessGeneration {
   bool oomSignalled = false;
   // Lifecycle snapshot shared memory.
   LifecycleView lifecycle;
+  uint64_t lastCloseCheckPublication = 0;
+  bool storageCloseUnconfirmed = false;
   SaturatedPlans saturatedPlans;
   // Tenant request contexts. workerd writes a `completed` row when a request's context
   // ends -- after its waitUntil work, whether or not it ran JavaScript, limits or not -- so
@@ -1549,6 +1555,7 @@ public:
     double requestedAt;
     uint64_t requestedAtUnixMs;
     std::vector<uint64_t> ids;
+    uint64_t generation;  // Zero for requests that follow the slot across restarts.
   };
   // At most one per machine: start the next generation, switch dispatch to it, drain the
   // previous one, close it (connections, SIGTERM, SIGKILL after a grace).
@@ -3159,7 +3166,7 @@ public:
     if (rotation && rotation->slot == slot) return true;
     return std::any_of(rotationQueue.begin(), rotationQueue.end(), [&](const auto& r) { return r.slot == slot; });
   }
-  uint64_t enqueue(size_t slot, const std::string& reason) {
+  uint64_t enqueue(size_t slot, const std::string& reason, uint64_t generation = 0) {
     const auto id = nextRequestId++;
     ++rotationCounts["requested"]; ++rotationReasons[reason];
     track(id, "queued");
@@ -3167,15 +3174,76 @@ public:
         << "\",\"reason\":\"" << reason << "\",\"observedAtUnixMs\":" << wall() << "}" << std::endl;
     // One queued rotation per slot; a manual request makes a queued automatic one unconditional.
     for (auto& queued : rotationQueue) if (queued.slot == slot) {
-      if (reason == "manual") queued.reason = reason;
+      if (reason == "manual") {
+        queued.reason = reason;
+        queued.generation = 0;
+      }
       queued.ids.push_back(id);
       return id;
     }
-    rotationQueue.push_back({slot, reason, mono(), wall(), {id}});
+    rotationQueue.push_back({slot, reason, mono(), wall(), {id}, generation});
     return id;
   }
   void enqueueAutomatic(size_t slot, const std::string& reason) {
     if (!queuedOrActive(slot)) enqueue(slot, reason);
+  }
+  static bool reportsUnconfirmedClose(std::string_view snapshot) {
+    try {
+      capnp::MallocMessageBuilder arena;
+      auto value = arena.initRoot<capnp::JsonValue>();
+      capnp::JsonCodec().decodeRaw(kj::arrayPtr(snapshot.data(), snapshot.size()), value);
+      auto count = json::field(json::field(value, "durableAdmission"), "unconfirmedCloseIdentities");
+      return count.isNumber() && count.getNumber() >= 1 && std::isfinite(count.getNumber());
+    } catch (const kj::Exception&) {
+      return false;
+    }
+  }
+  kj::Promise<void> watchUnconfirmedCloses() {
+    const auto* fixture = std::getenv("COWORKERD_DO_TEST_LIFECYCLE_DIR");
+    while (!shuttingDown && !durableClosed) {
+      std::vector<std::shared_ptr<ProcessGeneration>> generations;
+      std::vector<std::pair<std::string, std::filesystem::path>> reports;
+      auto collect = [&](const std::shared_ptr<ProcessGeneration>& process) {
+        if (!process || !process->durable || !process->threaded || process->durableTestStorage || process->pid == 0 ||
+            process->storageCloseUnconfirmed) return;
+        auto snapshot = process->lifecycle.read(&process->lastCloseCheckPublication);
+        if (snapshot.empty()) return;
+        std::filesystem::path marker;
+        if (fixture) marker = std::filesystem::path(fixture) /
+            ("unconfirmed-close-" + process->id + "-" + std::to_string(process->generation));
+        reports.emplace_back(std::move(snapshot), std::move(marker));
+        generations.push_back(process);
+      };
+      // An existing rotation already replaces its old generation. Observe close failures during its drain too.
+      if (rotation) collect(rotation->old);
+      for (const auto& slot : slots) if (slot.current && slot.current->state == "ready") collect(slot.current);
+      if (!reports.empty()) {
+        auto observed = co_await backgroundValue([reports = std::move(reports)] {
+          std::vector<size_t> unconfirmed;
+          for (size_t i = 0; i < reports.size(); ++i) {
+            const auto& [snapshot, marker] = reports[i];
+            std::error_code error;
+            // Change only the report in the cluster fixture. WAL and process exit still run normally.
+            const bool forTest = !marker.empty() && std::filesystem::exists(marker, error);
+            if (reportsUnconfirmedClose(forTest ? R"({"durableAdmission":{"unconfirmedCloseIdentities":1}})"
+                                                : std::string_view(snapshot))) unconfirmed.push_back(i);
+          }
+          return unconfirmed;
+        });
+        // Commit the result to the generation that supplied it even if its slot has since changed hands.
+        for (auto index : observed) generations[index]->storageCloseUnconfirmed = true;
+      }
+      co_await provider.getTimer().afterDelay(100 * kj::MILLISECONDS);
+    }
+  }
+  void triggerUnconfirmedCloseRotations() {
+    if (durableClosed) return;
+    for (size_t i = 0; i < slots.size(); ++i) {
+      const auto& p = slots[i].current;
+      if (p && p->state == "ready" && p->storageCloseUnconfirmed && !queuedOrActive(i)) {
+        enqueue(i, "unconfirmed-close", p->generation);
+      }
+    }
   }
   // The slot's current generation runs other bytes than the configured executable.
   bool binaryMismatch(size_t index) const {
@@ -3230,10 +3298,13 @@ public:
   void rotationTick() {
     // Closing the pool at the Server's exit takes over every generation.
     if (closingAll) return;
-    const auto now = mono();
     // Exited generations no rotation still refers to are released.
     for (auto& s : slots) std::erase_if(s.retiring, [&](const auto& p) { return p->pid == 0 && !(rotation && rotation->old == p); });
-    if (!shuttingDown) triggers(now);
+    if (!shuttingDown) {
+      triggerUnconfirmedCloseRotations();
+      triggers(mono());
+    }
+    const auto now = mono();
     if (!rotation && !shuttingDown) startNext(now);
     if (rotation) advance(now);
   }
@@ -3271,14 +3342,16 @@ public:
     if (rotationQueue.empty()) return;
     for (auto it = rotationQueue.begin(); it != rotationQueue.end(); ++it) {
       auto& s = slots[it->slot];
-      if (s.incoming || !s.current || s.current->pid == 0 || s.current->state != "ready") continue;
+      const bool expired = it->generation && (durableClosed || !s.current || s.current->pid == 0 ||
+          s.current->generation != it->generation || s.current->closing);
+      if (!expired && (s.incoming || !s.current || s.current->pid == 0 || s.current->state != "ready")) continue;
       auto request = std::move(*it);
       rotationQueue.erase(it);
-      if (request.reason == "binary" && !binaryMismatch(request.slot)) {
+      if (expired || (request.reason == "binary" && !binaryMismatch(request.slot))) {
         for (auto id : request.ids) track(id, "skipped");
         ++rotationCounts["skipped"];
         std::cout << "[process-rotation] {\"event\":\"skipped\",\"processId\":\"" << s.id
-            << "\",\"reason\":\"binary\",\"observedAtUnixMs\":" << wall() << "}" << std::endl;
+            << "\",\"reason\":\"" << request.reason << "\",\"observedAtUnixMs\":" << wall() << "}" << std::endl;
         return;
       }
       begin(std::move(request), now);
@@ -3593,6 +3666,7 @@ ProcessPool::ProcessPool(ProcessPoolConfig config,
         std::move(bindingAddress), std::move(sourceAddress), provider, eventPort, headers, suspects)) {}
 ProcessPool::~ProcessPool() noexcept(false) = default;
 kj::Promise<void> ProcessPool::run() {
+  if (impl->config.durableProcesses > 0 && !impl->config.threadedDurableTestStorage) impl->tasks.add(impl->watchUnconfirmedCloses());
   while (true) {
     impl->refresh();
     const auto heatNow = mono();
@@ -3655,6 +3729,11 @@ bool ProcessPool::durableHot(const std::string& hash) const {
   return false;
 }
 std::string ProcessPool::durableProcessFor(const std::string& objectKey) const { return impl->durableSlotFor(objectKey); }
+bool ProcessPool::durableCloseRecoveryPending(const std::string& objectKey) const {
+  const auto& rotation = impl->rotation;
+  return rotation && rotation->old && rotation->old->storageCloseUnconfirmed && rotation->old->pid > 0 &&
+      rotation->old->id == impl->durableSlotFor(objectKey);
+}
 bool ProcessPool::durableAvailable(const std::string& objectKey) {
   impl->refresh();
   const auto id = impl->durableSlotFor(objectKey);
