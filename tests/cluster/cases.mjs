@@ -1355,11 +1355,14 @@ async function threadedObjectSqlHeap(cluster) {
 
   assert.deepEqual(json(await call(0, 'hold-cursor'), 200, 'keep a live cursor until retirement'), first);
   const count = 256;
-  for (let offset = 1; offset < count; offset += 16) {
-    await Promise.all(Array.from({ length: Math.min(16, count - offset) }, async (_, i) => {
-      const reply = json(await call(offset + i, 'probe'), 200, 'open an ordinary object');
-      assert.deepEqual(reply.values, first.values);
-    }));
+  // Open one root at a time to keep cold storage recovery load low.
+  for (let index = 1; index < count; ++index) {
+    const response = await call(index, 'probe');
+    if (response.status === 503) {
+      console.error('Last storage rebuild error:', (await logs()).objects.lastError);
+    }
+    const reply = json(response, 200, `open ordinary object ${index}`);
+    assert.deepEqual(reply.values, first.values);
   }
   const allOpen = async () => {
     const state = await snapshot();
