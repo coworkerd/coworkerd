@@ -49,14 +49,14 @@ The fixture can vary the home and mailbox limits with `COWORKERD_DO_TEST_HOME_CO
 `COWORKERD_DO_TEST_BUSY_MS` control placement, and `COWORKERD_DO_TEST_FD_HEADROOM` sets the
 descriptor headroom before accounting for the home loops. These settings apply to disposable runs.
 
-On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" measure 4 64`
+On Linux, run `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/coworkerd-threaded" measure 4 64`
 to fill one durable child with four copies of 64 real objects each. The tool checks the next object's refusal
 and prints baseline and saturated thread count, RSS, descriptors, and admission counters.
 
 The `placement` mode alternates bounded synchronous work on one object with requests to new objects.
 It checks quiet-copy reuse, a distinct copy after the home becomes busy, pinned existing actors,
 returned event credits, and an unchanged ready child without actor resets or idle retirement.
-For example, `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/workerd" placement 4 64 3000`
+For example, `node node/threaded-durable-launch.test.mjs "$NODE" "$KERNEL_DIR/coworkerd-threaded" placement 4 64 3000`
 uses four homes, 64 roots per copy, and a 3000 ms busy threshold in the four-second window.
 The last argument can vary the threshold for measurements; output includes every work and cold-request
 duration plus the child's thread count, RSS, descriptors, and admission counters. These request durations
@@ -84,11 +84,11 @@ import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink
 import { get } from 'node:http';
 import { createConnection, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 
-const [nodeBinary, workerd, scenario, homeArg = '8', treeArg = '64', busyArg = '3000'] = process.argv.slice(2);
+const [nodeBinary, threaded, scenario, homeArg = '8', treeArg = '64', busyArg = '3000'] = process.argv.slice(2);
 const measure = scenario === 'measure';
 const httpLifecycle = scenario === 'http';
 const homeReservation = scenario === 'home-reservation';
@@ -151,7 +151,6 @@ const env = {
 const fixture = join(scratch, 'fixture');
 const configPath = join(fixture, 'node.json');
 const manifestPath = join(fixture, 'workers', 'manifest.json');
-const threaded = resolve(dirname(workerd), 'coworkerd-threaded');
 const descriptorLimitedThreaded = join(fixture, 'threaded-fd-limit');
 const workerId = 'counter';
 const token = 'fixture-management-placeholder';
@@ -173,7 +172,7 @@ const config = {
   management: { token },
 };
 
-const args = port => [manifestPath, workerd, `127.0.0.1:${port}`, '127.0.0.1:0', '127.0.0.1:0', configPath];
+const args = port => [manifestPath, threaded, `127.0.0.1:${port}`, '127.0.0.1:0', '127.0.0.1:0', configPath];
 const writeConfig = value => writeFile(configPath, JSON.stringify(value));
 
 async function refuseStart(pattern) {

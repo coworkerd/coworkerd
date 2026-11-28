@@ -1573,7 +1573,7 @@ public:
   // callback returns (set by the node, setRetiring).
   std::function<uint32_t(const std::string&, uint64_t)> retiring;
   ProcessPoolConfig config;
-  std::string executable, directory, runDirectory, bindingAddress, sourceAddress;
+  std::string directory, runDirectory, bindingAddress, sourceAddress;
   std::string egressAddress;  // empty while tenant Workers have no network
   kj::AsyncIoProvider& provider;
   kj::UnixEventPort& eventPort;
@@ -1636,7 +1636,6 @@ public:
   std::function<void()> rootMaintenance;
   double nextRootMaintenance = 0;
   BinarySignature configuredBinary;
-  BinarySignature threadedConfiguredBinary;
   uint64_t binaryChecks = 0, binaryChanges = 0, binaryChangedAtUnixMs = 0;
   // The sandbox. The launcher is pinned at startup: this Server starts every process with the file it
   // checked then (through its descriptor), so a launcher replaced on disk -- one of another release -- is
@@ -1718,11 +1717,11 @@ public:
   bool durableClosed = false;
   uint64_t shutdownClearedContexts = 0;
 
-  Impl(ProcessPoolConfig config, std::string executable,
+  Impl(ProcessPoolConfig config,
       std::string directory, std::string bindingAddress, std::string sourceAddress,
       kj::AsyncIoProvider& provider, kj::UnixEventPort& eventPort, const kj::HttpHeaderTable& headers,
       Suspects& suspects)
-      : config(config), executable(std::move(executable)),
+      : config(std::move(config)),
         directory(std::move(directory)), runDirectory(this->directory + "/run"), bindingAddress(std::move(bindingAddress)),
         sourceAddress(std::move(sourceAddress)), provider(provider), eventPort(eventPort), headers(headers), suspects(suspects) {
     if (auto* ms = std::getenv("COWORKERD_CPU_LIMIT_MS")) {
@@ -1771,9 +1770,8 @@ public:
     if (auto* path = std::getenv("COWORKERD_SANDBOX_ALLOWLIST")) this->config.allowlistPath = path;
     if (auto* bind = std::getenv("COWORKERD_SANDBOX_BIND_FOR_TEST")) sandbox.bindForTest = bind;
     this->config.validate();
-    if (this->config.threadedExecutable.empty())
-      this->config.threadedExecutable = (std::filesystem::path(this->executable).parent_path() / "coworkerd-threaded").string();
-    KJ_REQUIRE(access(this->executable.c_str(), X_OK) == 0, "workerd executable is required");
+    KJ_REQUIRE(access(this->config.threadedExecutable.c_str(), X_OK) == 0,
+        "coworkerd-threaded executable is required", this->config.threadedExecutable.c_str());
     std::filesystem::create_directories(this->directory + "/logs");
     std::filesystem::create_directories(runDirectory);
     std::filesystem::permissions(runDirectory, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
@@ -1783,7 +1781,7 @@ public:
       std::filesystem::create_directories(durableDirectory());
       std::filesystem::permissions(durableDirectory(), std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
     }
-    for (uint32_t i = 0; i < config.count; ++i) slots.push_back({"p" + std::to_string(i)});
+    for (uint32_t i = 0; i < this->config.count; ++i) slots.push_back({"p" + std::to_string(i)});
     for (uint32_t i = 0; i < this->config.quarantineProcesses; ++i) slots.push_back({"q" + std::to_string(i), true});
     for (uint32_t i = 0; i < this->config.durableProcesses; ++i) {
       Slot slot;
@@ -1818,8 +1816,7 @@ public:
       KJ_REQUIRE(bandFd >= 0, "cannot keep the memory band descriptor");
     }
     setUpSandbox();
-    configuredBinary = statSignature(this->executable);
-    threadedConfiguredBinary = statSignature(this->config.threadedExecutable);
+    configuredBinary = statSignature(this->config.threadedExecutable);
     std::cout << "[process-pool] {\"event\":\"channels\",\"runDirectory\":\"" << escape(runDirectory)
         << "\",\"binding\":\"" << escape(this->bindingAddress) << "\",\"source\":\"" << escape(this->sourceAddress)
         << "\",\"memoryBand\":" << (bandFd >= 0 ? "true" : "false")
@@ -2014,7 +2011,7 @@ public:
   // The interpreter and libraries of the workerd file open as `fd`, once per file.
   void resolveSharedObjects(int fd, const BinarySignature& signature) {
     if (sandbox.sharedObjectsFor.valid && signature == sandbox.sharedObjectsFor) return;
-    sandbox.sharedObjects = sharedObjects(fd, executable);
+    sandbox.sharedObjects = sharedObjects(fd, config.threadedExecutable);
     sandbox.sharedObjectsFor = signature;
   }
   // The launcher's command line for a process (PROTOCOL.md): the sandbox's layers and binds, the system call
@@ -2038,7 +2035,7 @@ public:
       // launcher refuses the pair and reports it as a launch failure (PROTOCOL.md, step `allowlist`).
       args.push_back(programSha256.empty() ? "unknown" : programSha256);
     }
-    if (!check && !program.empty() && program.front() == config.threadedExecutable) args.push_back("--threaded");
+    if (!check) args.push_back("--threaded");
     auto bind = [&](const char* option, const std::string& path) { args.push_back(option); args.push_back(path); };
     for (const auto& path : sandbox.sharedObjects) bind("--bind", path);
     bind("--bind-rw", "/dev/null");
@@ -2081,7 +2078,7 @@ public:
     sigaddset(&defaults, SIGTERM); sigaddset(&defaults, SIGINT);
     posix_spawnattr_setsigmask(&attr, &mask); posix_spawnattr_setsigdefault(&attr, &defaults);
     posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
-    auto args = launcherCommand(true, {executable}, sandbox.syscalls.programSha256);
+    auto args = launcherCommand(true, {config.threadedExecutable}, sandbox.syscalls.programSha256);
     std::vector<char*> argv;
     for (auto& arg : args) argv.push_back(arg.data());
     argv.push_back(nullptr);
@@ -2166,7 +2163,9 @@ public:
     // comes too late for the first spawn, and every launch is compared against this one).
     s.programSignature = programSignature;
     s.programSha256 = BinaryHasher::digestOf(programFd);
-    if (s.programSha256.empty()) throw std::runtime_error("cannot hash the workerd executable " + executable);
+    if (s.programSha256.empty()) {
+      throw std::runtime_error("cannot hash the threaded executable " + config.threadedExecutable);
+    }
     // The list has to cover the bytes this Server runs; which of its digests that is, is recorded.
     if (std::find(s.workerdSha256.begin(), s.workerdSha256.end(), s.programSha256) == s.workerdSha256.end()) {
       std::string named;
@@ -2258,8 +2257,9 @@ public:
       b.launcherSha256 = BinaryHasher::digestOf(b.launcherFd);
       std::filesystem::create_directories(b.root);
       std::filesystem::permissions(b.root, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+      const auto& executable = config.threadedExecutable;
       const int program = ::open(executable.c_str(), O_RDONLY | O_CLOEXEC);
-      if (program < 0) throw std::runtime_error("cannot open the workerd executable " + executable + ": " + strerror(errno));
+      if (program < 0) throw std::runtime_error("cannot open the threaded executable " + executable + ": " + strerror(errno));
       const int raisedProgram = raised(program);
       auto closeProgram = kj::defer([raisedProgram] { ::close(raisedProgram); });
       struct stat programInfo;
@@ -3187,7 +3187,7 @@ public:
   bool binaryMismatch(size_t index) const {
     const auto& p = slots[index].current;
     if (!p || p->pid == 0 || !p->binary.valid) return false;
-    const auto expected = threadedConfiguredBinary;
+    const auto expected = configuredBinary;
     const auto digest = hasher.lookup(expected);
     if (digest.empty() || p->binary == expected) return false;
     auto running = hasher.lookup(p->binary);
@@ -3202,6 +3202,7 @@ public:
     if (config.rotationBinaryCheckMs && now >= nextBinaryCheck) {
       nextBinaryCheck = now + config.rotationBinaryCheckMs;
       ++binaryChecks;
+      const auto& executable = config.threadedExecutable;
       auto signature = statSignature(executable);
       if (signature.valid && !(signature == configuredBinary)) {
         ++binaryChanges; binaryChangedAtUnixMs = wall();
@@ -3211,15 +3212,6 @@ public:
         configuredBinary = signature;
       }
       hasher.request(executable, configuredBinary);
-      if (config.ordinaryServer == "threaded") {
-        auto native = statSignature(config.threadedExecutable);
-        if (native.valid && !(native == threadedConfiguredBinary)) {
-          ++binaryChanges; binaryChangedAtUnixMs = wall();
-          automaticRetryAt = 0; automaticBackoffMs = 0;
-          threadedConfiguredBinary = native;
-        }
-        hasher.request(config.threadedExecutable, threadedConfiguredBinary);
-      }
     }
     if (now < automaticRetryAt) return;
     if (config.rotationBinaryCheckMs) {
@@ -3570,7 +3562,8 @@ public:
         << ",\"maxAgeMs\":" << config.rotationMaxAgeMs << ",\"maxRequests\":" << config.rotationMaxRequests
         << ",\"residentBytes\":" << config.rotationResidentBytes << ",\"residentBytesSource\":\""
         << escape(config.rotationResidentBytesSource) << "\",\"retryMs\":" << config.rotationRetryMs
-        << ",\"concurrency\":1},\"binary\":{\"path\":\"" << escape(executable) << "\",\"sha256\":\"" << hasher.lookup(configuredBinary)
+        << ",\"concurrency\":1},\"binary\":{\"path\":\"" << escape(config.threadedExecutable)
+        << "\",\"sha256\":\"" << hasher.lookup(configuredBinary)
         << "\",\"checks\":" << binaryChecks << ",\"changes\":" << binaryChanges << ",\"changedAtUnixMs\":" << binaryChangedAtUnixMs
         << ",\"hashes\":" << hasher.counts().first << ",\"hashFailures\":" << hasher.counts().second
         << "},\"automaticBackoffMs\":" << automaticBackoffMs << ",\"inProgress\":";
@@ -3598,11 +3591,11 @@ public:
   }
 };
 
-ProcessPool::ProcessPool(ProcessPoolConfig config, std::string executable,
+ProcessPool::ProcessPool(ProcessPoolConfig config,
     std::string directory, std::string bindingAddress, std::string sourceAddress,
     kj::AsyncIoProvider& provider, kj::UnixEventPort& eventPort, const kj::HttpHeaderTable& headers,
     Suspects& suspects)
-    : impl(std::make_unique<Impl>(config, std::move(executable), std::move(directory),
+    : impl(std::make_unique<Impl>(std::move(config), std::move(directory),
         std::move(bindingAddress), std::move(sourceAddress), provider, eventPort, headers, suspects)) {}
 ProcessPool::~ProcessPool() noexcept(false) = default;
 kj::Promise<void> ProcessPool::run() {

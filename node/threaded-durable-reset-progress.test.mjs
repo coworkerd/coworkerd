@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const [nodeBinary, workerd] = process.argv.slice(2);
+const [nodeBinary, threaded] = process.argv.slice(2);
 assert.equal(process.platform, 'linux');
 const scratch = await mkdtemp(join(tmpdir(), 'cwkd-reset-progress-'));
 const fixture = join(scratch, 'fixture');
@@ -30,7 +30,7 @@ const port = await new Promise((resolve, reject) => {
     server.close(error => error ? reject(error) : resolve(value));
   });
 });
-const args = [manifestPath, workerd, `127.0.0.1:${port}`, '127.0.0.1:0', '127.0.0.1:0', configPath];
+const args = [manifestPath, threaded, `127.0.0.1:${port}`, '127.0.0.1:0', '127.0.0.1:0', configPath];
 
 async function state() {
   const response = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {

@@ -462,7 +462,6 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `secrets.keyFile` | required | The cluster's secrets key `{"key":"<64 lowercase hexadecimal characters>"}` (that field only), readable by its owner only; the same file on the control plane and every node. The environment variable `COWORKERD_SECRETS_KEY_FILE` overrides it |
 | `storage.cacheDirectory` / `storage.cacheMaxBytes` | `<stack directory>/cache` / 64 MiB | The local caches of code (bundles, `packages/`, `modules/`), each of the three bounded by `cacheMaxBytes` |
 | `stackDirectory` | `/var/lib/coworkerd` | The stack directory: `logs/`, `run/` (the Unix sockets shared with workerd, mode 0700; a stack directory whose path is too long for those sockets stops the start), `cache/`, and on Linux with the sandbox not `off` `sandbox/` (0700) |
-| `workerdPath` | `workerd` in the directory of `coworkerd` | The workerd executable |
 | `listenAddress` | `0.0.0.0:8930` | The ingress (also the management endpoints) |
 | `peerListenAddress` | `0.0.0.0:8934` | The peer listener (calls from other nodes, trial loads during deployment) |
 | `advertisedAddress` | `<hostname>:<peer port>` | The address other nodes use to reach this node; they must be able to connect to it |
@@ -471,7 +470,7 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `processPool.count` | `1` | The number of ordinary workerd processes |
 | `processPool.inFlightLimit` | derived for ordinary and quarantine processes; 512 for durable processes | An explicit value sets the ceiling on each process. See [waiting-call capacity](#waiting-call-capacity). |
 | `processPool.ordinaryServer` | `threaded` | The execution backend for ordinary and quarantine processes. Use `threaded` when specifying this field |
-| `processPool.threadedExecutable` | `coworkerd-threaded` beside `workerdPath` | Executable for ordinary, quarantine and durable processes. Build it with `//src/workerd/threaded:coworkerd-threaded` in the matching workerd fork |
+| `processPool.threadedExecutable` | `coworkerd-threaded` beside `coworkerd` | Executable for ordinary, quarantine and durable processes. Build it with `//src/workerd/threaded:coworkerd-threaded` in the matching workerd fork |
 | `processPool.threadedMemoryBytes` | `0` | Native process memory budget in bytes. `0` divides 80% of the node's actual memory budget among ordinary, quarantine and durable processes plus one replacement generation. An explicit value cannot exceed this share |
 | `processPool.threadedResidentLimit` | `1840` | Maximum resident Worker versions in a native process, from `1` to `1840` for this shared pointer-space build. Memory and address budgets can refuse earlier. Idle versions are evicted before a new version is admitted |
 | `processPool.threadedThreadIdleMs` | `60000` | Native call threads above the warm pool of 32 are released after this idle interval. `0` keeps them. The pool grows up to `inFlightLimit`; eight separate control loops maintain state and return pre-execution refusals |
@@ -767,7 +766,7 @@ Peer protocol revisions 1 and 2 refuse each other before dispatch. Stateless pla
   (with the token). The node first announces its exit (readiness turns 503, its drain marker appears in the object store, and the other nodes stop placing new calls on it at their next listing), waits for the in-flight calls to complete (at most `drainTimeoutMs`), closes workerd,
   writes out the current hour's usage, removes its heartbeat and drain marker, then exits. A second SIGTERM exits immediately. compose allows 45 seconds (`stop_grace_period`).
 - **Upgrading nodes**: one at a time: load the new image, `docker compose up -d node-1` (recreates that one), wait until it is ready, then the next. Keep at least two nodes in the membership table and have the clients' front load balancer take a node out when its readiness turns 503. Clients must still handle refusals and connection failures: a request that still reaches the leaving node gets `503 SERVER_DRAINING`, to be sent to another node, and its port refuses connections once it has exited.
-- **Replacing workerd**: replace the file `workerdPath` points to; the node notices within a second and rotates process by process, with in-flight requests completing in the old process;
+- To replace the execution kernel, replace the file selected by `processPool.threadedExecutable`. The node notices within a second and rotates process by process, allowing in-flight requests to complete in the old generation.
   `coworkerd-apiserver tool rotate --server ... --all` rotates by hand as well.
 - **Replacing workerd** (only workerd, not the whole package): first put in an allowlist covering both the old and the new bytes, then replace the binary, finally switch to the allowlist covering only the new bytes -- the order and the reasons are in "System call allowlist" in section 4.
 - **Replacing the launcher** (`bin/coworkerd-launcher`, upgraded together with the node): the node checks and fixes it at startup, so replacing the file while running triggers no rotation, and the state endpoint's

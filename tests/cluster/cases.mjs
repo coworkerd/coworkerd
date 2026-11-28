@@ -249,6 +249,9 @@ async function threadedDatabaseRelease(cluster) {
   });
   assert.deepEqual(result.results, [{ ready: 1 }]);
   const owner = await databaseShardOwner(cluster, database);
+  await cluster.compose(['exec', '-T', owner, 'test', '!', '-e', '/opt/coworkerd/bin/workerd']);
+  const state = await cluster.state(owner);
+  assert.equal(state.processes.rotation.binary.path, '/opt/coworkerd/bin/coworkerd-threaded');
   const binary = createHash('sha256').update(await readFile(join(cluster.kernel, 'coworkerd-threaded'))).digest('hex');
   const process = await eventually('the owner runs the pinned threaded executable with default settings', async () => {
     const generation = await durableGeneration(cluster, owner);

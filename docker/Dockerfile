@@ -28,7 +28,7 @@ RUN useradd --system --uid 10001 --user-group --home-dir /var/lib/coworkerd --no
 # needs the options of docker-compose.sandbox.yml (sandbox.mode auto runs workerd without it otherwise).
 # The two coworkerd-syscalls-*.txt are the system call allowlist of this package's workerd, which the
 # launcher installs before it executes it; the Server finds them beside its own executable.
-COPY bin/coworkerd bin/coworkerd-apiserver bin/coworkerd-launcher bin/workerd bin/coworkerd-threaded \
+COPY bin/coworkerd bin/coworkerd-apiserver bin/coworkerd-launcher bin/coworkerd-threaded \
      bin/coworkerd-syscalls-startup.txt bin/coworkerd-syscalls-steady.txt /opt/coworkerd/bin/
 COPY docker/entrypoint.sh /usr/local/bin/coworkerd-entrypoint
 ENV PATH=/opt/coworkerd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

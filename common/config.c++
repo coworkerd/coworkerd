@@ -372,7 +372,6 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   // The paths and addresses of `serve`, and the shortcuts. A shortcut and the nested field it
   // fills may both appear only with the same value.
   result.stackDirectory = root.getStackDirectory().cStr();
-  result.workerdPath = root.getWorkerdPath().cStr();
   result.listenAddress = root.getListenAddress().cStr();
   if (result.processPool.threadedDurableTestStorage) {
     KJ_REQUIRE(!given({"storage"}) && !given({"desiredState", "objectStore"}) &&

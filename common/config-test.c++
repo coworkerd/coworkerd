@@ -147,6 +147,7 @@ void durableConfiguration(Fixture& fixture) {
       std::pair{"threadedStorage", R"({"durableObjects":{"threadedStorage":false}})"},
       std::pair{"alarmFireConcurrency", R"({"durableObjects":{"alarmFireConcurrency":2}})"},
       std::pair{"runtimePath", R"({"runtimePath":"retired.js"})"},
+      std::pair{"workerdPath", R"({"workerdPath":"retired-workerd"})"},
       std::pair{"sqlCpuLimitMs", R"({"processPool":{"sqlCpuLimitMs":200}})"},
       std::pair{"sqlWallLimitMs", R"({"processPool":{"sqlWallLimitMs":800}})"},
       std::pair{"probeOverdueMs", R"({"processPool":{"probeOverdueMs":400}})"},

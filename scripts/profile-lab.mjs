@@ -4,7 +4,7 @@
 // unprivileged user (uid 10001, as in the image and the systemd unit), the harness as root reads every process's /proc.
 // The binary directory needs a `coworkerd-server` that executes the node daemon `coworkerd` with its arguments: this
 // environment starts the node by that name (a two-line shell script will do).
-//   COWORKERD_PROFILE_BIN_DIR    directory with the node, launcher, workerd, coworkorkerd-threaded and syscall tables
+//   COWORKERD_PROFILE_BIN_DIR    directory with the node, launcher, coworkerd-threaded and syscall tables
 //   COWORKERD_PROFILE_STACK_DIR  disposable stack directory (default /tmp/coworkerd-lab-stack inside the container)
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
@@ -72,7 +72,7 @@ export async function waitFor(check, label, timeoutMs = 30000, intervalMs = 50) 
 // Server as that user. `sandbox` is the configuration's sandbox.mode; `ownBinaries` copies the three binaries into
 // the stack (a case that replaces files on disk); `keepStack` starts again on the stack as it is (3.4).
 export async function setup({ sandbox, syscalls = null, workers = { ordinary }, config = {}, env = {}, waitReady = true,
-    keepStack = false, ownBinaries = false, workerdPath = null, trace = false }) {
+    keepStack = false, ownBinaries = false, threadedExecutable = null, trace = false }) {
   await stop();
   let bin = BIN;
   if (!keepStack) {
@@ -93,7 +93,7 @@ export async function setup({ sandbox, syscalls = null, workers = { ordinary }, 
     await writeFile(`${STACK}/workers/manifest.json`, JSON.stringify(manifest));
     if (ownBinaries) {
       await mkdir(`${STACK}/bin`, { recursive: true });
-      for (const name of ["coworkerd-server", "coworkerd-launcher", "workerd"]) {
+      for (const name of ["coworkerd-server", "coworkerd-launcher", "coworkerd-threaded"]) {
         await copyFile(`${BIN}/${name}`, `${STACK}/bin/${name}`);
         await chmod(`${STACK}/bin/${name}`, 0o755);
       }
@@ -102,7 +102,8 @@ export async function setup({ sandbox, syscalls = null, workers = { ordinary }, 
         if (existsSync(`${BIN}/${name}`)) await copyFile(`${BIN}/${name}`, `${STACK}/bin/${name}`);
     }
   }
-  if (existsSync(`${STACK}/bin/workerd`)) bin = `${STACK}/bin`;
+  if (existsSync(`${STACK}/bin/coworkerd-threaded`)) bin = `${STACK}/bin`;
+  const program = threadedExecutable ?? `${bin}/coworkerd-threaded`;
   const configuration = { ...DEFAULTS, ...config,
     sandbox: { mode: sandbox, ...(syscalls ? { syscalls } : {}), ...(config.sandbox ?? {}) } };
   await writeFile(`${STACK}/server-config.json`, JSON.stringify(configuration));
@@ -112,7 +113,7 @@ export async function setup({ sandbox, syscalls = null, workers = { ordinary }, 
     COWORKERD_LOG_BUFFER_BYTES: "4194304", ...env };
   const child = spawn("setpriv", ["--reuid", USER, "--regid", USER, "--clear-groups",
     ...(trace ? ["--inh-caps", "+sys_ptrace", "--ambient-caps", "+sys_ptrace"] : []), "--", `${bin}/coworkerd-server`,
-    `${STACK}/workers/manifest.json`, workerdPath ?? `${bin}/workerd`, "0.0.0.0:8930", "127.0.0.1:8932", "127.0.0.1:8933", `${STACK}/server-config.json`],
+    `${STACK}/workers/manifest.json`, program, "0.0.0.0:8930", "127.0.0.1:8932", "127.0.0.1:8933", `${STACK}/server-config.json`],
     { env: { ...process.env, ...environment }, stdio: ["ignore", "pipe", "pipe"], detached: true, cwd: "/" });
   const output = collector();
   // Append the Server's output to the configured log file as it arrives.
@@ -128,7 +129,7 @@ export async function setup({ sandbox, syscalls = null, workers = { ordinary }, 
     await waitFor(async () => (await request("/__coworkerd/ready", { timeoutMs: 500 })).status === 200, "Server ready", 60000);
     await waitFor(async () => (await state()).processes.entries.every(e => e.state === "ready"), "processes ready", 60000);
   }
-  return { sandbox, syscalls, trace, binaries: binaries(bin), binaryDirectory: bin, workerdPath: workerdPath ?? `${bin}/workerd`,
+  return { sandbox, syscalls, trace, binaries: binaries(bin), binaryDirectory: bin, threadedExecutable: program,
     configuration, environment: Object.keys(env), serverPid: child.pid, startedAtUnixMs };
 }
 // The Server's output as it comes, per stream: its own records (the lines lines() reads) are kept whole; the rest -- among

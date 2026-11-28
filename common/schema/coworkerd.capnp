@@ -380,12 +380,11 @@ struct ServerConfig {
 
   # The single configuration file of `coworkerd --config FILE`. A minimal file
   # names nodeId and storage.endpoint; every other field has a default. The
-  # legacy positional form (manifest, workerd, addresses on the command line) takes the
-  # shortcuts below too, while taking paths and addresses from its arguments.
+  # positional test form takes the manifest, threaded executable and addresses from its arguments.
   # Default /var/lib/coworkerd: logs/, run/, cache/ of this Server. Serve only.
   stackDirectory @25 :Text;
-  # Default: `workerd` beside this executable. Serve only.
-  workerdPath @26 :Text;
+  # Keep the retired upstream executable path's ordinal unused.
+  unused26 @26 :Void;
   # Keep the retired runtime module path's ordinal unused.
   unused27 @27 :Void;
   # The ingress. Default 0.0.0.0:8930. Serve only.
@@ -745,7 +744,7 @@ struct ProcessPoolConfig {
   unused11 @11 :Void;
   # The only accepted value for this setting is "threaded".
   ordinaryServer @12 :Text = "threaded";
-  # Empty: coworkerd-threaded beside workerdPath.
+  # Empty: coworkerd-threaded beside the node executable.
   threadedExecutable @13 :Text;
   # Per-tenant calls while another tenant is in flight. Omitted or 0 disables it.
   tenantInFlightLimit @14 :UInt32 = 0;

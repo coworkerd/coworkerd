@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const [nodeBinary, workerd] = process.argv.slice(2);
+const [nodeBinary, threaded] = process.argv.slice(2);
 assert.equal(process.platform, 'linux');
 const reservePort = () => new Promise((resolve, reject) => {
   const socket = createServer();
@@ -44,7 +44,7 @@ for (const [label, options, override, expected] of cases) {
     await writeFile(config, JSON.stringify({ nodeId: 'memory-component', processPool: { count: 1 },
       quarantineProcesses: 0, sandbox: { mode: 'off', syscalls: { mode: 'off' } }, management: { allowWithoutToken: true }, memoryWatermarkEnabled: false,
       peerListenAddress: '127.0.0.1:0', ...options }));
-    child = spawn(nodeBinary, [manifest, workerd, `127.0.0.1:${port}`, '127.0.0.1:0', '127.0.0.1:0', config],
+    child = spawn(nodeBinary, [manifest, threaded, `127.0.0.1:${port}`, '127.0.0.1:0', '127.0.0.1:0', config],
       { env: { ...environment, ...override }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stderr.on('data', chunk => diagnostic = (diagnostic + chunk.toString()).slice(-3000));
     child.stdout.resume();

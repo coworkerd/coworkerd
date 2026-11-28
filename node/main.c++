@@ -10187,13 +10187,13 @@ std::optional<std::pair<std::string, int>> liveStackSocket(const fs::path& stack
 
 // ---- How the Server starts ----
 // `coworkerd --config FILE` reads everything from one file with defaults; the
-// positional form (`<manifest> <workerd> <http> <binding-rpc> <source>
+// positional form (`<manifest> <coworkerd-threaded> <http> <binding-rpc> <source>
 // [server-config]`) works as well. Both resolve to a Launch.
 struct Launch {
   std::string form;              // "serve" or "positional"
   fs::path configFile;           // empty: the positional form without a configuration file
   fs::path stackDirectory, manifestPath;
-  std::string workerd, listenAddress;
+  std::string listenAddress;
   std::string ignoredBindingAddress, ignoredSourceAddress;  // positional, unused
   bool experimentalNaiveLease = false;
   ServerConfig config;
@@ -10205,7 +10205,7 @@ constexpr const char* USAGE =
     "       coworkerd check storage ENDPOINT BUCKET  (the object store's self-check)\n"
     "       coworkerd check host [MiB]  (fresh-memory first touches and virtio balloon features)\n"
     "       coworkerd --version\n"
-    "       coworkerd <manifest> <workerd> <http-address> <binding-rpc-address> <source-address> [server-config]"
+    "       coworkerd <manifest> <coworkerd-threaded> <http-address> <binding-rpc-address> <source-address> [server-config]"
     "  (the regressions' form)\n";
 
 Launch serveLaunch(const std::vector<std::string>& args, bool naive) {
@@ -10224,8 +10224,6 @@ Launch serveLaunch(const std::vector<std::string>& args, bool naive) {
   KJ_REQUIRE(c.serverIdGiven, "the configuration needs a nodeId");
   launch.stackDirectory = fs::absolute(c.stackDirectory.empty() ? "/var/lib/coworkerd" : c.stackDirectory).lexically_normal();
   launch.manifestPath = launch.stackDirectory / "workers" / "manifest.json";
-  const auto self = executableDirectory();
-  launch.workerd = fs::absolute(c.workerdPath.empty() ? self / "workerd" : fs::path(c.workerdPath)).lexically_normal().string();
   launch.listenAddress = c.listenAddress.empty() ? "0.0.0.0:8930" : c.listenAddress;
   if (c.peerListenAddress.empty()) c.peerListenAddress = "0.0.0.0:8934";
   KJ_REQUIRE(c.desiredState.backend == "objectStore" && !c.desiredState.objectStore.endpoint.empty(),
@@ -10250,15 +10248,17 @@ Launch positionalLaunch(const std::vector<std::string>& args, bool naive) {
   launch.form = "positional";
   launch.experimentalNaiveLease = naive;
   launch.manifestPath = args[0];
-  launch.workerd = fs::absolute(args[1]).string();
   launch.listenAddress = args[2];
   launch.ignoredBindingAddress = args[3];
   launch.ignoredSourceAddress = args[4];
   if (args.size() == 6) launch.configFile = args[5];
   launch.config = ServerConfig::load(launch.configFile);
+  if (launch.config.processPool.threadedExecutable.empty()) {
+    launch.config.processPool.threadedExecutable = args[1];
+  }
   coworkerd::checkNodeLeaseMargin(launch.config.membership);
   KJ_REQUIRE(!launch.config.servePathsGiven(),
-      "stackDirectory, workerdPath and listenAddress are for `serve`; the positional form takes them as arguments");
+      "stackDirectory and listenAddress are for `serve`; the positional form takes them as arguments");
   // <stack>/workers/manifest.json -> <stack>.
   launch.stackDirectory = fs::absolute(launch.manifestPath).parent_path().parent_path();
   if (launch.config.cacheFollowsStack) launch.config.desiredState.cache.directory = launch.stackDirectory / "cache";
@@ -10286,14 +10286,12 @@ fs::path makeDurableTestStack(const fs::path& fixtureStack) {
 // the threaded binary's sandbox, this machine's memory protection keys, address space and
 // vm.max_map_count lower each process's resident limit (never the process count).
 // A plan that refuses ends the start.
-void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool, const std::string& workerdPath) {
+void planOrdinarySandbox(coworkerd::ProcessPoolConfig& pool) {
   if (const char* keys = std::getenv("COWORKERD_SANDBOX_PROTECTION_KEYS")) pool.protectionKeys = keys;
   KJ_REQUIRE(pool.protectionKeys == "auto" || pool.protectionKeys == "off" || pool.protectionKeys == "required",
       "sandbox.protectionKeys must be auto, off or required", pool.protectionKeys.c_str());
   if (pool.count + pool.quarantineProcesses + pool.durableProcesses == 0) return;
-  const auto threaded = pool.threadedExecutable.empty()
-      ? (fs::path(workerdPath).parent_path() / "coworkerd-threaded").string() : pool.threadedExecutable;
-  auto plan = coworkerd::planV8Sandbox(pool.protectionKeys, coworkerd::probeSandboxBuild(threaded),
+  auto plan = coworkerd::planV8Sandbox(pool.protectionKeys, coworkerd::probeSandboxBuild(pool.threadedExecutable),
       coworkerd::probeProtectionKeys(), coworkerd::probeMachine(), pool.threadedResidentLimit,
       pool.count + pool.durableProcesses);
   // Only for the fill-until-failure cell: a per-process limit above what the address space holds,
@@ -10323,8 +10321,10 @@ uint64_t nodeHardDescriptorLimit(rlim_t inherited) {
   return hard;
 }
 
-void applyProcessPoolEnvironment(ServerConfig& config, const std::string& workerdPath) {
+void applyProcessPoolEnvironment(ServerConfig& config) {
   auto& pool = config.processPool;
+  pool.threadedExecutable = fs::absolute(pool.threadedExecutable.empty()
+      ? executableDirectory() / "coworkerd-threaded" : fs::path(pool.threadedExecutable)).lexically_normal().string();
   const auto memoryBudgetBytes = config.memoryBudgetBytes;
   pool.cpuLimitMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_CPU_LIMIT_MS", pool.cpuLimitMs, UINT32_MAX));
   pool.durableCpuLimitMs = 30000;
@@ -10344,7 +10344,7 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
   pool.threadedResidentLimit = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_RESIDENT_LIMIT", pool.threadedResidentLimit, 1840));
   pool.threadedThreadIdleMs = static_cast<uint32_t>(environmentUnsigned("COWORKERD_THREADED_THREAD_IDLE_MS", pool.threadedThreadIdleMs, UINT32_MAX));
   pool.threadedMemoryBytes = environmentUnsigned("COWORKERD_THREADED_MEMORY_BYTES", pool.threadedMemoryBytes, UINT64_MAX);
-  planOrdinarySandbox(pool, workerdPath);
+  planOrdinarySandbox(pool);
   const auto [nodeBytes, memorySource] = coworkerd::MemoryWatermark::nodeMemory(config.memoryBudgetBytes);
   const auto generations = uint64_t(pool.count) + pool.quarantineProcesses + pool.durableProcesses + 1;
   const auto memoryShare = (nodeBytes - nodeBytes / 5) / generations;
@@ -10517,7 +10517,7 @@ std::string configurationJson(const Launch& launch, const ServerConfig& c, const
       : std::getenv("AWS_ACCESS_KEY_ID") ? "environment" : "none";
   std::ostringstream out;
   out << std::setprecision(17) << "{\"nodeId\":" << q(c.serverId) << ",\"stackDirectory\":" << q(launch.stackDirectory.string())
-      << ",\"workerdPath\":" << q(launch.workerd)
+      << ",\"threadedExecutable\":" << q(p.threadedExecutable)
       << ",\"listenAddress\":" << q(launch.listenAddress) << ",\"peerListenAddress\":" << q(c.peerListenAddress)
       << ",\"advertisedAddress\":" << q(m.advertisedAddress)
       << ",\"membership\":{\"backend\":" << q(m.backend) << ",\"ttlSeconds\":" << m.ttlSeconds
@@ -10674,7 +10674,7 @@ int run(Launch launch) {
     KJ_REQUIRE(std::string(enabled) == "0" || std::string(enabled) == "1", "invalid memory watermark override");
     serverConfig.memoryWatermarkEnabled = std::string(enabled) == "1";
   }
-  applyProcessPoolEnvironment(serverConfig, launch.workerd);
+  applyProcessPoolEnvironment(serverConfig);
   applyNodeDescriptorLimit(serverConfig);
   // Outbound requests and the peer key, as the file says or these override; the rules are checked here.
   if (const char* mode = std::getenv("COWORKERD_EGRESS_MODE"); mode != nullptr && *mode) serverConfig.egress.mode = mode;
@@ -10768,7 +10768,7 @@ int run(Launch launch) {
             << "\",\"source\":\"" << jsonEscape(sourceSocketAddress) << "\",\"ignoredBindingAddress\":\""
             << jsonEscape(launch.ignoredBindingAddress) << "\",\"ignoredSourceAddress\":\"" << jsonEscape(launch.ignoredSourceAddress)
             << "\"}" << std::endl;
-  coworkerd::ProcessPool runtime(serverConfig.processPool, launch.workerd,
+  coworkerd::ProcessPool runtime(serverConfig.processPool,
       stackDirectory.string(), bindingSocketAddress, sourceSocketAddress, *io.provider, io.unixEventPort,
       *headerTable, suspects);
   runtime.setHostCheckOomGuard([&hostCheck]() { return hostCheck.takeOomExposure(); });
@@ -11066,7 +11066,7 @@ int run(Launch launch) {
             << " peer-rpc=" << peerAddressText
             << " source=" << sourceSocketAddress
             << " egress=" << (egressOn ? "unix:" + egressSocket : std::string("off"))
-            << " workerd=" << launch.workerd << std::endl;
+            << " threadedExecutable=" << serverConfig.processPool.threadedExecutable << std::endl;
 
   httpServer.listenHttp(*httpListener).exclusiveJoin(drain.ingressClosed())
       .then([&httpListener]() -> kj::Promise<void> { httpListener = nullptr; return kj::NEVER_DONE; })
@@ -11122,7 +11122,7 @@ int runSelfCheck(const std::vector<std::string>& args) {
   std::optional<Launch> launch;
   try {
     launch = serveLaunch(options, false);
-    applyProcessPoolEnvironment(launch->config, launch->workerd);
+    applyProcessPoolEnvironment(launch->config);
     applyNodeDescriptorLimit(launch->config);
     report("configuration", true, ",\"configFile\":\"" + jsonEscape(launch->configFile.string()) + "\",\"nodeId\":\"" +
         jsonEscape(launch->config.serverId) + "\",\"webSocketsPerNode\":" + std::to_string(launch->config.webSocketsPerNode));
@@ -11256,11 +11256,12 @@ int runSelfCheck(const std::vector<std::string>& args) {
         c.suspectProbation && c.processPool.quarantineProcesses > 0);
     c.processPool.heatIdleMs = c.idleMs;
     const auto run = directory / "run";
-    coworkerd::ProcessPool pool(c.processPool, launch->workerd, directory.string(),
+    coworkerd::ProcessPool pool(c.processPool, directory.string(),
         "unix:" + (run / "binding.sock").string(), "unix:" + (run / "source.sock").string(), *io.provider, io.unixEventPort,
         *headerTable, suspects);
     report("sandbox", true, ",\"mode\":\"" + jsonEscape(c.processPool.sandboxMode) + "\",\"syscalls\":\"" +
-        jsonEscape(c.processPool.syscallsMode) + "\",\"workerd\":\"" + jsonEscape(launch->workerd) + "\"");
+        jsonEscape(c.processPool.syscallsMode) + "\",\"threadedExecutable\":\"" +
+        jsonEscape(c.processPool.threadedExecutable) + "\"");
   } catch (const kj::Exception& error) {
     report("sandbox", false, ",\"mode\":\"" + jsonEscape(c.processPool.sandboxMode) + "\",\"reason\":\"" +
         jsonEscape(cleanReason(error.getDescription().cStr())) + "\"");
