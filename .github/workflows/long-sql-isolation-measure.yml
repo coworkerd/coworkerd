@@ -1,5 +1,5 @@
-name: Long SQL isolation measurement
-run-name: Long SQL isolation (${{ inputs.architecture }})
+name: Waiting-call acceptance measurement
+run-name: Waiting-call acceptance (${{ inputs.architecture }})
 
 on:
   workflow_dispatch:
@@ -29,6 +29,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
@@ -47,17 +48,32 @@ jobs:
       - name: Measure on the idle runner
         shell: bash
         run: |
-          mkdir -p build/isolation-evidence
-          lscpu > build/isolation-evidence/host.txt
-          free -m >> build/isolation-evidence/host.txt
-          docker ps >> build/isolation-evidence/host.txt
+          mkdir -p build/waiting-evidence
+          lscpu > build/waiting-evidence/host.txt
+          free -m >> build/waiting-evidence/host.txt
+          docker ps >> build/waiting-evidence/host.txt
           kernel=$(python3 scripts/fetch-kernel.py --arch "$KERNEL_ARCH" --installed)
-          node tests/cluster/long-sql-isolation.mjs "$kernel" build/isolation-evidence/report.jsonl \
-            2>&1 | tee build/isolation-evidence/measurement.log
+          export COWORKERD_CLUSTER_PRODUCT_COMMIT="$(git rev-parse HEAD^)"
+          node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-evidence/report.jsonl \
+            --batches 2000,2000,2000 --ramp-ms 300 --expect-full \
+            2>&1 | tee build/waiting-evidence/measurement.log
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          const rows = fs.readFileSync('build/waiting-evidence/report.jsonl', 'utf8').trim()
+            .split('\n').map(JSON.parse);
+          const row = rows.find(row => row.type === 'effective');
+          assert.equal(row.placement.rootLimit, 7168);
+          assert.equal(row.placement.nestedLimit, 8192);
+          assert.equal(row.pool.inFlightLimit, 8192);
+          assert.equal(row.egress.concurrency, 0);
+          assert.equal(row.egress.requestsPerSecond, 0);
+          NODE
+          sha256sum build/waiting-evidence/report.jsonl | tee build/waiting-evidence/SHA256SUMS
       - name: Preserve raw evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: long-sql-isolation-${{ inputs.architecture }}
-          path: build/isolation-evidence/
+          name: waiting-call-acceptance-${{ inputs.architecture }}
+          path: build/waiting-evidence/
           if-no-files-found: ignore
