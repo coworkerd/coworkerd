@@ -1,0 +1,549 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sat, 28 Nov 2026 07:00:53 +0800
+Subject: [PATCH] Isolate stalled threaded WAL Home notifications
+
+Reserve bounded notification capacity per shipper. Keep write acknowledgements independent of Home inboxes and preserve the order of open results, breaks and close requests.
+
+Publish saturation to routing for new trees. Report registration races before execution and return inbox capacity on unregister and teardown.
+
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal-test.c++ b/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
+index 086b81e1c700cc6101474baed0d00c81439b0073..ec74f2bf3a693a7d9b325851c40ffeed2dca73a9 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
++++ b/src/workerd/server/factory/coworkerd-threaded-wal-test.c++
+@@ -92,6 +92,12 @@ struct WirePair {
+     reply(response.finish(openId));
+   }
+ 
++  void checkpoint(uint64_t openId) {
++    Writer response;
++    response.u8(MSG_CHECKPOINT_ASKED);
++    reply(response.finish(openId));
++  }
++
+   void expectGiveUp(uint64_t openId, uint64_t request, kj::StringPtr key) {
+     auto body = receive(MSG_GAVE_UP, openId);
+     Writer expected;
+@@ -118,6 +124,10 @@ KJ_TEST("threaded WAL routes interleaved home writes and ignores an old open and
+   auto first = std::make_shared<Inbox>();
+   auto second = std::make_shared<Inbox>();
+   auto post = [&](uint8_t type, uint64_t openId, const std::shared_ptr<Inbox>& inbox) {
++    if (type == MSG_OPEN) {
++      KJ_REQUIRE(inbox->tryRegister(openId));
++    }
++    if (type == MSG_CLOSED) inbox->unregister(openId);
+     Writer frame;
+     frame.u8(type);
+     KJ_REQUIRE(shared.post({.bytes = frame.finish(openId), .openId = openId, .inbox = inbox}, true));
+@@ -136,12 +146,6 @@ KJ_TEST("threaded WAL routes interleaved home writes and ignores an old open and
+         getLe64(observed.begin() + 9) == request);
+     return kj::mv(paf.promise);
+   };
+-  auto checkpoint = [&](uint64_t openId) {
+-    Writer reply;
+-    reply.u8(MSG_CHECKPOINT_ASKED);
+-    link.reply(reply.finish(openId));
+-  };
+-
+   post(MSG_OPEN, 1, first);
+   post(MSG_OPEN, 2, second);
+   auto held = append(1, 3);
+@@ -156,8 +160,8 @@ KJ_TEST("threaded WAL routes interleaved home writes and ignores an old open and
+   post(MSG_OPEN, 5, first);
+   auto reopened = append(5, 6);
+   link.ack(3);
+-  checkpoint(1);
+-  checkpoint(5);
++  link.checkpoint(1);
++  link.checkpoint(5);
+   auto notice = link.wait(first->next());
+   KJ_EXPECT(KJ_ASSERT_NONNULL(notice).openId == 5);
+   KJ_EXPECT(!reopened.poll(link.io.waitScope));
+@@ -555,6 +559,145 @@ kj::Promise<void> sendFrames(
+   return answer;
+ }
+ 
++KJ_TEST("a full threaded WAL home inbox leaves another home ready and drains in order") {
++  HomeSession test;
++  auto paused = std::make_shared<Inbox>(1);
++  const auto heldId = ++test.shared->nextId;
++  KJ_REQUIRE(paused->tryRegister(heldId));
++  Writer open;
++  open.u8(MSG_OPEN);
++  KJ_REQUIRE(
++      test.shared->post({.bytes = open.finish(heldId), .openId = heldId, .inbox = paused}, true));
++  test.link.receive(MSG_OPEN, heldId);
++
++  auto closed = kj::newPromiseAndFulfiller<uint64_t>();
++  auto ready = test.attachHome([&](uint64_t id, CloseReason reason) {
++    KJ_EXPECT(reason == CloseReason::DRAIN);
++    closed.fulfiller->fulfill(kj::mv(id));
++  });
++  TestRoot other(test, *ready, "namespace/ready/epoch"_kj);
++  acceptOpen(test, *ready, other);
++
++  auto tellSeal = [&](uint32_t salt, uint32_t frame) {
++    Writer seal;
++    seal.u8(MSG_SEALED);
++    seal.u32(salt);
++    seal.u32(0);
++    seal.u32(frame);
++    test.link.reply(seal.finish(heldId));
++  };
++  auto tellBreak = [&](kj::StringPtr reason) {
++    Writer broken;
++    broken.u8(MSG_BREAK);
++    broken.str(reason);
++    test.link.reply(broken.finish(heldId));
++  };
++  test.link.opened(heldId, ACK_QUOTA);
++  tellSeal(1, 12);
++  test.link.checkpoint(heldId);
++  const std::string heldReason(1024, 'x');
++  tellBreak(heldReason.c_str());
++  test.link.requestClose(heldId, MSG_CLOSE_ASKED);
++  tellSeal(2, 20);
++  test.link.requestClose(heldId, MSG_CLOSE_FOR_CODE_UPDATE);
++
++  // Every kind now has a pending slot. Repeated advisory traffic still fits,
++  // and a fresh open cannot claim another slot on the paused home.
++  tellSeal(2, 18);
++  tellBreak("a second report"_kj);
++  for (auto i KJ_UNUSED: kj::zeroTo(16)) {
++    test.link.checkpoint(heldId);
++  }
++  const auto freshId = ++test.shared->nextId;
++  KJ_EXPECT(!paused->tryRegister(freshId));
++
++  KJ_REQUIRE(other.db.run("PRAGMA journal_mode = WAL").getText(0) == "wal"_kj);
++  other.db.run("CREATE TABLE entries (value INTEGER)");
++  other.db.run("INSERT INTO entries VALUES (42)");
++  auto confirmation = other.shipper.onCommit();
++  auto frames = test.link.receive(MSG_FRAMES, other.id());
++  KJ_REQUIRE(frames.size() > 17);
++  KJ_EXPECT(other.shipper.hasPendingWrites());
++  KJ_EXPECT(!confirmation.poll(test.link.io.waitScope));
++  test.link.ack(getLe64(frames.begin() + 9));
++  test.link.wait(kj::mv(confirmation));
++  KJ_EXPECT(!other.shipper.hasPendingWrites());
++  KJ_EXPECT(other.db.run("SELECT value FROM entries").getInt(0) == 42);
++  test.link.requestClose(other.id(), MSG_CLOSE_ASKED);
++  KJ_EXPECT(test.link.wait(kj::mv(closed.promise)) == other.id());
++  KJ_REQUIRE(test.shared->negotiated());
++
++  auto take = [&](uint8_t type) {
++    auto next = test.link.wait(paused->next());
++    auto notice = kj::mv(KJ_ASSERT_NONNULL(next));
++    KJ_EXPECT(notice.type == type, notice.type, type);
++    KJ_EXPECT(notice.openId == heldId);
++    return notice;
++  };
++  KJ_EXPECT(take(MSG_OPENED).status == ACK_QUOTA);
++  take(MSG_CHECKPOINT_ASKED);
++  const auto broken = take(MSG_BREAK);
++  KJ_EXPECT(broken.reason == kj::StringPtr(heldReason.c_str()).first(MAX_BREAK_REASON_BYTES));
++  take(MSG_CLOSE_ASKED);
++  auto seal = take(MSG_SEALED);
++  KJ_EXPECT(seal.salt1 == 2 && seal.upToFrame == 20);
++  take(MSG_CLOSE_FOR_CODE_UPDATE);
++  auto noMore = paused->next();
++  KJ_EXPECT(!noMore.poll(test.link.io.waitScope));
++
++  // Retiring the local shipper discards queued and late notices for its ID.
++  noMore = nullptr;
++  paused->push({.type = MSG_CLOSE_ASKED, .openId = heldId});
++  paused->unregister(heldId);
++  paused->push({.type = MSG_CLOSE_FOR_CODE_UPDATE, .openId = heldId});
++  KJ_EXPECT(paused->tryRegister(freshId));
++  paused->push({.type = MSG_OPENED, .openId = freshId});
++  auto fresh = test.link.wait(paused->next());
++  KJ_EXPECT(KJ_ASSERT_NONNULL(fresh).openId == freshId);
++}
++
++KJ_TEST("threaded WAL Home publishes its registration limit and closes its inbox") {
++  HomeSession test;
++  std::atomic<bool> full{false};
++  auto inbox = std::make_shared<Inbox>(1);
++  auto home = kj::heap<Home>(test.shared, [](uint64_t, CloseReason) {}, test.clock, full, inbox);
++  KJ_EXPECT(!full.load());
++  uint64_t openId;
++  {
++    TestRoot root(test, *home, "namespace/capacity/epoch"_kj);
++    openId = root.id();
++    acceptOpen(test, *home, root);
++    KJ_EXPECT(full.load());
++    auto refusal = kj::runCatchingExceptions(
++        [&] { TestRoot rejected(test, *home, "namespace/refused/epoch"_kj); });
++    const auto& error = KJ_ASSERT_NONNULL(refusal);
++    KJ_EXPECT(error.getType() == kj::Exception::Type::OVERLOADED);
++    KJ_EXPECT(error.getDescription() == HOME_CAPACITY_REFUSAL);
++    KJ_EXPECT(error.getDetail(ThreadedWalLog::HOME_CAPACITY_DETAIL) != kj::none);
++  }
++  test.link.receive(MSG_CLOSED, openId);
++  KJ_EXPECT(!full.load());
++  home = nullptr;
++  KJ_EXPECT(full.load());
++  KJ_EXPECT(test.link.wait(inbox->next()) == kj::none);
++  KJ_EXPECT(test.shared->negotiated());
++}
++
++KJ_TEST("threaded WAL Home returns capacity across more opens than its slot limit") {
++  HomeSession test;
++  auto home = test.attachHome();
++  for (auto i KJ_UNUSED: kj::zeroTo(HOME_OPEN_LIMIT + 1)) {
++    uint64_t openId;
++    {
++      TestRoot root(test, *home, "namespace/retired/epoch"_kj);
++      openId = root.id();
++      acceptOpen(test, *home, root);
++    }
++    test.link.receive(MSG_CLOSED, openId);
++  }
++  KJ_EXPECT(test.shared->negotiated());
++}
++
+ KJ_TEST("threaded WAL home gives up a pending write at its deadline after caller cancellation") {
+   HomeSession test;
+   auto home = test.attachHome();
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.c++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+index bce15faf84cba989edf7cd2ffd32cb673558fbe9..f2377e20899dfc1116577d8750268d52fee1c056 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal.c++
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.c++
+@@ -7,9 +7,11 @@
+ #include <kj/thread.h>
+ 
+ #include <algorithm>
++#include <array>
+ #include <atomic>
+ #include <chrono>
+ #include <deque>
++#include <list>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -27,12 +29,16 @@ using namespace wal;
+ constexpr size_t QUEUED_RECORD_BYTES = 72u << 20;
+ // Reserve room for open/close and give-up commands when the data queue is full.
+ constexpr size_t QUEUED_CONTROL_BYTES = 1u << 20;
+-constexpr size_t QUEUED_NOTIFICATIONS = 4096;
++constexpr size_t HOME_OPEN_LIMIT = 4096;
++constexpr size_t MAX_BREAK_REASON_BYTES = 256;
+ constexpr uint8_t ACK_TIMEOUT = 255;
+ constexpr uint8_t ACK_DISCONNECTED = 254;
+ constexpr auto STORAGE_UNAVAILABLE =
+     "jsg.Error: Durable Object storage is unavailable: the node's replicator is not reachable "
+     "(STORAGE_UNAVAILABLE)"_kj;
++constexpr auto HOME_CAPACITY_REFUSAL =
++    "jsg.Error: Durable Object storage is unavailable: its Home has no notification capacity "
++    "(STORAGE_UNAVAILABLE)"_kj;
+ constexpr auto CLOSE_UNCONFIRMED =
+     "the previous SQLite connection did not confirm close in this generation"_kj;
+ 
+@@ -107,7 +113,97 @@ struct Notification {
+   kj::String reason;
+ };
+ 
+-using Inbox = Mailbox<Notification>;
++class Inbox {
++ public:
++  explicit Inbox(size_t openLimit = HOME_OPEN_LIMIT): openLimit(openLimit) {}
++
++  bool tryRegister(uint64_t openId) {
++    std::lock_guard lock(mutex);
++    if (closed || opens.size() == openLimit) return false;
++    KJ_ASSERT(opens.try_emplace(openId).second);
++    return true;
++  }
++
++  bool atCapacity() {
++    std::lock_guard lock(mutex);
++    return closed || opens.size() == openLimit;
++  }
++
++  void unregister(uint64_t openId) {
++    std::lock_guard lock(mutex);
++    auto entry = opens.find(openId);
++    if (entry == opens.end()) return;
++    for (auto& slot: entry->second) {
++      KJ_IF_SOME(notice, slot) {
++        notices.erase(notice);
++      }
++    }
++    opens.erase(entry);
++  }
++
++  void push(Notification notice) {
++    std::lock_guard lock(mutex);
++    auto entry = opens.find(notice.openId);
++    if (entry == opens.end()) return;
++    auto& slot = entry->second[notice.type];
++    KJ_IF_SOME(queued, slot) {
++      // There is one open result and one request for each close reason. The
++      // shipper keeps the first break reason and latches a checkpoint request.
++      if (notice.type != MSG_SEALED) return;
++      if (queued->salt1 == notice.salt1 && queued->salt2 == notice.salt2 &&
++          queued->upToFrame >= notice.upToFrame) {
++        return;
++      }
++      // A seal is advisory. Keep its newest position and let earlier controls
++      // run first. The shipper checks the salts against its live WAL on delivery.
++      *queued = kj::mv(notice);
++      notices.splice(notices.end(), notices, queued);
++      return;
++    }
++    const bool wasEmpty = notices.empty();
++    slot = notices.insert(notices.end(), kj::mv(notice));
++    // Use the bounded mailbox as a wake latch. It may hold an earlier wake
++    // when unregistering a shipper clears the last notification.
++    if (wasEmpty) wake.push(true, 1, 1);
++  }
++
++  kj::Promise<kj::Maybe<Notification>> next() {
++    for (;;) {
++      {
++        std::lock_guard lock(mutex);
++        if (closed) co_return kj::none;
++        if (!notices.empty()) {
++          auto& notice = notices.front();
++          opens.at(notice.openId)[notice.type] = kj::none;
++          auto result = kj::mv(notice);
++          notices.pop_front();
++          co_return kj::mv(result);
++        }
++      }
++      if (co_await wake.next() == kj::none) co_return kj::none;
++    }
++  }
++
++  void close() {
++    std::lock_guard lock(mutex);
++    closed = true;
++    opens.clear();
++    notices.clear();
++    wake.close();
++  }
++
++ private:
++  using Notices = std::list<Notification>;
++  // Each live registration reserves one slot per routed message kind. Only
++  // BREAK owns variable-length data, bounded by MAX_BREAK_REASON_BYTES.
++  using Slots = std::array<kj::Maybe<Notices::iterator>, MSG_CLOSE_FOR_CODE_UPDATE + 1>;
++  const size_t openLimit;
++  std::mutex mutex;
++  bool closed = false;
++  Notices notices;
++  std::map<uint64_t, Slots> opens;
++  Mailbox<bool> wake;
++};
+ 
+ struct Command {
+   kj::Array<kj::byte> bytes;
+@@ -256,6 +352,8 @@ class Session {
+       if (type == MSG_OPEN) routes.emplace(command.openId, kj::mv(command.inbox));
+       if (command.ack.get() != nullptr) pending.emplace(command.request, kj::mv(command.ack));
+       co_await wire.write(kj::mv(command.bytes));
++      // Only the SQLite close path posts CLOSED. Unregistering a shipper just
++      // releases its Home inbox slots. The command FIFO keeps CLOSED before OPEN.
+       if (type == MSG_CLOSED) routes.erase(command.openId);
+     }
+   }
+@@ -297,8 +395,8 @@ class Session {
+         KJ_REQUIRE(payload.size() >= 2, "invalid threaded WAL break");
+         const size_t length = size_t(payload[0]) | (size_t(payload[1]) << 8);
+         KJ_REQUIRE(payload.size() == length + 2, "invalid threaded WAL break length");
+-        notice.reason = kj::str(kj::arrayPtr(
+-            reinterpret_cast<const char*>(payload.begin() + 2), length));
++        notice.reason = kj::str(kj::arrayPtr(reinterpret_cast<const char*>(payload.begin() + 2),
++            kj::min(length, MAX_BREAK_REASON_BYTES)));
+         break;
+       }
+       case MSG_CHECKPOINT_ASKED:
+@@ -315,8 +413,7 @@ class Session {
+       default:
+         KJ_FAIL_REQUIRE("unknown threaded WAL reply", type);
+     }
+-    KJ_REQUIRE(entry->second->push(kj::mv(notice), 1, QUEUED_NOTIFICATIONS),
+-        "threaded WAL home cannot receive notification");
++    entry->second->push(kj::mv(notice));
+   }
+ };
+ 
+@@ -324,33 +421,59 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+  public:
+   Home(std::shared_ptr<Shared> shared,
+       kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose,
+-      const kj::MonotonicClock& clock)
++      const kj::MonotonicClock& clock,
++      kj::Maybe<std::atomic<bool>&> walFull = kj::none,
++      std::shared_ptr<Inbox> inbox = std::make_shared<Inbox>())
+       : shared(kj::mv(shared)),
+         clock(clock),
+-        inbox(std::make_shared<Inbox>()),
++        inbox(kj::mv(inbox)),
++        walFull(walFull),
+         requestClose(kj::mv(requestClose)),
+         tasks(*this) {
++    publishCapacity();
+     tasks.add(read());
+   }
+ 
++  ~Home() noexcept(false) override {
++    inbox->close();
++    publishCapacity();
++  }
++
+   bool enabled() const override { return true; }
+   uint64_t nextRequest() override { return ++shared->nextId; }
+ 
+   uint64_t registerShipper(DurableLogShipper& shipper) override {
+-    KJ_REQUIRE(shared->negotiated(), STORAGE_UNAVAILABLE);
++    if (!shared->negotiated()) {
++      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
++    }
+     const auto openId = nextRequest();
+     auto result = kj::newPromiseAndFulfiller<void>();
+     shippers.emplace(openId, Registration{&shipper, kj::mv(result.fulfiller), result.promise.fork()});
++    if (!inbox->tryRegister(openId)) {
++      shippers.erase(openId);
++      if (!shared->negotiated()) {
++        kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
++      }
++      auto error = KJ_EXCEPTION(OVERLOADED, kj::str(HOME_CAPACITY_REFUSAL));
++      error.setDetail(ThreadedWalLog::HOME_CAPACITY_DETAIL, kj::heapArray<kj::byte>(0));
++      kj::throwRecoverableException(kj::mv(error));
++    }
++    publishCapacity();
+     return openId;
+   }
+ 
+   void unregisterShipper(DurableLogShipper& shipper) override {
+-    shippers.erase(shipper.getOpenId());
++    const auto openId = shipper.getOpenId();
++    inbox->unregister(openId);
++    shippers.erase(openId);
++    publishCapacity();
+   }
+ 
+   kj::Promise<void> waitForOpen(uint64_t openId, kj::Timer& timer) override {
+     const auto found = shippers.find(openId);
+-    KJ_REQUIRE(shared->negotiated() && found != shippers.end(), STORAGE_UNAVAILABLE);
++    if (!shared->negotiated() || found == shippers.end()) {
++      kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
++    }
+     auto timeout = timer.afterDelay(shared->confirmationTimeout).then([] {
+       kj::throwRecoverableException(KJ_EXCEPTION(FAILED, kj::str(STORAGE_UNAVAILABLE)));
+     });
+@@ -393,10 +516,17 @@ class Home final: public DurableWalChannel, private kj::TaskSet::ErrorHandler {
+   std::shared_ptr<Shared> shared;
+   const kj::MonotonicClock& clock;
+   std::shared_ptr<Inbox> inbox;
++  kj::Maybe<std::atomic<bool>&> walFull;
+   std::map<uint64_t, Registration> shippers;
+   kj::Function<void(uint64_t, ThreadedWalLog::CloseReason)> requestClose;
+   kj::TaskSet tasks;
+ 
++  void publishCapacity() {
++    KJ_IF_SOME(full, walFull) {
++      full.store(inbox->atCapacity(), std::memory_order_relaxed);
++    }
++  }
++
+   void taskFailed(kj::Exception&&) override { shared->stop(); }
+ 
+   void gaveUp(uint64_t openId, uint64_t request, kj::StringPtr key, bool unsent) {
+@@ -576,8 +706,9 @@ uint64_t ThreadedWalLog::unconfirmedCloseIdentities() const {
+ }
+ 
+ kj::Own<DurableWalChannel> ThreadedWalLog::attachHome(
+-    kj::Function<void(uint64_t, CloseReason)> requestClose) {
+-  return kj::heap<Home>(impl->shared, kj::mv(requestClose), kj::systemPreciseMonotonicClock());
++    kj::Function<void(uint64_t, CloseReason)> requestClose, kj::Maybe<std::atomic<bool>&> walFull) {
++  return kj::heap<Home>(
++      impl->shared, kj::mv(requestClose), kj::systemPreciseMonotonicClock(), walFull);
+ }
+ 
+ kj::Promise<ThreadedWalLog::PreparedOpen> ThreadedWalLog::prepareOpen(
+diff --git a/src/workerd/server/factory/coworkerd-threaded-wal.h b/src/workerd/server/factory/coworkerd-threaded-wal.h
+index f2fe8312b10840d141b47ebe57df78f63a7b6af9..e4b514269b2e43a60f2e5b5d41e0cf6a8ced4d3f 100644
+--- a/src/workerd/server/factory/coworkerd-threaded-wal.h
++++ b/src/workerd/server/factory/coworkerd-threaded-wal.h
+@@ -2,6 +2,7 @@
+ 
+ #include "coworkerd-wal-shipper.h"
+ 
++#include <atomic>
+ #include <memory>
+ 
+ namespace workerd::server {
+@@ -20,8 +21,11 @@ class ThreadedWalLog {
+   kj::Duration confirmationTimeout() const;
+   uint64_t unconfirmedCloseIdentities() const;
+   static constexpr kj::Exception::DetailTypeId CLOSE_UNCONFIRMED_DETAIL = 0x997a5d73b0e11893ull;
++  static constexpr kj::Exception::DetailTypeId HOME_CAPACITY_DETAIL = 0xb81762c5823219dfull;
+   enum class CloseReason { DRAIN, CODE_UPDATED };
+-  kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t, CloseReason)> requestClose);
++  // If supplied, the routing flag outlives the Home and is updated on its owning thread.
++  kj::Own<DurableWalChannel> attachHome(kj::Function<void(uint64_t, CloseReason)> requestClose,
++      kj::Maybe<std::atomic<bool>&> walFull = kj::none);
+ 
+   class PreparedOpen {
+    public:
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 974470feb6085ee0f537f33022c5fd492097f987..37b1e2c9be4859eb2adafee54c865d433b527140 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -462,6 +462,25 @@ struct DatabaseAdmissionFixture {
+   }
+ };
+ 
++KJ_TEST("durable placement skips a full WAL Home for fresh trees and keeps existing routes") {
++  DatabaseAdmissionFixture test;
++  auto& table = *test.server.durableAdmission;
++  for (auto& thread: test.server.threads) thread->home->walFull = true;
++
++  auto existing = test.queue(test.victim, test.now).ticket;
++  KJ_REQUIRE(existing.has_value());
++  KJ_EXPECT(table.homeFor(existing->tree) == 1u);
++
++  auto refused = test.queue(test.neighbor, test.now);
++  KJ_EXPECT(refused.status == DatabaseAdmissionFixture::Admission::Status::OVERLOADED);
++  KJ_EXPECT(!refused.ticket.has_value());
++
++  test.server.threads[1]->home->walFull = false;
++  auto replacement = test.queue(test.neighbor, test.now).ticket;
++  KJ_REQUIRE(replacement.has_value());
++  KJ_EXPECT(table.homeFor(replacement->tree) == 2u);
++}
++
+ KJ_TEST("accept expiry releases every waiter and limits replacement to the actual pre-release total") {
+   DatabaseAdmissionFixture test;
+   auto& server = test.server;
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 9656855c948c66daf2ea8a93aa05e484324a8723..cfe75f0372931bccee40b3b3e45a2c80df8eb321 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -2771,6 +2771,7 @@ struct ThreadedServer {
+       uint64_t memory = 0;
+       server::DurableHomeLoad load{std::chrono::seconds(4)};
+       server::DurablePressure pressure;
++      std::atomic<bool> walFull{false};
+       std::vector<DurableIncoming> incoming;
+       std::set<uint64_t> resident;
+       uint64_t databaseLastUse = 0;
+@@ -3292,6 +3293,7 @@ struct ThreadedServer {
+         if (!threads[i]->home) continue;
+         if (databaseVictim && databaseVictim->home == i + 1) continue;
+         auto &home = *threads[i]->home;
++        if (home.walFull.load(std::memory_order_relaxed)) continue;
+         if (!database && now < home.databasePreferredUntil) continue;
+         // An empty copy keeps its definition until its isolate is released.
+         // Prefer a matching warm copy, then an unused home, then a different empty copy.
+@@ -4005,7 +4007,7 @@ struct ThreadedServer {
+           }
+           break;
+         }
+-      });
++      }, thread.home->walFull);
+     }
+     thread.idleSince.store(nowNs());
+     thread.descriptor.store(-1, std::memory_order_release);
