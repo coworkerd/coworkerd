@@ -973,7 +973,7 @@ async function durableHomeReuse(cluster) {
           }
           if (op === '/release') this.release?.();
           if (op === '/write') await this.ctx.storage.put('value', await request.text());
-          return Response.json({ copy, instance, value: (await this.ctx.storage.get('value')) ?? null });
+          return Response.json({ copy, instance: this.instance, value: (await this.ctx.storage.get('value')) ?? null });
         }
       }
       export default { fetch(request, env) {
