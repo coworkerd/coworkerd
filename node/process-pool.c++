@@ -80,6 +80,7 @@ namespace {
 constexpr kj::Exception::DetailTypeId DURABLE_COPY_RESERVATION_REFUSED = 0xe05c5dbb242a7eb4ull;
 // Assigned by ThreadedWalLog in the kernel.
 constexpr kj::Exception::DetailTypeId STORAGE_CLOSE_UNCONFIRMED = 0x997a5d73b0e11893ull;
+constexpr kj::Exception::DetailTypeId WAL_HOME_CAPACITY_REFUSED = 0xb81762c5823219dfull;
 // Supervisor cadence for reading limit events (status, exits and failures read on demand).
 constexpr double LIMIT_EVENT_SYNC_MS = 1000;
 // A finished invocation without a `completed` row is forgotten after this long, or sooner
@@ -497,7 +498,8 @@ kj::Promise<v1::rpc::EventDispatcher::Client> RuntimeConnection::openThreaded(kj
         co_return result.getDispatcher();
       } catch (const kj::Exception& error) {
         // Only the trusted start reply can establish that the event never ran.
-        if (error.getDetail(DURABLE_COPY_RESERVATION_REFUSED) != kj::none) {
+        if (error.getDetail(DURABLE_COPY_RESERVATION_REFUSED) != kj::none ||
+            error.getDetail(WAL_HOME_CAPACITY_REFUSED) != kj::none) {
           confirmRefusal(PreExecutionRefusal::CAPACITY);
         } else if (error.getDetail(STORAGE_CLOSE_UNCONFIRMED) != kj::none) {
           confirmRefusal(PreExecutionRefusal::STORAGE_CLOSE_UNCONFIRMED);

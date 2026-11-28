@@ -5,7 +5,7 @@ Subject: [PATCH] Pass the optional lease to the isolate busy test invocation
 
 
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 36322625deeb2b69763e3103d8105468f69d0ecb..c289c19b59fa32682f79d6933c093e5a98d5d996 100644
+index d10266d5e8b0e35c2600be5589a44ca023f86aad..103aa3d4912434595e6fbdb5534c284d72c084eb 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -109,7 +109,7 @@ KJ_TEST("a stateless isolate starts idle after loading and counts its next HTTP

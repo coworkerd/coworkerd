@@ -95,7 +95,7 @@ index b2d1c524acd9ca2f1aaddbde51c2ebda230add16..826470760ed770ebdfea1ed21f6faf92
      "//src/workerd/server/factory:coworkerd-durable-cpu",
      "//src/workerd/server/factory:coworkerd-durable-placement",
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 9656855c948c66daf2ea8a93aa05e484324a8723..3b76c416e8efacaee9d538d91e646116038bfc20 100644
+index cfe75f0372931bccee40b3b3e45a2c80df8eb321..9139eb3ab715551d051af1791a323d5649cecc6c 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -25,6 +25,7 @@

@@ -23,10 +23,10 @@ index 21f3e6a6878c75062824ae8eee91c60cb0fb348b..29cac2ec2db8d1d0a3b47de134b73abf
 +  whenEnded @0 () -> ();
 +}
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 974470feb6085ee0f537f33022c5fd492097f987..36322625deeb2b69763e3103d8105468f69d0ecb 100644
+index 37b1e2c9be4859eb2adafee54c865d433b527140..d10266d5e8b0e35c2600be5589a44ca023f86aad 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
-@@ -2355,6 +2355,27 @@ KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handl
+@@ -2374,6 +2374,27 @@ KJ_TEST("waitUntil's 30 seconds start when the response ends, not when the handl
    if (ended) drain.wait(waitScope);
  }
  
@@ -55,7 +55,7 @@ index 974470feb6085ee0f537f33022c5fd492097f987..36322625deeb2b69763e3103d8105468
    kj::EventLoop loop;
    kj::WaitScope waitScope(loop);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 3b76c416e8efacaee9d538d91e646116038bfc20..42b04ee2a300782f847886d8c9c9efa3c158a2d2 100644
+index 9139eb3ab715551d051af1791a323d5649cecc6c..691933acb3f53ef1784fca72f7462da16ed2d36e 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1563,8 +1563,16 @@ struct Measurement {
@@ -159,7 +159,7 @@ index 3b76c416e8efacaee9d538d91e646116038bfc20..42b04ee2a300782f847886d8c9c9efa3
      return kj::READY_NOW;
    }
  
-@@ -7633,6 +7651,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
+@@ -7635,6 +7653,7 @@ kj::Promise<void> Dispatcher::jsRpcSession(JsRpcSessionContext context) {
    }
    auto prepared = prepareInvocation(state, server, slot, input, descriptor, kj::mv(budgetLifetime), kj::mv(props),
        std::move(preparation), std::move(tenant));
@@ -167,7 +167,7 @@ index 3b76c416e8efacaee9d538d91e646116038bfc20..42b04ee2a300782f847886d8c9c9efa3
    auto identity = invocationIdentity(*slot, input);
    startBoundRpcSession(context.getResults(),
        kj::mv(prepared.entry).attach(kj::mv(prepared.invocation)), std::move(slot),
-@@ -7777,6 +7796,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
+@@ -7779,6 +7798,7 @@ kj::Promise<void> Invocation::request(kj::HttpMethod method,
        httpEntryObserver(input, entrypoint.c_str(), headers, state.placementCallId));
    auto &invocation = prepared.invocation;
    auto &entry = prepared.entry;
