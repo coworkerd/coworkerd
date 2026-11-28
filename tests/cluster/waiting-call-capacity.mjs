@@ -38,8 +38,8 @@ const rootLimit = optionalLimit('root-limit');
 const nestedLimit = optionalLimit('nested-limit');
 const processLimit = optionalLimit('process-limit');
 assert.ok((rootLimit === undefined && nestedLimit === undefined) ||
-  (rootLimit !== undefined && nestedLimit !== undefined && nestedLimit > rootLimit),
-  'set both placement limits, with the nested limit greater than the root limit');
+  (rootLimit !== undefined && nestedLimit !== undefined && nestedLimit >= rootLimit),
+  'set both placement limits, with the nested limit at least the root limit');
 
 function integer(value, min, max) {
   assert.match(value, /^\d+$/);

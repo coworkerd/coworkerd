@@ -17,7 +17,7 @@ namespace coworkerd {
 
 struct ProcessPoolConfig {
   uint32_t count = 1;
-  uint32_t inFlightLimit = 2432;
+  uint32_t inFlightLimit = 8192;
   uint32_t basePort = 9000;  // ignored (workerd listens on an inherited Unix socket)
   uint32_t probeIntervalMs = 50;
   uint32_t probeOverdueMs = 400;
@@ -111,9 +111,8 @@ struct ProcessPoolConfig {
   // The largest Wasm memory the plan allows a process's isolates (0: no cap of the sandbox's).
   uint32_t sandboxWasmCapMiB = 0;
   std::string sandboxPlanJson, sandboxWarning;
-  // An explicit inFlightLimit applies to every process. Its default is higher for ordinary and quarantine processes.
-  uint32_t durableInFlightLimit = 512;
-  uint32_t inFlightLimitFor(bool durable) const { return durable ? durableInFlightLimit : inFlightLimit; }
+  // The node can lower an omitted limit when its startup resource budget requires it.
+  bool inFlightLimitExplicit = false;
   void validate() const;
 };
 
@@ -268,8 +267,9 @@ struct ServerConfig {
   bool disableAlreadyPlacedForTest = false;
   uint32_t peerTimeoutMs = 2000;
   int64_t clockOffsetMsForTest = 0;
-  uint32_t rootLimit = 2048;
-  uint32_t nestedLimit = 2304;
+  uint32_t rootLimit = 8192;
+  uint32_t nestedLimit = 8192;
+  bool placementLimitsExplicit = false;
   uint32_t tenantRootLimit = 0;
   uint32_t tenantNestedLimit = 0;
   uint32_t tenantBorrowBelowPercent = 0;

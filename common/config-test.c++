@@ -81,11 +81,13 @@ void memoryConfiguration(Fixture& fixture) {
 void tenantBorrowConfiguration(Fixture& fixture) {
   const auto defaults = fixture.load("{}");
   KJ_REQUIRE(defaults.tenantRootLimit == 0 && defaults.tenantNestedLimit == 0 && defaults.tenantBorrowBelowPercent == 0);
-  KJ_REQUIRE(defaults.rootLimit == 2048 && defaults.nestedLimit == 2304);
-  KJ_REQUIRE(defaults.processPool.inFlightLimitFor(false) == 2432 && defaults.processPool.inFlightLimitFor(true) == 512);
+  KJ_REQUIRE(defaults.rootLimit == 8192 && defaults.nestedLimit == 8192 && !defaults.placementLimitsExplicit);
+  KJ_REQUIRE(defaults.processPool.inFlightLimit == 8192 && !defaults.processPool.inFlightLimitExplicit);
+  const auto shared = fixture.load(R"({"placement":{"rootLimit":800,"nestedLimit":800}})");
+  KJ_REQUIRE(shared.rootLimit == 800 && shared.nestedLimit == 800 && shared.placementLimitsExplicit);
   const auto oldRootOnly = fixture.load(R"({"placement":{"rootLimit":200},"processPool":{"inFlightLimit":600}})");
   KJ_REQUIRE(oldRootOnly.rootLimit == 200 && oldRootOnly.nestedLimit == 384);
-  KJ_REQUIRE(oldRootOnly.processPool.inFlightLimitFor(false) == 600 && oldRootOnly.processPool.inFlightLimitFor(true) == 600);
+  KJ_REQUIRE(oldRootOnly.processPool.inFlightLimit == 600 && oldRootOnly.processPool.inFlightLimitExplicit);
   const auto oldNestedOnly = fixture.load(R"({"placement":{"nestedLimit":300}})");
   KJ_REQUIRE(oldNestedOnly.rootLimit == 128 && oldNestedOnly.nestedLimit == 300);
   const auto explicitConfig = fixture.load(R"({"placement":{"tenantRootLimit":16,"tenantNestedLimit":16,"tenantBorrowBelowPercent":88}})");

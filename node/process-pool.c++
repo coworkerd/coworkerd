@@ -2476,7 +2476,7 @@ public:
     p->contextsVisible = !p->threaded;
     p->eventDigest = EVP_MD_CTX_new();
     KJ_REQUIRE(p->eventDigest && EVP_DigestInit_ex(p->eventDigest, EVP_sha256(), nullptr) == 1, "cannot hash the event channel");
-    const int listener = listenUnix(p->socketPath, config.inFlightLimitFor(p->durable));
+    const int listener = listenUnix(p->socketPath, config.inFlightLimit);
     auto closeListener = kj::defer([listener] { ::close(listener); });
     const int lifecycle = p->lifecycle.create();
     auto closeLifecycle = kj::defer([lifecycle] { ::close(lifecycle); });
@@ -2706,7 +2706,7 @@ public:
     // launcher itself executed through the descriptor this Server pinned at startup.
     std::vector<std::string> args = {executable, "serve", "--experimental", "--socket-fd", "rpc=" + std::to_string(LISTEN_FD), path};
     if (p->threaded) args = {executable, std::to_string(LISTEN_FD), sourceAddress,
-        p->id + ":" + std::to_string(p->generation), std::to_string(config.inFlightLimitFor(p->durable))};
+        p->id + ":" + std::to_string(p->generation), std::to_string(config.inFlightLimit)};
     if (p->durableTestStorage) args.push_back("--durable-test-storage");
     else if (p->durable && p->threaded) args.push_back("--durable-storage");
     std::string file = executable;
@@ -3386,7 +3386,7 @@ public:
   }
   bool admitted(const ProcessGeneration& p) const {
     return p.pid > 0 && p.state == "ready" && p.runtime && !p.runtime->disconnected &&
-        (!p.durableBudgets || p.durableBudgets->connected) && p.inFlight < config.inFlightLimitFor(p.durable);
+        (!p.durableBudgets || p.durableBudgets->connected) && p.inFlight < config.inFlightLimit;
   }
   bool admittedTenant(const ProcessGeneration& p, const std::string& worker) const {
     if (!admitted(p)) return false;
@@ -3990,7 +3990,7 @@ ProcessPool::PausedAdmission ProcessPool::pausedAdmission(const std::string& wor
     if (!p) continue;
     if (impl->admitted(*p)) return {};
     if (p->state == "paused" && p->pid > 0 && p->runtime && !p->runtime->disconnected &&
-        !p->closing && !p->retiring && p->inFlight < impl->config.inFlightLimitFor(p->durable)) result.processes.push_back(p);
+        !p->closing && !p->retiring && p->inFlight < impl->config.inFlightLimit) result.processes.push_back(p);
   }
   return result;
 }
@@ -4377,8 +4377,7 @@ kj::Promise<std::string> ProcessPool::stateJson(uint32_t idleMs, kj::Timer& time
       << ",\"idleDestroyIntervalMs\":" << impl->config.idleDestroyIntervalMs
       << ",\"quarantineProcesses\":" << impl->config.quarantineProcesses
       << ",\"durableProcesses\":" << impl->config.durableProcesses
-      << ",\"inFlightLimit\":" << impl->config.inFlightLimit
-      << ",\"durableInFlightLimit\":" << impl->config.durableInFlightLimit << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
+      << ",\"inFlightLimit\":" << impl->config.inFlightLimit << ",\"probeIntervalMs\":" << impl->config.probeIntervalMs
       << ",\"probeOverdueMs\":" << impl->config.probeOverdueMs << ",\"stuckTimeoutMs\":" << impl->config.stuckTimeoutMs
       << ",\"watchdog\":" << (impl->config.watchdog ? "true" : "false") << ",\"restartBackoffMs\":" << impl->config.restartBackoffMs
       << ",\"restartMaxMs\":" << impl->config.restartMaxMs

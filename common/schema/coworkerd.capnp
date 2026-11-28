@@ -702,8 +702,8 @@ struct ServerConfig {
 
 struct ProcessPoolConfig {
   count @0 :UInt32 = 1;
-  # An explicit value applies to all process classes. The default for a durable process is 512.
-  inFlightLimit @1 :UInt32 = 2432;
+  inFlightLimit @1 :UInt32 = 8192;
+  # An omitted limit can be lowered to fit the node's startup resource budget.
   # Parsed and ignored: each workerd listens on a Unix socket it inherits from the
   # Server, in the stack's run directory, and has no TCP port.
   basePort @2 :UInt32 = 9000;
@@ -818,9 +818,9 @@ struct CpuReport {
 }
 
 struct PlacementConfig {
-  # A configuration that specifies only one keeps the previous default of the other.
-  rootLimit @0 :UInt32 = 2048;
-  nestedLimit @1 :UInt32 = 2304;
+  rootLimit @0 :UInt32 = 8192;
+  nestedLimit @1 :UInt32 = 8192;
+  # The shared default can be lowered to fit the node. If only one is configured, the other keeps its previous default.
   idleMs @2 :UInt32 = 30000;
   homeProbability @3 :Float64 = 0.05;
   avoidMaxMs @4 :UInt32 = 2000;

@@ -197,10 +197,11 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.peerTimeoutMs = root.getPeerTimeoutMs();
   result.clockOffsetMsForTest = root.getClockOffsetMsForTest();
   auto placement = root.getPlacement();
-  const bool rootLimitGiven = given({"placement", "rootLimit"});
-  const bool nestedLimitGiven = given({"placement", "nestedLimit"});
+  const bool rootLimitGiven = given({"placement", "rootLimit"}).has_value();
+  const bool nestedLimitGiven = given({"placement", "nestedLimit"}).has_value();
   result.rootLimit = !rootLimitGiven && nestedLimitGiven ? 128 : placement.getRootLimit();
   result.nestedLimit = rootLimitGiven && !nestedLimitGiven ? 384 : placement.getNestedLimit();
+  result.placementLimitsExplicit = rootLimitGiven || nestedLimitGiven;
   result.tenantRootLimit = placement.getTenantRootLimit();
   result.tenantNestedLimit = placement.getTenantNestedLimit();
   result.tenantBorrowBelowPercent = placement.getTenantBorrowBelowPercent();
@@ -214,10 +215,8 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.subcalls = placement.getSubcalls().cStr();
   KJ_REQUIRE(result.subcalls == "home" || result.subcalls == "local",
       "placement.subcalls is \"home\" or \"local\"", result.subcalls.c_str());
-  KJ_REQUIRE(result.rootLimit > 0 &&
-      (result.nestedLimit > result.rootLimit ||
-       (result.equalLimitsForTest && result.nestedLimit == result.rootLimit)),
-      "nestedLimit must exceed rootLimit (equalLimitsForTest is only for the control)");
+  KJ_REQUIRE(result.rootLimit > 0 && result.nestedLimit >= result.rootLimit,
+      "nestedLimit must be at least rootLimit");
   KJ_REQUIRE(result.tenantRootLimit <= result.rootLimit && result.tenantNestedLimit <= result.nestedLimit,
       "per-tenant placement limits must not exceed their node-wide limits");
   KJ_REQUIRE(result.tenantBorrowBelowPercent <= 100, "placement.tenantBorrowBelowPercent must be in [0, 100]");
@@ -231,7 +230,7 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.processPool = {pool.getCount(), pool.getInFlightLimit(), pool.getBasePort(),
     pool.getProbeIntervalMs(), pool.getProbeOverdueMs(), pool.getStuckTimeoutMs(),
     pool.getRestartBackoffMs(), pool.getRestartMaxMs(), pool.getWatchdog()};
-  if (given({"processPool", "inFlightLimit"})) result.processPool.durableInFlightLimit = pool.getInFlightLimit();
+  result.processPool.inFlightLimitExplicit = given({"processPool", "inFlightLimit"}).has_value();
   result.processPool.pausedAdmissionWaitMs = pool.getPausedAdmissionWaitMs();
   result.processPool.sqlCpuLimitMs = pool.getSqlCpuLimitMs();
   result.processPool.sqlWallLimitMs = pool.getSqlWallLimitMs();

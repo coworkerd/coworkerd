@@ -91,7 +91,7 @@ still hold process resources. The input and output gates govern execution and al
 interleaving across awaits. See [kernel admission](../patches/workerd/0045-threaded-durable-admission.patch)
 and [node routing](../node/main.c++).
 
-The count matches the node's default of 512 calls in flight per durable process. The byte limit budgets
+The byte limit budgets
 4 KiB of declared bytes per waiting slot on average. Each admitted event reserves one descriptor
 and a separate 4 KiB of metadata plus its declared bytes from the child's shared budget. A single
 full mailbox therefore charges up to 512 descriptors and 4 MiB of memory for waiting events.
