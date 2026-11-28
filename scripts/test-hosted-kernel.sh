@@ -15,9 +15,6 @@ mkdir -p "$raw/allowlist"
 install -m 0755 workerd/bazel-bin/src/workerd/server/workerd "$raw/workerd"
 install -m 0755 workerd/bazel-bin/src/workerd/threaded/coworkerd-threaded "$raw/coworkerd-threaded"
 touch "$raw/allowlist/coworkerd-syscalls-"{startup,steady}.txt
-# Stop the Bazel server to free memory. The hosted runner discards its workspace.
-(cd workerd && "$RUNNER_TEMP/kernel-tools/bazel" --output_user_root="$RUNNER_TEMP/kernel-bazel" shutdown)
-
 sudo apt-get install -y --no-install-recommends clang-19 libstdc++-14-dev cmake ninja-build libssl-dev
 npm ci --prefix cli --registry=https://registry.npmjs.org
 bash scripts/build.sh -DCOWORKERD_TEST_WORKERD=
