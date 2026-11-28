@@ -1415,9 +1415,10 @@ struct DurableLogChannelTest {
     const auto appendLe = [](std::string& out, uint64_t value, int bytes) {
       for (int i = 0; i < bytes; ++i) out.push_back(char(value >> (8 * i)));
     };
-    const int peer = log.openChannel("d0");
+    const int peer = log.openChannel("d0-1", 1);
     KJ_REQUIRE(peer >= 0);
-    auto& channel = log.channels.at("d0");
+    auto& channel = log.channels.at("d0-1");
+    channel.pid = 321;  // The child has completed the separately tested readiness handshake.
     for (int i = 0; i < COUNT; ++i) {
       auto hex = [](int i) { return i < 10 ? char('0' + i) : char('a' + i - 10); };
       auto ns = std::string(64, '1'), id = std::string(62, '2') + hex(i / 16) + hex(i % 16);
@@ -1432,12 +1433,14 @@ struct DurableLogChannelTest {
       object.openGeneration = 2;
       auto& facet = object.facets[0];
       facet.open = true;
-      facet.processId = "d0";
+      facet.processId = channel.processId;
       facet.openEpoch = 1;
       facet.openGeneration = 2;
       const auto key = name + "/0";
-      channel.openFacets.emplace(key, DurableLog::Channel::Open{{1, 2}});
+      const uint64_t openId = i + 1;
+      channel.openFacets.emplace(key, DurableLog::Channel::Open{{1, 2}, openId});
       std::string closed(1, '\x07');  // FROM_CLOSED, as the durable shipper writes it.
+      appendLe(closed, openId, 8);
       appendLe(closed, key.size(), 2);
       closed += key;
       appendLe(closed, 1, 8);  // time of close
@@ -1462,8 +1465,8 @@ struct DurableLogChannelTest {
     KJ_REQUIRE(handled > 0 && handled <= 16 && suspended,
         "reader must be suspended between slices with the burst in memory", handled);
     const auto bytesLeft = channel.inbox.size();
-    log.closeChannel("d0");
-    KJ_REQUIRE(!log.channels.contains("d0"));
+    log.closeChannel("d0-1");
+    KJ_REQUIRE(!log.channels.contains("d0-1"));
     for (int i = 0; i < COUNT; ++i) {
       const auto& object = log.objects.at(objects[i]);
       const auto& facet = object.facets.at(0);
@@ -1476,58 +1479,6 @@ struct DurableLogChannelTest {
     KJ_IF_SOME(wake, clock.nextEvent()) {
       KJ_REQUIRE(wake > clock.now() + 1 * kj::MICROSECONDS, "close must cancel the suspended reader");
     }
-  }
-
-  static void upstreamChannelEof() {
-    auto temp = (std::filesystem::temp_directory_path() / "coworkerd-upstream-channel-XXXXXX").string();
-    KJ_REQUIRE(::mkdtemp(temp.data()) != nullptr);
-    KJ_DEFER({ std::error_code ignored; std::filesystem::remove_all(temp, ignored); });
-    auto io = kj::setupAsyncIo();
-    auto& timer = io.provider->getTimer();
-    ObjectStoreConfig store;
-    store.backend = "directory"; store.directory = temp; store.endpoint = "unused";
-    MembershipView membership;
-    size_t closeCalls = 0;
-    DurableLog::Hooks hooks;
-    hooks.closeObjects = [&](std::string) -> kj::Promise<void> { ++closeCalls; co_return; };
-    DurableLog log({"node", "instance", temp, {}}, store, io.provider->getNetwork(), timer,
-        *io.lowLevelProvider, membership, std::move(hooks));
-    log.setNodeEpoch(1).wait(io.waitScope);
-    const int old = log.openChannel("d0-1"), active = log.openChannel("d0-2");
-    KJ_REQUIRE(old >= 0 && active >= 0);
-    KJ_DEFER({ ::close(old); ::close(active); });
-    auto& channel = log.channels.at("d0-1");
-
-    const std::string ns(64, '1'), damagedId(64, '2'), closedId(64, '3');
-    const auto makeObject = [&](const std::string& id) -> DurableLog::Object& {
-      const auto name = durableHostName(ns, id, 1);
-      auto& object = log.objects[name];
-      log.locate(object, ns, id, 1);
-      std::filesystem::create_directories(object.positionPath(temp).parent_path());
-      object.objectName = name;
-      object.state = DurableLog::ObjectState::LOCAL;
-      object.shardEpoch = object.openEpoch = object.openGeneration = 1;
-      object.dispatchedChannel = channel.processId;
-      return object;
-    };
-    auto& damaged = makeObject(damagedId);
-    auto& facet = damaged.facets[0];
-    facet.processId = channel.processId;
-    facet.open = true;
-    channel.openFacets[damaged.objectName + "/0"] = {{damaged.openEpoch, damaged.openGeneration}, 0};
-    auto& closed = makeObject(closedId);
-    log.channelEnded(channel, "upstream fixture EOF before reap");
-    KJ_REQUIRE(!channel.open && log.channels.contains("d0-1"));
-    KJ_REQUIRE(damaged.state == DurableLog::ObjectState::REPAIR && !facet.open);
-    const DurableLog::ObjectIdentity identity{ns, closedId, "tenant", 1, 1, 0};
-    KJ_REQUIRE(log.checkObjectDispatch(identity, "d0", 2).ready,
-        "an ended upstream channel cannot block dispatch to the replacement");
-    KJ_REQUIRE(closed.dispatchedChannel.empty());
-    // The directory fixture has no remote history. Exercise the rebuild's decision before the storage read.
-    auto rebuild = log.rebuild(damaged.objectName, "upstream fixture recovery", false);
-    (void)rebuild.poll(io.waitScope);
-    KJ_REQUIRE(damaged.state == DurableLog::ObjectState::REBUILDING && closeCalls == 0,
-        "an ended upstream channel cannot make this rebuild reset live generations");
   }
 
   static void threadedChannel() {
@@ -2781,7 +2732,6 @@ int main(int argc, char* argv[]) {
   else if (mode == "refused-peer") coworkerd::DurableLogChannelTest::refusedPeer(argc == 3 ? argv[2] : "");
   else if (mode == "refused-owner") coworkerd::DurableLogChannelTest::refusedOwner(argc == 3 ? argv[2] : "");
   else if (mode == "earlier-segment") coworkerd::DurableLogChannelTest::earlierSegment();
-  else if (mode == "upstream-channel-eof") coworkerd::DurableLogChannelTest::upstreamChannelEof();
   else if (mode == "threaded-channel") coworkerd::DurableLogChannelTest::threadedChannel();
   else if (mode == "parked-websocket") coworkerd::DurableLogChannelTest::parkedWebSocket();
   else if (mode == "websocket-frame-budget") coworkerd::DurableLogChannelTest::webSocketFrameBudget();

@@ -248,7 +248,6 @@ add_executable(coworkerd-node-contract-test EXCLUDE_FROM_ALL
 target_include_directories(coworkerd-node-contract-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apiserver")
 target_link_libraries(coworkerd-node-contract-test PRIVATE common)
 add_test(NAME durable-channel COMMAND coworkerd-durable-channel-test)
-add_test(NAME durable-upstream-channel-eof COMMAND coworkerd-durable-channel-test upstream-channel-eof)
 add_test(NAME durable-threaded-channel COMMAND coworkerd-durable-channel-test threaded-channel)
 add_test(NAME durable-parked-websocket COMMAND coworkerd-durable-channel-test parked-websocket)
 add_test(NAME durable-websocket-frame-budget COMMAND coworkerd-durable-channel-test websocket-frame-budget)

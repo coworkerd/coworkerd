@@ -500,7 +500,7 @@ async function threadedDatabaseAlarm(cluster) {
 }
 
 async function threadedDatabasePlacement(cluster) {
-  const [threaded, secondOwner] = cluster.nodes;
+  const [threaded, secondOwner, ingressOnly] = cluster.nodes;
   const tenant = await cluster.tenant('sql-placement', { durableObjectNamespaces: 128 });
   const candidates = [threaded, secondOwner];
   await waitForDurableMembership(cluster, candidates);
@@ -563,6 +563,12 @@ async function threadedDatabasePlacement(cluster) {
     assert.match(rejected[0]?.error, /UNIQUE constraint failed/);
     await read(db);
   }
+
+  const ingressState = await cluster.state(ingressOnly);
+  assert.equal(ingressState.processes.configuration.durableProcesses, 0);
+  assert.ok(ingressState.processes.entries.every(entry => entry.processClass !== 'durable'));
+  const viaIngress = await workerCall(cluster, ingressOnly, tenant, 'read?db=DB0');
+  assert.deepEqual(json(viaIngress, 200, 'a node with zero durable slots forwards D1'), [{ value: selected[0].name }]);
 
   const assertWarmCopies = async () => {
     const warm = await durableGeneration(cluster, threaded);
@@ -4358,7 +4364,7 @@ export const durableGatedCases = {
   },
   'durable-threaded-rotation-recovery': { test: durableRotationRecovery, nodes: ['node-1', 'node-2', 'node-3'] },
   'durable-threaded-database-release': {
-    test: threadedDatabaseRelease, nodes: ['node-1', 'node-2', 'node-3'], holdPeerAcks: false,
+    test: threadedDatabaseRelease, holdPeerAcks: false,
   },
   'durable-threaded-database-alarm': {
     test: threadedDatabaseAlarm, nodes: ['node-1', 'node-2', 'node-3'],
