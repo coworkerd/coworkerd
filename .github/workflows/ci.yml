@@ -148,7 +148,8 @@ jobs:
     name: Cluster integration tests (shard ${{ matrix.shard }})
     needs: linux-build-and-unit-tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    # The longest shard takes 16 minutes on a usual runner and has taken 20. Leave room for a slow one.
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -167,7 +168,7 @@ jobs:
           mkdir -p build
           tar -xf "$RUNNER_TEMP/cluster-inputs.tar" -C build
       - name: Run cluster integration tests
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           SHARD: ${{ matrix.shard }}/${{ strategy.job-total }}
         run: |

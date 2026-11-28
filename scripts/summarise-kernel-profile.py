@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 
-from kernel_artifacts import BINARIES, ROOT, sha256
+from kernel_artifacts import PROFILED, ROOT, sha256
 
 
 def summarise(profile_root, kernel, output):
@@ -16,7 +16,7 @@ def summarise(profile_root, kernel, output):
     if not windows:
         raise ValueError("no cluster profiling workloads ran")
     output.mkdir(parents=True)
-    for program in BINARIES:
+    for program in PROFILED:
         digest = sha256(kernel / program)
         summaries = 0
         for node in sorted(profile_root.glob("node-*")):
