@@ -267,7 +267,7 @@ struct ServerConfig {
   bool disableAlreadyPlacedForTest = false;
   uint32_t peerTimeoutMs = 2000;
   int64_t clockOffsetMsForTest = 0;
-  uint32_t rootLimit = 8192;
+  uint32_t rootLimit = 7168;
   uint32_t nestedLimit = 8192;
   bool placementLimitsExplicit = false;
   uint32_t tenantRootLimit = 0;

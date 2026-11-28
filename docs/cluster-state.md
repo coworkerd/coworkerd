@@ -216,9 +216,12 @@ by code and successful second-pass placements under the `saturationFallback` dec
 
 **Admission limits apply before any wait.** The node counts roots and nested calls together.
 It refuses a new root at `placement.rootLimit` and a nested call at `placement.nestedLimit`
-(`503 OVERLOADED`). By default both admissions use the same safety ceiling of up to 8,192,
-reduced to fit the node's startup budget. A higher configured nested limit leaves room for
-trees already admitted to make nested calls. [Waiting-call capacity](guide/install.md#waiting-call-capacity) The memory band ([process isolation](process-isolation.md)) adds to it: in yellow a node refuses forwarded roots and nested calls for versions cold on it, in red all of them (`LOAD_BAND_REJECTED`); a request executing where it arrived is never refused by the band. A refusal carries the reason, the node's band and load and a suggested avoidance time.
+(`503 OVERLOADED`). The defaults stop new roots at 7,168 and allow nested calls up to 8,192
+total calls. The difference leaves room for trees already admitted. When startup resources
+lower the limits, the node preserves one eighth of its call budget for nested work.
+[Waiting-call capacity](guide/install.md#waiting-call-capacity)
+
+The memory band ([process isolation](process-isolation.md)) adds to it: in yellow a node refuses forwarded roots and nested calls for versions cold on it, in red all of them (`LOAD_BAND_REJECTED`); a request executing where it arrived is never refused by the band. A refusal carries the reason, the node's band and load and a suggested avoidance time.
 
 **Stateless isolate busy time.** The threaded kernel reports `isolateBusy` on each loaded stateless
 isolate in the node's lifecycle snapshot. The reading covers the 3,000 ms sliding window ending at

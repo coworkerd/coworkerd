@@ -19,7 +19,7 @@ capacity probes used 20 GiB and up to 50,000 tasks. [Fixture](../tests/cluster/R
 | Node settings | Offered | Verified replies | True upstream peak | Time at peak |
 | --- | ---: | ---: | ---: | ---: |
 | Original defaults | 2,000 × 2 | 128 each | 128 each | 1.977 s, 1.976 s |
-| New defaults | 2,000 × 3 | 2,000 each | 2,000 each | 1.343 s, 1.520 s, 1.524 s |
+| Initial capacity candidate | 2,000 × 3 | 2,000 each | 2,000 each | 1.343 s, 1.520 s, 1.524 s |
 | 6,000 roots, 6,256 process slots | 2,000 × 2 | 2,000 each | 2,000 each | 1.392 s, 1.524 s |
 | 6,000 roots, 6,256 process slots | 4,500 | 4,500 | 4,500 | 0.753 s |
 | 6,000 roots, 6,256 process slots | 6,000 | 6,000 | 3,483 | 1.592 s |
@@ -29,9 +29,10 @@ capacity probes used 20 GiB and up to 50,000 tasks. [Fixture](../tests/cluster/R
 
 The original root limit was 128. Each 2,000-call batch produced 1,872 client-visible
 `PLACEMENT_EXHAUSTED` responses, matching the node's `OVERLOADED` count, and every admitted call
-waited two seconds. The new-default run used product `b1c0828`, the same kernel and all three
-node and process admission settings omitted. The node reported an effective 8,192 slots for
-each. It answered all 6,000 offers successfully. Client p99 was 2.197–2.333 s. The raised
+waited two seconds. The initial capacity candidate used product `b1c0828`, the same kernel and all three
+node and process admission settings omitted. The node reported 8,192 slots for each and answered
+all 6,000 offers successfully. Client p99 was 2.197–2.333 s. The final default reserves 1,024
+of those slots for nested calls, with new roots admitted up to 7,168. The raised
 limits produced no refusals in the completed rows. The client took
 4.309 s to offer the first 6,000-call batch and 8.144 s for the 9,000-call batch. At 10,000 offered
 the original 16 s collection deadline expired with 7,001 settled client results. This ended that

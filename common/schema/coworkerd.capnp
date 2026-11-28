@@ -818,9 +818,9 @@ struct CpuReport {
 }
 
 struct PlacementConfig {
-  rootLimit @0 :UInt32 = 8192;
+  rootLimit @0 :UInt32 = 7168;
   nestedLimit @1 :UInt32 = 8192;
-  # The shared default can be lowered to fit the node. If only one is configured, the other keeps its previous default.
+  # The defaults can be lowered to fit the node. If only one is configured, the other keeps its previous default.
   idleMs @2 :UInt32 = 30000;
   homeProbability @3 :Float64 = 0.05;
   avoidMaxMs @4 :UInt32 = 2000;

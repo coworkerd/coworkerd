@@ -511,8 +511,8 @@ The configuration file is a JSON object (unknown fields are refused). The table 
 | `membership.clockSkewToleranceMs` / `membership.createSettleMs` | `2000` / `1000` | How far this machine's clock may be from the store's `Date` (more refuses the start, and is only warned of while running); how long a new epoch's registration settles before it is read back |
 | `membership.backend` / `desiredState.backend` | `objectStore` with the `storage` block | Where the members and the desired state are kept: a node started with `--config` requires `objectStore` for both, and `file` is only the command line's test form (a 0.3 `etcd` backend is refused, section 9) |
 | `desiredState.pollIntervalMs` | `5000` | How often the node reads the tenant index's hint, and what changed (50 to 3600000) |
-| `placement.rootLimit` | Up to `8192` | Refuse a new root call once the node has this many roots and nested calls in flight. |
-| `placement.nestedLimit` | Up to `8192` | Refuse a new nested call once the node has this many roots and nested calls in flight. It must be at least the root limit. |
+| `placement.rootLimit` | Up to `7168` | Refuse a new root call once the node has this many roots and nested calls in flight. |
+| `placement.nestedLimit` | Up to `8192` | Refuse a new nested call once the node has this many roots and nested calls in flight. It must exceed the root limit. |
 | `placement.tenantRootLimit` | `0` | Per-tenant share for concurrent root calls on this node. `0` disables this check; the node-wide `rootLimit` still applies. |
 | `placement.tenantNestedLimit` | `0` | Per-tenant share for concurrent nested calls on this node. `0` disables this check; the node-wide `nestedLimit` still applies. |
 | `placement.tenantBorrowBelowPercent` | `0` | Integer between `0` and `100`. `0` keeps enabled per-tenant limits hard. Otherwise, a tenant beyond its share can borrow while total node occupancy (roots plus nested calls) is strictly below this percentage of `rootLimit` for a root or `nestedLimit` for a nested call. At or above that threshold, new calls beyond a tenant’s share get the existing retryable `503 OVERLOADED` tenant refusal. Calls already admitted may finish. Node state at `placement.tenantAdmission` shows current `borrowed` occupancy and cumulative `busyRejections` by tenant and call type. |
@@ -552,15 +552,17 @@ with `COWORKERD_CONFIG=<file>` set, that file is used directly. Both ways give t
 
 ### Waiting-call capacity
 
-When the node and process limits are omitted, the node uses one safety limit for the total of
-root and nested calls. It starts from 8,192 and lowers the limit if its memory, task or descriptor
-budget cannot fund that many slots. The effective counts are reported in the startup configuration
-and in `placement` and `processes.configuration` in node state. The 8,192 ceiling leaves about
-27% below the 11,250-call run in which every request overlapped and completed. With the new
-defaults, all 2,000 two-second waits completed in three consecutive batches, with full
-overlap for 1.343–1.524 s per batch. A configuration that specifies
-only one placement limit keeps the previous default for the other (`128` roots or `384` total
-at nested admission).
+When the node and process limits are omitted, the node starts from an 8,192-slot budget for
+root and nested calls. This leaves about 27% below the 11,250-call run in which every request
+overlapped and completed. The node stops accepting new roots at 7,168 and reserves 1,024 slots
+for nested calls of trees already admitted. That reserve is one eighth of the budget and
+corresponds to about 486 MiB at the measured waiting-call cost. If memory, tasks or descriptors
+reduce the budget, the node keeps the same proportion, with at least one nested slot.
+The effective counts appear in the startup configuration and in `placement` and
+`processes.configuration` in node state.
+
+A configuration that specifies only one placement limit keeps the previous default for the
+other (`128` roots or `384` total at nested admission).
 
 With one ordinary process, two quarantine processes and one durable process, the full 8,192-slot
 default needs about 14.4 GiB of node memory, 32,916 tasks of startup headroom and a hard descriptor

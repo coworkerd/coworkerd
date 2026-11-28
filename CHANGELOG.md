@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- **Behavior change.** The node defaults to one safety limit of up to 8,192 root and nested calls in flight, and the per-process default is up to 8,192 across process classes. The node lowers omitted limits to fit its startup resource budgets. A configuration that specifies just one placement limit keeps the previous default for the other. See the [installation guide](docs/guide/install.md#waiting-call-capacity) for the reading and startup requirements.
+- **Behavior change.** The default node limit is up to 7,168 calls in flight at root admission and up to 8,192 at nested admission. The per-process default is up to 8,192 across process classes. When the limits are omitted, the node sizes them to fit its startup resource budgets and reserves one eighth for nested work. A configuration that specifies just one placement limit keeps the previous default for the other. See the [installation guide](docs/guide/install.md#waiting-call-capacity) for the reading and startup requirements.
 
 - **Behavior change.** Per-tenant outbound concurrency and rate limits are off by default. Set `egress.concurrency` to `32` and `egress.requestsPerSecond` to `100` to keep the previous defaults. Existing explicit settings keep their values.
 

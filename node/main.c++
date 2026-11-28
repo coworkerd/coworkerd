@@ -10439,7 +10439,12 @@ void applyProcessPoolEnvironment(ServerConfig& config, const std::string& worker
       pool.inFlightLimit = std::min({uint64_t(pool.inFlightLimit), byThreads, byMemory, childSlots, nodeSlots});
       KJ_REQUIRE(pool.inFlightLimit > 0, "insufficient host resources for one call slot",
           byThreads, byMemory, childSlots, nodeSlots);
-      if (!config.placementLimitsExplicit) config.rootLimit = config.nestedLimit = pool.inFlightLimit;
+      if (!config.placementLimitsExplicit) {
+        KJ_REQUIRE(pool.inFlightLimit > 1, "insufficient host resources for both root and nested call slots");
+        config.nestedLimit = pool.inFlightLimit;
+        // Reserve one eighth of the measured budget for nested calls from already admitted roots.
+        config.rootLimit = config.nestedLimit - std::max(1u, config.nestedLimit / 8);
+      }
     }
     const auto threadsRequired = fixedThreads + nativeGenerations * pool.inFlightLimit;
     KJ_REQUIRE(threadsRequired <= uidHeadroom,

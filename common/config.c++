@@ -215,8 +215,10 @@ ServerConfig ServerConfig::load(const fs::path& path) {
   result.subcalls = placement.getSubcalls().cStr();
   KJ_REQUIRE(result.subcalls == "home" || result.subcalls == "local",
       "placement.subcalls is \"home\" or \"local\"", result.subcalls.c_str());
-  KJ_REQUIRE(result.rootLimit > 0 && result.nestedLimit >= result.rootLimit,
-      "nestedLimit must be at least rootLimit");
+  KJ_REQUIRE(result.rootLimit > 0 &&
+      (result.nestedLimit > result.rootLimit ||
+       (result.equalLimitsForTest && result.nestedLimit == result.rootLimit)),
+      "nestedLimit must exceed rootLimit (equalLimitsForTest is only for the control)");
   KJ_REQUIRE(result.tenantRootLimit <= result.rootLimit && result.tenantNestedLimit <= result.nestedLimit,
       "per-tenant placement limits must not exceed their node-wide limits");
   KJ_REQUIRE(result.tenantBorrowBelowPercent <= 100, "placement.tenantBorrowBelowPercent must be in [0, 100]");
