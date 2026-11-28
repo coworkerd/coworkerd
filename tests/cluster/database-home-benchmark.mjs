@@ -26,7 +26,7 @@ const patchedIdleWindow = mode === '--idle-window-patched';
 const idleWindow = mode === '--idle-window' || defaultIdleWindow || patchedIdleWindow || idleAdmission;
 const mainThreadProfile = mode === '--main-thread-profile' || mode === '--main-thread-profile-smoke';
 const profileControl = mainThreadProfile ? process.env.COWORKERD_PROFILE_CONTROL : undefined;
-assert.ok(profileControl === undefined || ['plain', 'traced'].includes(profileControl));
+assert.ok(profileControl === undefined || ['plain', 'traced', 'paired-release'].includes(profileControl));
 const modes = ['--main-thread-profile', '--main-thread-profile-smoke', '--smoke', '--default-admission', '--cold-follow-up', '--throughput', '--throughput-smoke',
   '--idle-window', '--idle-window-default', '--idle-window-patched', '--idle-window-admission',
   '--idle-admission-unpaced', '--idle-admission-memory', '--idle-admission-mixed',
@@ -119,7 +119,9 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
     }),
     ...(mixedCeiling === 'memory' && { COWORKERD_DO_TEST_MAILBOX_EVENTS: '4' }),
     ...(throughput && { COWORKERD_DO_TEST_MAILBOX_BYTES: String(throughputMailbox.bytes) }),
-    ...(mainThreadProfile && profileControl !== 'plain' && { COWORKERD_BENCHMARK_TRACE: traceInContainer }),
+    ...(mainThreadProfile && (profileControl === undefined || profileControl === 'traced') && {
+      COWORKERD_BENCHMARK_TRACE: traceInContainer,
+    }),
   }),
 });
 const [owner] = cluster.nodes;
@@ -593,8 +595,7 @@ async function runNetworkThroughput() {
       await runCell({ operation, clients: 16, profileMode: 'plain', round: 1 });
     }
   } else if (mainThreadProfile) {
-    await runProfile({ cluster, container, owner, binaries, runCell, record, smoke,
-      control: profileControl === 'traced' });
+    await runProfile({ cluster, container, owner, binaries, runCell, record, smoke, control: profileControl });
   } else {
     for (const cell of cells) await runCell(cell);
   }

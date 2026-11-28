@@ -34,6 +34,10 @@ foreach(patch IN ITEMS kj-http-abort.diff capnp-http-upload.diff)
   endif()
 endforeach()
 
+add_executable(coworkerd-bench-http-forwarder EXCLUDE_FROM_ALL
+  tests/cluster/main-thread-profile/http-forwarder.c++)
+target_link_libraries(coworkerd-bench-http-forwarder PRIVATE kj-http)
+
 set(GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${GENERATED_DIR}")
 
@@ -289,6 +293,7 @@ foreach(case native-config tenant-execution deadlines event-loop shutdown-signal
   add_test(NAME node-${case} COMMAND coworkerd-node-contract-test ${case})
 endforeach()
 add_test(NAME node-ingress-descriptor-plan COMMAND coworkerd-node-contract-test ingress-descriptor-plan)
+add_test(NAME node-compact-invocation-json COMMAND coworkerd-node-contract-test compact-invocation-json)
 # The object store client's kept-alive connections, against a loopback store of the test's own.
 add_executable(coworkerd-object-store-test EXCLUDE_FROM_ALL common/object-store-test.c++)
 target_link_libraries(coworkerd-object-store-test PRIVATE common)
