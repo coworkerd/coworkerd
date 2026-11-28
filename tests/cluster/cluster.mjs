@@ -59,7 +59,7 @@ export class Cluster {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
     budgetLifetime, nodeEnvironment, nodeVolumes, binariesDirectory, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
-    databaseFixtureNodes = [], databaseAlarmFixture = false, previousProduct, previousKernel,
+    databaseFixtureNodes = [], databaseAlarmFixture = false, alarmWallMs, previousProduct, previousKernel,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -96,6 +96,7 @@ export class Cluster {
     this.platformFixture = platformFixture;
     this.databaseFixtureNodes = new Set(databaseFixtureNodes);
     this.databaseAlarmFixture = databaseAlarmFixture;
+    this.alarmWallMs = alarmWallMs;
     this.previousProduct = previousProduct;
     this.previousKernel = previousKernel;
   }
@@ -130,7 +131,7 @@ export class Cluster {
     const binaries = this.binariesDirectory ?? process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(this.productRoot, 'build');
     const files = Object.fromEntries(['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher']
       .map(file => [`bin/${file}`, join(binaries, file)]));
-    if (this.platformFixture || this.databaseAlarmFixture) {
+    if (this.platformFixture || this.databaseAlarmFixture || this.alarmWallMs !== undefined) {
       files['bin/coworkerd'] = join(binaries, 'coworkerd-platform-test');
     }
     for (const file of ['workerd', 'coworkerd-threaded']) files[`bin/${file}`] = join(this.kernel, file);
@@ -212,6 +213,9 @@ export class Cluster {
           overrides[node].volumes.push({ type: 'bind', source: join(binaries, 'coworkerd-platform-test'),
             target: '/opt/coworkerd/bin/coworkerd', read_only: true });
         }
+      }
+      if (this.alarmWallMs !== undefined) {
+        overrides[node].environment.COWORKERD_TEST_ALARM_WALL_MS = String(this.alarmWallMs);
       }
       if (this.databaseAlarmFixture) {
         const target = '/tmp/coworkerd-database-alarm-fixture.js';

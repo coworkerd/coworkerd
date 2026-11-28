@@ -1,0 +1,165 @@
+diff --git a/c++/src/kj/async-io-unix.c++ b/c++/src/kj/async-io-unix.c++
+index f2d687343f3b9d95daa4c1b6c5abcbd1f248f575..c809eb056146f82fe4dc1897b6af151f33a4f6fb 100644
+--- a/c++/src/kj/async-io-unix.c++
++++ b/c++/src/kj/async-io-unix.c++
+@@ -484,6 +484,10 @@ public:
+     }
+   }
+ 
++  Promise<void> whenPeerClosedWrite() override {
++    return observer.whenPeerClosedWrite();
++  }
++
+   void shutdownWrite() override {
+     // There's no legitimate way to get an AsyncStreamFd that isn't a socket through the
+     // UnixAsyncIoProvider interface.
+diff --git a/c++/src/kj/async-io.h b/c++/src/kj/async-io.h
+index 6841efa3ed39c59a877b67543379e5ce14c3a710..955f8a52375de6e2373a6e944bd314a0d585fc93 100644
+--- a/c++/src/kj/async-io.h
++++ b/c++/src/kj/async-io.h
+@@ -187,6 +187,10 @@ public:
+   // Get the underlying Unix file descriptor, if any. Returns kj::none if this object actually
+   // isn't wrapping a file descriptor.
+ 
++  virtual kj::Promise<void> whenPeerClosedWrite() { return kj::NEVER_DONE; }
++  // Detect a peer half-close without reading any data. Supported by Unix sockets on epoll and
++  // kqueue. Use at most one pending listener.
++
+   virtual kj::Maybe<void*> getWin32Handle() const { return kj::none; }
+   // Get the underlying Win32 HANDLE, if any. Returns nullptr if this object actually isn't
+   // wrapping a handle.
+diff --git a/c++/src/kj/async-unix.c++ b/c++/src/kj/async-unix.c++
+index c34c51faeacdeb4202d5f6cd681170e13ca19b0e..61d125f480cad5a66128146a1d24c409089b668b 100644
+--- a/c++/src/kj/async-unix.c++
++++ b/c++/src/kj/async-unix.c++
+@@ -486,6 +486,10 @@ void UnixEventPort::FdObserver::fire(short events) {
+   if (events & (EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLERR)) {
+     if (events & (EPOLLHUP | EPOLLRDHUP)) {
+       atEnd = true;
++      KJ_IF_SOME(f, peerClosedWriteFulfiller) {
++        f->fulfill();
++        peerClosedWriteFulfiller = kj::none;
++      }
+     } else {
+       // Since we didn't receive EPOLLRDHUP, we know that we're not at the end.
+       atEnd = false;
+@@ -906,6 +910,10 @@ void UnixEventPort::FdObserver::fire(struct kevent event) {
+     case EVFILT_READ:
+       if (event.flags & EV_EOF) {
+         atEnd = true;
++        KJ_IF_SOME(f, peerClosedWriteFulfiller) {
++          f->fulfill();
++          peerClosedWriteFulfiller = kj::none;
++        }
+       } else {
+         atEnd = false;
+       }
+@@ -1685,6 +1693,18 @@ void UnixEventPort::wake() const {
+ 
+ #endif  // KJ_USE_EPOLL, else KJ_USE_KQUEUE, else
+ 
++Promise<void> UnixEventPort::FdObserver::whenPeerClosedWrite() {
++#if KJ_USE_EPOLL || KJ_USE_KQUEUE
++  KJ_REQUIRE(flags & OBSERVE_READ, "FdObserver was not set to observe reads.");
++  if (atEnd.orDefault(false)) return kj::READY_NOW;
++  auto paf = newPromiseAndFulfiller<void>();
++  peerClosedWriteFulfiller = kj::mv(paf.fulfiller);
++  return kj::mv(paf.promise);
++#else
++  return kj::NEVER_DONE;
++#endif
++}
++
+ #if !KJ_USE_EPOLL
+ void UnixEventPort::updateNextTimerEvent(kj::Maybe<TimePoint> time) {
+   KJ_UNIMPLEMENTED("SleepHooks not used on this platform, this shouldn't be called");
+diff --git a/c++/src/kj/async-unix.h b/c++/src/kj/async-unix.h
+index f4efdcd21a2cf0b9250f8363d5acf4fe326023c4..c12e7e33ce79fbe655c6e0c686291de027eb2ed1 100644
+--- a/c++/src/kj/async-unix.h
++++ b/c++/src/kj/async-unix.h
+@@ -412,6 +412,8 @@ public:
+   Promise<void> whenWriteDisconnected();
+   // Resolves when poll() on the file descriptor reports POLLHUP or POLLERR.
+ 
++  Promise<void> whenPeerClosedWrite();
++
+ private:
+   UnixEventPort& eventPort;
+   int fd;
+@@ -421,6 +423,7 @@ private:
+   kj::Maybe<Own<PromiseFulfiller<void>>> writeFulfiller;
+   kj::Maybe<Own<PromiseFulfiller<void>>> urgentFulfiller;
+   kj::Maybe<Own<PromiseFulfiller<void>>> hupFulfiller;
++  kj::Maybe<Own<PromiseFulfiller<void>>> peerClosedWriteFulfiller;
+   // Replaced each time `whenBecomesReadable()` or `whenBecomesWritable()` is called. Reverted to
+   // null every time an event is fired.
+ 
+diff --git a/c++/src/kj/compat/http.c++ b/c++/src/kj/compat/http.c++
+index e3458f16b13166014a12006e8245cef048ecb275..32b8cc5d7855b71c0738eec833b60fe578b34457 100644
+--- a/c++/src/kj/compat/http.c++
++++ b/c++/src/kj/compat/http.c++
+@@ -1623,6 +1623,13 @@ public:
+     }
+   }
+ 
++  kj::Promise<void> whenMessageRead() {
++    if (onMessageDone == kj::none) return kj::READY_NOW;
++    auto fork = messageReadQueue.fork();
++    messageReadQueue = fork.addBranch();
++    return fork.addBranch();
++  }
++
+   bool isCleanDrain() {
+     // Returns whether we can cleanly drain the stream at this point.
+     if (onMessageDone != kj::none) return false;
+@@ -8053,16 +8060,29 @@ private:
+     auto service = KJ_ASSERT_NONNULL(kj::mv(maybeService),
+         "SuspendableHttpServiceFactory did not suspend, but returned kj::none.");
+ 
+-    // TODO(perf): If the client disconnects, should we cancel the response? Probably, to
+-    //   prevent permanent deadlock. It's slightly weird in that arguably the client should
+-    //   be able to shutdown the upstream but still wait on the downstream, but I believe many
+-    //   other HTTP servers do similar things.
+-
+     auto body = httpInput.getEntityBody(
+         HttpInputStreamImpl::REQUEST, request.method, 0, headers);
+ 
+-    co_await service->request(
++    auto handling = service->request(
+         request.method, request.url, headers, *body, *this).attach(kj::mv(service));
++    if (server.settings.cancelHttpOnClientDisconnect) {
++      auto peerClosed = stream.whenPeerClosedWrite().then([this]() {
++        // A FIN can arrive while the parser or application still has request
++        // bytes buffered. Let the body reader finish framing the request first.
++        return httpInput.whenMessageRead();
++      });
++      auto disconnected = stream.whenWriteDisconnected().exclusiveJoin(kj::mv(peerClosed))
++          .then([this]() -> kj::Promise<bool> {
++        // After a 101 the WebSocket relay owns the socket.
++        if (upgraded) return kj::NEVER_DONE;
++        return true;
++      });
++      if (co_await kj::mv(handling).then([] { return false; }).exclusiveJoin(kj::mv(disconnected))) {
++        co_return BREAK_LOOP_CONN_ERR;
++      }
++    } else {
++      co_await handling;
++    }
+     // Response done. Await next request.
+ 
+     KJ_IF_SOME(p, webSocketError) {
+diff --git a/c++/src/kj/compat/http.h b/c++/src/kj/compat/http.h
+index e0d1dc0d7d98e5a597ca065ded9537e24eca380c..33d3a485b519940c3531cf62d3e38ac675191f80 100644
+--- a/c++/src/kj/compat/http.h
++++ b/c++/src/kj/compat/http.h
+@@ -1241,6 +1241,10 @@ struct HttpServerSettings {
+     AUTOMATIC_COMPRESSION, // Will perform compression parameter negotiation if client requests it.
+   };
+   WebSocketCompressionMode webSocketCompressionMode = NO_COMPRESSION;
++
++  bool cancelHttpOnClientDisconnect = false;
++  // Cancel a pending HTTP response on a socket error or a FIN after the complete request.
++  // An upgraded WebSocket handles its own disconnect.
+ };
+ 
+ class HttpServerErrorHandler {

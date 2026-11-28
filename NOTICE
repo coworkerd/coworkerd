@@ -11,7 +11,7 @@ patches/workerd/series. The workerd binary in the release packages and images is
 that tag with those patches.
 
 The build fetches Cap'n Proto (https://github.com/capnproto/capnproto, MIT License) and applies
-patches/kj-http-abort.diff and patches/capnp-http-upload.diff to it.
+patches/kj-http-abort.diff, patches/capnp-http-upload.diff and patches/kj-peer-half-close.diff to it.
 
 examples/email-routing-template/ and examples/x402-proxy-template/ are official Cloudflare
 templates (https://github.com/cloudflare/templates), included as they are under the MIT License;

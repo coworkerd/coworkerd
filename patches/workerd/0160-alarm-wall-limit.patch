@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Wed, 25 Nov 2026 14:52:19 +0800
+Subject: [PATCH] Use the same alarm wall time on both runtime hosts
+
+
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 029547c394ad7ca3fae4f8617fef7345f926ba41..1003100d994a4d840cca4e87a0283b43a23f635a 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -138,6 +138,12 @@ kj_test(
+     ],
+ )
+ 
++wd_cc_library(
++    name = "coworkerd-alarm-limit",
++    hdrs = ["coworkerd-alarm-limit.h"],
++    deps = ["@capnp-cpp//src/kj"],
++)
++
+ # The C++ side of the Rust server: compiles workers, starts requests, builds actors and their
+ # storage, serves the capnp RPC protocols, encodes channel tokens, runs the inspector.
+ wd_cc_library(
+@@ -162,6 +168,7 @@ wd_cc_library(
+     hdrs = ["coworkerd-channels.h"],
+     linkstatic = CC_LIBRARY_LINKSTATIC,
+     deps = [
++        ":coworkerd-alarm-limit",
+         ":coworkerd-sandbox",
+         ":coworkerd-wal",
+         ":worker-factory-hdrs",
+diff --git a/src/workerd/server/factory/coworkerd-alarm-limit.h b/src/workerd/server/factory/coworkerd-alarm-limit.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b73bb25da064dfbe9d4bfb934cc40ef39a5c969f
+--- /dev/null
++++ b/src/workerd/server/factory/coworkerd-alarm-limit.h
+@@ -0,0 +1,26 @@
++// Copyright (c) 2026 Coworkerd contributors
++// Licensed under the Apache 2.0 license found in the LICENSE file or at:
++//     https://opensource.org/licenses/Apache-2.0
++
++#pragma once
++
++#include <kj/debug.h>
++#include <kj/time.h>
++
++#include <cstdlib>
++
++namespace workerd {
++
++inline kj::Duration coworkerdAlarmLimit() {
++  static const auto limit = []() {
++    constexpr auto MAX_MS = 15 * 60 * 1000;
++    const auto* setting = std::getenv("COWORKERD_TEST_ALARM_WALL_MS");
++    if (setting == nullptr) return MAX_MS * kj::MILLISECONDS;
++    auto milliseconds = kj::StringPtr(setting).parseAs<unsigned int>();
++    KJ_REQUIRE(milliseconds > 0 && milliseconds <= MAX_MS, "invalid test alarm wall time");
++    return milliseconds * kj::MILLISECONDS;
++  }();
++  return limit;
++}
++
++}  // namespace workerd
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index 07b2b49119784dc6a8d210fb3b3a72ea114f6e78..a0760cbdddb59298b737203d83e276666ffd10de 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -4,6 +4,7 @@
+ //     https://opensource.org/licenses/Apache-2.0
+ 
+ #include "worker-factory-impl.h"
++#include "coworkerd-alarm-limit.h"
+ 
+ #include <workerd/api/analytics-engine.capnp.h>
+ #include <workerd/api/trace.h>
+@@ -389,7 +390,7 @@ class NullLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
+     return kj::NEVER_DONE;
+   }
+   kj::Duration getAlarmLimit() override {
+-    return 15 * kj::MINUTES;
++    return coworkerdAlarmLimit();
+   }
+   size_t getBufferingLimit() override {
+     return kj::maxValue;
+diff --git a/src/workerd/threaded/BUILD.bazel b/src/workerd/threaded/BUILD.bazel
+index b2d1c524acd9ca2f1aaddbde51c2ebda230add16..826470760ed770ebdfea1ed21f6faf92aea3f71c 100644
+--- a/src/workerd/threaded/BUILD.bazel
++++ b/src/workerd/threaded/BUILD.bazel
+@@ -15,6 +15,7 @@ THREADED_DEPS = [
+     "//src/workerd/jsg",
+     "//src/workerd/server:v8-platform-impl",
+     "//src/workerd/server:workerd-api",
++    "//src/workerd/server/factory:coworkerd-alarm-limit",
+     "//src/workerd/server/factory:coworkerd-durable-admission",
+     "//src/workerd/server/factory:coworkerd-durable-cpu",
+     "//src/workerd/server/factory:coworkerd-durable-placement",
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index cfe75f0372931bccee40b3b3e45a2c80df8eb321..9139eb3ab715551d051af1791a323d5649cecc6c 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -25,6 +25,7 @@
+ #include <workerd/jsg/async-context.h>
+ #include <workerd/jsg/coworkerd-rpc-code.h>
+ #include <workerd/jsg/setup.h>
++#include <workerd/server/factory/coworkerd-alarm-limit.h>
+ #include <workerd/server/factory/coworkerd-durable-admission.h>
+ #include <workerd/server/factory/coworkerd-durable-cpu.h>
+ #include <workerd/server/factory/coworkerd-durable-placement.h>
+@@ -1796,7 +1797,7 @@ struct RequestLimits final: LimitEnforcer {
+     return kj::NEVER_DONE;
+   }
+   kj::Duration getAlarmLimit() override {
+-    return 0 * kj::SECONDS;
++    return coworkerdAlarmLimit();
+   }
+   size_t getBufferingLimit() override {
+     return 1 << 20;
