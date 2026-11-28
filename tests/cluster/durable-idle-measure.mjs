@@ -201,7 +201,7 @@ async function measure(cluster, node, record, residencyOnly) {
   }
   // Placement packs live trees into an existing copy first. Open read-only
   // warmup IDs outside both measured cohorts to fill every home with this Worker.
-  const expectedCopies = initial.admission.workerThreads;
+  const expectedCopies = initial.admission.maxHomes ?? initial.admission.workerThreads;
   const warmCopies = new Map([[first.moduleId, 1]]);
   let warmupCalls = 1;
   let warmupErrors = 0;
@@ -374,7 +374,7 @@ async function runMeasurement(output, residencyOnly) {
     appendFile(output, JSON.stringify({ metric, at: new Date().toISOString(), ...fields }) + '\n');
   const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-durable-idle-')), kernel, controller.signal, {
     singleNode: true, threadedNodes: ['node-1'],
-    configureNode: () => ({ durableObjects: { processes: 1, peers: 0, threadedStorage: true } }),
+    configureNode: () => ({ durableObjects: { processes: 1, peers: 0, threadedStorage: true, maxHomes: 4 } }),
   });
   const [node] = cluster.nodes;
   try {

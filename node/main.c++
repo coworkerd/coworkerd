@@ -10357,9 +10357,19 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
   KJ_REQUIRE((pool.count + pool.quarantineProcesses == 0 && !pool.threadedDurable()) ||
       (pool.threadedMemoryBytes > 0 && pool.threadedMemoryBytes <= memoryShare),
       "native process memory budget exceeds its node share", memorySource.c_str());
-  if (pool.count + pool.quarantineProcesses > 0) {
-    const auto threadsRequired = 32 + (uint64_t(pool.count) + pool.quarantineProcesses + 1) *
-        (uint64_t(pool.inFlightLimit) + 27) + uint64_t(pool.durableProcesses) * 8;
+  if (pool.threadedDurable() && pool.durableMaxHomes == 0) {
+    pool.durableMaxHomes = uint32_t(std::clamp<uint64_t>(pool.threadedMemoryBytes >> 20, 512, 16384));
+  }
+  const bool ordinaryThreads = pool.count + pool.quarantineProcesses > 0;
+  if (ordinaryThreads || pool.threadedDurable()) {
+    const auto ordinaryRequired = ordinaryThreads
+        ? (uint64_t(pool.count) + pool.quarantineProcesses + 1) * (uint64_t(pool.inFlightLimit) + 27)
+        : 0;
+    // Plan for the home ceiling and control threads of every durable child and one replacement.
+    const auto durableRequired = pool.threadedDurable()
+        ? (uint64_t(pool.durableProcesses) + 1) * (uint64_t(pool.durableMaxHomes) + 32)
+        : uint64_t(pool.durableProcesses) * 8;
+    const auto threadsRequired = 32 + ordinaryRequired + durableRequired;
     uint64_t uidThreads = 0;
 #ifdef __linux__
     // RLIMIT_NPROC counts every existing thread of the real UID, including
@@ -10402,6 +10412,8 @@ void applyProcessPoolEnvironment(coworkerd::ProcessPoolConfig& pool, uint64_t me
       }
     }
 #endif
+  }
+  if (ordinaryThreads) {
     const auto minimumMemory = (64ull << 20) + (uint64_t(pool.inFlightLimit) + 16) * (256ull << 10) + (2ull << 20);
     KJ_REQUIRE(pool.threadedMemoryBytes - std::min<uint64_t>(pool.threadedMemoryBytes / 10, std::max<uint64_t>(8ull << 20, uint64_t(pool.inFlightLimit) << 20)) > minimumMemory,
         "native process memory budget leaves no active Worker", minimumMemory, pool.threadedMemoryBytes);

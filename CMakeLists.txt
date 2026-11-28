@@ -370,6 +370,10 @@ if(NOT COWORKERD_TEST_WORKERD_PATH STREQUAL "")
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" home-reservation)
     set_tests_properties(node-threaded-durable-home-reservation PROPERTIES TIMEOUT 20)
+    add_test(NAME node-threaded-durable-home-resource COMMAND "${COWORKERD_TEST_NODE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
+      "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" home-resource)
+    set_tests_properties(node-threaded-durable-home-resource PROPERTIES TIMEOUT 20)
     add_test(NAME node-threaded-durable-warm-copies COMMAND "${COWORKERD_TEST_NODE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/node/threaded-durable-launch.test.mjs" "$<TARGET_FILE:coworkerd>"
       "${COWORKERD_TEST_WORKERD_PATH}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/runtime.js" warm-copies)

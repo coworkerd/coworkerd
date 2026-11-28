@@ -105,14 +105,16 @@ const cluster = new BenchmarkCluster(directory, kernel, controller.signal, {
     // Raise the planning budget while keeping an explicit, equal process cap.
     ...(!defaultAdmission && !idleWindow && { memoryBudgetBytes: 16 * 1024 ** 3 }),
     processPool: { count: 1, ...(!unpacedAdmission && !mixedAdmission && !busyProcesses && {
-      inFlightLimit: throughput ? throughputInFlightLimit : 128,
+      inFlightLimit: Math.max(settings.homes, throughput ? throughputInFlightLimit : 128),
     }),
       ...(memoryAdmission && { threadedMemoryBytes: 448 * 1024 ** 2 }),
       ...(!defaultAdmission && !idleWindow && { threadedMemoryBytes: 3 * 1024 ** 3 }) },
-    durableObjects: { processes: busyProcesses ?? 1, threadedStorage: true, peers: 0, residentObjects },
+    durableObjects: {
+      processes: busyProcesses ?? 1, threadedStorage: true, peers: 0, residentObjects,
+      maxHomes: settings.homes,
+    },
   }),
   nodeEnvironment: () => ({
-    ...(!defaultHomes && { COWORKERD_DO_TEST_HOME_COUNT: String(settings.homes) }),
     // Keep both mailbox limits above the offered concurrency and its routing bytes.
     ...(!unpacedAdmission && !mixedAdmission && !busyProcesses && {
       COWORKERD_DO_TEST_MAILBOX_EVENTS: String(throughput ? throughputMailbox.events : 32),
@@ -347,7 +349,7 @@ async function identify(kernelHash) {
     const snapshot = await durableProcesses();
     for (const entry of snapshot.entries) {
       assert.equal(entry.binarySha256, kernelHash);
-      assert.equal(entry.lifecycle.durableAdmission.workerThreads, settings.homes);
+      assert.equal(entry.lifecycle.durableAdmission.maxHomes, settings.homes);
     }
     return snapshot;
   }, { timeout: 30000 });

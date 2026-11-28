@@ -133,6 +133,17 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0188 extends admission-time idle retirement to ordinary trees. The threaded server selects a tree,
   and its home rechecks live work before closing it and returning its routing credit. Patch 0189 extends
   the native test to exercise a new event arriving after the home last reported the object idle.
+  Patch 0194 reserves one thread, descriptor credits and memory for each home on demand.
+  It reuses the least recently used home when all its trees remain idle through the home loop's
+  final check. It changes the threaded server and its native tests.
+  Patch 0195 returns empty home threads and their reservations, preserves the database
+  replacement credit in routing, and reports the resource
+  that refused a durable preface. An already fenced home remains selected until its trees
+  and copy release. It changes the threaded server and the durable admission table and tests.
+  Patch 0196 reports copy-budget pressure during source and event preparation as a pre-execution
+  refusal. It checks the event's copy credit before opening a new actor or SQLite connection.
+  Patch 0197 keeps an established root's existing copy credit when the new-admission budget is full.
+  Patch 0198 releases a cold copy and home after the last preparation ends without publishing a root.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

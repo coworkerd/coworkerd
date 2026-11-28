@@ -81,11 +81,10 @@ async function fixture(side, binaries, volume, objects) {
       quarantineProcesses: 1,
       placement: { rootLimit: 512, nestedLimit: 1024 },
       processPool: { count: 1, inFlightLimit: 512, threadedMemoryBytes: 3 * 1024 ** 3 },
-      durableObjects: { processes: 1, threadedStorage: true, peers: 0, segmentBytes: 512 * 1024 ** 2,
+      durableObjects: { processes: 1, threadedStorage: true, maxHomes: 16, peers: 0, segmentBytes: 512 * 1024 ** 2,
         segmentIntervalMs: 3600000 },
     }),
     nodeEnvironment: () => ({
-      COWORKERD_DO_TEST_HOME_COUNT: '16',
       COWORKERD_DO_TEST_MAILBOX_EVENTS: '64',
       COWORKERD_DO_TEST_MAILBOX_BYTES: '1048576',
       COWORKERD_LOG_IO_TRACE: '/tmp/log-io-probe/events.bin',

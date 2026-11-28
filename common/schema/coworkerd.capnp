@@ -489,6 +489,8 @@ struct ServerConfig {
     sqlProcessSpillBytes @27 :UInt64 = 0;
     # Shared across all threaded hibernatable WebSocket data deliveries to homes on this node.
     socketFrameBytesPerNode @28 :UInt64 = 134217728;
+    # Hard ceiling for lazy home creation. 0 derives it from the per-process memory budget.
+    maxHomes @29 :UInt32 = 0;
   }
 
   struct IngressConfig {

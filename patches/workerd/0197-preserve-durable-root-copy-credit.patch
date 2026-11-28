@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sat, 28 Nov 2026 15:51:46 +0800
+Subject: [PATCH] Keep existing durable roots callable at copy admission
+ pressure
+
+
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 80f15988e3259e65b482a3f29dfbd622ca8e54de..31d0f72433e16a289fd5045874fa1f0e7a104df2 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -1441,6 +1441,25 @@ KJ_TEST("descriptor queue: empty, full, FIFO, SPSC handoff and close") {
+   KJ_EXPECT(received == 2000 && concurrent.pop() == -1);
+ }
+ 
++KJ_TEST("resident durable event preparation uses its existing charge above the admission ceiling") {
++  auto budget = std::make_shared<ResourceBudget>(256ull << 20, 10, 16);
++  ResourceReservation copy(budget, 128);
++  KJ_ASSERT(copy.registerPreparation());
++  const auto borrowed = budget->admissionMaximum - budget->memoryReserved.load() + 1;
++  KJ_ASSERT(budget->change(0, borrowed, 0, 0));
++  const auto held = budget->memoryReserved.load();
++  const char* refusal = nullptr;
++  KJ_EXPECT(!copy.prepare(&refusal));
++  KJ_REQUIRE(refusal != nullptr);
++  KJ_EXPECT(kj::StringPtr(refusal) == "copy-memory"_kj);
++  copy.prepareResident();
++  KJ_EXPECT(budget->memoryReserved.load() == held);
++  KJ_EXPECT(copy.preparing == 2);
++  copy.prepared();
++  KJ_EXPECT(copy.preparing == 1);
++  KJ_ASSERT(budget->change(borrowed, 0, 0, 0));
++}
++
+ KJ_TEST("actual reservation arithmetic, both watermarks and RAII release") {
+   initializeV8();
+   auto budget = std::make_shared<ResourceBudget>(2ull << 30, 10, 512);
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index 601e803406775af4d66f5b021276c247fb6c7479..e0cdb0eabaae4fd57ca4ebab2b74a3a6ba42bed0 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -595,6 +595,11 @@ struct ResourceReservation final: SqliteProcessMemoryBudget {
+     ++preparing;
+     return true;
+   }
++  void prepareResident() {
++    std::lock_guard lock(mutex);
++    KJ_ASSERT(registered);
++    ++preparing;
++  }
+   void prepared() {
+     std::lock_guard lock(mutex);
+     KJ_ASSERT(preparing > 0);
+@@ -3133,7 +3138,14 @@ struct ThreadedServer {
+     return true;
+   }
+ 
+-  std::shared_ptr<ResourcePreparation> prepareSlot(const std::shared_ptr<Slot> &slot) {
++  std::shared_ptr<ResourcePreparation> prepareSlot(const std::shared_ptr<Slot> &slot,
++      bool residentDurableRoot = false) {
++    if (residentDurableRoot) {
++      // The copy already carries this root. The separate event reservation
++      // was acquired at routing, and future growth still checks the budget.
++      slot->reservation->prepareResident();
++      return std::make_shared<ResourcePreparation>(slot->reservation);
++    }
+     const bool durable = bool(slot->resetDurableRoot);
+     if (durable && refuseCopyReservationForTest()) {
+       kj::throwRecoverableException(durableCopyBudgetRefusal("copy-memory"));
+@@ -7916,8 +7928,8 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+       "durable class missing from pinned Worker");
+   // Confirm the event's copy credit before opening a new actor or its SQLite
+   // connection. A trusted refusal here can still prove the event did not run.
+-  auto preparation = server.prepareSlot(slot);
+   auto found = state.durableRoots.find(ticket.tree);
++  auto preparation = server.prepareSlot(slot, found != state.durableRoots.end());
+   // Keep sharing the preparation until a home publishes the root. There can
+   // be new arrivals between the scanner's completion and opening SQLite.
+   std::shared_ptr<ThreadState::WalPreparation> walPreparation;

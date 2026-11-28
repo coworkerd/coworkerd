@@ -953,6 +953,112 @@ async function threadedDatabaseAdmission(cluster) {
   console.log('Three busy homes refused a fourth database. Idle admission preserved the queued read and confirmed rows.');
 }
 
+async function durableHomeReuse(cluster) {
+  const [owner] = cluster.nodes;
+  const tenants = [];
+  for (const name of ['home-first', 'home-second', 'home-third']) {
+    const tenant = await cluster.tenant(name);
+    tenants.push(tenant);
+    await cluster.deploy(tenant, 'worker', `
+      import { DurableObject } from 'cloudflare:workers';
+      let copy;
+      export class Counter extends DurableObject {
+        instance = crypto.randomUUID();
+        async fetch(request) {
+          copy ??= crypto.randomUUID();
+          const op = new URL(request.url).pathname;
+          if (op === '/hold') {
+            await new Promise(resolve => { this.release = resolve; });
+            this.release = undefined;
+          }
+          if (op === '/release') this.release?.();
+          if (op === '/write') await this.ctx.storage.put('value', await request.text());
+          return Response.json({ copy, instance: this.instance, value: (await this.ctx.storage.get('value')) ?? null });
+        }
+      }
+      export default { fetch(request, env) {
+        const { pathname, searchParams } = new URL(request.url);
+        return env.OBJECT.getByName(pathname.split('/').at(-1)).fetch(
+          'http://object/' + (searchParams.get('op') ?? 'read'),
+          searchParams.has('value') ? { method: 'POST', body: searchParams.get('value') } : {});
+      } };
+    `, { wrangler: {
+      durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'Counter' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['Counter'] }],
+    } });
+  }
+  const [first, second, third] = tenants;
+  const call = (tenant, root, params = {}) => request(cluster.urls[owner],
+    `/${tenant.name}/worker/${root}?${new URLSearchParams(params)}`, { timeout: 12000 });
+  const read = async (tenant, root) => json(await call(tenant, root), 200, `${tenant.name}/${root}`);
+  const snapshot = () => durableGeneration(cluster, owner);
+  const initial = await eventually('the empty child reserves no homes', async () => {
+    const child = await snapshot();
+    assert.equal(child.lifecycle.durableAdmission.workerThreads, 0);
+    assert.equal(child.lifecycle.durableAdmission.homeReservedDescriptors, 0);
+    assert.equal(child.lifecycle.durableAdmission.homeReservedBytes, 0);
+    return child;
+  });
+  await waitForDatabaseCatalog(cluster);
+  const roots = new Map();
+  for (const tenant of [first, second]) {
+    const copies = [];
+    for (const root of ['a', 'b']) {
+      const value = tenant.name + '-' + root;
+      const saved = json(await call(tenant, root, { op: 'write', value }), 200, 'confirmed write');
+      assert.equal(saved.value, value);
+      roots.set(value, saved);
+      copies.push(saved.copy);
+    }
+    assert.equal(copies[0], copies[1], 'both roots share one home');
+  }
+  assert.notEqual(roots.get('home-first-a').copy, roots.get('home-second-a').copy);
+
+  const holdFirst = call(first, 'a', { op: 'hold' });
+  const holdSecond = call(second, 'a', { op: 'hold' });
+  void holdFirst.catch(() => {});
+  void holdSecond.catch(() => {});
+  try {
+    await eventually('both homes have a running event and an idle sibling', async () => {
+      const { lifecycle: { durableAdmission: state } } = await snapshot();
+      assert.equal(state.running, 2);
+      assert.equal(state.residentRoots, 4);
+    }, { interval: 25 });
+    const refusal = json(await call(third, 'a'), 503, 'all homes are in use');
+    assertDurableCapacityRefusal(refusal);
+    assert.equal((await snapshot()).lifecycle.durableAdmission.homeRetirements, 0);
+    json(await call(first, 'a', { op: 'release' }), 200, 'release the first home');
+    json(await holdFirst, 200, 'first running event completed');
+
+    const newcomer = await read(third, 'a');
+    assert.notEqual(newcomer.copy, roots.get('home-first-a').copy);
+    const retained = await read(second, 'b');
+    assert.deepEqual(retained, roots.get('home-second-b'), 'the other home was preserved');
+    await eventually('one retirement returned both roots on the same child', async () => {
+      const state = await snapshot();
+      assert.equal(state.pid, initial.pid);
+      assert.equal(state.generation, initial.generation);
+      assert.equal(state.lifecycle.durableAdmission.workerThreads, 2);
+      assert.equal(state.lifecycle.durableAdmission.homeRetirements, 1);
+      assert.equal(state.lifecycle.durableAdmission.admissionRetirements, 2);
+    }, { interval: 25 });
+
+    const reopened = await read(first, 'a');
+    assert.equal(reopened.value, 'home-first-a');
+    assert.notEqual(reopened.instance, roots.get(reopened.value).instance);
+    assert.notEqual(reopened.copy, roots.get(reopened.value).copy);
+    const sibling = await read(first, 'b');
+    assert.equal(sibling.value, 'home-first-b');
+    assert.notEqual(sibling.instance, roots.get(sibling.value).instance);
+    assert.equal(sibling.copy, reopened.copy);
+    json(await call(second, 'a', { op: 'release' }), 200, 'release the protected home');
+    json(await holdSecond, 200, 'the event on the protected home completed');
+  } finally {
+    await Promise.allSettled([first, second].map(tenant => call(tenant, 'a', { op: 'release' })));
+    await Promise.allSettled([holdFirst, holdSecond]);
+  }
+}
+
 async function threadedDatabaseAdmissionMixed(cluster) {
   const [owner] = cluster.nodes;
   const homes = 4;
@@ -977,8 +1083,21 @@ async function threadedDatabaseAdmissionMixed(cluster) {
   const query = db => request(cluster.urls.apiserver, db.path + '/query', {
     method: 'POST', token: sqlTenant.token, body: { sql: 'SELECT 1 AS value' },
   });
-  const expectQuery = async db => assert.deepEqual(
-    json(await query(db), 200, db.name).results, [{ value: 1 }]);
+  let capacityRefusals = 0;
+  const expectQuery = async (db, retry = false) => {
+    const until = performance.now() + 8000;
+    for (;;) {
+      const response = await query(db);
+      if (response.status !== 503 || !retry) {
+        assert.deepEqual(json(response, 200, db.name).results, [{ value: 1 }]);
+        return;
+      }
+      assertDurableCapacityRefusal(json(response, 503, db.name));
+      ++capacityRefusals;
+      assert.ok(performance.now() < until, `${db.name} did not obtain an idle home`);
+      await delay(40);
+    }
+  };
   for (const db of names.slice(0, homes)) await expectQuery(db);
   const before = await eventually('four homes hold settled databases before the scan', async () => {
     const state = await durableGeneration(cluster, owner);
@@ -998,7 +1117,9 @@ async function threadedDatabaseAdmissionMixed(cluster) {
     await eventually('the tenant Workers contend for new homes before the scan', () => {
       assert.ok(attempts >= competitorCount);
     }, { interval: 10 });
-    for (const db of names.slice(homes)) await expectQuery(db);
+    // Whole-home reuse lets the Workers occupy every slot. They can briefly
+    // leave no idle home for SQL, and only trusted pre-execution refusals can retry.
+    for (const db of names.slice(homes)) await expectQuery(db, true);
   } finally {
     scanning = false;
     for (const result of await traffic) {
@@ -1011,6 +1132,7 @@ async function threadedDatabaseAdmissionMixed(cluster) {
     assert.equal(after.generation, before.generation);
     assert.ok(after.lifecycle.durableAdmission.admissionRetirements >= count - homes);
   }, { interval: 25 });
+  console.log(`Database scan completed with ${capacityRefusals} retryable capacity refusals`);
 }
 
 async function threadedSqlDefaultMailbox(cluster) {
@@ -2764,6 +2886,11 @@ async function durableCopyReservationRefusal(cluster) {
     const reply = await call();
     assert.equal(await recordedRefusals(), before + 1,
       `the owner records one refusal for marker ${request} (received HTTP ${reply.status})`);
+    const logs = await cluster.compose(['logs', '--no-color', '--no-log-prefix', owner]);
+    const copyMemory = logs.split('\n').filter(line => line.startsWith('[durable-admission] '))
+      .map(line => JSON.parse(line.slice('[durable-admission] '.length)))
+      .filter(row => row.resource === 'copy-memory');
+    assert.equal(copyMemory.length, refusal, 'event preparation refusal reports the copy memory budget');
     await eventually('the refused event released its mailbox credit in the same process', async () => {
       const current = await durableGeneration(cluster, owner);
       assert.equal(current.generation, initial.generation);
@@ -4438,11 +4565,16 @@ export const durableGatedCases = {
   'durable-threaded-database-admission': {
     test: threadedDatabaseAdmission, nodes: ['node-1'],
     controlDurableLifecycle: true, confirmTimeoutMs: 15000,
-    nodeEnvironment: () => ({ COWORKERD_DO_TEST_HOME_COUNT: '3' }),
+    configureNode: () => ({ durableObjects: { threadedStorage: true, confirmTimeoutMs: 15000, maxHomes: 3 } }),
+  },
+  'durable-threaded-home-reuse': {
+    test: durableHomeReuse, nodes: ['node-1'], singleNode: true, holdPeerAcks: false,
+    configureNode: () => ({ durableObjects: { threadedStorage: true, peers: 0, maxHomes: 2 } }),
   },
   'durable-threaded-database-admission-mixed': {
     test: threadedDatabaseAdmissionMixed, nodes: ['node-1'],
     singleNode: true, holdPeerAcks: false,
+    configureNode: () => ({ durableObjects: { threadedStorage: true, maxHomes: 4 } }),
   },
   'durable-threaded-database-accounting': {
     test: threadedDatabaseAccounting, nodes: ['node-1'], holdPeerAcks: false,

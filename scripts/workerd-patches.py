@@ -382,7 +382,11 @@ def allowed_path(name, path):
                                    '0188-retire-idle-objects-at-admission.patch',
                                    '0190-harden-ordinary-object-admission.patch',
                                    '0191-return-wal-slots-before-admission-tree-credit.patch',
-                                   '0192-bound-admission-wal-return.patch'} and path in {
+                                   '0192-bound-admission-wal-return.patch',
+                                   '0194-reserve-durable-homes-on-demand.patch',
+                                   '0195-report-durable-home-admission-pressure.patch',
+                                   '0197-preserve-durable-root-copy-credit.patch',
+                                   '0198-release-durable-copies-without-a-root.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name in {'0189-test-busy-objects-with-stale-idle-observations.patch',
@@ -392,9 +396,9 @@ def allowed_path(name, path):
                               'src/workerd/api/actor-state.c++',
                               'src/workerd/util/sqlite.c++', 'src/workerd/util/sqlite.h',
                               'src/workerd/util/sqlite-test.c++'} or
-                          name == '0179-size-default-object-mailbox.patch' and
-                              path == 'src/workerd/threaded/threaded-server.c++' or
-                          name == '0181-report-durable-copy-reservation-refusal.patch' and
+                          name in {'0179-size-default-object-mailbox.patch',
+                                   '0181-report-durable-copy-reservation-refusal.patch',
+                                   '0196-report-durable-preparation-memory-refusal.patch'} and
                               path == 'src/workerd/threaded/threaded-server.c++' or
                           name == '0182-bound-platform-sqlite-memory.patch' and path in {
                               'src/workerd/api/actor-state.c++', 'src/workerd/io/actor-sqlite.c++',

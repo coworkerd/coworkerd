@@ -32,8 +32,8 @@ check the new instance and stored value, while the child must retain its ready P
 It does not send JavaScript RPC calls.
 The disposable role defaults to four home loops, capped by the startup thread limit, and 64 roots per
 copy. Cold placement closes at 64 MiB or 3000 ms busy time in a four-second window. The per-object
-waiting mailbox defaults to 512 events/2 MiB. Reservations keep 256 descriptors plus five per home
-outside admission, then charge 16 KiB/four descriptors per root and 4 KiB/one descriptor per event plus
+waiting mailbox defaults to 512 events/2 MiB. Reservations keep 256 descriptors for process control and charge five per
+created home, then charge 16 KiB/four descriptors per root and 4 KiB/one descriptor per event plus
 declared waiting bytes. Facets reserve their own metadata and descriptors. The capacity, queue,
 pressure and overlap measurements in PR #43 cover these reservation costs. Actual body execution
 remains subject to the copy/process memory limits.
@@ -44,7 +44,7 @@ ingress fixture uses 32 call slots so its concurrency limit does not hide durabl
 The `group-refusal` mode injects one empty V8-group factory result only in the disposable role, then
 requires returned reservations, successful retry and the original ready child. This does not simulate
 physical address-space exhaustion; `COWORKERD_DO_TEST_REFUSE_GROUP` is zero by default.
-The fixture can vary the home and mailbox limits with `COWORKERD_DO_TEST_HOME_COUNT`,
+The fixture varies the home ceiling via `durableObjects.maxHomes` and the placement and mailbox limits via
 `COWORKERD_DO_TEST_TREES_PER_COPY`, `COWORKERD_DO_TEST_MAILBOX_EVENTS` and
 `COWORKERD_DO_TEST_MAILBOX_BYTES`. `COWORKERD_DO_TEST_PLACEMENT_BYTES` and
 `COWORKERD_DO_TEST_BUSY_MS` control placement, and `COWORKERD_DO_TEST_FD_HEADROOM` sets the
@@ -93,6 +93,7 @@ const [nodeBinary, workerd, runtime, scenario, homeArg = '8', treeArg = '64', bu
 const measure = scenario === 'measure';
 const httpLifecycle = scenario === 'http';
 const homeReservation = scenario === 'home-reservation';
+const homeResource = scenario === 'home-resource';
 const warmCopies = scenario === 'warm-copies';
 const events = scenario === 'events';
 const rpcCpu = scenario === 'rpc-cpu-events';
@@ -116,6 +117,11 @@ const placement = scenario === 'placement' || placementControl;
 const exerciseEvents = loadCancel || cpuEvents || warmCopies || boundedEvents || measure || placement || httpLifecycle || outputGate || httpMemory || groupRefusal || overlap;
 const homeCount = Number(homeArg);
 const treesPerHome = Number(treeArg);
+const maxHomes = overlap ? 4
+  : homeReservation || warmCopies || loadCancel ? 2
+  : cpuEvents ? 1
+  : queues || measure || placement || httpLifecycle || httpMemory ? homeCount
+  : undefined;
 if (measure || placement) {
   assert.ok(Number.isInteger(homeCount) && homeCount >= 1 && homeCount <= 32);
   assert.ok(Number.isInteger(Number(busyArg)) && Number(busyArg) > 0 && Number(busyArg) <= 4000);
@@ -129,23 +135,20 @@ const env = {
   ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(COWORKERD_|WORKERD_)/.test(key))),
   TMPDIR: scratch,
   ...(outputGate ? { COWORKERD_DO_TEST_COMMIT_DELAY_MS: '300' } : {}),
+  ...(homeResource ? { COWORKERD_DO_TEST_FD_HEADROOM: '447' } : {}),
   ...(groupRefusal ? { COWORKERD_DO_TEST_REFUSE_GROUP: '1' } : {}),
-  ...(overlap ? { COWORKERD_DO_TEST_HOME_COUNT: '4' } : {}),
-  ...(homeReservation || warmCopies ? { COWORKERD_DO_TEST_HOME_COUNT: '2' } : {}),
-  ...(loadCancel ? { COWORKERD_DO_TEST_HOME_COUNT: '2', COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST: '2500',
+  ...(loadCancel ? { COWORKERD_THREADED_SOURCE_DELAY_FOR_TEST: '2500',
     COWORKERD_LEASE_TTL_MS: '4000' } : {}),
   ...(httpMemory ? { COWORKERD_DO_TEST_PLACEMENT_BYTES: String(memoryPlacementMiB * 1024 * 1024) } : {}),
-  ...(queues ? { COWORKERD_DO_TEST_HOME_COUNT: homeArg, COWORKERD_DO_TEST_MAILBOX_EVENTS: '4',
+  ...(queues ? { COWORKERD_DO_TEST_MAILBOX_EVENTS: '4',
     COWORKERD_DO_TEST_MAILBOX_BYTES: String(mailboxBytes) } : {}),
   ...(queueMemory ? { COWORKERD_THREADED_MEMORY_BYTES: String(128 * 1024 * 1024) } : {}),
-  ...(cpuEvents ? { COWORKERD_CPU_LIMIT_MS: '250', COWORKERD_THREADED_TRACE_FOR_TEST: '1',
-    COWORKERD_DO_TEST_HOME_COUNT: '1' } : {}),
+  ...(cpuEvents ? { COWORKERD_CPU_LIMIT_MS: '250', COWORKERD_THREADED_TRACE_FOR_TEST: '1' } : {}),
   ...(boundedEvents ? {
     COWORKERD_CPU_LIMIT_MS: '250',
     COWORKERD_THREADED_TRACE_FOR_TEST: '1',
   } : {}),
   ...(measure || placement || httpLifecycle || httpMemory ? {
-    COWORKERD_DO_TEST_HOME_COUNT: homeArg,
     COWORKERD_DO_TEST_TREES_PER_COPY: treeArg,
     ...(placement ? { COWORKERD_DO_TEST_BUSY_MS: busyArg } : {}),
   } : {}),
@@ -161,10 +164,10 @@ const config = {
   nodeId: 'fixture',
   ...(httpMemory ? { memoryLimitMiB: 128 } : {}),
   durableObjects: {
-    processes: 1, threadedTestStorage: true, ...(measure || placement || queues || httpLifecycle || httpMemory ? { residentObjects: 0 } : {}),
+    processes: 1, threadedTestStorage: true, maxHomes, ...(measure || placement || queues || httpLifecycle || httpMemory ? { residentObjects: 0 } : {}),
   },
-  processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: overlap ? 32 : 8,
-    ...(queueLimit ? { threadedExecutable: descriptorLimitedThreaded } : {}) },
+  processPool: { count: exerciseEvents ? 1 : 0, inFlightLimit: overlap ? 32 : Math.max(8, maxHomes ?? 0),
+    ...(queueLimit || homeResource ? { threadedExecutable: descriptorLimitedThreaded } : {}) },
   quarantineProcesses: 0,
   sandbox: { mode: 'off', syscalls: { mode: 'off' } },
   peerListenAddress: '127.0.0.1:0',
@@ -203,7 +206,7 @@ function sendPreface(path, preface) {
     socket.once('error', reject);
     socket.once('data', bytes => {
       socket.setTimeout(0);
-      resolve({ socket, receipt: bytes.toString() });
+      resolve({ socket, receipt: bytes.subarray(0, 1).toString() });
     });
     socket.once('end', () => reject(new Error('admission closed without a response')));
   });
@@ -246,16 +249,17 @@ function durablePreface(objectId, invocationId, queuedBytes, expiry = process.hr
   }) + '\n';
 }
 
-async function waitForAdmission(path, waiting, homeSessions = 0, { running } = {}) {
+async function waitForAdmission(path, waiting, homeSessions = 0, { running, workerThreads } = {}) {
   let state;
   const until = performance.now() + 2000;
   do {
     state = await readAdmission(path);
     if (state.waiting === waiting && state.homeSessions === homeSessions &&
-        (running === undefined || state.running === running)) return state;
+        (running === undefined || state.running === running) &&
+        (workerThreads === undefined || state.workerThreads === workerThreads)) return state;
     await delay(20);
   } while (performance.now() < until);
-  const expected = JSON.stringify({ waiting, homeSessions, running });
+  const expected = JSON.stringify({ waiting, homeSessions, running, workerThreads });
   assert.fail(`Admission counters did not reach ${expected}: ${JSON.stringify(state)}`);
 }
 
@@ -264,7 +268,7 @@ let diagnostics = '';
 try {
   const modules = join(fixture, 'workers', workerId, 'v1');
   await mkdir(modules, { recursive: true });
-  if (queueLimit) {
+  if (queueLimit || homeResource) {
     await copyFile(new URL('./threaded-durable-fd-limit.test.sh', import.meta.url), descriptorLimitedThreaded);
     await chmod(descriptorLimitedThreaded, 0o755);
     await symlink(threaded, `${descriptorLimitedThreaded}.target`);
@@ -525,8 +529,15 @@ try {
   assert.equal(paths.length, 1);
   const stack = join(scratch, paths[0]);
   const socketPath = join(stack, 'run', processInfo.socket);
-  assert.equal((await readAdmission(socketPath)).workerThreads,
-    Number(env.COWORKERD_DO_TEST_HOME_COUNT ?? Math.min(4, config.processPool.inFlightLimit)));
+  const empty = await readAdmission(socketPath);
+  const memoryBudget = Number(environment.find(value =>
+    value.startsWith('COWORKERD_THREADED_MEMORY_BYTES='))?.split('=')[1]);
+  assert.ok(Number.isSafeInteger(memoryBudget) && memoryBudget > 0);
+  const defaultCeiling = Math.max(512, Math.min(16384, Math.floor(memoryBudget / 1048576)));
+  assert.equal(empty.maxHomes, maxHomes ?? defaultCeiling);
+  assert.equal(empty.workerThreads, 0);
+  assert.equal(empty.homeReservedBytes, 0);
+  assert.equal(empty.homeReservedDescriptors, 0);
   const ordinary = await sendPreface(socketPath, 'T');
   ordinary.socket.destroy();
   assert.equal(ordinary.receipt, 'R');
@@ -586,56 +597,72 @@ try {
   assert.equal(durable.pid, processInfo.pid);
   assert.equal(durable.generation, processInfo.generation);
   assert.equal(durable.state, 'ready');
-  if (homeReservation) {
+  if (homeReservation || homeResource) {
     const homeThreads = async () => {
       const tasks = join('/proc', String(processInfo.pid), 'task');
       const rows = await Promise.all((await readdir(tasks)).map(async tid =>
         [(await readFile(join(tasks, tid, 'comm'), 'utf8')).trim(), Number(tid)]));
-      return rows.filter(([name]) => name === 'cwkd-call').map(([, tid]) => tid).sort((a, b) => a - b);
+      return rows.filter(([name]) => name === 'cwkd-home').map(([, tid]) => tid).sort((a, b) => a - b);
     };
-    // Observe actual Linux home loops, not just the reservation table's thread dimension.
-    const originalThreads = await homeThreads();
-    assert.equal(originalThreads.length, 2);
+    const homes = homeResource ? 6 : 2;
+    await waitForAdmission(socketPath, 0, 0, { workerThreads: 0 });
+    assert.deepEqual(await homeThreads(), []);
+    const baseline = await readProcessResources(processInfo.pid);
     const keep = [];
-    const claim = async (id, definition) => {
+    const claim = async id => {
       const connection = await sendPreface(socketPath,
-        durablePreface(id.repeat(64), `home-${id}`, 0, undefined, definition));
+        durablePreface(String(id).repeat(64), `home-${id}`, 0, undefined, `definition-${id}`));
       keep.push(connection.socket);
       return connection;
     };
+    let originalThreads;
     try {
-      for (const [id, definition] of [['1', 'definition-one'], ['2', 'definition-two']]) {
-        const connection = await claim(id, definition);
+      for (let id = 1; id <= homes; ++id) {
+        const connection = await claim(id);
         assert.equal(connection.receipt, 'A');
         connection.socket.write(Buffer.alloc(1));
+        // Grow while the previous home sessions are still in use.
+        await waitForAdmission(socketPath, id, id, { workerThreads: id });
       }
-      const occupied = await waitForAdmission(socketPath, 2, 2);
-      assert.equal(occupied.homes, 2);
-      assert.deepEqual(await homeThreads(), originalThreads);
-      const refused = await claim('3', 'definition-three');
+      const occupied = await readAdmission(socketPath);
+      assert.equal(occupied.homes, homes);
+      originalThreads = await homeThreads();
+      assert.equal(originalThreads.length, homes);
+      assert.equal(occupied.homeReservedDescriptors, homes * 5);
+      assert.equal(occupied.homeReservedBytes, homes * 256 * 1024);
+      const refused = await claim(homes + 1);
       assert.equal(refused.receipt, 'R',
         'a definition without a reservable home must be refused before acknowledgement');
       const bounded = await readAdmission(socketPath);
-      assert.equal(bounded.trees, 2);
-      assert.equal(bounded.waiting, 2);
-      assert.equal(bounded.homes, 2);
+      assert.equal(bounded.trees, homes);
+      assert.equal(bounded.waiting, homes);
+      assert.equal(bounded.homes, homes);
       assert.equal(bounded.reservedBytes, occupied.reservedBytes);
       assert.equal(bounded.reservedDescriptors, occupied.reservedDescriptors);
       assert.deepEqual(await homeThreads(), originalThreads, 'refusal must not create another home thread');
+      assert.equal(bounded.lastHomeRefusal, homeResource ? 'home-descriptors' : 'home-ceiling');
+      if (homeResource) {
+        assert.equal(bounded.maxHomes, defaultCeiling);
+        assert.equal(bounded.descriptorBudget, 65);
+      }
     } finally {
       for (const socket of keep) socket.destroy();
     }
-    const drained = await waitForAdmission(socketPath, 0);
+    const drained = await waitForAdmission(socketPath, 0, 0, { workerThreads: 0 });
     assert.equal(drained.trees, 0);
-    assert.equal(drained.reservedBytes, 0);
-    assert.equal(drained.reservedDescriptors, 0);
-    const retry = await claim('3', 'definition-three');
+    for (const field of ['reservedBytes', 'reservedDescriptors', 'homeReservedBytes', 'homeReservedDescriptors']) {
+      assert.equal(drained[field], 0);
+    }
+    const emptyResources = await readProcessResources(processInfo.pid);
+    assert.equal(emptyResources.descriptors, baseline.descriptors);
+    assert.equal(emptyResources.threads, baseline.threads);
+    const retry = await claim(homes + 1);
     try {
       assert.equal(retry.receipt, 'A');
       const reserved = await readAdmission(socketPath);
       assert.equal(reserved.homes, 1, 'the home must already be reserved when acknowledgement arrives');
     } finally { retry.socket.destroy(); }
-    await waitForAdmission(socketPath, 0);
+    await waitForAdmission(socketPath, 0, 0, { workerThreads: 0 });
     const state = await fetch(`http://127.0.0.1:${port}/__coworkerd/state`, {
       headers: {Authorization: `Bearer ${token}`}, signal: AbortSignal.timeout(1000),
     }).then(response => response.json());
@@ -643,8 +670,8 @@ try {
     assert.equal(live.pid, processInfo.pid);
     assert.equal(live.generation, processInfo.generation);
     assert.equal(live.state, 'ready');
-    assert.deepEqual(await homeThreads(), originalThreads);
-    console.log(JSON.stringify({event: 'home-reserved-before-ack', homes: 2,
+    assert.deepEqual(await homeThreads(), []);
+    console.log(JSON.stringify({event: 'home-reserved-before-ack', homes,
       homeThreadIds: originalThreads, refusedDefinitions: 1, creditsReturned: true}));
   } else if (cpuEvents) {
     const request = async (path, options, accepted = [200]) => {
@@ -662,7 +689,7 @@ try {
     const tasks = join('/proc', String(processInfo.pid), 'task');
     const tids = new Set();
     for (const tid of await readdir(tasks)) {
-      if ((await readFile(join(tasks, tid, 'comm'), 'utf8')).trim() === 'cwkd-call') tids.add(Number(tid));
+      if ((await readFile(join(tasks, tid, 'comm'), 'utf8')).trim() === 'cwkd-home') tids.add(Number(tid));
     }
     assert.equal(tids.size, 1);
     const samples = [];
@@ -1176,7 +1203,7 @@ try {
     } finally {
       for (const socket of keep.splice(0)) socket.destroy();
     }
-    await waitForAdmission(socketPath, 0);
+    await waitForAdmission(socketPath, 0, 0, { workerThreads: 0 });
     const baseline = await readProcessResources(processInfo.pid);
     const start = performance.now();
     let full, reserved;
@@ -1207,12 +1234,12 @@ try {
         const maxFiles = Number(soft);
         assert.equal(maxFiles, 512);
         assert.equal(Number(hard), 512);
-        const remaining = maxFiles - 256 - homeCount * 5 - reserved.reservedDescriptors;
+        const remaining = maxFiles - 256 - reserved.homeReservedDescriptors - reserved.reservedDescriptors;
         assert.ok(remaining >= 0 && remaining < (accepted % 4 === 0 ? 5 : 1));
         assert.ok(full.descriptors <= maxFiles - 256, 'fixed descriptor headroom consumed');
       } else if (queueMemory) {
         assert.ok(refused, 'memory reservation ceiling was not reached');
-        const remaining = 16 * 1024 * 1024 - reserved.reservedBytes;
+        const remaining = 16 * 1024 * 1024 - reserved.homeReservedBytes - reserved.reservedBytes;
         assert.ok(remaining >= 0 && remaining < (accepted % 4 === 0 ? 36864 : 20480));
       } else {
         assert.equal(accepted, treesPerHome * 4);
@@ -1220,7 +1247,7 @@ try {
     } finally {
       for (const socket of keep) socket.destroy();
     }
-    const released = await waitForAdmission(socketPath, 0);
+    const released = await waitForAdmission(socketPath, 0, 0, { workerThreads: 0 });
     assert.equal(released.trees, 0);
     assert.equal(released.reservedDescriptors, 0);
     assert.equal(released.reservedBytes, 0);
@@ -1533,7 +1560,7 @@ try {
       generation: sameChild.generation, admission: counters}));
   }
   assert.deepEqual((await readdir(fixture)).sort(),
-    ['node.json', 'runtime', ...(queueLimit ? ['threaded-fd-limit', 'threaded-fd-limit.target'] : []), 'workers']);
+    ['node.json', 'runtime', ...(queueLimit || homeResource ? ['threaded-fd-limit', 'threaded-fd-limit.target'] : []), 'workers']);
   child.kill('SIGTERM');
   await exited;
   assert.equal(child.exitCode, 0);
