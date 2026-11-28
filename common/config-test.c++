@@ -142,12 +142,23 @@ void webSocketConfiguration(Fixture& fixture) {
 void durableConfiguration(Fixture& fixture) {
   KJ_REQUIRE(fixture.load("{}").processPool.durableProcesses == 1);
   KJ_REQUIRE(fixture.load(R"({"durableObjects":{"processes":0}})").processPool.durableProcesses == 0);
-  for (const auto* value : {"true", "false"}) {
+  for (const auto& [name, config] : std::array{
+      std::pair{"threadedStorage", R"({"durableObjects":{"threadedStorage":true}})"},
+      std::pair{"threadedStorage", R"({"durableObjects":{"threadedStorage":false}})"},
+      std::pair{"alarmFireConcurrency", R"({"durableObjects":{"alarmFireConcurrency":2}})"},
+      std::pair{"runtimePath", R"({"runtimePath":"retired.js"})"},
+      std::pair{"sqlCpuLimitMs", R"({"processPool":{"sqlCpuLimitMs":200}})"},
+      std::pair{"sqlWallLimitMs", R"({"processPool":{"sqlWallLimitMs":800}})"},
+      std::pair{"probeOverdueMs", R"({"processPool":{"probeOverdueMs":400}})"},
+      std::pair{"pausedAdmissionWaitMs", R"({"processPool":{"pausedAdmissionWaitMs":1000}})"},
+      std::pair{"gc", R"({"gc":{"budgetMs":2000}})"},
+      std::pair{"idleDestroyIntervalMs", R"({"idleDestroyIntervalMs":10})"}
+  }) {
     std::string refusal;
-    try { fixture.load(std::string("{\"durableObjects\":{\"threadedStorage\":") + value + "}}"); }
+    try { fixture.load(config); }
     catch (const kj::Exception& error) { refusal = error.getDescription().cStr(); }
     KJ_REQUIRE(refusal.find("Unknown field") != std::string::npos &&
-        refusal.find("threadedStorage") != std::string::npos, value, refusal.c_str());
+        refusal.find(name) != std::string::npos, name, refusal.c_str());
   }
 }
 

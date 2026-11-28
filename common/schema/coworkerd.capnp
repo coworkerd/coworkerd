@@ -1060,7 +1060,7 @@ struct InvocationDescriptor {
   compatibilityDate @2 :Text;
   mainModule @3 :Text;
   contentHash @4 :Text;
-  bindings @5 :List(Binding);
+  unused5 @5 :Void;
   invocationId @6 :Text;
   treeId @7 :Text;
   lease @8 :InvocationLease;
@@ -1090,67 +1090,33 @@ struct InvocationDescriptor {
   # The load check before this dispatch loaded the version: the call's cold start.
   coldLoaded @25 :Bool;
   # The limits this Worker names: its own, else its tenant's default; 0 means this node's own value
-  # applies. The runtime bridge puts them in the loader key, so the
-  # version's isolate is created under them (and a change of them loads another isolate), and workerd's CPU
-  # and memory limits take them from there. The ceiling against the tenant's maximum is the control plane's.
+  # applies. These limits are part of the loaded copy's identity.
   cpuLimitMs @26 :UInt32;
   memoryLimitMiB @27 :UInt32;
-  # The version's Durable Object namespace Bindings: each one's name, class and namespace id (empty while the namespace
-  # cannot be used: none for the class, or being deleted).
-  durableObjects @28 :List(DurableObjectNamespace);
-  # A request to an object, which the runtime of a durable process hands to the object's Host: the object's namespace,
-  # id and class, and how many Durable Object calls led to it (0 from a stateless Worker).
+  unused28 @28 :Void;
+  # Actor identity for nested calls from this event.
   durableObject @29 :DurableObjectTarget;
   # A trial load (and a load check): the Durable Object classes the version declares, checked among its exports.
   durableObjectClasses @30 :List(Text);
-
-  struct Binding {
-    name @0 :Text;
-    workerId @1 :Text;
-    versionId @2 :Text;
-    contentHash @3 :Text;
-    definitionHash @4 :Text;
-    entrypoint @5 :Text;
-    assets @6 :Bool;
-  }
 
   struct Secret {
     name @0 :Text;
     value @1 :Text;
   }
 
-  struct DurableObjectNamespace {
-    name @0 :Text;
-    className @1 :Text;
-    namespaceId @2 :Text;
-    # A d1_databases Binding: the tenant's database it names and the id of the one object that database is, so the
-    # runtime needs no hash of its own for it.
-    database @3 :Text;
-    objectId @4 :Text;
-  }
-
   struct DurableObjectTarget {
     namespaceId @0 :Text;
     objectId @1 :Text;
-    className @2 :Text;
-    hops @3 :UInt16;
-    # The object's shard, the shard's epoch this node holds it at, and the epoch since which this node's copy of the
-    # shard's objects is the one: the object's Host is named by it, so that a shard this node takes over from another
-    # node starts its objects from empty while one it takes back from itself keeps them.
-    shard @4 :UInt32;
-    shardEpoch @5 :UInt64;
-    dataEpoch @6 :UInt64;
-    # A tenant's database (the D1 shape): its name. The class is then the platform's own SQL Worker class, which the
-    # Host takes from its SQL_CLASS Binding and runs as the object's facet -- no tenant code is loaded.
+    unused2 @2 :Void;
+    unused3 @3 :Void;
+    unused4 @4 :Void;
+    unused5 @5 :Void;
+    unused6 @6 :Void;
     database @7 :Text;
-    # This request is the object's alarm, scheduled for this time (Unix milliseconds): the object's class runs its
-    # alarm() handler, and the answer says what its own database held.
-    alarmAtUnixMs @8 :UInt64;
-    # How many times its handler has already been tried (alarmInfo.retryCount).
-    alarmRetryCount @9 :UInt32;
-    alarmFacetId @10 :UInt32 = 1;
-    # The node's wall limit for one alarm attempt on the legacy host.
-    alarmWallMs @11 :UInt32;
+    unused8 @8 :Void;
+    unused9 @9 :Void;
+    unused10 @10 :Void;
+    unused11 @11 :Void;
   }
 }
 

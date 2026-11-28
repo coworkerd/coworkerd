@@ -1578,7 +1578,7 @@ public:
   }
 
   // ---- A Worker's log lines: 256 KB an event ----
-  // workerd caps a request's trace at 256 KB, but gives a streaming tail every line (runtime.js, TenantLog); the node
+  // workerd sends the event's console lines to the node, which
   // keeps the cap, per event: a request, or a message of a WebSocket connection toward the Worker (nextLogEvent, from
   // the connection's relay). An object's events are the object's: workerd records an object's lines under its latest
   // request, whichever of its requests or connections wrote them, so a request to an object (startObjectLogEvent) and a
@@ -2683,7 +2683,7 @@ public:
             std::min(limits.cpuMs, 30000u), limits.memoryMiB, target.namespaceId, target.objectId,
             target.dataEpoch, target.alarmAtUnixMs, target.alarmFacetId, target.isDatabase())}
         : coworkerd::prepareRootDispatch(desiredState.state(), *version, limits.cpuMs, limits.memoryMiB,
-        target.namespaceId, target.objectId, target.dataEpoch, target.isDatabase(), target.alarmAtUnixMs,
+        target.namespaceId, target.objectId, target.dataEpoch, target.alarmAtUnixMs,
         target.alarmFacetId);
     if (!root) throw DurableDispatchRefused{{false, 409, "DO_NAMESPACE_UNAVAILABLE",
         "the Durable Object namespace is unavailable or being deleted"}};
@@ -3743,7 +3743,6 @@ private:
       descriptor.setTrial(true);
       descriptor.setLoadCheck(loadCheck);
       if (!sourceInvocationId.empty()) descriptor.setSourceInvocationId(sourceInvocationId.c_str());
-      descriptor.initBindings(0);
       if (!version.declaredClasses.empty()) {
         auto classes = descriptor.initDurableObjectClasses(version.declaredClasses.size());
         for (size_t i = 0; i < version.declaredClasses.size(); ++i) classes.set(i, version.declaredClasses[i].c_str());
@@ -3757,54 +3756,12 @@ private:
       holdSecrets(plain.plan);
       return kj::str(plain.descriptor(std::move(encoded)).c_str());
     }
-    // The classes the version declares (its bridge exports each one for the objects' Hosts, whichever call loads the
-    // isolate first), and its Durable Object namespace Bindings, with this node's view of each class's namespace: a
-    // namespace that cannot be used has no id (its Binding refuses every call).
-    if (!version.declaredClasses.empty()) {
-      auto classes = descriptor.initDurableObjectClasses(version.declaredClasses.size());
-      for (size_t i = 0; i < version.declaredClasses.size(); ++i) classes.set(i, version.declaredClasses[i].c_str());
-    }
-    if (!version.durableObjects.empty()) {
-      auto namespaces = descriptor.initDurableObjects(version.durableObjects.size());
-      for (size_t i = 0; i < version.durableObjects.size(); ++i) {
-        const auto& binding = version.durableObjects[i];
-        namespaces[i].setName(binding.binding.c_str());
-        namespaces[i].setClassName(binding.className.c_str());
-        // A database Binding names one of the tenant's databases: its namespace is the database's, and the one
-        // object it holds is named "database" in it (the id is computed here, so the runtime needs no hash for it).
-        if (!binding.database.empty()) {
-          const auto* space = desiredState.state().database(coworkerd::tenantOf(version.workerId), binding.database);
-          const bool usable = space != nullptr && space->status == "active";
-          namespaces[i].setDatabase(binding.database.c_str());
-          namespaces[i].setNamespaceId(usable ? space->id.c_str() : "");
-          if (usable) {
-            namespaces[i].setObjectId(
-                coworkerd::durableObjectIdFromName(space->id, coworkerd::DATABASE_OBJECT_NAME).c_str());
-          }
-          continue;
-        }
-        const auto* space = desiredState.state().durableNamespace(version.workerId, binding.className);
-        namespaces[i].setNamespaceId(space && space->status == "active" ? space->id.c_str() : "");
-      }
-    }
     if (durable) {
-      // A request to an object: its Host runs the Worker's class with the version's variables, secrets and Durable Object
-      // Bindings; Service Bindings are not given to a class in this release.
       auto target = descriptor.initDurableObject();
       target.setNamespaceId(durable->namespaceId.c_str());
       target.setObjectId(durable->objectId.c_str());
       const auto& className = durable->platformClass ? durable->platformClass->name : durable->className;
-      target.setClassName(className.c_str());
-      target.setHops(durable->hops);
-      target.setShard(durable->shard);
-      target.setShardEpoch(durable->shardEpoch);
-      target.setDataEpoch(durable->dataEpoch);
       target.setDatabase(durable->database.c_str());
-      target.setAlarmAtUnixMs(durable->alarmAtUnixMs);
-      target.setAlarmRetryCount(durable->alarmRetryCount);
-      target.setAlarmFacetId(durable->alarmFacetId);
-      if (durable->alarmAtUnixMs) target.setAlarmWallMs(leaseConfig.alarmWallMs);
-      descriptor.initBindings(0);
       holdSecrets(root != nullptr ? root->plan : std::string());
       if (root != nullptr) {
         auto encoded = root->descriptor(encodeJson(descriptor.asReader()));
@@ -3863,25 +3820,6 @@ private:
     if (perCallForTest()) {
       const auto* worker = desiredState.state().worker(version.workerId);
       if (worker && worker->valid) bindingPins = worker->closure;
-    }
-    auto bindings = descriptor.initBindings(version.bindings.size());
-    for (size_t index = 0; index < version.bindings.size(); ++index) {
-      bindings[index].setName(version.bindings[index].name.c_str());
-      if (version.bindings[index].assets) {
-        // The ASSETS Binding: this version's own asset layer.
-        bindings[index].setAssets(true);
-        bindings[index].setWorkerId(version.workerId.c_str());
-        bindings[index].setVersionId(version.versionId.c_str());
-        bindings[index].setContentHash(version.contentHash.c_str());
-        bindings[index].setDefinitionHash(version.definitionHash.c_str());
-        continue;
-      }
-      bindings[index].setWorkerId(version.bindings[index].workerId.c_str());
-      const auto& target = bindingPins->at(version.bindings[index].workerId);
-      bindings[index].setVersionId(target.versionId.c_str());
-      bindings[index].setContentHash(target.contentHash.c_str());
-      bindings[index].setDefinitionHash(target.definitionHash.c_str());
-      bindings[index].setEntrypoint(version.bindings[index].entrypoint.c_str());
     }
     const coworkerd::VersionPins emptyPins;
     const auto plain = coworkerd::preparePlainDispatch(desiredState.state(), version,
@@ -4281,7 +4219,7 @@ rpc::EventDispatcher::Client makeRejectionDispatcher(
 rpc::EventDispatcher::Client makeD1BudgetRejection(
     capnp::HttpOverCapnpFactory& factory, const kj::HttpHeaderTable& headerTable, const char* code,
     const std::string& reason) {
-  // Native D1 clients read the error field. The legacy shim also uses the structured code and reason.
+  // D1 clients read the error field. Preserve code and reason for the HTTP response.
   const auto detail = jsonEscape(cleanReason(reason));
   const auto body = "{\"success\":false,\"code\":\"" + std::string(code) + "\",\"reason\":\"" + detail +
       "\",\"error\":\"" + code + ": " + detail + "\"}";
@@ -7347,7 +7285,7 @@ private:
 
 // A request to a Durable Object (docs/compatibility.md, section 7): from a stateless Worker's namespace Binding, or from
 // an object's. In this release the owner of every object is this node: the request runs on the object's durable process
-// (ProcessPool::selectDurable: d0, ... by the object's id), whose runtime gives it to the object's Host -- the active
+// (ProcessPool::selectDurable: d0, ... by the object's id), which dispatches it to the object's home -- the active
 // version of the Worker, its class declared and its namespace active. A durable process being replaced or restarted is
 // waited for, at most DURABLE_WAIT_MS within the request's lease. One [do] line per request, with its outcome.
 class DurableDispatch final {
@@ -7666,8 +7604,7 @@ private:
         target.dataEpoch, target.shardEpoch, target.shard};
     if (!disposable) slot->durableLog = &durableLog;
     slot->timing = request.timing;
-    // The durable host loads platform packages from its admitting daemon. The upstream database class
-    // comes from the static runtime.
+    // The admitting daemon serves platform packages directly to the durable kernel.
     if (!target.isDatabase() && !target.platformClass) {
       auto unavailable = co_await server.ensureCode(*version, deadline, true);
       if (!unavailable.empty()) {
@@ -8102,8 +8039,7 @@ kj::Promise<void> PeerBootstrap::openObjectInvocation(OpenObjectInvocationContex
 
 class BindingBootstrap;
 
-// The node's end of a session its own runtime opened for a method call (runtime/runtime.js: the Binding shim's
-// rpcTarget). It carries no HTTP request; its one method call is the envelope.
+// The native kernel opens this session to ask the node for a binding target over RPC.
 class RpcSessionDispatcher final: public rpc::EventDispatcher::Server {
 public:
   RpcSessionDispatcher(BindingBootstrap& bootstrap, NativeProps props): bootstrap(bootstrap), nativeProps(std::move(props)) {}
@@ -8440,7 +8376,7 @@ public:
     const bool assetsCall = descriptor.getAssets();
     server.observeSequenceMapSize(descriptor.getSequenceMapSize());
     if (descriptor.hasDurableObject()) {
-      // A call to a Durable Object of the calling Worker (runtime.js, DurableNamespace): from a stateless Worker a Binding
+      // A call to a Durable Object of the calling Worker uses a namespace binding. From a stateless Worker a binding
       // call of its call tree, from an object (callerObjectId) a call of that object's.
       auto call = descriptor.getDurableObject();
       DurableDispatch::Request request;
@@ -8861,11 +8797,7 @@ public:
   }
 
 private:
-  // A Worker's console lines, from the runtime of one of this node's processes (runtime/runtime.js, TenantLog: the
-  // streaming tail workerd gives each Worker it loads, bound to that Worker's identity by the runtime; only the
-  // runtimes reach this socket), as they are written, with the invocation they belong to. They are kept as that
-  // Worker's lines (WorkerdOutput::appendTenantLines); what a line says never decides whose it is. An event's lines past
-  // 256 KB (ServerCore::chargeLogLine) and lines beyond what one append carries are cut and counted.
+  // The threaded kernel sends console lines with their Worker and invocation identity.
   static constexpr size_t MAX_LOG_POST_BYTES = 16 * 1024 * 1024, MAX_LOG_APPEND_BYTES = 2 * 1024 * 1024;
   static constexpr const char* LOG_EVENT_EXCEEDED = "Log size limit exceeded: more than 256 KB of lines in one event (a request, "
       "a request to a Durable Object, or a message of a WebSocket connection); the event's later lines are not kept";

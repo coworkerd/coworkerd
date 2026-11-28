@@ -62,6 +62,6 @@ RootDispatch preparePlainDispatch(const DeploymentState& catalog, const VersionD
 std::optional<RootDispatch> prepareRootDispatch(const DeploymentState& catalog,
     const VersionDefinition& version, uint32_t cpuLimitMs, uint32_t memoryLimitMib,
     const std::string& namespaceId, const std::string& objectId, uint64_t dataEpoch,
-    bool database, uint64_t alarmAtUnixMs, uint32_t alarmFacetId);
+    uint64_t alarmAtUnixMs, uint32_t alarmFacetId);
 
 }  // namespace coworkerd
