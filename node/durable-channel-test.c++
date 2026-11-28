@@ -426,7 +426,7 @@ struct DurableLogChannelTest {
     complete(AlarmOutcome::FIRED);
     now = log.alarms.at(key).notBeforeMs;
     flush();
-    KJ_REQUIRE(attempts.back().alarm.retryCount == 0 && log.alarms.at(key).countedRetries == 0);
+    KJ_REQUIRE(attempts.back().alarm.retryCount == 0 && log.alarms.at(key).retries == 0);
 
     complete(AlarmOutcome::NOT_DUE, wall + 50);
     KJ_REQUIRE(log.alarms.at(key).atUnixMs == wall + 50);
