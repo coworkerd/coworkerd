@@ -10,21 +10,22 @@ const [mode, productArg, kernelArg, reportArg, iterationsArg, hotRateArg, option
 const iterations = Number(iterationsArg);
 const hotRate = Number(hotRateArg);
 const calibrate = mode === 'calibrate';
+const overload = mode === 'overload';
 const longRun = option === '--long';
-assert.ok(['dynamic', 'pinned', 'calibrate'].includes(mode) && productArg && kernelArg && reportArg &&
+assert.ok(['dynamic', 'pinned', 'calibrate', 'overload'].includes(mode) && productArg && kernelArg && reportArg &&
   Number.isSafeInteger(iterations) && iterations > 0 && iterations <= 500_000_000 && !extra.length &&
-  (option === undefined || (!calibrate && longRun)) &&
-  (calibrate ? hotRateArg === undefined : Number.isInteger(hotRate) && hotRate > 0 && hotRate <= 100),
-  'Usage: node tests/cluster/hot-worker-placement.mjs <dynamic|pinned|calibrate> <product-checkout> ' +
+  (calibrate || overload ? hotRateArg === undefined && option === undefined :
+    (option === undefined || longRun) && Number.isInteger(hotRate) && hotRate > 0 && hotRate <= 100),
+  'Usage: node tests/cluster/hot-worker-placement.mjs <dynamic|pinned|calibrate|overload> <product-checkout> ' +
   '<verified-kernel-directory> <new-report.jsonl> <iterations> [hot-requests-per-second [--long]]');
 
 const productRoot = resolve(productArg);
 const kernel = resolve(kernelArg);
 const report = resolve(reportArg);
-const pinned = mode !== 'dynamic';
+const pinned = calibrate || mode === 'pinned';
 const home = 'node-3';
 const hot = 'hot-placement/compute';
-const light = 'hot-neighbor/light';
+const light = overload ? null : 'hot-neighbor/light';
 const clientImage = 'node:22-trixie';
 const controller = new AbortController();
 for (const signal of ['SIGINT', 'SIGTERM']) {
@@ -51,11 +52,12 @@ const cluster = new Cluster(await mkdtemp(join(tmpdir(), 'coworkerd-hot-placemen
 });
 
 async function waitForHomes() {
-  await eventually('all ingresses agree that both Workers have the same home', async () => {
+  const workers = light ? [hot, light] : [hot];
+  await eventually('all ingresses agree on the Worker homes and candidates', async () => {
     for (const node of cluster.nodes) {
-      const path = `/__coworkerd/placement?workers=${hot},${light}`;
+      const path = `/__coworkerd/placement?workers=${workers.join(',')}`;
       const rows = json(await request(cluster.urls[node], path, { token: cluster.management }), 200, 'Worker homes');
-      assert.equal(rows.length, 2);
+      assert.equal(rows.length, workers.length);
       for (const row of rows) {
         assert.equal(row.home, home);
         assert.deepEqual([...row.candidates].sort(), cluster.nodes);
@@ -74,7 +76,7 @@ async function measure() {
   const kernelHashes = Object.fromEntries(await Promise.all(kernels.map(async name => [name, await sha256(join(kernel, name))])));
   for (const name of kernels) assert.equal(kernelHashes[name], manifest.files[name]);
   const binaries = resolve(process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(productRoot, 'build'));
-  await record({ metric: 'provenance', mode, longRun, iterations, hotRate: calibrate ? null : hotRate, home,
+  await record({ metric: 'provenance', mode, longRun, iterations, hotRate: calibrate || overload ? null : hotRate, home,
     commit: await cluster.command('git', ['rev-parse', 'HEAD'], { cwd: productRoot }),
     cliVersion: JSON.parse(await readFile(join(productRoot, 'cli/package.json'), 'utf8')).version,
     productBinarySha256: await sha256(join(binaries, 'coworkerd')),
@@ -83,7 +85,7 @@ async function measure() {
   await cluster.start();
   await waitForHomes();
   const hotTenant = await cluster.tenant('hot-placement');
-  const lightTenant = await cluster.tenant('hot-neighbor');
+  const lightTenant = light ? await cluster.tenant('hot-neighbor') : null;
   await cluster.deploy(hotTenant, 'compute', `
     const iterations = ${iterations};
     ${checksum.toString()}
@@ -92,9 +94,11 @@ async function measure() {
       return Response.json({ nodeId: request.cf.nodeId, id, checksum: checksum() });
     } };
   `);
-  await cluster.deploy(lightTenant, 'light', `export default { fetch(request) {
-    return Response.json({ nodeId: request.cf.nodeId });
-  } };`);
+  if (lightTenant) {
+    await cluster.deploy(lightTenant, 'light', `export default { fetch(request) {
+      return Response.json({ nodeId: request.cf.nodeId });
+    } };`);
+  }
 
   const cpu = Object.fromEntries(await Promise.all(cluster.nodes.map(async node => {
     const details = await cluster.compose(['exec', '-T', node, 'sh', '-ec',
@@ -106,12 +110,12 @@ async function measure() {
   const daemonVersion = await cluster.compose(['exec', '-T', home, 'coworkerd', '--version']);
   await record({ metric: 'daemon-version', lines: daemonVersion.split('\n') });
   const input = join(cluster.directory, 'placement-measure.json');
-  await writeFile(input, JSON.stringify({ home, hot, light, hotRate: calibrate ? null : hotRate, calibrate, longRun, checksum: checksum(),
+  await writeFile(input, JSON.stringify({ home, hot, light, hotRate, calibrate, overload, longRun, checksum: checksum(),
     nodes: cluster.nodes, management: cluster.management }), { mode: 0o600 });
   const client = fileURLToPath(new URL('./hot-worker-placement-client.mjs', import.meta.url));
   const result = await cluster.command('docker', ['run', '--rm', '--network', `${cluster.project}_frontend`,
     '-v', `${input}:/measure.json:ro`, '-v', `${client}:/client.mjs:ro`, clientImage, 'node', '/client.mjs'],
-  { timeout: 420000, maxBuffer: 8 * 1024 * 1024 });
+  { timeout: overload ? 540000 : 420000, maxBuffer: 8 * 1024 * 1024 });
   for (const line of result.split('\n')) {
     const row = JSON.parse(line);
     await record(row);
