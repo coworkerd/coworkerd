@@ -1083,8 +1083,21 @@ async function threadedDatabaseAdmissionMixed(cluster) {
   const query = db => request(cluster.urls.apiserver, db.path + '/query', {
     method: 'POST', token: sqlTenant.token, body: { sql: 'SELECT 1 AS value' },
   });
-  const expectQuery = async db => assert.deepEqual(
-    json(await query(db), 200, db.name).results, [{ value: 1 }]);
+  let capacityRefusals = 0;
+  const expectQuery = async (db, retry = false) => {
+    const until = performance.now() + 8000;
+    for (;;) {
+      const response = await query(db);
+      if (response.status !== 503 || !retry) {
+        assert.deepEqual(json(response, 200, db.name).results, [{ value: 1 }]);
+        return;
+      }
+      assertDurableCapacityRefusal(json(response, 503, db.name));
+      ++capacityRefusals;
+      assert.ok(performance.now() < until, `${db.name} did not obtain an idle home`);
+      await delay(40);
+    }
+  };
   for (const db of names.slice(0, homes)) await expectQuery(db);
   const before = await eventually('four homes hold settled databases before the scan', async () => {
     const state = await durableGeneration(cluster, owner);
@@ -1104,7 +1117,9 @@ async function threadedDatabaseAdmissionMixed(cluster) {
     await eventually('the tenant Workers contend for new homes before the scan', () => {
       assert.ok(attempts >= competitorCount);
     }, { interval: 10 });
-    for (const db of names.slice(homes)) await expectQuery(db);
+    // Whole-home reuse lets the Workers occupy every slot. They can briefly
+    // leave no idle home for SQL, and only trusted pre-execution refusals can retry.
+    for (const db of names.slice(homes)) await expectQuery(db, true);
   } finally {
     scanning = false;
     for (const result of await traffic) {
@@ -1117,6 +1132,7 @@ async function threadedDatabaseAdmissionMixed(cluster) {
     assert.equal(after.generation, before.generation);
     assert.ok(after.lifecycle.durableAdmission.admissionRetirements >= count - homes);
   }, { interval: 25 });
+  console.log(`Database scan completed with ${capacityRefusals} retryable capacity refusals`);
 }
 
 async function threadedSqlDefaultMailbox(cluster) {
