@@ -145,6 +145,18 @@ with adjacent quiet windows. Its driver runs on demand on a quiet test machine.
 The same driver measures [one Worker above three-node capacity](../../docs/hot-worker-overload.md).
 The `overload` mode calibrates the live cluster before and after the fixed-rate control and
 overload windows. It records client replies through drain, per-node root slots, and placement counters.
+The placement and overload modes score after each participating execution node has returned 550
+validated warm-up replies from the compute Worker. A pinned calibration warms the home alone.
+
+The `sustained` mode keeps the same Worker busy for ten minutes and counts validated replies per
+minute by execution node. It uses 24 closed-loop lanes on one node with placement disabled and
+72 lanes through a three-node ingress. The sustained readings start after six calls so the score
+captures the change in rate. Run the two fixtures serially on a quiet host.
+
+```sh
+node tests/cluster/hot-worker-placement.mjs sustained "$PWD" "$kernel" build/hot-worker-node.jsonl 150000000 --one-node
+node tests/cluster/hot-worker-placement.mjs sustained "$PWD" "$kernel" build/hot-worker-ingress.jsonl 150000000
+```
 
 ### Threaded SQL deadline and disconnect
 
