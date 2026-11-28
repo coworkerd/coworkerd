@@ -59,7 +59,7 @@ export class Cluster {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
     budgetLifetime, nodeEnvironment, nodeVolumes, binariesDirectory, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
-    databaseFixtureNodes = [], databaseAlarmFixture = false, previousProduct, previousKernel,
+    databaseFixtureNodes = [], databaseAlarmFixture = false, previousProduct, previousKernel, memoryLimit,
   } = {}) {
     this.directory = directory;
     this.kernel = kernel;
@@ -98,6 +98,7 @@ export class Cluster {
     this.databaseAlarmFixture = databaseAlarmFixture;
     this.previousProduct = previousProduct;
     this.previousKernel = previousKernel;
+    this.memoryLimit = memoryLimit;
   }
 
   async command(program, args, { cwd = this.directory, token, env, cleanup = false, timeout = 60000,
@@ -196,7 +197,9 @@ export class Cluster {
         } : {}),
         ...this.configureNode?.(node),
       }));
+      const memLimit = this.memoryLimit?.(node);
       overrides[node] = {
+        ...(memLimit && { mem_limit: memLimit }),
         ...(this.publishPeerPorts && { ports: ['127.0.0.1:0:8934'] }),
         ...(this.webSocketsPerNode ? { ulimits: { nofile: { soft: 1024, hard: 524288 } } } : {}),
         // Keep a killed owner down so that only a different node can recover the object.

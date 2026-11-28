@@ -7,10 +7,10 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { Cluster, eventually, json, request } from './cluster.mjs';
 
-const [kernelArg, reportArg, ...extra] = process.argv.slice(2);
-assert.ok(kernelArg && reportArg && extra.length === 0,
-  'Usage: node tests/cluster/durable-cpu-isolation-measure.mjs <verified-kernel-directory> <new-report.jsonl>');
-assert.equal(process.platform, 'linux');
+const [kernelArg, reportArg, mode, ...extra] = process.argv.slice(2);
+assert.ok(kernelArg && reportArg && [undefined, '--oversubscribed'].includes(mode) && !extra.length,
+  'Usage: node tests/cluster/durable-cpu-isolation-measure.mjs <verified-kernel-directory> <new-report.jsonl> [--oversubscribed]');
+if (mode === undefined) assert.equal(process.platform, 'linux');
 const root = fileURLToPath(new URL('../../', import.meta.url));
 const kernel = resolve(kernelArg);
 const report = resolve(reportArg);
@@ -42,7 +42,9 @@ function source(className) {
         const phase = url.searchParams.get('phase');
         if (phase === 'warm') this.sentinel = 'preserved ' + this.instance;
         if (phase === 'burn') {
-          console.log('cpu-window ' + url.searchParams.get('window') + ' ' + Date.now());
+          const home = url.searchParams.get('home');
+          console.log(home === null ? 'cpu-window ' + url.searchParams.get('window') + ' ' + Date.now()
+            : 'cpu-home ' + url.searchParams.get('window') + ' ' + home + ' ' + Date.now());
           let checksum = 1;
           for (let i = 0; i < 2000000000; ++i) checksum = Math.imul(checksum, 1664525) + i | 0;
           this.checksum = checksum;
@@ -69,14 +71,21 @@ async function measure() {
   const pins = JSON.parse(await readFile(join(root, 'patches/workerd/artifacts.json'), 'utf8'));
   const manifest = JSON.parse(await readFile(join(kernel, 'kernel.json'), 'utf8'));
   const binaryHash = createHash('sha256').update(await readFile(join(kernel, 'coworkerd-threaded'))).digest('hex');
-  assert.equal(manifest.patchSeriesSha256, pins.patchSeriesSha256);
+  const pinned = manifest.patchSeriesSha256 === pins.patchSeriesSha256;
+  if (mode === undefined) assert.ok(pinned, 'use the kernel pinned for this checkout');
   assert.equal(binaryHash, manifest.files['coworkerd-threaded']);
   const run = (program, args) => cluster.command(program, args, { cwd: root });
   await record('provenance', { commit: await run('git', ['rev-parse', 'HEAD']),
-    kernelRelease: pins.releaseTag, archiveSha256: pins.archives[manifest.architecture], binaryHash,
-    os: await run('uname', ['-a']), cpu: await run('lscpu', []), node: process.version,
+    ...(pinned && { kernelRelease: pins.releaseTag, archiveSha256: pins.archives[manifest.architecture] }),
+    patchSeriesSha256: manifest.patchSeriesSha256, binaryHash,
+    os: await run('uname', ['-a']),
+    ...(mode === undefined && { cpu: await run('lscpu', []) }), node: process.version,
     pairs, offersPerWindow, intervalMs, limitMs: cpuMs });
   await cluster.start();
+  if (mode === '--oversubscribed') {
+    await measureOversubscribed(binaryHash);
+    return;
+  }
   const first = await cluster.tenant('acceptance-cpu');
   const second = await cluster.tenant('acceptance-neighbor');
   const roles = { sameTenant: 'SameTenantProbe', otherTenant: 'OtherTenantProbe' };
@@ -243,6 +252,127 @@ async function measure() {
   }));
   await record('gate-summary', { child: ready.child, load: await run('uptime', []), ...results });
   console.log(JSON.stringify(results, null, 2));
+}
+
+async function measureOversubscribed(binaryHash) {
+  const inside = (...args) => cluster.compose(['exec', '-T', node, ...args]);
+  const cores = Number(await inside('nproc'));
+  assert.ok(Number.isSafeInteger(cores) && cores >= 1);
+  const cpuMax = await inside('cat', '/sys/fs/cgroup/cpu.max');
+  const linux = await inside('uname', '-a');
+  const busyHomes = cores + 1;
+  const burners = [];
+  for (let index = 0; index < busyHomes; ++index) {
+    const tenant = await cluster.tenant('cpu-home-' + index);
+    burners.push({ tenant, path: `/${tenant.name}/burner/one` });
+    await cluster.deploy(tenant, 'burner', source('BurnObject'), { wrangler: {
+      durable_objects: { bindings: [{ name: 'OBJECT', class_name: 'BurnObject' }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: ['BurnObject'] }],
+    } });
+    await cluster.api(`${tenant.path}/workers/burner`, {
+      token: tenant.token, method: 'PATCH', body: { limits: { cpuMs } },
+    });
+  }
+  const other = await cluster.tenant('cpu-home-neighbor');
+  const roles = { sameTenant: burners[0].tenant, otherTenant: other };
+  for (const [role, tenant] of Object.entries(roles)) {
+    const className = role === 'sameTenant' ? 'SameTenantProbe' : 'OtherTenantProbe';
+    await cluster.deploy(tenant, 'probe', source(className), { wrangler: {
+      durable_objects: { bindings: [{ name: 'OBJECT', class_name: className }] },
+      migrations: [{ tag: 'v1', new_sqlite_classes: [className] }],
+    } });
+  }
+  const paths = Object.fromEntries(Object.entries(roles)
+    .map(([role, tenant]) => [role, `/${tenant.name}/probe/one`]));
+  const call = path => request(cluster.urls[node], path, { timeout: 15000 });
+  const ok = async path => json(await call(path), 200, path);
+  const initial = await eventually('the worker catalog and CPU limits reached the owner', async () => {
+    const state = await cluster.state(node);
+    const control = await cluster.api('/v1/status');
+    assert.equal(String(state.storage.appliedTenantsRevision), String(control.storage.tenantsRevision));
+    const entry = state.processes.entries.find(entry => entry.processClass === 'durable');
+    assert.equal(entry.binarySha256, binaryHash);
+    assert.equal(entry.sandbox.durableServer, 'threaded');
+    assert.equal(entry.state, 'ready');
+    return { pid: entry.pid, generation: entry.generation, processId: entry.processId };
+  });
+  const lifecycle = async () => {
+    const state = await cluster.state(node);
+    const { pid, generation, processId, lifecycle } = state.processes.entries
+      .find(entry => entry.processClass === 'durable');
+    assert.deepEqual({ pid, generation, processId }, initial);
+    return lifecycle.durableAdmission;
+  };
+  await record('oversubscribed-settings', { cores, cpuMax, busyHomes, linux, ...initial });
+
+  async function offers(warmed) {
+    const begin = performance.now();
+    const requests = [];
+    for (let index = 0; index < offersPerWindow; ++index) {
+      const due = begin + index * intervalMs;
+      const remaining = due - performance.now();
+      if (remaining > 0) await delay(Math.ceil(remaining));
+      for (const [role, path] of Object.entries(paths)) {
+        requests.push((async () => {
+          const sentAt = Date.now();
+          if (performance.now() - due >= intervalMs) return { role, sentAt, missed: true };
+          try {
+            const value = await ok(path);
+            assert.equal(value.copy, warmed[role].copy);
+            assert.equal(value.instance, warmed[role].instance);
+            return { role, sentAt, doneAt: Date.now(), scheduledElapsedMs: performance.now() - due };
+          } catch (error) {
+            return { role, sentAt, error: error.message };
+          }
+        })());
+      }
+    }
+    return Promise.all(requests);
+  }
+
+  const windows = [];
+  for (let index = 0; index < pairs; ++index) {
+    const warmedBurners = await Promise.all(burners.map(({ path }) => ok(path + '?phase=warm')));
+    const warmed = Object.fromEntries(await Promise.all(Object.entries(paths)
+      .map(async ([role, path]) => [role, await ok(path + '?phase=warm')])));
+    assert.equal(new Set([...warmedBurners, ...Object.values(warmed)].map(value => value.copy)).size,
+      busyHomes + Object.keys(paths).length);
+    const quiet = { index, condition: 'quiet', probes: await offers(warmed) };
+    await record('oversubscribed-window', quiet);
+    windows.push(quiet);
+    const work = burners.map(({ path }, home) => call(path + `?phase=burn&window=${index}&home=${home}`)
+      .then(reply => ({ ...reply, home, doneAt: Date.now() }), error => ({ error: error.message, home, doneAt: Date.now() })));
+    const admitted = await eventually('more home events are running than the available CPUs', async () => {
+      const sample = await lifecycle();
+      assert.ok(sample.running >= busyHomes);
+      return { at: Date.now(), running: sample.running, homes: sample.homes };
+    }, { timeout: cpuMs, interval: 25 });
+    const probes = await offers(warmed);
+    const completed = await Promise.all(work);
+    for (const reply of completed) {
+      assert.equal(json(reply, 503, `CPU limit on home ${reply.home}`).code, 'CPU_LIMIT_EXCEEDED');
+    }
+    const busy = { index, condition: 'busy', admitted, probes, completed, admission: await lifecycle() };
+    await record('oversubscribed-window', busy);
+    windows.push(busy);
+  }
+  const log = await inside('cat', '/var/lib/coworkerd/logs/workerd.log');
+  const starts = log.split('\n').flatMap(line => {
+    const match = line.match(/^cpu-home (\d+) (\d+) (\d+)$/);
+    return match ? [{ index: Number(match[1]), home: Number(match[2]), at: Number(match[3]) }] : [];
+  });
+  for (const window of windows.filter(row => row.condition === 'busy')) {
+    const entries = starts.filter(start => start.index === window.index);
+    assert.equal(new Set(entries.map(start => start.home)).size, busyHomes);
+    assert.ok(Math.max(...entries.map(start => start.at)) < Math.min(...window.completed.map(reply => reply.doneAt)),
+      'all busy homes started before the first CPU-limit reply');
+  }
+  const results = Object.fromEntries(Object.keys(roles).map(role => [role,
+    Object.fromEntries(['quiet', 'busy'].map(condition => [condition, summary(windows
+      .filter(window => window.condition === condition).flatMap(window => window.probes.filter(row => row.role === role)))])),
+  ]));
+  await record('oversubscribed-summary', { cores, busyHomes, starts, results, ...initial });
+  console.log(JSON.stringify({ cores, busyHomes, results }, null, 2));
 }
 
 try {

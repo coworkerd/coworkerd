@@ -81,6 +81,33 @@ workloads in separate clusters and uploads `idle.jsonl` and `idle-residency.json
 node tests/cluster/durable-idle-measure.mjs "$kernel" build/durable-residency.jsonl --residency
 ```
 
+### Threaded durable home capacity
+
+The capacity driver starts one durable process and runs the default home policy under 2 GiB and
+6 GiB node cgroup memory limits. The Worker workload puts a tracked background operation on
+each resident copy and periodically checks that the same copies still serve. The database
+workload holds peer acknowledgements for writes, so each admitted SQLite home stays in use
+through the first refusal. Both workloads record the refusal, its process resource, the
+number of resident homes, and the child's RSS, threads and descriptors.
+
+```sh
+for size in small large; do
+  node tests/cluster/durable-home-capacity-measure.mjs "$kernel" "build/worker-homes-$size.jsonl" workers "$size"
+  node tests/cluster/durable-home-capacity-measure.mjs "$kernel" "build/database-homes-$size.jsonl" databases "$size"
+done
+node tests/cluster/durable-home-capacity-measure.mjs "$kernel" build/idle-low.jsonl idle small 4
+node tests/cluster/durable-home-capacity-measure.mjs "$kernel" build/idle-default.jsonl idle small
+node tests/cluster/durable-home-capacity-measure.mjs "$prior_kernel" build/idle-prior.jsonl idle small
+node tests/cluster/durable-home-capacity-measure.mjs "$kernel" build/home-reuse.jsonl reuse small
+node tests/cluster/durable-cpu-isolation-measure.mjs "$kernel" build/home-cpu.jsonl --oversubscribed
+```
+
+The idle runs compare the process RSS, anonymous RSS, thread and descriptor counts, and its
+cgroup's memory readings. The reuse run pairs the first call into a free home with the first
+call that takes it from an idle Worker. The CPU run starts one more busy home than the node
+has available CPUs and records the latency, errors and missed offers of two other Workers.
+Run each fixture with its own output path on an otherwise quiet Linux host.
+
 ### Single-node waiting-call baseline
 
 The fixture enables ingress placement and sends fixed batches of 8, 16 and 24 stateless Worker
