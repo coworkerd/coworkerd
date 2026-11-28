@@ -33,22 +33,28 @@ const worker = `
   import { DurableObject } from 'cloudflare:workers';
   let copy;
   export class ObjectUnderTest extends DurableObject {
-    async fetch(request) {
+    async visit(op) {
       copy ??= crypto.randomUUID();
-      const op = new URL(request.url).pathname;
-      if (op === '/pin' && !this.release) {
+      if (op === 'pin' && !this.release) {
         this.ctx.waitUntil(new Promise(resolve => { this.release = resolve; }));
-      } else if (op === '/release') {
+      } else if (op === 'release') {
         this.release?.();
         this.release = undefined;
       }
-      return Response.json({ copy, pinned: Boolean(this.release),
-        value: (await this.ctx.storage.get('value')) ?? null });
+      return { copy, pinned: Boolean(this.release),
+        value: (await this.ctx.storage.get('value')) ?? null };
     }
   }
-  export default { fetch(request, env) {
+  export default { async fetch(request, env) {
     const op = new URL(request.url).searchParams.get('op') ?? 'read';
-    return env.OBJECT.getByName('one').fetch('http://object/' + op);
+    try {
+      return Response.json(await env.OBJECT.getByName('one').visit(op));
+    } catch (error) {
+      if (error.code !== 'OVERLOADED' || !error.message.startsWith('OVERLOADED: ')) throw error;
+      return new Response(error.message.slice('OVERLOADED: '.length), {
+        status: 503, headers: { 'content-type': 'application/json' },
+      });
+    }
   } };
 `;
 const binding = {
@@ -99,9 +105,9 @@ function sameChild(before, after) {
   assert.equal(after.generation, before.generation);
 }
 
-function checkCapacityRefusal(reply) {
-  const refused = json(reply, 503, 'new home refused before execution');
-  assert.equal(refused.code, 'OVERLOADED');
+function checkCapacityRefusal(reply, tenant) {
+  const refused = json(reply, 503, tenant.name + ' new home refused before execution');
+  assert.equal(refused.code, 'OVERLOADED', JSON.stringify(refused));
   assert.equal(refused.dispatched, false);
   assert.equal(refused.retryable, true);
   return refused;
@@ -152,7 +158,7 @@ async function fillWorkers() {
           assert.equal(result.pinned, true);
           participants.set(batch[index], result.copy);
         } else {
-          refusals.push(checkCapacityRefusal(reply));
+          refusals.push(checkCapacityRefusal(reply, batch[index]));
         }
       }
       offered += batch.length;
