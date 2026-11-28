@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: maslow <wangfugen@126.com>
+Date: Sat, 28 Nov 2026 16:01:25 +0800
+Subject: [PATCH] Release a durable copy that never hosted a root
+
+
+diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
+index 31d0f72433e16a289fd5045874fa1f0e7a104df2..152104b85c8ba626cc2af47bbf396130d125e629 100644
+--- a/src/workerd/threaded/threaded-server-test.c++
++++ b/src/workerd/threaded/threaded-server-test.c++
+@@ -182,14 +182,16 @@ KJ_TEST("platform databases use the database Worker and a copy pinned to the spe
+   KJ_EXPECT(!platformDurablePlan(input.get(), plan.get(), selection.get(), route));
+ }
+ 
+-KJ_TEST("an exclusive database copy keeps its isolate while the home has a reservation") {
++KJ_TEST("unplaced copies return their home while used tenant copies can stay warm") {
+   const auto database = PLATFORM_DATABASE_COPY_PREFIX + std::string(64, 'a');
+   const auto tenant = std::string(64, 'a') + ":" + std::string(64, 'b');
+-  KJ_EXPECT(!shouldReleaseDurableCopy(1, false, database, false));
+-  KJ_EXPECT(!shouldReleaseDurableCopy(0, true, database, false));
+-  KJ_EXPECT(shouldReleaseDurableCopy(0, false, database, false));
+-  KJ_EXPECT(!shouldReleaseDurableCopy(0, false, tenant, false));
+-  KJ_EXPECT(shouldReleaseDurableCopy(0, false, tenant, true));
++  KJ_EXPECT(!shouldReleaseDurableCopy(1, false, database, false, false));
++  KJ_EXPECT(!shouldReleaseDurableCopy(0, true, database, true, false));
++  KJ_EXPECT(shouldReleaseDurableCopy(0, false, database, true, false));
++  KJ_EXPECT(!shouldReleaseDurableCopy(1, false, tenant, false, false));
++  KJ_EXPECT(shouldReleaseDurableCopy(0, false, tenant, false, false));
++  KJ_EXPECT(!shouldReleaseDurableCopy(0, false, tenant, true, false));
++  KJ_EXPECT(shouldReleaseDurableCopy(0, false, tenant, true, true));
+ }
+ 
+ KJ_TEST("above the admission ceiling a database replaces only a sufficient charge within the hard budget") {
+diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
+index e0cdb0eabaae4fd57ca4ebab2b74a3a6ba42bed0..557242bae8c7deb3214c186add16798ab124fb9f 100644
+--- a/src/workerd/threaded/threaded-server.c++
++++ b/src/workerd/threaded/threaded-server.c++
+@@ -1579,6 +1579,8 @@ struct Slot {
+   std::atomic<uint> active{0}, maxActive{0}, creates{0};
+   std::function<void(bool)> homeTurn;
+   std::function<void(Worker::Actor &)> resetDurableRoot;
++  // Set only by the durable home after it publishes its first actor.
++  bool hasHostedDurableRoot = false;
+ };
+ 
+ struct Entry {
+@@ -2328,11 +2330,11 @@ bool productPlatformPlan(Json::Reader plan) {
+ constexpr char PLATFORM_DATABASE_COPY_PREFIX[] = "platform-object-v1:";
+ 
+ bool shouldReleaseDurableCopy(uint32_t reservedTrees, bool hasResidentRoots,
+-    const std::string &definition, bool resettingOrExpired) {
++    const std::string &definition, bool hasHostedRoot, bool resettingOrExpired) {
+   // The catalog mints tenant fingerprints with a hexadecimal definition hash first.
+   // The platform copy key below is recomputed when the database route is validated.
+   return reservedTrees == 0 && !hasResidentRoots &&
+-      (resettingOrExpired || definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX));
++      (!hasHostedRoot || resettingOrExpired || definition.starts_with(PLATFORM_DATABASE_COPY_PREFIX));
+ }
+ 
+ std::string platformCopyKey(Json::Reader descriptor, Json::Reader plan,
+@@ -4141,7 +4143,7 @@ struct ThreadedServer {
+       // tree retires so a new database can open on an unused home.
+       releaseCopy = state.admissionWalClosing.empty() &&
+           shouldReleaseDurableCopy(home.reservedTrees, !state.durableRoots.empty(),
+-              state.durableSlot->planRevision,
++              state.durableSlot->planRevision, state.durableSlot->hasHostedDurableRoot,
+               home.pressure.resetting() || (home.reclaiming && !closingForAdmission) ||
+                   (idleMs && nowNs() - lastUse >= idleMs * 1000000));
+     }
+@@ -7992,6 +7994,7 @@ kj::Promise<rpc::EventDispatcher::Client> DurableBootstrap::prepare(
+                     })
+                 .first;
+     server.publishDurableRoot(state.durableHome, ticket.tree);
++    slot->hasHostedDurableRoot = true;
+     found->second.broken = found->second.actor->onBroken()
+                                .then([]() {}, [tree](kj::Exception &&error) {
+       const auto at = tree->state.durableRoots.find(tree->tree);

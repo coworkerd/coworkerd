@@ -385,7 +385,8 @@ def allowed_path(name, path):
                                    '0192-bound-admission-wal-return.patch',
                                    '0194-reserve-durable-homes-on-demand.patch',
                                    '0195-report-durable-home-admission-pressure.patch',
-                                   '0197-preserve-durable-root-copy-credit.patch'} and path in {
+                                   '0197-preserve-durable-root-copy-credit.patch',
+                                   '0198-release-durable-copies-without-a-root.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name in {'0189-test-busy-objects-with-stale-idle-observations.patch',
