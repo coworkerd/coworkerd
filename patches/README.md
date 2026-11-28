@@ -140,8 +140,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   replacement credit in routing, and reports the resource
   that refused a durable preface. An already fenced home remains selected until its trees
   and copy release. It changes the threaded server and the durable admission table and tests.
-  Patch 0196 reports copy-memory pressure during source and event preparation as a pre-execution
+  Patch 0196 reports copy-budget pressure during source and event preparation as a pre-execution
   refusal. It checks the event's copy credit before opening a new actor or SQLite connection.
+  Patch 0197 keeps an established root's existing copy credit when the new-admission budget is full.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go
