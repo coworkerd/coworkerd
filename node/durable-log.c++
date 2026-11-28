@@ -791,7 +791,7 @@ constexpr uint8_t ACK_OK = 0, ACK_UNAVAILABLE = 1, ACK_TOO_LARGE = 3, ACK_QUOTA 
 
 // Cloudflare's alarm retries: the first two seconds later, doubling, a quarter of jitter; six counted tries, and
 // past them the delay doubles to about seventeen minutes (src/workerd/server/alarm-scheduler.h).
-constexpr uint32_t ALARM_RETRY_START_SECONDS = 2, ALARM_RETRY_MAX_TRIES = 6, ALARM_RETRY_BACKOFF_MAX = 9;
+constexpr uint32_t ALARM_RETRY_START_SECONDS = 2, ALARM_RETRY_MAX_TRIES = 6;
 // The facet tree index workerd keeps beside an object's databases (src/workerd/server/facet-tree-index.h): an
 // 8 byte magic number, then one entry per facet -- its parent (2 bytes), the length of its name (2) and the name.
 constexpr uint64_t FACET_INDEX_MAGIC = 0xc4cdce5bc5b0ef57ull;
@@ -6925,14 +6925,12 @@ void DurableLog::alarmReported(const std::string& objectName, uint32_t facetId, 
   state.fromHint = false;
   if (fresh) {
     ++alarmsSet;
-    if (settings.threadedAlarmEvents && previous && previous != atUnixMs) {
+    if (previous && previous != atUnixMs) {
       state.fireToken = 0;
       state.firing = false;
       state.rebuildWaiting = false;
     }
     state.retries = 0;
-    state.countedRetries = 0;
-    state.backoff = 0;
     state.clearing = false;
     state.notBeforeMs = 0;
     log("alarm-set", "\"object\":" + quote(object->objectName) + ",\"facet\":" + std::to_string(facetId) +
@@ -6969,9 +6967,7 @@ DurableLog::AlarmDispatchLease::AlarmDispatchLease(DurableLog& owner, std::strin
     : owner(owner), key(std::move(key)), process(std::move(process)), token(token), cold(cold), probes(std::move(probes)) {
   ++owner.activeAlarmFires;owner.peakAlarmFires = std::max(owner.peakAlarmFires, owner.activeAlarmFires);
   if (cold) ++owner.activeAlarmPreparations;
-  if (owner.settings.threadedAlarmEvents) {
-    KJ_ASSERT(owner.activeThreadedAlarms.insert(this->key).second);
-  }
+  KJ_ASSERT(owner.activeThreadedAlarms.insert(this->key).second);
   auto& count = owner.alarmProcessFires[this->process];++count.first;count.second = std::max(count.second, count.first);
 }
 double DurableLog::alarmMonotonicMs() const {
@@ -6986,7 +6982,7 @@ DurableLog::AlarmDispatchLease::~AlarmDispatchLease() noexcept(false) {
   AlarmCpuScope measured(owner);--owner.activeAlarmFires;
   if (cold) --owner.activeAlarmPreparations;
   --owner.alarmProcessFires.at(process).first;
-  if (owner.settings.threadedAlarmEvents) owner.activeThreadedAlarms.erase(key);
+  owner.activeThreadedAlarms.erase(key);
   const auto now = owner.alarmMonotonicMs();
   // This lease exists before evalLater: even a dispatch that never starts or loses its entry releases its probe.
   for (const auto& probe: probes) {
@@ -7000,7 +6996,7 @@ DurableLog::AlarmDispatchLease::~AlarmDispatchLease() noexcept(false) {
   if (alarm != owner.alarms.end() && alarm->second.fireToken == token && alarm->second.firing) {
     alarm->second.firing = false;alarm->second.notBeforeMs = std::max(alarm->second.notBeforeMs, now + 1000);
     owner.indexAlarm(key, alarm->second);
-  } else if (alarm != owner.alarms.end() && owner.settings.threadedAlarmEvents) {
+  } else if (alarm != owner.alarms.end()) {
     owner.indexAlarm(key, alarm->second);
   }
   owner.wakeAlarmPreparations();owner.scheduleAlarmPump();
@@ -7165,10 +7161,7 @@ void DurableLog::pumpAlarmFires() {
       if (!gate.open) break; // Only one bucket can offer the next probe.
     }
   }
-  const auto fireRoom = [this] {
-    return settings.threadedAlarmEvents || activeAlarmFires < settings.config.alarmFireConcurrency;
-  };
-  for (unsigned n = 0;n < 8 && fireRoom();++n) {
+  for (unsigned n = 0;n < 8;++n) {
     const bool coldRoom = activeAlarmPreparations < ALARM_REBUILD_WAIT_LIMIT;
     auto preparation = alarmPreparationQueue.end();
     if (coldRoom && !alarmPreparationQueue.empty()) {
@@ -7258,7 +7251,7 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
   DurableAlarm ask{found->second.namespaceId, found->second.objectId, found->second.tenant, found->second.shard,
       found->second.facetId, found->second.dataEpoch, found->second.shardEpoch, found->second.atUnixMs,
       found->second.retries, token,
-      settings.threadedAlarmEvents && found->second.clearing};
+      found->second.clearing};
   const auto started = alarmMonotonicMs();
   AlarmResult result;
   try {
@@ -7292,8 +7285,6 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
   if (gone) {
     // Its schedule is gone (the object reported the clearing, or the shard left this node): the hint goes with it.
     log(result.outcome == AlarmOutcome::FIRED ? "alarm-fired" : "alarm-done", fields + ",\"scheduled\":false");
-    if (result.outcome == AlarmOutcome::FIRED && !settings.threadedAlarmEvents)
-      writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId, ask.shardEpoch, ask.tenant);
     co_return;
   }
   auto& state = again->second;
@@ -7309,29 +7300,17 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
   switch (result.outcome) {
     case AlarmOutcome::FIRED: {
       log("alarm-fired", fields + ",\"retries\":" + std::to_string(state.retries));
-      // The handler cleared the object's own alarm, and the report of that clears the schedule. A report that did
-      // not come (the object went away with the answer in flight) leaves this entry behind, so it goes now; the
-      // object's database is still the truth and reports again at its next open.
-      if (settings.threadedAlarmEvents) {
-        // The WAL channel reports the committed schedule independently of the reply.
-        state.retries = 0;
-        state.countedRetries = 0;
-        state.backoff = 0;
-        state.clearing = false;
-        state.notBeforeMs = alarmMonotonicMs() + 1000;
-      } else if (state.atUnixMs == ask.atUnixMs) {
-        eraseAlarm(key);
-        writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, 0, ask.facetId, ask.shardEpoch, ask.tenant);
-      }
+      // The WAL channel reports the committed schedule independently of the reply.
+      state.retries = 0;
+      state.clearing = false;
+      state.notBeforeMs = alarmMonotonicMs() + 1000;
       co_return;
     }
     case AlarmOutcome::NOT_DUE: {
       log("alarm-not-due", fields + ",\"holds\":" + std::to_string(result.atUnixMs));
-      if (settings.threadedAlarmEvents) {
-        if (auto* object = objectOf(durableHostName(ask.namespaceId, ask.objectId, ask.dataEpoch))) {
-          alarmReported(object->objectName, ask.facetId, result.atUnixMs);
-          co_return;
-        }
+      if (auto* object = objectOf(durableHostName(ask.namespaceId, ask.objectId, ask.dataEpoch))) {
+        alarmReported(object->objectName, ask.facetId, result.atUnixMs);
+        co_return;
       }
       state.fromHint = false;
       if (result.atUnixMs == 0) {
@@ -7341,8 +7320,6 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
         state.atUnixMs = result.atUnixMs;
         state.dueObserved = false;
         state.retries = 0;
-        state.countedRetries = 0;
-        state.backoff = 0;
         state.clearing = false;
         state.notBeforeMs = 0;
         writeAlarmHint(ask.namespaceId, ask.objectId, ask.shard, result.atUnixMs, ask.facetId, ask.shardEpoch, ask.tenant);
@@ -7351,21 +7328,13 @@ kj::Promise<void> DurableLog::fireAlarm(std::string key, uint64_t token) {
     }
     case AlarmOutcome::FAILED: {
       ++state.retries;
-      if (settings.threadedAlarmEvents && state.retries > ALARM_RETRY_MAX_TRIES) {
+      if (state.retries > ALARM_RETRY_MAX_TRIES) {
         state.clearing = true;
         log("alarm-retry-exhausted", fields);
         co_return;  // The next validated dispatch conditionally clears the stored time.
       }
       ++alarmRetries;
-      if (state.countedRetries < ALARM_RETRY_MAX_TRIES) {
-        ++state.countedRetries;
-      } else {
-        state.backoff = std::min<uint32_t>(state.backoff + 1, ALARM_RETRY_BACKOFF_MAX);
-      }
-      const uint32_t steps = state.countedRetries >= ALARM_RETRY_MAX_TRIES
-          ? ALARM_RETRY_MAX_TRIES - 1 + state.backoff
-          : state.retries - 1;
-      const uint64_t seconds = uint64_t(ALARM_RETRY_START_SECONDS) << std::min<uint32_t>(steps, ALARM_RETRY_BACKOFF_MAX);
+      const uint64_t seconds = uint64_t(ALARM_RETRY_START_SECONDS) << (state.retries - 1);
       // A quarter of jitter, so the retries of many objects do not land together.
       const auto jitter = seconds * 1000 / 4;
       const uint64_t delay = seconds * 1000 - jitter / 2 + (jitter ? (randomBelow(jitter)) : 0);
@@ -7836,8 +7805,7 @@ void DurableLog::shardGone(const std::string& namespaceId, uint32_t shard, const
   }
   uint32_t droppedAlarms = 0;
   for (auto it = alarms.begin(); it != alarms.end();) {
-    if (it->second.namespaceId == namespaceId && it->second.shard == shard &&
-        (settings.threadedAlarmEvents || !it->second.firing)) {
+    if (it->second.namespaceId == namespaceId && it->second.shard == shard) {
       unindexAlarm(it->first, it->second);
       it = alarms.erase(it);
       ++droppedAlarms;
@@ -8573,7 +8541,7 @@ std::string DurableLog::json() const {
       << ",\"recordLimitRefusals\":" << recordLimitRefusals
       << ",\"objectFailures\":" << objectFailures << "},\"alarms\":{\"scheduled\":" << alarms.size() << ",\"set\":" << alarmsSet << ",\"cleared\":"
       << alarmsCleared << ",\"fired\":" << alarmsFired << ",\"failed\":" << alarmFailures << ",\"retries\":"
-      << alarmRetries << ",\"fireConcurrency\":" << (settings.threadedAlarmEvents ? 0 : settings.config.alarmFireConcurrency)
+      << alarmRetries
       << ",\"inFlight\":" << activeAlarmFires << ",\"peakInFlight\":" << peakAlarmFires
       << ",\"capacityDeferred\":" << alarmDeferred << ",\"inactiveDropped\":" << alarmInactive
       << ",\"dispatchAttempts\":" << alarmAttempts << ",\"schedulingThreadCpuNs\":" << alarmPumpCpuNs
@@ -8667,7 +8635,6 @@ std::string DurableLog::json() const {
       << settings.config.snapshotBytes << "\",\"objectBytes\":\"" << settings.config.objectBytes
       << "\",\"checkpointBytes\":\"" << settings.config.checkpointBytes << "\",\"recoverParallelism\":"
       << settings.config.recoverParallelism << ",\"rebuildConcurrency\":" << settings.config.rebuildConcurrency
-      << ",\"alarmFireConcurrency\":" << settings.config.alarmFireConcurrency
       << ",\"residentObjects\":" << settings.config.residentObjects
       << ",\"usagePublishMs\":" << settings.config.usagePublishMs << "}}";
   return out.str();

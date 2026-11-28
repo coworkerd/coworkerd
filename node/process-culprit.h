@@ -35,7 +35,7 @@ std::string confirmedCpuCulprit(Process& p, Limits limits, Labelled labelled, Co
     // The limit this Worker's executions run under (its own where it names one): the row has to be
     // against that limit, and to have spent it.
     const std::string worker = value.getWorkerId().cStr(), version = value.getVersionId().cStr();
-    const bool recent = p.threaded && std::any_of(p.recentDispatched.begin(), p.recentDispatched.end(), [&](const auto& completed) {
+    const bool recent = std::any_of(p.recentDispatched.begin(), p.recentDispatched.end(), [&](const auto& completed) {
       return completed.workerId == worker && completed.versionId == version && completed.invocationId == value.getInvocationId().cStr();
     });
     const auto limit = call == p.calls.end() ? (recent ? limits(worker, p.durable).cpuMs : 0u) : limits(call->second->workerId, p.durable).cpuMs;

@@ -499,8 +499,8 @@ struct ServerConfig {
     # Auxiliary alarm discovery; all ownership still uses the ordinary shard acquisition.
     alarmDiscoveryIntervalMs @20 :UInt32 = 60000;
     alarmTakeoverConcurrency @21 :UInt32 = 4;
-    # Background alarm dispatches per node; ordinary process and tenant admission still applies.
-    alarmFireConcurrency @22 :UInt32 = 2;
+    # Keep the retired upstream alarm concurrency ordinal unused.
+    unused22 @22 :Void;
     # Use disposable storage in a single-node threaded durable fixture.
     threadedTestStorage @23 :Bool = false;
     # Keep the retired backend switch's ordinal unused.

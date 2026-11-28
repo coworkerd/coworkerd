@@ -854,12 +854,8 @@ private:
 // one `startEvent` carried), so the channel that carries our descriptor for a `fetch` carries nothing for a method
 // call. The name of the one method a session takes is the only text of our own on the way in.
 constexpr uint64_t JS_RPC_TARGET_TYPE_ID = 0xa1a96525142a9d98ull;
-// What one node names when it asks another's session for the target's entrypoint; the node that executes the call
-// puts its own descriptor in its place (RpcDescriptorTarget), so a descriptor never travels between nodes.
+// The method name that asks the dispatcher's top-level RPC target for its selected entrypoint or actor.
 constexpr kj::StringPtr JS_RPC_BIND_METHOD = "coworkerd-bind"_kj;
-// The property of the runtime's top-level RPC target that answers with a version's entrypoint or an object's facet
-// (runtime/runtime.js, __coworkerdRpcBind): the descriptor is the name of the property read from it.
-constexpr kj::StringPtr JS_RPC_RUNTIME_PROPERTY = "__coworkerdRpcBind"_kj;
 
 // One call's parameters copied into another request, except the method it names: a serialized JavaScript value is
 // copied as the pointer it is, so nothing of it is decoded here.
@@ -972,13 +968,11 @@ private:
   std::function<void(const std::string&)> failed;
 };
 
-// The top-level target of a session on the node that executes the call: the runtime's own target takes our
-// descriptor as the name of the property it answers with the version's entrypoint (or the object's facet), so the
-// tenant's method call is then delivered to that entrypoint by workerd's RPC itself.
+// The first call asks the selected event for the entrypoint or actor capability.
 class RpcDescriptorTarget final: public rpc::JsRpcTarget::Server {
 public:
-  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot, bool threaded)
-      : runtimeTarget(kj::mv(runtimeTarget)), descriptor(kj::mv(descriptor)), slot(std::move(slot)), threaded(threaded) {}
+  RpcDescriptorTarget(capnp::Capability::Client runtimeTarget, std::shared_ptr<AdmissionSlot> slot)
+      : runtimeTarget(kj::mv(runtimeTarget)), slot(std::move(slot)) {}
 
   DispatchCallResult dispatchCall(uint64_t interfaceId, uint16_t methodId,
       capnp::CallContext<capnp::AnyPointer, capnp::AnyPointer> context) override {
@@ -993,12 +987,7 @@ private:
     auto params = context.getParams().getAs<rpc::JsRpcTarget::CallParams>();
     auto request = runtimeTarget.typelessRequest(interfaceId, methodId, params.totalSize(), {});
     auto builder = request.initAs<rpc::JsRpcTarget::CallParams>();
-    if (threaded) builder.setMethodName(JS_RPC_BIND_METHOD);
-    else {
-      auto path = builder.initMethodPath(2);
-      path.set(0, JS_RPC_RUNTIME_PROPERTY);
-      path.set(1, descriptor);
-    }
+    builder.setMethodName(JS_RPC_BIND_METHOD);
     copyCallParams(params, builder);
     // The runtime answers with a capability, not by running a method: the property is read.
     builder.getOperation().setGetProperty();
@@ -1010,18 +999,14 @@ private:
   }
 
   capnp::Capability::Client runtimeTarget;
-  kj::String descriptor;
   std::shared_ptr<AdmissionSlot> slot;
-  bool threaded;
 };
 
-// A workerd event dispatcher of this node with the descriptor that opened it: `getHttpService` is the event as it
-// always was, and `jsRpcSession` is the same event as a JS RPC session, whose top-level target carries the
-// descriptor into the runtime.
+// Expose the native event as an HTTP service or as a JS RPC session.
 class RpcDescriptorDispatcher final: public rpc::EventDispatcher::Server {
 public:
-  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, kj::String descriptor, std::shared_ptr<AdmissionSlot> slot, bool threaded)
-      : inner(kj::mv(inner)), descriptor(kj::mv(descriptor)), slot(std::move(slot)), threaded(threaded) {}
+  RpcDescriptorDispatcher(rpc::EventDispatcher::Client inner, std::shared_ptr<AdmissionSlot> slot)
+      : inner(kj::mv(inner)), slot(std::move(slot)) {}
 
   kj::Promise<void> getHttpService(GetHttpServiceContext context) override {
     context.initResults(capnp::MessageSize{4, 1}).setHttp(inner.getHttpServiceRequest().send().getHttp());
@@ -1031,16 +1016,14 @@ public:
   kj::Promise<void> jsRpcSession(JsRpcSessionContext context) override {
     auto opened = inner.jsRpcSessionRequest().send();
     auto results = context.initResults(capnp::MessageSize{4, 2});
-    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), kj::str(descriptor), slot, threaded));
+    results.setTopLevel(kj::heap<RpcDescriptorTarget>(opened.getTopLevel(), slot));
     results.setSession(opened.getSession());
     return kj::READY_NOW;
   }
 
 private:
   rpc::EventDispatcher::Client inner;
-  kj::String descriptor;
   std::shared_ptr<AdmissionSlot> slot;
-  bool threaded;
 };
 
 class ServerCore final {
@@ -2424,45 +2407,43 @@ public:
         shared->fulfiller->fulfill();
       }
     });
-    if (process->threadedServer()) {
-      if (auto found = threadedLoads.find(key); found != threadedLoads.end()) {
-        auto pending = found->second;
-        // The shared check owns its own process admission. A waiter keeps no
-        // extra process ticket, invocation number, or another caller's deadline.
-        process.reset();
-        bool expired = false;
-        try {
-          auto remaining = static_cast<int64_t>(std::max(0.0, deadline - monotonicTimeMs()) * 1000) * kj::MICROSECONDS;
-          co_await timer.timeoutAfter(remaining, pending->done.addBranch());
-          // A completed load can release hundreds of waiters. Let ready I/O
-          // and existing RPC continuations run before opening their calls.
-          co_await kj::yieldUntilWouldSleep();
-        } catch (const kj::Exception&) { expired = true; }
-        if (expired || monotonicTimeMs() >= deadline) {
-          LoadCheck result;
-          result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
-          co_return result;
-        }
-        if (pending->result) {
-          const auto& result = *pending->result;
-          if (!result.refusal) co_return LoadCheck{};
-          if (result.refusal->code != "LEASE_EXPIRED") {
-            LoadCheck failed;
-            failed.refusal = refusal(result.refusal->code, result.refusal->reason, result.refusal->status, root);
-            failed.refusal->category = result.refusal->category;
-            failed.refusal->notExecuted = result.refusal->notExecuted;
-            failed.refusal->retryable = result.refusal->retryable;
-            co_return failed;
-          }
-        }
-        // Cancellation or the initiating caller's deadline cannot poison a
-        // later caller's check. Select the current generation again.
-        co_return co_await loadCheck(std::move(version), std::move(entrypoint), deadline, root);
+    if (auto found = threadedLoads.find(key); found != threadedLoads.end()) {
+      auto pending = found->second;
+      // The shared check owns its own process admission. A waiter keeps no
+      // extra process ticket, invocation number, or another caller's deadline.
+      process.reset();
+      bool expired = false;
+      try {
+        auto remaining = static_cast<int64_t>(std::max(0.0, deadline - monotonicTimeMs()) * 1000) * kj::MICROSECONDS;
+        co_await timer.timeoutAfter(remaining, pending->done.addBranch());
+        // A completed load can release hundreds of waiters. Let ready I/O
+        // and existing RPC continuations run before opening their calls.
+        co_await kj::yieldUntilWouldSleep();
+      } catch (const kj::Exception&) { expired = true; }
+      if (expired || monotonicTimeMs() >= deadline) {
+        LoadCheck result;
+        result.refusal = refusal("LEASE_EXPIRED", "lease expired during the load check", 410, root);
+        co_return result;
       }
-      auto signal = kj::newPromiseAndFulfiller<void>();
-      shared = std::make_shared<PendingThreadedLoad>(kj::mv(signal.promise), kj::mv(signal.fulfiller));
-      threadedLoads.emplace(key, shared);
+      if (pending->result) {
+        const auto& result = *pending->result;
+        if (!result.refusal) co_return LoadCheck{};
+        if (result.refusal->code != "LEASE_EXPIRED") {
+          LoadCheck failed;
+          failed.refusal = refusal(result.refusal->code, result.refusal->reason, result.refusal->status, root);
+          failed.refusal->category = result.refusal->category;
+          failed.refusal->notExecuted = result.refusal->notExecuted;
+          failed.refusal->retryable = result.refusal->retryable;
+          co_return failed;
+        }
+      }
+      // Cancellation or the initiating caller's deadline cannot poison a
+      // later caller's check. Select the current generation again.
+      co_return co_await loadCheck(std::move(version), std::move(entrypoint), deadline, root);
     }
+    auto signal = kj::newPromiseAndFulfiller<void>();
+    shared = std::make_shared<PendingThreadedLoad>(kj::mv(signal.promise), kj::mv(signal.fulfiller));
+    threadedLoads.emplace(key, shared);
     LoadCheck result;
     result.sequence = nextSequence++;
     const auto forInvocation = invocationId(result.sequence);
@@ -3205,10 +3186,8 @@ private:
     auto opened = runtime.open(process, descriptor, version->definitionHash,
         slot ? slot->nativeProps : NativeProps(), kj::mv(token), threadedSql,
         durable == nullptr && slot ? slot->requestLease : nullptr);
-    // The same event as a JS RPC session: the runtime reads no cf for one, so its top-level target takes this
-    // descriptor as the name of the property that answers with the version's entrypoint (or the object's facet).
     opened.dispatcher = rpc::EventDispatcher::Client(
-        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), kj::str(descriptor), slot, process->threadedServer()));
+        kj::heap<RpcDescriptorDispatcher>(kj::mv(opened.dispatcher), slot));
     pathMark(timing, "open-runtime-send");
     phaseTiming("open-runtime-send", started, process);
     opened.ready = kj::mv(opened.ready).then([started, process, timing] {
@@ -3737,7 +3716,6 @@ private:
       auto json = message.initRoot<capnp::JsonValue>();
       capnp::JsonCodec().encode(descriptor, json);
       auto value = coworkerd::json::encodeCompact(json.asReader());
-      if (!process.threadedServer()) return value;
       value.pop_back();
       value += ",\"nativeNamespaces\":[";
       bool first = true;
@@ -3780,14 +3758,11 @@ private:
     auto holdSecrets = [&](const std::string& plan) {
       if (version.secrets.empty()) return;
       syncSecretDictionary();
-      std::string revision;
-      if (process.threadedServer()) {
-        revision = coworkerd::plainPlanFingerprint(plan);
-        if (revision.empty()) revision = version.definitionHash;
-      }
+      auto revision = coworkerd::plainPlanFingerprint(plan);
+      if (revision.empty()) revision = version.definitionHash;
       // Its values changed after the call was admitted and the region cannot take them: nothing is sent.
       if (!secretDictionary.sent(coworkerd::tenantOf(version.workerId), secretValues(version), process.processId,
-              process.generation, revision, process.threadedServer(), monotonicTimeMs(), expiresAtMonotonicMs))
+              process.generation, std::string(revision), true, monotonicTimeMs(), expiresAtMonotonicMs))
         throw ProcessUnavailable{false, "this node's secret dictionary cannot take this call's secret values now", true};
     };
     if (!version.secrets.empty()) {
@@ -3815,7 +3790,7 @@ private:
     // (and the loader key of a Worker that names none has no limits segment).
     auto limits = namedLimits(version.workerId);
     if (process.threadedDurableRole()) limits.cpuMs = std::min(limits.cpuMs, 30000u);
-    else if (process.threadedServer() && limits.cpuMs > 300000) limits.cpuMs = 300000;
+    else if (limits.cpuMs > 300000) limits.cpuMs = 300000;
     descriptor.setCpuLimitMs(limits.cpuMs);
     descriptor.setMemoryLimitMiB(limits.memoryMiB);
     if (trial) {
@@ -5186,7 +5161,7 @@ public:
       if (slot->process) slot->process->snapshotAfterFailure();
       if (tracked->hasStarted()) { slot->report(tracked->status(), limitCode()); throw; }
       failure = error.getDescription().cStr();
-      if (slot->process && slot->process->threadedServer()) platformCode = rpcFailureCode(error);
+      if (slot->process) platformCode = rpcFailureCode(error);
     }
     co_await refuse(*tracked, failure, platformCode);
   }
@@ -5226,7 +5201,7 @@ private:
     }
     KJ_IF_SOME(error, failed) {
       if (tracked->hasStarted()) kj::throwFatalException(kj::mv(error));
-      co_await refuse(*tracked, failure, slot->process && slot->process->threadedServer() ? rpcFailureCode(error) : "");
+      co_await refuse(*tracked, failure, slot->process ? rpcFailureCode(error) : "");
     }
   }
   // A failure before the response started: the code the call's limits or its process say.
@@ -9609,7 +9584,7 @@ private:
             std::string names;
             for (const auto& name : named) names += (names.empty() ? "" : ", ") + name;
             if (kind == "class" || kind == "object" ||
-                (process->threadedServer() && flag("nativeHttpValidated") &&
+                (flag("nativeHttpValidated") &&
                     flag("hasDefault") && flag("entrypointUsable"))) {
               verdict.message = "the default export serves fetch (" + kind + ")";
               // The isolate stays for the next call; the load check before it need not load again.
@@ -11067,8 +11042,7 @@ int run(Launch launch) {
       server.placementConfig().durableLog,
       membership->view().backend == "objectStore" && runtime.durableProcesses() > 0,
       uint32_t(uint64_t(server.placementConfig().membership.ttlSeconds) * 1000 +
-          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs,
-      true},
+          server.placementConfig().membership.livenessGraceMs), server.placementConfig().peerTimeoutMs},
       server.placementConfig().desiredState.objectStore, io.provider->getNetwork(), timer, *io.lowLevelProvider,
       membership->view(),
       {[&peerForwarder, &membership](std::string nodeId, uint64_t ownerEpoch, uint64_t firstSeq) {

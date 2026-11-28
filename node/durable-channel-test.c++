@@ -335,7 +335,7 @@ struct DurableLogChannelTest {
   static void threadedAlarms() {
     auto io = kj::setupAsyncIo();
     MembershipView membership;
-    DurableLog log({.config = {}, .objectStore = false, .threadedAlarmEvents = true},
+    DurableLog log({.config = {}, .objectStore = false},
         {}, io.provider->getNetwork(), io.provider->getTimer(), *io.lowLevelProvider, membership, {});
     double now = 1000;
     uint64_t wall = 500000;

@@ -347,7 +347,6 @@ public:
     DurableLogConfig config;
     bool objectStore = true;
     uint32_t tailWaitMs = 25000, peerTimeoutMs = 2000;
-    bool threadedAlarmEvents = false;
   };
   // `openStream` opens a log stream to one peer; `fetchTail` asks a node for what it holds of a previous owner's log
   // for a shard; `knownShardEpoch` is this node's view of who owns a shard, for the fencing of the records it takes
@@ -617,7 +616,7 @@ private:
     uint32_t shard = 0, facetId = 0;
     uint64_t dataEpoch = 0, shardEpoch = 0, atUnixMs = 0;
     double notBeforeMs = 0;   // monotonic: a retry waits for it
-    uint32_t retries = 0, countedRetries = 0, backoff = 0;
+    uint32_t retries = 0;
     bool firing = false;
     bool clearing = false;
     // Read from the hint in the store rather than reported by the object: the object's own database decides when it

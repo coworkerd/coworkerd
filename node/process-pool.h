@@ -46,7 +46,6 @@ public:
   std::function<void()> closeSqlInput;
   kj::Promise<void> rejectAfterCrash(kj::Exception&& error);
   kj::Promise<void> onExit();
-  bool threadedServer() const;
   bool threadedDurableTestRole() const;
   bool threadedDurableRole() const;
   bool cpuLimitExceeded() const;

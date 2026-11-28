@@ -464,7 +464,6 @@ async function threadedDatabaseAlarm(cluster) {
     const process = await durableGeneration(cluster, db.owner);
     assert.equal(process.lifecycle.durableServer, 'threaded');
     const before = await stats();
-    assert.equal(before.fireConcurrency, 0, 'the owner uses the native alarm dispatcher');
     assert.equal(before.scheduled, 0);
     const seed = await query([
       { sql: 'CREATE TABLE records (value TEXT PRIMARY KEY)' },
