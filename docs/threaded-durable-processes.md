@@ -1,6 +1,8 @@
 # Threaded Durable Object processes
 
-Design for [issue #16](https://github.com/coworkerd/coworkerd/issues/16).
+This design records the migration proposed in [#16](https://github.com/coworkerd/coworkerd/issues/16).
+For the release decision and landing order, see [#159](https://github.com/coworkerd/coworkerd/issues/159).
+The [Durable Objects guide](guide/durable-objects.md) and [database guide](guide/databases.md) describe the current backend.
 The source and baseline use main at `dfc8803731a33feaaf8796313a0053d403f5ba8a`.
 The node continues to own placement and durable history. The threaded child hosts object events and native database
 operations. Billing and separation by trust level are outside this design.
@@ -13,7 +15,7 @@ and a writable object-data directory. The node routes a DO binding, SQL request 
 `DurableShards` and `DurableLog::openObject`. The durable dispatch in [node/main.c++](../node/main.c++) checks
 ownership, the object image and the selected generation's log channel again immediately before dispatch.
 [node/root-objects.c++](../node/root-objects.c++) prepares the root definition. The trusted
-[runtime](../runtime/runtime.js) loads it through `ROOTS`, builds the class wrapper and uses the root actor
+[runtime](https://github.com/coworkerd/coworkerd/blob/6f0c75fa55447c1a519a45de4a6d4a018f24254b/runtime/runtime.js) loads it through `ROOTS`, builds the class wrapper and uses the root actor
 registry for the actual call. A tenant Worker version shares an isolate across its objects.
 `SqlDatabase` in that same runtime implements the SQL side of the D1 binding and the HTTP API using one shared
 runtime isolate. Durable processes share the upstream event loop even across different isolates.
@@ -542,7 +544,7 @@ decided.
   stable owner or must survive takeover. An in-memory firing token or retry counter cannot enforce a
   cluster-wide cap after a crash. A durable count, if required, needs an explicitly reviewed SQLite metadata
   representation, schedule identity, rollback compatibility and a definition for ambiguous in-flight failures.
-  [Node scheduler](../node/durable-log.c++) · [Alarm wrapper](../runtime/runtime.js).
+  [Node scheduler](../node/durable-log.c++) · [Alarm wrapper](https://github.com/coworkerd/coworkerd/blob/6f0c75fa55447c1a519a45de4a6d4a018f24254b/runtime/runtime.js).
 
   **Decided.** The cap counts on the owner that fires the alarm, in memory. After the sixth failed retry of a
   schedule that owner clears it through confirmed storage, as "Lifecycle and alarms" describes. A takeover

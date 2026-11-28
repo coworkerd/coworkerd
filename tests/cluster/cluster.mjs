@@ -126,7 +126,7 @@ export class Cluster {
 
   async start() {
     const context = join(this.directory, 'image');
-    await Promise.all(['bin', 'docker', 'runtime'].map(dir => mkdir(join(context, dir), { recursive: true })));
+    await Promise.all(['bin', 'docker'].map(dir => mkdir(join(context, dir), { recursive: true })));
     const binaries = this.binariesDirectory ?? process.env.COWORKERD_CLUSTER_BIN_DIR ?? join(this.productRoot, 'build');
     const files = Object.fromEntries(['coworkerd', 'coworkerd-apiserver', 'coworkerd-launcher']
       .map(file => [`bin/${file}`, join(binaries, file)]));

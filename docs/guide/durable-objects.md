@@ -34,7 +34,8 @@ export default {
 `ctx.storage.sql` exposes workerd's SQLite API. Key-value methods such as `get`, `put`, `delete` and `list`, and storage transactions, use the same database and durability path. The object's env contains the version's variables, secrets, Durable Object bindings and D1 bindings; Service Bindings are not installed in it. Facets have separate databases but belong to the root object's storage, eviction and recovery tree; `ctx.facets.clone()` is refused.
 
 SQLite execution in a tenant object's event draws from that event's CPU budget. The home tracks the budget
-across awaits and checks it while SQLite runs. An event that uses up its CPU budget receives
+across awaits and checks it while SQLite runs. Each fetch, RPC method, alarm and delivered WebSocket
+message gets its own budget. An event that uses up its CPU budget receives
 `503 CPU_LIMIT_EXCEEDED` and the home resets its object tree. A subsequent event reopens the confirmed
 state. SQL interruption is cooperative, so native work can run until its next progress check.
 The platform's [D1 and HTTP SQL queries](databases.md#sql-deadlines) have their own wall deadline.
@@ -187,8 +188,6 @@ Measured recovery of 24 small objects whose alarms were already due, with two su
 | Next 60-second patrol | 104.90 s | 130.28 s | about 98 s |
 
 Each node had a 1 CPU cgroup quota and 1,536 MiB memory, with one durable process. Eight clients each made ten hot-object requests per second, and two more continuously read other objects. Every measured alarm fired once and user requests had no failures. The member path took about 24.30 seconds to detect the loss; the patrol path added about 31.10 seconds between detection and its first metadata read. A rebuild occupied a slot for about 25.2 seconds, and the median object waited another 25.4 seconds in the rebuild queue. This per-object wait explains the additional time over the earlier examples. The measured drain rate was about 0.318 objects/second, close to the capacity estimate of `8 / 25 = 0.32`. Adding measured discovery overhead to the formula estimates about 350 / 379 seconds for 100 objects and 3,150 / 3,179 seconds for 1,000, for the member / patrol paths respectively. Those larger counts are projections.
-
-With the former alarm dispatch budget, a live-owner test with 2,010 alarms used the same per-node CPU and memory quotas, eight hot clients and two continuously requesting stateless clients. Concurrency 2 drained the alarms in 14.73 seconds and concurrency 1 took 17.15 seconds. Hot-request p99 was 57.5 / 79.1 ms in each run's preceding static window and 165.5 / 133.9 ms during drain, respectively. Node 3 was already CPU-quota saturated before firing began, so these measurements include quota contention. The threaded server uses request admission for alarms, and `durableObjects.alarmFireConcurrency` has no effect.
 
 Object-store hints identify which objects the next shard owner should wake, but the database decides whether an alarm is due. A stale hint can cause a harmless wake; a missing hint delays discovery until the object is opened again. Treat delivery as retryable, with no exactly-once side-effect guarantee.
 

@@ -9,8 +9,7 @@ This document is for operators and contributors who need to know what runs where
 | `coworkerd` | The node daemon, one per stack directory | The ingress and the management endpoints; placement per call and forwarding to peers; the pool of workerd processes with its watchdog, limits, suspects, quarantine, eviction and rotation; per-tenant logs and usage; its membership, suspects and usage in the object store; following the desired state | Writing tenants, credentials or deployments; talking to `cowctl` |
 | `coworkerd-apiserver` | The control plane, an executable of its own | The `/v1` API; tenants and credentials; validation and trial loads of new versions; publishing code packages to object storage; writing the desired state; collecting state and logs from the nodes and summing usage from the object store; the operations tool `coworkerd-apiserver tool` | Running tenant code; serving tenant requests |
 | `coworkerd-launcher` | A small C program, built only for Linux | Setting up the least-privilege environment of one workerd process and installing its system call filter, then executing workerd | Anything else |
-| `workerd` | Upstream workerd `v1.20261012.1` with the patch series in `patches/workerd/` | Executing tenant code; the workerd side of the limits, idle eviction, the memory watermark and the steady-state system call filter | Placement, state, policy |
-| The runtime bridge | `runtime/runtime.js`, copied into every workerd generation | Loading each version into an isolate of its own, building its `env` and dispatching each call to its entry point | -- |
+| `coworkerd-threaded` | Built from the pinned workerd source and patch series | Loading Worker packages and environments, dispatching HTTP and RPC, running Durable Objects on home threads and enforcing execution limits | Placement, state, policy |
 | `cowctl` | A Node.js command line, with the wrangler adapter `cli/adapter.mjs` | Converting wrangler projects and deploying them; the developer's and the administrator's commands, all through `/v1` | Talking to object storage or the nodes |
 | Object storage | External, an S3-compatible service reached over plain HTTP with path-style requests | Membership and the desired state (tenants, credentials, deployments, sealed secrets), version definitions, code packages, modules and static assets, suspects, usage, Durable Object shard ownership, uploaded WAL segments, manifests, snapshots, alarm hints and durable-usage hints ([cluster state](cluster-state.md), section 2) | -- |
 
@@ -34,12 +33,11 @@ The node's working state is its stack directory (`stackDirectory`, default `/var
 - `logs/` holds `workerd.log` and its rotations, and the workerd processes' pid files (`<slot>.pid`, and `workerd.pid` for the first); the node's own log is not there, it goes to standard output and error.
 - `run/` (mode 0700) holds the Unix sockets the workerd processes call back on and each process's own socket; ordinary and quarantine processes can write it; durable processes also have a writable `do/` mount.
 - `cache/` is the verified cache of code from object storage.
-- `processes/` holds each slot's workerd configuration and its copy of the runtime bridge, written again for every new generation.
 - `sandbox/` (mode 0700) is the launcher's root, created on Linux when the sandbox is not `off` and the launcher is an executable file.
 
 The stack also holds `do/` for SQLite databases and facets, and `do/log/` for the append log and recovery metadata. The latest confirmed tail may exist only on the owner and its confirming peers before upload; an empty stack recovers uploaded history and any surviving peer tail, not necessarily every acknowledged write. See [cluster state](cluster-state.md), section 12, for trusted-file reuse and the remaining recovery boundaries. A second node started on the same stack directory finds the first one's sockets live and refuses to start, changing nothing.
 
-Durable objects run in a separate category of workerd processes, `d0`, `d1`, … (`durableObjects.processes`, default 1). The runtime wraps each declared class with its variables, secrets, object and database bindings. The node's `DurableShards` owns and routes shards; `DurableLog` confirms committed SQLite frames with peers, seals segments, publishes per-object manifests and snapshots, and rebuilds objects. D1 uses a platform SQL Worker class on this same path, one namespace / shard / object per database. The SQL Worker implements the SQL HTTP protocol; the runtime's D1 client exposes the supported JavaScript methods.
+Durable objects run in a separate category of workerd processes, `d0`, `d1`, … (`durableObjects.processes`, default 1). The kernel loads each class with its variables, secrets, object and database bindings. The node's `DurableShards` owns and routes shards; `DurableLog` confirms committed SQLite frames with peers, seals segments, publishes per-object manifests and snapshots, and rebuilds objects. D1 uses a platform SQL Worker class on this same path, one namespace / shard / object per database. The SQL Worker implements the SQL HTTP protocol; workerd's D1 client exposes the supported JavaScript methods.
 
 ## 3. Deployment forms
 
@@ -107,7 +105,7 @@ Durable objects run in a separate category of workerd processes, `d0`, `d1`, …
 | `common/` | Shared by both: the object storage client and the state on it (revision sequences, the membership's objects, the tenant manifests and indexes, sealed secrets), the deployment state, code packages, tenancy, configuration, log cleaning and the log writer, JSON helpers and the Cap'n Proto schema |
 | `launcher/` | `coworkerd-launcher` and the description of its protocol with the node |
 | `cli/` | `cowctl` and the wrangler adapter |
-| `runtime/` | The runtime bridge, and a static example workerd configuration the node does not use |
+| `runtime/` | The platform D1 request handler embedded in the node and the source for local bindings such as R2 |
 | `patches/` | The workerd patch series with its upstream tag, and the Cap'n Proto change the build applies |
 | `docker/`, `examples/` | The image, the compose files and the example projects of the release package |
 | `scripts/` | Build, release, patch, allowlist and compatibility-flag tools, and the Linux toolchain image |
@@ -125,6 +123,6 @@ Durable objects run in a separate category of workerd processes, `d0`, `d1`, …
 Each architecture (`linux/amd64`, `linux/arm64`) has a package and an image.
 
 - The package's `bin/` holds `coworkerd`, `coworkerd-apiserver`, `coworkerd-launcher`, `workerd`, the startup and steady-state system call tables of this workerd with `coworkerd-syscalls.json`, the record of how they were made, and the `cowctl` wrapper, which runs it with the `node` on `PATH`; the wrangler `cowctl` pins declares Node.js 22 or newer.
-- `lib/cowctl/` holds `cowctl` and the adapter with their dependencies; `runtime/` holds `runtime.js`; `docker/`, `examples/`, six packaged guide pages in `docs/` (`quickstart`, `install`, `compat`, `errors`, `databases`, `durable-objects`), `INSTALL.md`, `VERSION` (the `--version` output) and `SHA256SUMS` of every file complete it. The tarball is reproducible: sorted entries, the source commit's time, no owners, normalised modes.
+- `lib/cowctl/` holds `cowctl` and the adapter with their dependencies; `docker/`, `examples/`, six packaged guide pages in `docs/` (`quickstart`, `install`, `compat`, `errors`, `databases`, `durable-objects`), `INSTALL.md`, `VERSION` (the `--version` output) and `SHA256SUMS` of every file complete it. The tarball is reproducible: sorted entries, the source commit's time, no owners, normalised modes.
 - The image is built from the unpacked package, compiles nothing, and holds the four executables and the two tables, without `cowctl`, which needs Node.js.
 - A release record per architecture lists the version, the source, the workerd build with its patch series, the allowlist and the hashes of the package and the image.

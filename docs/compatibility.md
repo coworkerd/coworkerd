@@ -22,12 +22,11 @@ Anything a project configures outside the line is refused at conversion and list
 
 ## 3. How tenant code runs
 
-workerd's dynamic Worker Loader loads a Worker with its own modules, compatibility date and flags and environment, which is what one version needs; the rest is the package format, the deployment state and a bridge module.
+The threaded kernel loads a Worker version with its modules, compatibility date, flags and environment.
 
-- **The runtime bridge** (`runtime/runtime.js`) fetches the version's manifest and modules from its node, checks the package hash and every module's hash, and loads them into an isolate of their own. A bridge module generated per version imports the tenant's main module and dispatches each call to the entry point it names: a class extending `WorkerEntrypoint`, constructed per call, or an object with `fetch`; a named export serves a Binding's `entrypoint`.
-- **`env`** holds the version's variables and secrets, fixed when the isolate loads, and the call's Bindings, which change from call to call because they carry the call tree's identity and budget; they arrive through `ctx.props`. The bridge runs the handler inside `withEnv`, so `import { env } from "cloudflare:workers"` sees the same `env` during a call; at a module's top level it sees the variables and secrets.
-- **A Binding is a capability bound to its target.** Tenant code gets a stub created by the platform for one target Worker and version; it cannot name another target, and the node executes exactly the target the definition approved.
-- **A Durable Object** is an object of one of the version's classes, named by its namespace's id and its own. The control plane makes a class's namespace id when a version first declares the class and keeps it for the class's name in later versions. Every call to an object goes to the node's durable process (`d0`), where the runtime keeps an object of its own, `Host`, for each one: the Host runs the tenant's class as its facet, from the isolate the Worker Loader keeps for the version under the same key as the version's stateless calls -- with the same CPU and memory limits -- and with a SQLite database of its own. A namespace Binding in `env` has `idFromName`, `newUniqueId`, `idFromString`, `get` and `getByName`; a stub has `fetch`, a WebSocket upgrade included.
+- **The package loader** gets the version's manifest and modules from the node, verifies their hashes and loads the version in an isolate. A named export serves a Binding's `entrypoint`.
+- **`env`** holds the version's variables, secrets and bindings. The node validates the target of each binding call against the deployment and charges the active invocation's budget.
+- **A Durable Object** belongs to a namespace the control plane creates when a class is declared. Its shard owner dispatches events to a home thread. The object and its facets have their own SQLite storage. See the [Durable Objects guide](guide/durable-objects.md) for IDs, HTTP, RPC and WebSocket behavior.
 - **Compatibility flags** are the version's own plus `enable_request_signal`, which the platform always turns on because cancellation depends on `Request.signal`; `disable_request_signal` is refused. It also adds `rpc` unless the version already specifies `rpc` or `no_rpc`.
 
 ## 4. What is checked at deployment

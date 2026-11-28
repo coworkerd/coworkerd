@@ -186,10 +186,9 @@ For a kernel you built from source, use the `KERNEL_DIR` set in the source-build
 ```bash
 KERNEL_DIR="${KERNEL_DIR:-$(python3 scripts/fetch-kernel.py)}"
 bash scripts/build.sh -DCOWORKERD_TEST_WORKERD="$KERNEL_DIR/workerd"
-mkdir -p build/cluster/{bin,runtime,docker}
+mkdir -p build/cluster/{bin,docker}
 cp build/coworkerd build/coworkerd-apiserver build/coworkerd-launcher build/cluster/bin/
 cp "$KERNEL_DIR/workerd" "$KERNEL_DIR/coworkerd-threaded" "$KERNEL_DIR"/allowlist/coworkerd-syscalls-*.txt build/cluster/bin/
-cp runtime/runtime.js build/cluster/runtime/
 cp docker/Dockerfile docker/entrypoint.sh build/cluster/docker/
 export COWORKERD_VERSION=dev COWORKERD_PROJECT=coworkerd-dev
 docker build --build-arg COWORKERD_VERSION="$COWORKERD_VERSION" -t "coworkerd:$COWORKERD_VERSION" \
