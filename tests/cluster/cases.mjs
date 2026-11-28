@@ -2488,12 +2488,6 @@ async function durableAdmissionRefusal(cluster) {
   const tenant = await cluster.tenant('durable-refusal', { durableObjectNamespaces: 48 });
   const { databases } = await createDatabaseHomes(cluster, tenant, new Map([[databaseOwner, 1]]));
   const [db] = databases.get(databaseOwner);
-  await cluster.deploy(tenant, 'admission-delay', `
-    export default { async fetch() {
-      await scheduler.wait(5000);
-      return new Response('promise committed');
-    } };
-  `);
   await cluster.deploy(tenant, 'counter', `
     import { DurableObject } from 'cloudflare:workers';
     async function call(env, name, op) {
@@ -2531,8 +2525,8 @@ async function durableAdmissionRefusal(cluster) {
           return Response.json({ scheduled: true });
         }
         if (pathname === '/background-promise') {
-          void this.env.DELAY.fetch('http://delay/').then(reply => reply.text())
-            .then(value => this.ctx.storage.put('promise', value));
+          void scheduler.wait(5000)
+            .then(() => this.ctx.storage.put('promise', 'promise committed'));
           return Response.json({ scheduled: true });
         }
         if (pathname === '/background-result') {
@@ -2563,7 +2557,6 @@ async function durableAdmissionRefusal(cluster) {
     durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] },
     migrations: [{ tag: 'v1', new_sqlite_classes: ['Counter'] }],
     d1_databases: [{ binding: 'DB', database_name: db.name }],
-    services: [{ binding: 'DELAY', service: 'admission-delay' }],
   } });
   const { namespaceId, shards } = await cluster.api(`${tenant.path}/workers/counter/namespaces/Counter`, { token: tenant.token });
   const names = node => Array.from({ length: 64 }, (_, i) => `counter-${i}`).filter(name => {

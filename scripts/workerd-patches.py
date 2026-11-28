@@ -381,7 +381,8 @@ def allowed_path(name, path):
                                    '0180-fix-database-admission-accounting.patch',
                                    '0188-retire-idle-objects-at-admission.patch',
                                    '0190-harden-ordinary-object-admission.patch',
-                                   '0191-return-wal-slots-before-admission-tree-credit.patch'} and path in {
+                                   '0191-return-wal-slots-before-admission-tree-credit.patch',
+                                   '0192-bound-admission-wal-return.patch'} and path in {
                               'src/workerd/threaded/threaded-server.c++',
                               'src/workerd/threaded/threaded-server-test.c++'} or
                           name == '0189-test-busy-objects-with-stale-idle-observations.patch' and path ==

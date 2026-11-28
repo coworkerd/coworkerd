@@ -123,3 +123,4 @@
 0189-test-busy-objects-with-stale-idle-observations.patch
 0190-harden-ordinary-object-admission.patch
 0191-return-wal-slots-before-admission-tree-credit.patch
+0192-bound-admission-wal-return.patch

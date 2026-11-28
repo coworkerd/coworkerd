@@ -58,7 +58,7 @@ Set `COWORKERD_CLUSTER_BIN_DIR` to use daemons and a launcher from a different b
 mailbox on another. It checks Worker and object calls through fetch and RPC, plus public HTTP SQL and the D1
 binding. The child records the refusals without dispatching the writes. Closing the held invocation lets admission retire the idle tree. Once capacity returns, each caller
 retries once and the stored counter or row confirms one write per retry. The object slot also
-stays occupied while a timer and an unawaited Service Binding promise finish their writes.
+stays occupied while a timer and an unawaited scheduler promise finish their writes.
 The case checks that both stored values survive subsequent admission retirement and reopen.
 
 `durable-threaded-copy-reservation-refusal` consumes a one-shot marker at the cold-copy reservation step
