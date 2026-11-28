@@ -79,7 +79,9 @@ Use a new output path for each run. Custom batches record refusals and partial o
 `--expect-full` to require every request in each batch to overlap and succeed. For a controlled
 comparison, set `--root-limit` and `--nested-limit` on the node or `--process-limit` on its sole
 ordinary process. `--ramp-ms` spreads each batch's offers over a fixed interval while the upstream
-delay stays at two seconds. Run the fixture with the repository's verified release kernel.
+delay stays at two seconds. Set `--wait-ms` only for a separate capacity probe with a longer
+hold, which lets larger batches overlap even when they take more than two seconds to reach the
+upstream. Run the fixture with the repository's verified release kernel.
 
 The JSONL includes per-call offers, replies and upstream hold intervals, sampled node occupancy and
 refusals, and per-process RSS, threads and open descriptors. The client and upstream run in separate

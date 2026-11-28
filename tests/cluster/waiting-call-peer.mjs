@@ -3,11 +3,11 @@ import { lookup } from 'node:dns/promises';
 import { createServer, get } from 'node:http';
 import { setTimeout as delay } from 'node:timers/promises';
 
-const [role, planArg, rampArg] = process.argv.slice(2);
+const [role, planArg, rampArg, waitArg] = process.argv.slice(2);
 assert.ok(role === 'client' || role === 'upstream');
 const plan = planArg.split(',').map(Number);
 const rampMs = Number(rampArg);
-const waitMs = 2000;
+const waitMs = Number(waitArg);
 const target = role === 'client' ? (await lookup('node-1-peer', { family: 4 })).address : undefined;
 // Linux CLOCK_MONOTONIC in both containers, on the same Docker VM.
 const now = () => Number(process.hrtime.bigint()) / 1e6;
@@ -18,7 +18,7 @@ let active = 0;
 function invoke(id) {
   return new Promise((resolve, reject) => {
     const request = get('http://' + target + ':8930/waiting-capacity/wait?call=' + id,
-      { agent: false, signal: AbortSignal.timeout(12000) }, response => {
+      { agent: false, signal: AbortSignal.timeout(waitMs + 12000) }, response => {
         response.setEncoding('utf8');
         let text = '';
         response.on('data', chunk => { text += chunk; });

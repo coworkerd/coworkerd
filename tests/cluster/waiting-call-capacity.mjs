@@ -16,6 +16,7 @@ const { positionals: [kernelDirectory, outputPath, ...extra], values: options } 
     'nested-limit': { type: 'string' },
     'process-limit': { type: 'string' },
     'ramp-ms': { type: 'string', default: '0' },
+    'wait-ms': { type: 'string', default: '2000' },
     'node-memory-gib': { type: 'string', default: '16' },
     'node-tasks': { type: 'string', default: '40000' },
     'expect-full': { type: 'boolean' },
@@ -24,13 +25,14 @@ const { positionals: [kernelDirectory, outputPath, ...extra], values: options } 
 assert.ok(kernelDirectory && outputPath && !extra.length,
   'Usage: node tests/cluster/waiting-call-capacity.mjs <kernel-directory> <new-output.jsonl> ' +
   '[--batches 128,512,2000] [--root-limit N --nested-limit N] [--process-limit N] [--ramp-ms N] ' +
-  '[--node-memory-gib N] [--node-tasks N] [--expect-full]');
+  '[--wait-ms N] [--node-memory-gib N] [--node-tasks N] [--expect-full]');
 const maxCalls = 12000;
 const plan = options.batches === undefined ? [8, 16, 24, 16, 24, 8, 24, 8, 16] :
   options.batches.split(',').map(value => integer(value, 1, maxCalls));
 assert.ok(plan.length <= 12 && plan.reduce((total, count) => total + count, 0) <= 60000,
   'use at most 12 batches and 60,000 offers in one run');
-const rampMs = integer(options['ramp-ms'], 0, 1500);
+const waitMs = integer(options['wait-ms'], 2000, 12000);
+const rampMs = integer(options['ramp-ms'], 0, waitMs - 500);
 const expectFull = options['expect-full'] || options.batches === undefined;
 const rootLimit = optionalLimit('root-limit');
 const nestedLimit = optionalLimit('nested-limit');
@@ -175,11 +177,11 @@ function summarize(calls, waits, waitMs) {
     failureCounts.set(failure, (failureCounts.get(failure) ?? 0) + 1);
     return false;
   });
-  const heldTwoSeconds = released.filter(call => call.releasedMs - call.enteredMs >= waitMs).length;
+  const heldFullDelay = released.filter(call => call.releasedMs - call.enteredMs >= waitMs).length;
   const latencies = valid.map(call => call.finishedMs - call.sentMs).sort((a, b) => a - b);
   const percentile = p => latencies[Math.ceil(latencies.length * p) - 1] ?? null;
   return { replies: valid.length, failureCounts: Object.fromEntries(failureCounts), entered: intervals.length, released: released.length,
-    heldTwoSeconds, peak, peakOverlapMs, p50Ms: percentile(.5), p99Ms: percentile(.99), maxMs: percentile(1),
+    heldFullDelay, peak, peakOverlapMs, p50Ms: percentile(.5), p99Ms: percentile(.99), maxMs: percentile(1),
     offerSpanMs: Math.max(...calls.map(call => call.sentMs)) - Math.min(...calls.map(call => call.sentMs)),
     upstreamEntrySpanMs: intervals.length ?
       Math.max(...intervals.map(call => call.enteredMs)) - Math.min(...intervals.map(call => call.enteredMs)) : null };
@@ -210,13 +212,13 @@ async function run() {
     publishedPin: { releaseTag: pins.releaseTag, sha256: pins.archives[kernelRecord.architecture] },
     linux: { architecture: engine.Architecture, release: engine.KernelVersion, cpus: engine.NCPU,
       memoryBytes: engine.MemTotal, os: engine.OperatingSystem, dockerVersion: engine.ServerVersion },
-    fixture: { peerImage, plan, rampMs, recoveryMs, nodeResources, peerResources, rootLimit, nestedLimit, processLimit } });
+    fixture: { peerImage, plan, rampMs, waitMs, recoveryMs, nodeResources, peerResources, rootLimit, nestedLimit, processLimit } });
   await cluster.start();
   for (const [role, name] of Object.entries(sides)) {
     await cluster.command('docker', ['run', '--detach', '--rm', '--name', name, '--network', cluster.project + '_backend',
       '--network-alias', role === 'upstream' ? 'waiting-origin' : 'waiting-client', ...peerResources,
       '--mount', 'type=bind,source=' + peerSource + ',target=/peer.mjs,readonly',
-      peerImage, 'node', '/peer.mjs', role, plan.join(','), String(rampMs)]);
+      peerImage, 'node', '/peer.mjs', role, plan.join(','), String(rampMs), String(waitMs)]);
     started.push(name);
   }
   const tenant = await cluster.tenant(tenantName);
@@ -234,7 +236,7 @@ async function run() {
     eventually('local client ready', () => control('client', '/status')),
     cluster.command('docker', ['inspect', '--format', '{{.Image}}', sides.upstream]),
   ]);
-  const { waitMs } = origin;
+  assert.equal(origin.waitMs, waitMs);
   const warm = async () => {
     const reply = await control('client', '/warm', 'POST');
     assert.deepEqual(reply, { status: 200, nodeId: node, upstream: 'warm' });
@@ -293,14 +295,14 @@ async function run() {
     const expected = { number, offered };
     assert.deepEqual(await control('upstream', '/batch', 'POST'), expected);
     assert.deepEqual(await control('client', '/batch', 'POST'), expected);
-    const during = Promise.all([250, 1050, 1750].map(ms => capture(async () => {
+    const during = Promise.all([250, Math.max(1050, Math.ceil((rampMs + waitMs) / 2)), waitMs - 250].map(ms => capture(async () => {
       await delay(ms, undefined, { signal: controller.signal });
       return sample();
     })));
     await eventually('every client request settled', async () => {
       const observation = await control('client', '/status');
       assert.equal(observation.completed, offered);
-    }, { timeout: 16000, interval: 300 });
+    }, { timeout: rampMs + waitMs + 16000, interval: 300 });
     const [clientResult, upstreamResult, samples] = await Promise.all([
       control('client', '/result'),
       eventually('local upstream drained', async () => {
@@ -324,7 +326,7 @@ async function run() {
     assert.ok(!recovered.error, recovered.error);
     if (expectFull) {
       assert.equal(summary.replies, offered);
-      assert.equal(summary.heldTwoSeconds, offered);
+      assert.equal(summary.heldFullDelay, offered);
       assert.equal(summary.peak, offered);
       assert.ok(summary.peakOverlapMs > 0);
     }
