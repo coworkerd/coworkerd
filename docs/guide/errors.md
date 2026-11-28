@@ -101,9 +101,10 @@ operation. Catch the error in the object to choose what the handler returns.
 | `SQL_MEMORY_LIMIT_EXCEEDED` | The connection reached its 32 MiB SQLite heap limit | The active transaction rolled back. Reduce the memory needed by the statement. |
 | `OVERLOADED` | The durable process could not reserve more SQLite heap | The active transaction rolled back. The SQL error has `dispatched: false` and `retryable: true`. Retry the transaction when process headroom returns. |
 
-A rolled-back implicit turn that included earlier writes or pending alarm changes fails the
-responses waiting for confirmation. Subsequent calls reopen the last confirmed storage. A rollback
-confined to an explicit transaction can leave the same connection available.
+A rollback that affects earlier writes or pending alarm changes fails responses waiting for
+confirmation with HTTP 503. Subsequent calls reopen the last confirmed storage. A rollback
+confined to the failing statement or to an isolated explicit transaction can leave the same
+connection available.
 
 ## 2. The control plane (`/v1` and `cowctl`)
 

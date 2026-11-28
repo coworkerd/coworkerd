@@ -49,18 +49,18 @@ On the experimental threaded backend, each SQLite connection has a 32 MiB heap b
 `ctx.storage.sql`. The budget covers SQLite's live allocations, including prepared statements, page caches and
 query working memory. Each facet uses its own connection. The durable process reserves the heap
 in 64 KiB steps alongside its other memory use. The connection retains one step across small
-drops while busy. After one second idle, the home releases reclaimable page cache and excess
-reserved credit. Opening and internal maintenance are accounted for. Confirmed close returns the
-connection's remaining reservation.
+drops while busy. After one second of inactivity, the home releases reclaimable page cache and
+excess reserved credit, including while an ordinary WebSocket stays open. Opening and internal
+maintenance are accounted for. Confirmed close returns the connection's remaining reservation.
 
 A statement that exceeds the connection heap limit throws `SQL_MEMORY_LIMIT_EXCEEDED`. A shared
 reservation refusal throws `OVERLOADED` with `dispatched: false` and `retryable: true` for
 the failed SQL operation. The active transaction rolls back. A refused explicit transaction
-cannot commit, even if the callback catches the error. If a statement outside an explicit
-transaction rolls back an implicit write, or rollback affects earlier writes or pending alarm
-bookkeeping, responses waiting for those writes fail and the object resets. The next call
-opens the last confirmed storage. After rollback confined to an isolated transaction, the same
-connection can serve further statements. When shared headroom returns, retry the transaction.
+cannot commit, even if the callback catches the error. If rollback affects earlier writes or a
+pending alarm change, responses waiting for storage confirmation fail with HTTP 503 and the
+object resets. The next call opens the last confirmed storage. If the statement opened its own
+implicit transaction or the rollback stays within an isolated explicit transaction, the same
+object can serve further statements. When shared headroom returns, retry the transaction.
 Side effects elsewhere in the handler may have run.
 
 Isolate copies and SQLite reservations share seven eighths of the configured

@@ -13,6 +13,7 @@ assert.ok(baseline && candidate && extra.length === 0,
 
 const source = `
   import { DurableObject } from 'cloudflare:workers';
+  const sort = 'SELECT sum(id) AS value FROM (SELECT id FROM sort_rows ORDER BY payload LIMIT 384)';
   export class Ledger extends DurableObject {
     instance = crypto.randomUUID();
     fetch(request) {
@@ -20,11 +21,20 @@ const source = `
       if (request.url.endsWith('/seed')) {
         sql.exec('CREATE TABLE ledger (id INTEGER PRIMARY KEY, value INTEGER)');
         sql.exec('INSERT INTO ledger VALUES (1, 0)');
+        sql.exec("CREATE TABLE sort_rows AS WITH RECURSIVE rows(id) AS (VALUES(1) UNION ALL "
+          + "SELECT id + 1 FROM rows WHERE id < 512) SELECT id, printf('%04d', 513 - id) "
+          + "|| hex(zeroblob(384)) AS payload FROM rows");
+        const plan = sql.exec('EXPLAIN QUERY PLAN ' + sort).toArray();
+        if (!plan.some(row => row.detail.includes('TEMP B-TREE FOR ORDER BY'))) {
+          throw new Error('expected the query to sort in a temporary B-tree');
+        }
       }
       const write = request.method === 'POST';
       let value;
       if (write) {
         value = sql.exec('UPDATE ledger SET value = value + 1 WHERE id = 1 RETURNING value').one().value;
+      } else if (request.url.endsWith('/sort')) {
+        value = sql.exec(sort).one().value;
       } else {
         for (let i = 0; i < 8; i++) {
           value = sql.exec('SELECT value FROM ledger WHERE id = ?', 1).one().value;
@@ -75,7 +85,7 @@ async function measure(label, kernel, round) {
       assert.equal(current.binarySha256, binarySha256);
       return current;
     });
-    const call = async (operation, suffix = '') => json(await request(cluster.urls[node],
+    const call = async (operation, suffix = operation === 'sort' ? '/sort' : '') => json(await request(cluster.urls[node],
       `/${tenant.name}/ledger${suffix}`, { method: operation === 'write' ? 'POST' : 'GET' }),
     200, operation);
     const initial = await call('read', '/seed');
@@ -87,7 +97,7 @@ async function measure(label, kernel, round) {
       return Number(fields[11]) + Number(fields[12]);
     };
     let expected = 50;
-    for (const operation of ['read', 'write']) {
+    for (const operation of ['read', 'write', 'sort']) {
       const before = await ticks();
       const started = performance.now();
       const pending = [];
@@ -126,7 +136,8 @@ async function measure(label, kernel, round) {
           Array.from({ length: samples }, (_, i) => expected + i + 1));
         expected += samples;
       } else {
-        assert.ok(successful.every(row => row.value === expected));
+        const expectedValue = operation === 'sort' ? 123072 : expected;
+        assert.ok(successful.every(row => row.value === expectedValue));
       }
     }
     assert.equal((await call('read')).value, expected);

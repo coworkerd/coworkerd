@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: maslow <wangfugen@126.com>
-Date: Sat, 28 Nov 2026 05:15:46 +0800
+Date: Sat, 28 Nov 2026 09:54:22 +0800
 Subject: [PATCH] Budget SQLite heap for threaded Durable Objects
 
 Charge live ordinary object connections to the durable process, enforce the per-connection cap in tenant SQL, and preserve the confirmation contract when a refusal rolls back pending writes.
@@ -156,7 +156,7 @@ index 090c91902a3f48fa0717ffa822b5e0e862cd2943..971e2b076c43132254de57a36bd0e88b
    friend class Statement;
  
 diff --git a/src/workerd/io/actor-sqlite.c++ b/src/workerd/io/actor-sqlite.c++
-index a9fad6b15915875f292b57b20d822f7fb2a65d2a..92639735c8e76cfe0d5621f8915a6da7ec0e130c 100644
+index a9fad6b15915875f292b57b20d822f7fb2a65d2a..7fa3cc546d98f0c4eb35de13b86042f084c865be 100644
 --- a/src/workerd/io/actor-sqlite.c++
 +++ b/src/workerd/io/actor-sqlite.c++
 @@ -55,6 +55,23 @@ ActorSqlite::ActorSqlite(kj::Own<SqliteDatabase> dbParam,
@@ -220,21 +220,27 @@ index a9fad6b15915875f292b57b20d822f7fb2a65d2a..92639735c8e76cfe0d5621f8915a6da7
    if (parent == kj::none && actorSqlite.db->getWalTransactionLimit() != nullptr) {
      actorSqlite.db->rollbackWalTransaction();
      alarmDirty = false;
-@@ -369,11 +391,13 @@ kj::Promise<void> ActorSqlite::startImplicitTxnImpl(kj::Own<ImplicitTxn> txn) {
-   // transaction by evaluating by awaiting kj::yield() first, which runs the function on the next
+@@ -370,14 +392,15 @@ kj::Promise<void> ActorSqlite::startImplicitTxnImpl(kj::Own<ImplicitTxn> txn) {
    // turn of the event loop
    co_await kj::yield();
-+  if (txn->wasRolledBackForSqlMemory()) co_return;
  
-   // If there were tasks blocking the transaction, wait for them.
-   if (!blockTasks.isEmpty()) {
+-  // If there were tasks blocking the transaction, wait for them.
+-  if (!blockTasks.isEmpty()) {
++  // A rolled-back transaction must not wait on tasks started by its replacement.
++  if (!txn->wasRolledBackForSqlMemory() && !blockTasks.isEmpty()) {
      co_await blockTasks.onEmpty();
    }
+ 
+-  // Don't commit if shutdown() has been called, or if one of the blockTasks threw, or we broke
+-  // for any other reason before the transaction could complete.
++  // Fail the existing output lock if rollback broke the actor, including when a
++  // response was already waiting for this commit.
+   requireNotBroken();
 +  if (txn->wasRolledBackForSqlMemory()) co_return;
  
-   // Don't commit if shutdown() has been called, or if one of the blockTasks threw, or we broke
-   // for any other reason before the transaction could complete.
-@@ -405,6 +429,7 @@ kj::Promise<void> ActorSqlite::startImplicitTxnImpl(kj::Own<ImplicitTxn> txn) {
+   // Start the schedule request before commit(), for correctness in workerd.
+   auto precommitAlarmState = startPrecommitAlarmScheduling();
+@@ -405,6 +428,7 @@ kj::Promise<void> ActorSqlite::startImplicitTxnImpl(kj::Own<ImplicitTxn> txn) {
  
  void ActorSqlite::onWrite(bool allowUnconfirmed) {
    requireNotBroken();
@@ -242,7 +248,7 @@ index a9fad6b15915875f292b57b20d822f7fb2a65d2a..92639735c8e76cfe0d5621f8915a6da7
    if (currentTxn.is<NoTxn>()) {
      startImplicitTxn();
    }
-@@ -859,6 +884,9 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::setAlarm(
+@@ -859,6 +883,9 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::setAlarm(
    KJ_IF_SOME(exp, currentTxn.tryGet<ExplicitTxn*>()) {
      exp->setAlarmDirty();
    } else {
@@ -252,7 +258,7 @@ index a9fad6b15915875f292b57b20d822f7fb2a65d2a..92639735c8e76cfe0d5621f8915a6da7
      haveDeferredDelete = false;
    }
  
-@@ -868,6 +896,7 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::setAlarm(
+@@ -868,6 +895,7 @@ kj::Maybe<kj::Promise<void>> ActorSqlite::setAlarm(
  kj::OneOf<kj::Own<ActorCacheInterface::Transaction>, kj::Promise<void>> ActorSqlite::
      startTransaction() {
    requireNotBroken();
@@ -260,7 +266,7 @@ index a9fad6b15915875f292b57b20d822f7fb2a65d2a..92639735c8e76cfe0d5621f8915a6da7
  
    KJ_IF_SOME(itxn, currentTxn.tryGet<ImplicitTxn*>()) {
      return itxn->waitForCompletion();
-@@ -885,6 +914,7 @@ kj::OneOf<kj::Own<ActorCacheInterface::Transaction>, kj::Promise<void>> ActorSql
+@@ -885,6 +913,7 @@ kj::OneOf<kj::Own<ActorCacheInterface::Transaction>, kj::Promise<void>> ActorSql
  ActorCacheInterface::DeleteAllResults ActorSqlite::deleteAll(
      WriteOptions options, SpanParent traceSpan, DeleteAllOptions deleteAllOptions) {
    requireNotBroken();
@@ -366,28 +372,39 @@ index b82413c9bae32a96f505bdda2a7c5dec1cfb3d02..2635c7767873b29a08dbd6d34bec93e1
    error.setDetail(COWORKERD_CODE_DETAIL_ID, kj::heapArray(code.asBytes()));
    return error;
 diff --git a/src/workerd/server/factory/coworkerd-durable-admission.c++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
-index a793aac7257991a114bcf3f37520c264ef1542f6..d553a0ffa3272026554809f3da60379588ff953f 100644
+index a793aac7257991a114bcf3f37520c264ef1542f6..21fe0e2d2a4dbfedc899553997790fb7fb7b9b08 100644
 --- a/src/workerd/server/factory/coworkerd-durable-admission.c++
 +++ b/src/workerd/server/factory/coworkerd-durable-admission.c++
-@@ -384,6 +384,10 @@ void DurableIdleLifecycle::pendingFinished(Pending operation, Time now) {
+@@ -384,11 +384,19 @@ void DurableIdleLifecycle::pendingFinished(Pending operation, Time now) {
    if (pending.empty()) lastUnblocked = now;
  }
  
++DurableIdleLifecycle::Time DurableIdleLifecycle::idleSince() const {
++  return std::max(lastEvent, lastUnblocked);
++}
++
 +bool DurableIdleLifecycle::idleFor(Time now, std::chrono::seconds interval) const {
-+  return pending.empty() && now - std::max(lastEvent, lastUnblocked) >= interval;
++  return pending.empty() && now - idleSince() >= interval;
 +}
 +
  DurableIdleLifecycle::Decision DurableIdleLifecycle::check(
      Time now, bool hasOrdinarySocket, bool pressured) {
    if (ordinarySocket && !hasOrdinarySocket) lastUnblocked = now;
+   ordinarySocket = hasOrdinarySocket;
+-  const auto idle = now - std::max(lastEvent, lastUnblocked);
++  const auto idle = now - idleSince();
+   if (!pending.empty() && now - *pending.rbegin() < std::chrono::minutes(15)) {
+     return Decision::WAIT;
+   }
 diff --git a/src/workerd/server/factory/coworkerd-durable-admission.h b/src/workerd/server/factory/coworkerd-durable-admission.h
-index a5355ec578e469118e4a00056436a708a48354d4..5cefa676742c3e7584d7a03f6e8025d4f04d9770 100644
+index a5355ec578e469118e4a00056436a708a48354d4..97f64d65fe90ae59eb19fd99ae65b6c520f67e5b 100644
 --- a/src/workerd/server/factory/coworkerd-durable-admission.h
 +++ b/src/workerd/server/factory/coworkerd-durable-admission.h
-@@ -176,6 +176,7 @@ class DurableIdleLifecycle {
+@@ -176,6 +176,8 @@ class DurableIdleLifecycle {
    Pending pendingStarted(Time now);
    void pendingFinished(Pending pending, Time now);
    bool hasPending() const { return !pending.empty(); }
++  Time idleSince() const;
 +  bool idleFor(Time now, std::chrono::seconds interval) const;
    Decision check(Time now, bool hasOrdinarySocket, bool pressured);
  
@@ -408,7 +425,7 @@ index 7ed3e940c34e4a80dfbe99a7fd95d5d0166a6de7..6ca675465a476625d2a1f0493df6eac0
  
  kj::Own<DurableLogShipper> DurableStorage::ship(kj::StringPtr uniqueKey,
 diff --git a/src/workerd/threaded/threaded-server-test.c++ b/src/workerd/threaded/threaded-server-test.c++
-index 974470feb6085ee0f537f33022c5fd492097f987..be2011c0612c7dac1afa5b5b0ce345167260fd1b 100644
+index 974470feb6085ee0f537f33022c5fd492097f987..4ec6a3727f4eebe079da57c187ce97b486f13824 100644
 --- a/src/workerd/threaded/threaded-server-test.c++
 +++ b/src/workerd/threaded/threaded-server-test.c++
 @@ -4,6 +4,7 @@
@@ -419,7 +436,7 @@ index 974470feb6085ee0f537f33022c5fd492097f987..be2011c0612c7dac1afa5b5b0ce34516
  #include <workerd/server/factory/coworkerd-wal-wire.h>
  
  #include <spawn.h>
-@@ -754,6 +755,140 @@ KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and re
+@@ -754,6 +755,154 @@ KJ_TEST("SQLite heap held by multiple databases meets the process ceiling and re
    KJ_EXPECT(budget->memoryReserved.load() == beforeOpen);
  }
  
@@ -495,15 +512,29 @@ index 974470feb6085ee0f537f33022c5fd492097f987..be2011c0612c7dac1afa5b5b0ce34516
 +  KJ_EXPECT(t.rows() == 2);
 +}
 +
-+KJ_TEST("ordinary object SQLite refusal fails the output gate for earlier writes") {
++KJ_TEST("ordinary object SQLite refusal of the first write keeps the connection open") {
++  ObjectSqlHeapTest t(ObjectSqlHeapTest::MiB);
++  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
++      t.run("INSERT INTO entries VALUES (2, randomblob(?))", ObjectSqlHeapTest::largeBlob));
++  KJ_EXPECT(!t.db->observedCriticalError());
++  KJ_EXPECT(t.rows() == 1);
++  t.flush();
++  KJ_EXPECT(t.commits == 1);
++  t.run("INSERT INTO entries VALUES (3, NULL)");
++  t.flush();
++  KJ_EXPECT(t.commits == 2);
++  KJ_EXPECT(t.rows() == 2);
++}
++
++KJ_TEST("ordinary object SQLite refusal fails a response already waiting on the output gate") {
 +  ObjectSqlHeapTest t(ObjectSqlHeapTest::MiB);
 +  t.run("INSERT INTO entries VALUES (2, NULL)");
-+  {
-+    SqliteDatabase::ObjectSqlTransaction txn(*t.db);
-+    t.db->run("SAVEPOINT object_sync");
-+    KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
-+        t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob));
-+  }
++  t.actor->blockTransaction(kj::NEVER_DONE);
++  auto waitingResponse = t.gate.wait(nullptr);
++  KJ_REQUIRE(!waitingResponse.poll(t.waitScope));
++  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED",
++      t.run("INSERT INTO entries VALUES (3, randomblob(?))", ObjectSqlHeapTest::largeBlob));
++  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED", waitingResponse.wait(t.waitScope));
 +  KJ_EXPECT(t.db->observedCriticalError());
 +  KJ_EXPECT(t.rows() == 1);
 +  KJ_EXPECT_THROW_MESSAGE("SQL_MEMORY_LIMIT_EXCEEDED", t.flush());
@@ -561,7 +592,7 @@ index 974470feb6085ee0f537f33022c5fd492097f987..be2011c0612c7dac1afa5b5b0ce34516
    constexpr auto MiB = ResourceBudget::MiB;
    auto budget = std::make_shared<ResourceBudget>(96 * MiB, 4, 2, ResourceBudget::ReclaimMode::NONE);
 diff --git a/src/workerd/threaded/threaded-server.c++ b/src/workerd/threaded/threaded-server.c++
-index 9656855c948c66daf2ea8a93aa05e484324a8723..476b4c7318eb715b14e27d624362659bff75daa4 100644
+index 9656855c948c66daf2ea8a93aa05e484324a8723..83909e7e5fc8ab03e6d4c76701a4078eef84b6d8 100644
 --- a/src/workerd/threaded/threaded-server.c++
 +++ b/src/workerd/threaded/threaded-server.c++
 @@ -1967,6 +1967,7 @@ server::DurableIdleLifecycle::Time durableIdleNow() {
@@ -576,7 +607,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..476b4c7318eb715b14e27d624362659b
      bool idleClosing = false;
      bool cancelExpiredWork = false;
      bool admissionClosing = false;
-+    bool sqliteTrimmed = false;
++    std::optional<server::DurableIdleLifecycle::Time> sqliteTrimmedForIdleSince;
      std::shared_ptr<class DurableNodeSockets> nodeSockets;
      kj::Function<bool()> hasLocalSockets;
      kj::Function<kj::Promise<SocketParkResult>()> parkSockets;
@@ -588,39 +619,24 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..476b4c7318eb715b14e27d624362659b
    std::atomic<uint64_t> durableAdmissionRetirements{0};
    std::atomic<uint64_t> durableActorResets{0}, durableIsolateResets{0};
    std::atomic<uint64_t> nextDurableActor{0};
-@@ -3372,6 +3375,7 @@ struct ThreadedServer {
-     KJ_REQUIRE(durableAdmission->markSocket(ticket, state.durableHome), "the durable tree is closing");
-     KJ_ASSERT(root.sockets.emplace(ticket.event, session).second);
-     root.idle->eventFinished(durableIdleNow());
-+    root.sqliteTrimmed = false;
-   }
- 
-   bool finishDurable(server::DurableAdmission::Ticket ticket, bool databaseCanRetire = false) {
-@@ -3459,6 +3463,7 @@ struct ThreadedServer {
-         if (root != state.durableRoots.end() && !root->second.resetting) {
-           root->second.sockets.erase(call.ticket.event);
-           root->second.idle->eventFinished(durableIdleNow());
-+          root->second.sqliteTrimmed = false;
-         }
-       }
-     });
-@@ -3637,7 +3642,14 @@ struct ThreadedServer {
+@@ -3637,7 +3640,15 @@ struct ThreadedServer {
          else if (root.cancelExpiredWork)
            decision = Decision::CANCEL_PENDING;
        }
 -      if (decision == Decision::WAIT) continue;
 +      if (decision == Decision::WAIT) {
-+        if (!ordinarySocket && !root.sqliteTrimmed &&
++        const auto idleSince = root.idle->idleSince();
++        if (root.sqliteTrimmedForIdleSince != idleSince &&
 +            root.idle->idleFor(now, std::chrono::seconds(1))) {
 +          trimIdleObjectSqlite(*root.tree);
-+          root.sqliteTrimmed = true;
++          root.sqliteTrimmedForIdleSince = idleSince;
 +        }
 +        continue;
 +      }
        const bool cancelPending = decision == Decision::CANCEL_PENDING;
        const bool closeSocketSessions = !root.sockets.empty() && !root.resetting && !root.idleClosing;
        if (root.resetting || root.idleClosing) root.stopFacets(nullptr);
-@@ -3830,6 +3842,7 @@ struct ThreadedServer {
+@@ -3830,6 +3841,7 @@ struct ThreadedServer {
          ",\"reservedDescriptors\":" + std::to_string(state.reserved.descriptors) +
          ",\"reservedBytes\":" + std::to_string(state.reserved.memory) +
          ",\"sqliteHeapReservedBytes\":" + std::to_string(resources->sqliteMemoryReserved.load()) +
@@ -628,7 +644,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..476b4c7318eb715b14e27d624362659b
          ",\"copyMemoryReservedBytes\":" + std::to_string(resources->memoryReserved.load()) +
          ",\"copyMemoryMaximum\":" + std::to_string(resources->memoryMaximum) +
          ",\"overloaded\":" + std::to_string(state.overloads) +
-@@ -6345,6 +6358,7 @@ struct DurableTreeContext {
+@@ -6345,6 +6357,7 @@ struct DurableTreeContext {
    kj::Own<server::FacetTreeIndex> index;
    std::shared_ptr<server::DurableIdleLifecycle> idle;
    std::map<uint, server::DurableLogShipper*> shippers;
@@ -636,7 +652,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..476b4c7318eb715b14e27d624362659b
    uint liveFacets = 0;
    std::shared_ptr<DurableNodeSockets> nodeSockets;
    std::map<uint, SocketManager> socketManagers;
-@@ -6370,6 +6384,10 @@ struct DurableTreeContext {
+@@ -6370,6 +6383,10 @@ struct DurableTreeContext {
    }
  };
  
@@ -647,7 +663,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..476b4c7318eb715b14e27d624362659b
  void beginDurableUpgrade(DurableTreeContext &tree, kj::StringPtr invocation) {
    KJ_ASSERT(tree.socketUpgradeInvocations.emplace(invocation.begin(), invocation.end()).second);
  }
-@@ -7199,19 +7217,22 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7199,19 +7216,22 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
    auto *borrowedObserver = observer.get();
    if (reservation) observer = kj::mv(observer).attachToThisReference(std::move(reservation));
    auto makeCache = [tree, facet, parentFacet, name = kj::str(facetName),
@@ -676,7 +692,7 @@ index 9656855c948c66daf2ea8a93aa05e484324a8723..476b4c7318eb715b14e27d624362659b
        sqliteProcessBudget = slot->reservation;
      }
      KJ_ASSERT(tree->server.durableLog.get() == nullptr || prepared != kj::none,
-@@ -7226,6 +7247,15 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
+@@ -7226,6 +7246,15 @@ DurableActorHandle makeDurableActor(const std::shared_ptr<DurableTreeContext> &t
      }
      auto database = tree->storage().open(tree->uniqueKey, tree->storageId, observer, facet,
          sqlWalFrameLimitBytes, memoryLimit, std::move(sqliteProcessBudget));
@@ -791,7 +807,7 @@ index c692e7c32c1f96f90cb21b0b2cc5737db82b14f7..49b642840a032e67cf0019e6855f84b6
  
    // Thread-local pointer to the active scope. Set to this on construction (if not already set),
 diff --git a/src/workerd/util/sqlite.c++ b/src/workerd/util/sqlite.c++
-index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb38132973bc0 100644
+index c3248ac983258d0ffa872f8d375cd45df6239059..cfebc4b18a009425efb8435052d0454a83bda193 100644
 --- a/src/workerd/util/sqlite.c++
 +++ b/src/workerd/util/sqlite.c++
 @@ -6,6 +6,7 @@
@@ -802,7 +818,7 @@ index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb381
  #include <workerd/jsg/exception.h>
  #include <workerd/util/autogate.h>
  #include <workerd/util/entropy.h>
-@@ -918,19 +919,100 @@ SqliteDatabase::operator sqlite3*() {
+@@ -918,19 +919,102 @@ SqliteDatabase::operator sqlite3*() {
  }
  
  SqliteMemoryScope SqliteDatabase::enterMemoryScope() {
@@ -837,7 +853,8 @@ index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb381
 +      "SQL_MEMORY_LIMIT_EXCEEDED");
 +}
 +
-+void SqliteDatabase::settleObjectSqlRefusal(SqliteMemoryScope::LimitRefusal refusal) {
++void SqliteDatabase::settleObjectSqlRefusal(
++    SqliteMemoryScope::LimitRefusal refusal, bool transactionWasOpen) {
 +  if (objectSqlTransactionDepth != 0) objectSqlTransactionRefusal = refusal;
 +  auto exception = objectSqlMemoryException(refusal);
 +  try {
@@ -846,7 +863,8 @@ index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb381
 +      clearCommitCheck();
 +      // A rolled-back implicit turn could contain writes outside a callback,
 +      // including writes by other events whose responses are waiting on it.
-+      const bool needsFailedOutput = objectSqlTransactionDepth == 0 || objectSqlTransactionWasOpen;
++      const bool needsFailedOutput =
++          objectSqlTransactionDepth == 0 ? transactionWasOpen : objectSqlTransactionWasOpen;
 +      KJ_IF_SOME(callback, objectSqlRollback) {
 +        criticalErrorOccurred = callback(needsFailedOutput, exception);
 +      }
@@ -911,7 +929,7 @@ index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb381
  }
  
  bool SqliteDatabase::observedCriticalError() {
-@@ -966,7 +1048,7 @@ void SqliteDatabase::rollbackWalTransaction() {
+@@ -966,7 +1050,7 @@ void SqliteDatabase::rollbackWalTransaction() {
    // allocations while allowing the trusted rollback to finish. The platform
    // transaction calls this after leaving the failed SQLite call's memory scope.
    SqliteMemoryScope memoryScope(sqliteMemoryBytes, kj::maxValue, processMemoryBudget.get(),
@@ -920,7 +938,7 @@ index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb381
    if (!sqlite3_get_autocommit(*this)) {
      run("ROLLBACK TRANSACTION");
    } else {
-@@ -978,6 +1060,17 @@ void SqliteDatabase::rollbackWalTransaction() {
+@@ -978,6 +1062,17 @@ void SqliteDatabase::rollbackWalTransaction() {
  void SqliteDatabase::releaseCachedMemory() {
    auto memoryScope = enterMemoryScope();
    sqlite3_db_release_memory(*this);
@@ -938,7 +956,7 @@ index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb381
  }
  
  bool SqliteSpillBudget::tryCharge(uint64_t bytes) noexcept {
-@@ -1138,6 +1231,11 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
+@@ -1138,6 +1233,11 @@ void SqliteDatabase::handleCriticalError(kj::Maybe<int> errorCode,
      kj::Maybe<const kj::Exception&> maybeException) {
    KJ_IF_SOME(code, errorCode) {
      if (code == SQLITE_OK) return;
@@ -950,7 +968,7 @@ index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb381
      auto* limit = getWalTransactionLimit();
      const bool platformTransaction = limit != nullptr && limit->isActive();
      const bool platformCanSettle = platformTransaction && maybeException == kj::none;
-@@ -1557,7 +1655,8 @@ void SqliteDatabase::close() noexcept {
+@@ -1557,7 +1657,8 @@ void SqliteDatabase::close() noexcept {
  
    SqliteMemoryScope memoryScope(sqliteMemoryBytes,
        processMemoryBudget == nullptr ? sqliteMaxMemoryBytes : size_t(kj::maxValue),
@@ -960,7 +978,7 @@ index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb381
  
    KJ_IF_SOME(db, maybeDb) {
      for (auto& listener: resetListeners) {
-@@ -2289,8 +2388,14 @@ void SqliteDatabase::Query::nextRow(bool first) {
+@@ -2289,8 +2390,14 @@ void SqliteDatabase::Query::nextRow(bool first) {
        done = true;
      } else if (err != SQLITE_ROW) {
        KJ_ON_SCOPE_FAILURE({
@@ -977,7 +995,7 @@ index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb381
            // A failing iterator can outlive the JS callback. Release the VM's
            // allocations and temporary files now, so rollback and the next
            // statement have room.
-@@ -2341,11 +2446,21 @@ SqliteDatabase::Query::ValuePtr SqliteDatabase::Query::getValue(uint column) {
+@@ -2341,11 +2448,21 @@ SqliteDatabase::Query::ValuePtr SqliteDatabase::Query::getValue(uint column) {
  kj::StringPtr SqliteDatabase::Query::getColumnName(uint column) {
    auto memoryScope = db.enterMemoryScope();
    sqlite3_stmt* statement = getStatement();
@@ -1001,7 +1019,7 @@ index c3248ac983258d0ffa872f8d375cd45df6239059..db904bdfb88ee0daed76fb1df48bb381
      // A column accessor can allocate, for example when it expands a zero BLOB.
      // Finalize this execution now rather than returning a bogus empty value.
 diff --git a/src/workerd/util/sqlite.h b/src/workerd/util/sqlite.h
-index c2f5ba84ac493ace98494bae394ba6d87fa7abac..3938e2074d70bb2efbbbba50778e83b0d4c51616 100644
+index c2f5ba84ac493ace98494bae394ba6d87fa7abac..c4369a0c7ca39a6535a816832c95747b2106ccda 100644
 --- a/src/workerd/util/sqlite.h
 +++ b/src/workerd/util/sqlite.h
 @@ -7,6 +7,7 @@
@@ -1012,7 +1030,7 @@ index c2f5ba84ac493ace98494bae394ba6d87fa7abac..3938e2074d70bb2efbbbba50778e83b0
  #include <kj/filesystem.h>
  #include <kj/function.h>
  #include <kj/list.h>
-@@ -323,6 +324,46 @@ class SqliteDatabase {
+@@ -323,6 +324,49 @@ class SqliteDatabase {
    void setWalHook(WalHook callback, void* context);
    void rollbackWalTransaction();
    void releaseCachedMemory();
@@ -1025,6 +1043,7 @@ index c2f5ba84ac493ace98494bae394ba6d87fa7abac..3938e2074d70bb2efbbbba50778e83b0
 +    if (!hasObjectSqlBudget()) return func();
 +    requireObjectSqlTransaction();
 +    KJ_ASSERT(objectSqlRefusal == nullptr);
++    const bool transactionWasOpen = inTransaction || !savepoints.empty();
 +    auto refusal = SqliteMemoryScope::LimitRefusal::NONE;
 +    objectSqlRefusal = &refusal;
 +    KJ_DEFER(objectSqlRefusal = nullptr);
@@ -1032,7 +1051,9 @@ index c2f5ba84ac493ace98494bae394ba6d87fa7abac..3938e2074d70bb2efbbbba50778e83b0
 +      return func();
 +    } catch (...) {
 +      objectSqlRefusal = nullptr;
-+      if (refusal != SqliteMemoryScope::LimitRefusal::NONE) settleObjectSqlRefusal(refusal);
++      if (refusal != SqliteMemoryScope::LimitRefusal::NONE) {
++        settleObjectSqlRefusal(refusal, transactionWasOpen);
++      }
 +      throw;
 +    }
 +  }
@@ -1059,7 +1080,7 @@ index c2f5ba84ac493ace98494bae394ba6d87fa7abac..3938e2074d70bb2efbbbba50778e83b0
  
    // Invoke the onWrite() callback.
    //
-@@ -468,6 +509,7 @@ class SqliteDatabase {
+@@ -468,6 +512,7 @@ class SqliteDatabase {
    // The amount of memory in bytes used by this database for use by sqlite3_mem_methods.
    size_t sqliteMemoryBytes = 0;
    std::shared_ptr<SqliteProcessMemoryBudget> processMemoryBudget;
@@ -1067,7 +1088,7 @@ index c2f5ba84ac493ace98494bae394ba6d87fa7abac..3938e2074d70bb2efbbbba50778e83b0
  
    // The maximum amount of memory in bytes that can be used by this database for use by
    // sqlite3_mem_methods (from WorkerLimits::sqliteMaxMemoryMb). This is set to kj::maxValue to
-@@ -510,6 +552,15 @@ class SqliteDatabase {
+@@ -510,6 +555,16 @@ class SqliteDatabase {
    kj::Maybe<sqlite3_stmt&> currentStatement;
  
    bool criticalErrorOccurred = false;
@@ -1078,12 +1099,13 @@ index c2f5ba84ac493ace98494bae394ba6d87fa7abac..3938e2074d70bb2efbbbba50778e83b0
 +  bool objectSqlTransactionWasOpen = false;
 +  kj::Maybe<kj::Function<bool(bool, const kj::Exception&)>> objectSqlRollback;
 +  bool hasObjectSqlBudget() const;
-+  [[noreturn]] void settleObjectSqlRefusal(SqliteMemoryScope::LimitRefusal refusal);
++  [[noreturn]] void settleObjectSqlRefusal(
++      SqliteMemoryScope::LimitRefusal refusal, bool transactionWasOpen);
 +
    kj::Maybe<kj::Function<void(bool allowUnconfirmed)>> onWriteCallback;
    kj::Maybe<kj::Function<void(kj::StringPtr errorMessage, kj::Maybe<kj::Exception> maybeException)>>
        onCriticalErrorCallback;
-@@ -713,6 +764,12 @@ class SqliteDatabase::Query final: private ResetListener {
+@@ -713,6 +768,12 @@ class SqliteDatabase::Query final: private ResetListener {
    // that the method is being run on, otherwise this is quite a gotcha.
    uint changeCount();
  
