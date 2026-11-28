@@ -1,4 +1,4 @@
-// Run the cluster workloads on both instrumented kernel executables. Keep the strace
+// Run the cluster workloads on the instrumented threaded executable, the only one a node starts. Keep the strace
 // process separate so the node still reports the executable's PID in its lifecycle log.
 import { appendFile, chmod, mkdir, mkdtemp, readFile, rename, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 const [kernel, output] = process.argv.slice(2).map(path => resolve(path));
 const { Cluster } = await import(pathToFileURL(resolve('tests/cluster/cluster.mjs')));
 const { cases } = await import(pathToFileURL(resolve('tests/cluster/cases.mjs')));
-const programs = ['workerd', 'coworkerd-threaded'];
+const programs = ['coworkerd-threaded'];
 const wrapper = `#!/bin/sh
 set -eu
 binary=$(basename "$0")

@@ -12,7 +12,7 @@ import sys
 import tempfile
 import unittest
 
-from kernel_artifacts import ARCHITECTURES, BINARIES, ROOT, archive_name, sha256
+from kernel_artifacts import ARCHITECTURES, BINARIES, PROFILED, ROOT, archive_name, sha256
 
 
 class KernelArtifactsTest(unittest.TestCase):
@@ -73,7 +73,7 @@ class KernelArtifactsTest(unittest.TestCase):
             path.write_bytes(b"\x7fELF\x02\x01\x01" + b"\0" * 9
                              + struct.pack("<HH", 3, elf_machine) + b"\0" * 44 + name.encode())
             path.chmod(0o755)
-        workerd = sha256(self.checkout / BINARIES["workerd"])
+        workerd = sha256(self.checkout / BINARIES[PROFILED[0]])
         record = {"architecture": machine, "workerd": {"sha256": workerd},
                   "profiles": [{"run": "fixture"}], "generatedAt": "fixture"}
         for kind in ("startup", "steady"):
@@ -151,7 +151,7 @@ class KernelArtifactsTest(unittest.TestCase):
             stream.write("\n")
         self.assertIn("do not match this upstream and patch series", self.fetch(arch, ok=False).stderr)
 
-    def test_bundle_requires_one_run_and_both_profiled_binaries(self):
+    def test_bundle_requires_one_run_and_a_profile_of_the_threaded_binary(self):
         commit = self.git(self.root, "rev-parse", "HEAD").decode().strip()
         env = {**os.environ, "GITHUB_REPOSITORY": "example/kernel", "GITHUB_RUN_ID": "42",
                "GITHUB_RUN_ATTEMPT": "1", "GITHUB_WORKFLOW_SHA": commit}
@@ -195,7 +195,19 @@ class KernelArtifactsTest(unittest.TestCase):
                         "--out", str(self.out), env=env)
         wrong_profile = self.run_script("kernel-release.py", "assemble", str(self.out), "--commit", commit,
                                         env=env, ok=False)
-        self.assertIn("syscall profiles must cover these exact two binaries", wrong_profile.stderr)
+        self.assertIn("syscall profiles must cover the threaded executable", wrong_profile.stderr)
+
+        # A table made after the node stopped starting the upstream binary names the threaded one alone.
+        for each in ARCHITECTURES:
+            self.write_build(each)
+            threaded = sha256(self.checkout / BINARIES[PROFILED[0]])
+            record = json.loads(allowlist.read_text())
+            record["workerd"]["sha256s"] = [threaded]
+            record["profiles"] = [{"run": PROFILED[0], "workerdSha256": threaded}]
+            allowlist.write_text(json.dumps(record))
+            self.run_script("package-kernel.py", "--github-run", "--arch", each, "--allowlist", str(self.allowlist),
+                            "--out", str(self.out), env=env)
+        self.run_script("kernel-release.py", "assemble", str(self.out), "--commit", commit, env=env)
 
 
 if __name__ == "__main__":
