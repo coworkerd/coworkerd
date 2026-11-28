@@ -204,11 +204,13 @@ async function run() {
   assert.ok(pins.archives[kernelRecord.architecture], 'use the published kernel pinned by this checkout');
   assert.equal(hashes.workerd, kernelRecord.files.workerd);
   assert.equal(hashes.threaded, kernelRecord.files['coworkerd-threaded']);
-  const [productCommit, engine] = await Promise.all([
+  const productRevision = process.env.COWORKERD_CLUSTER_PRODUCT_COMMIT ?? 'HEAD';
+  const [productCommit, fixtureCommit, engine] = await Promise.all([
+    cluster.command('git', ['rev-parse', '--verify', productRevision + '^{commit}'], { cwd: projectRoot }),
     cluster.command('git', ['rev-parse', 'HEAD'], { cwd: projectRoot }),
     cluster.command('docker', ['info', '--format', '{{json .}}']).then(JSON.parse),
   ]);
-  await record({ type: 'provenance', at: new Date().toISOString(), productCommit, hashes, kernel: kernelRecord,
+  await record({ type: 'provenance', at: new Date().toISOString(), productCommit, fixtureCommit, hashes, kernel: kernelRecord,
     publishedPin: { releaseTag: pins.releaseTag, sha256: pins.archives[kernelRecord.architecture] },
     linux: { architecture: engine.Architecture, release: engine.KernelVersion, cpus: engine.NCPU,
       memoryBytes: engine.MemTotal, os: engine.OperatingSystem, dockerVersion: engine.ServerVersion },
@@ -299,10 +301,18 @@ async function run() {
       await delay(ms, undefined, { signal: controller.signal });
       return sample();
     })));
-    await eventually('every client request settled', async () => {
-      const observation = await control('client', '/status');
-      assert.equal(observation.completed, offered);
-    }, { timeout: rampMs + waitMs + 16000, interval: 300 });
+    try {
+      await eventually('every client request settled', async () => {
+        const observation = await control('client', '/status');
+        assert.equal(observation.completed, offered);
+      }, { timeout: rampMs + waitMs + 16000, interval: 300 });
+    } catch (error) {
+      const [client, upstream, samples] = await Promise.all([
+        capture(() => control('client', '/result')), capture(() => control('upstream', '/result')), during,
+      ]);
+      await record({ type: 'incomplete-batch', number, offered, before, during: samples, client, upstream });
+      throw error;
+    }
     const [clientResult, upstreamResult, samples] = await Promise.all([
       control('client', '/result'),
       eventually('local upstream drained', async () => {
