@@ -105,7 +105,8 @@ Run `ingress-placement-saturation` and `ingress-placement-all-busy` through the 
 to test deterministic readings at the isolate and CPU thresholds. These cases check that an
 ordinary request skips busy nodes and executes once on the idle candidate, that a lost peer
 open stops placement, and that explicit soft refusals can be revisited. The all-busy case
-fills the three root slots with sleeping requests to verify the hard concurrency limit.
+checks tie rotation and even placement of sleeping roots, then verifies hard refusal when
+both slots on each node are full.
 
 The default suite also runs `ingress-placement-live-saturation` with the pinned kernel to
 test the production reader without overrides. It warms an isolate on the Worker home,

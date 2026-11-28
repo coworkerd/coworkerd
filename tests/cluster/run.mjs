@@ -42,8 +42,8 @@ function defaultSuites() {
   const placementCases = {
     'ingress-placement': { test: ingressPlacementEnabled },
     'isolate-busy': { test: isolateBusy },
-    'ingress-placement-saturation': { test: ingressPlacementSaturation, isolatePermilleOnThird: 899 },
-    'ingress-placement-all-busy': { test: ingressPlacementAllBusy, isolatePermilleOnThird: 900 },
+    'ingress-placement-saturation': { test: ingressPlacementSaturation, isolatePermilleOnThird: 899, rootLimit: 1 },
+    'ingress-placement-all-busy': { test: ingressPlacementAllBusy, isolatePermilleOnThird: 900, rootLimit: 2 },
     'ingress-placement-live-saturation': { test: ingressPlacementLiveSaturation },
   };
   return [
@@ -66,13 +66,13 @@ function defaultSuites() {
         },
       };
     }),
-    ...Object.entries(placementCases).map(([name, { test, isolatePermilleOnThird }]) => ({
+    ...Object.entries(placementCases).map(([name, { test, isolatePermilleOnThird, rootLimit }]) => ({
       selected: [[name, test]],
       options: {
         configureNode: () => ({
           ingressPlacement: true,
           ...(isolatePermilleOnThird && { initialPlacementHops: 3, peerTimeoutMs: 1200 }),
-          placement: { homeProbability: 1, ...(isolatePermilleOnThird && { rootLimit: 1 }) },
+          placement: { homeProbability: 1, ...(rootLimit && { rootLimit }) },
         }),
         nodeEnvironment: isolatePermilleOnThird ? node => ({
           COWORKERD_WORKER_BUSY_PERMILLE_FOR_TEST: { 'node-1': 900, 'node-2': 899, 'node-3': isolatePermilleOnThird }[node],

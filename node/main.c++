@@ -5963,12 +5963,21 @@ public:
     std::optional<InvocationRejection> tenantRefusal;
     size_t finalRefusals = 0;
     const auto firstPassSize = std::min<size_t>(ordered.size(), hops);
-    std::vector<std::string> saturated;
+    std::vector<coworkerd::SaturatedPlacementCandidate> saturated;
     for (size_t i = 0; i < firstPassSize + saturated.size(); ++i) {
       // Revisit only explicit soft refusals from the bounded first pass.
       const bool fallback = i >= firstPassSize;
       if (!fallback) --hops;
-      const auto& id = fallback ? saturated[i - firstPassSize] : ordered[i];
+      else if (i == firstPassSize && saturated.size() > 1) {
+        const auto now = monotonicTimeMs();
+        const bool localLast = server.lastResort();
+        coworkerd::orderSaturationFallbacks(saturated, nextSaturationFallback++, [&](const auto& nodeId) {
+          if (localLast && nodeId == config.serverId) return 2;
+          auto found = avoidance.find(nodeId);
+          return found != avoidance.end() && found->second.until > now ? 1 : 0;
+        });
+      }
+      const auto& id = fallback ? saturated[i - firstPassSize].nodeId : ordered[i];
       const bool preferIdle = !fallback && allocation.ingressRoot && firstPassSize > 1;
       InvocationAttempt result;
       const auto startedAt = wallTimeMsForTest();
@@ -6023,7 +6032,7 @@ public:
       const auto& refusal = *result.failure;
       if (preferIdle && coworkerd::placementSaturationRefusal(refusal.code) && rerouteAfter(refusal)) {
         // Keep the probe in attempt diagnostics. The retry determines the candidate's final refusal.
-        saturated.push_back(id);
+        saturated.push_back({id, refusal.inFlight});
       } else {
         ++finalRefusals;
         allNotExecuted = allNotExecuted && refusal.notExecuted;
@@ -6095,6 +6104,7 @@ private:
   }
   struct Avoidance { double until = 0; uint32_t failures = 0; };
   std::map<std::string, Avoidance> avoidance;
+  uint64_t nextSaturationFallback = 0;
 
   struct PeerState: coworkerd::PeerConnectionReuse<PeerConnection> {
     kj::Maybe<kj::ForkedPromise<kj::Rc<PeerConnection>>> connecting;
