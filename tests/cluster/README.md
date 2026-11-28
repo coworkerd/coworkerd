@@ -64,18 +64,30 @@ after mailbox admission. Fetch, RPC, public SQL, and D1 `run()` and `exec()` eac
 did not start and that one retry applies it once. A Durable Object exception after writing and a SQL
 constraint failure retain their ordinary error results.
 
-### Single-node waiting-call baseline
+### Single-node waiting calls
 
-The fixture enables ingress placement and sends fixed batches of 8, 16 and 24 stateless Worker
-requests to a private HTTP upstream with a two-second delay. It verifies the actual upstream
-overlap and completed replies. The JSONL records RSS, threads and open descriptors per process
-before, during, after drain and after recovery.
+The fixture enables ingress placement and sends ordinary stateless Worker requests to a private
+HTTP upstream that waits two seconds per request. The default plan runs fixed batches of 8, 16
+and 24 and checks that all requests wait at once and return the correct reply.
 
 ```sh
-node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-capacity.jsonl
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-baseline.jsonl
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-defaults.jsonl --batches 128,512,2000
 ```
 
-Use a new output path for each run. The fixture removes its disposable cluster and upstream.
+Use a new output path for each run. Custom batches record refusals and partial overlap. Add
+`--expect-full` to require every request in each batch to overlap and succeed. For a controlled
+comparison, set `--root-limit` and `--nested-limit` on the node or `--process-limit` on its sole
+ordinary process. `--ramp-ms` spreads each batch's offers over a fixed interval while the upstream
+delay stays at two seconds. Run the fixture with the repository's verified release kernel.
+
+The JSONL includes per-call offers, replies and upstream hold intervals, sampled node occupancy and
+refusals, and per-process RSS, threads and open descriptors. The client and upstream run in separate
+containers on a private network. Cgroup samples record their resource limits and events separately
+from the node. Use the actual peak and its duration to judge overlap. Offers and sampled in-flight
+counts can differ from the exact upstream timeline. The fixture removes its disposable cluster
+and sidecars. Its node container defaults to a 16 GiB memory cap and a 40,000-task cap. Set
+`--node-memory-gib` and `--node-tasks` to repeat the readings with explicit container budgets.
 
 Run `node tests/cluster/run.mjs "$kernel" egress-limits` to check a private HTTP upstream under the
 default egress settings, a concurrency limit on its own and a request rate limit on its own.

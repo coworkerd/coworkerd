@@ -58,7 +58,7 @@ export class Cluster {
   constructor(directory, kernel, signal, {
     holdPeerAcks = false, threadedNodes = [], membership, confirmTimeoutMs, versionDrainTimeoutMs,
     controlDurableLifecycle = false, delayRecoveryPeers = false, fatalTestBinary, webSocketsPerNode, configureNode,
-    budgetLifetime, nodeEnvironment, nodeVolumes, binariesDirectory, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
+    budgetLifetime, nodeEnvironment, nodeVolumes, nodeComposeResources, binariesDirectory, singleNode = false, publishPeerPorts = false, productRoot = root, platformFixture,
     databaseFixtureNodes = [], databaseAlarmFixture = false, previousProduct, previousKernel,
   } = {}) {
     this.directory = directory;
@@ -90,6 +90,7 @@ export class Cluster {
     this.configureNode = configureNode;
     this.nodeEnvironment = nodeEnvironment;
     this.nodeVolumes = nodeVolumes;
+    this.nodeComposeResources = nodeComposeResources;
     this.binariesDirectory = binariesDirectory;
     this.productRoot = productRoot;
     this.publishPeerPorts = publishPeerPorts;
@@ -197,6 +198,7 @@ export class Cluster {
         ...this.configureNode?.(node),
       }));
       overrides[node] = {
+        ...this.nodeComposeResources,
         ...(this.publishPeerPorts && { ports: ['127.0.0.1:0:8934'] }),
         ...(this.webSocketsPerNode ? { ulimits: { nofile: { soft: 1024, hard: 524288 } } } : {}),
         // Keep a killed owner down so that only a different node can recover the object.
