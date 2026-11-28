@@ -26,6 +26,12 @@ on:
       full_cluster:
         description: 'Also run the production cluster suite on both architectures for release verification.'
         type: boolean
+      benchmark_seed:
+        description: 'Export the action cache from this cold default-source benchmark.'
+        type: boolean
+      benchmark_seed_run:
+        description: 'Read the action cache from this branch benchmark run.'
+        type: string
 
 permissions:
   contents: read
@@ -52,11 +58,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR: ${{ inputs.pull_request }}
           SOURCE_COMMIT: ${{ inputs.source_commit }}
+          BENCHMARK_SEED: ${{ inputs.benchmark_seed }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           sha=${SOURCE_COMMIT:-$GITHUB_SHA}
           if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
             echo 'Provide a full lowercase source commit SHA.' >&2
             exit 1
+          fi
+          if [[ $BENCHMARK_SEED == true ]]; then
+            if [[ $GITHUB_REF_TYPE != branch || $GITHUB_REF_NAME == "$DEFAULT_BRANCH" || -n $PR ]] ||
+                ! gh api "repos/$GITHUB_REPOSITORY/compare/$sha...$DEFAULT_BRANCH" --jq .status | grep -qxE 'ahead|identical'; then
+              echo 'A branch benchmark seed must build source already on the default branch.' >&2
+              exit 1
+            fi
           fi
           if [[ -n $PR ]]; then
             if [[ ! $PR =~ ^[1-9][0-9]*$ || -z $SOURCE_COMMIT ]]; then
@@ -137,6 +152,7 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           CACHE_PREFIX: ${{ steps.cache-key.outputs.prefix }}
           CURRENT_CACHE: ${{ steps.cache-key.outputs.name }}
+          BENCHMARK_RUN: ${{ inputs.benchmark_seed_run }}
         run: bash control/scripts/find-kernel-cache.sh
       - name: Download the Bazel action cache
         id: download
@@ -174,6 +190,7 @@ jobs:
           test "$(git rev-parse HEAD)" = "$KERNEL_COMMIT"
           bash ../control/scripts/measure-kernel-build.sh bash ../control/scripts/build-kernel.sh
       - name: Build, profile and test the kernel archive
+        id: archive-build
         if: github.event_name == 'workflow_dispatch'
         working-directory: source
         env:
@@ -183,7 +200,7 @@ jobs:
           bash ../control/scripts/measure-kernel-build.sh bash ../control/scripts/test-hosted-kernel.sh
       - name: Pack the Bazel action cache
         id: seed-pack
-        if: steps.seed-build.outcome == 'success'
+        if: steps.seed-build.outcome == 'success' || (inputs.benchmark_seed && steps.archive-build.outcome == 'success')
         run: |
           cache="$RUNNER_TEMP/kernel-action-cache"
           test -z "$(find "$cache/ac" "$cache/cas" ! -type d ! -type f -print -quit)"
