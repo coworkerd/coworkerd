@@ -83,6 +83,12 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0186 clears the window when stateless initialization completes, before the slot is published
   to request threads and the lifecycle sampler. It changes the threaded server, its test, and
   `src/workerd/threaded/isolate-busy.h`.
+  Patch 0195 collects deferred actor handles on the owning home after retirement and drains the
+  home's TCMalloc thread cache. An empty home collects at its final idle retirement. A home with
+  remaining objects groups retirements into one-second batches. The durable pool manager returns
+  free page-heap spans, including free portions of huge pages, outside the routing and isolate
+  locks. The warm copy and its live objects remain rooted. The patch changes the threaded server,
+  its test and its Bazel file.
   Patches 0130 through 0134 add fatal attribution and bounded diagnostics to the ordinary and
   quarantine threaded roles. They change only the threaded server, its tests and its Bazel file.
   Patch 0108 parks facet sockets in the same tree-wide handoff as root sockets. Its HTTP and
