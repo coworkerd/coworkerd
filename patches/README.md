@@ -138,6 +138,9 @@ Coworkerd runs upstream [workerd](https://github.com/cloudflare/workerd) with a 
   Patch 0184 adds each platform database's SQLite heap to its copy's process memory reservation
   in 1 MiB steps. The hooks use the existing allocator scope in `src/workerd/util/` and the copy
   accounting in `src/workerd/threaded/`.
+  Patch 0187 applies the same heap meter to ordinary threaded Durable Objects. A failed
+  allocation in user SQL rolls back the active storage transaction and returns a catchable
+  error. The connection continues to use the existing threaded WAL close contract.
   Keep implementation in our helpers and upstream hooks small so that following upstream stays manageable.
 - **Following upstream.** About every four weeks, and at once when V8 has a security fix: a multi-tenant platform
   runs mutually untrusting code, and lagging behind upstream is itself an exposure. V8 patches, if any are needed, go

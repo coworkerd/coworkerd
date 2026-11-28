@@ -82,7 +82,8 @@ and 24 and checks that all requests wait at once and return the correct reply.
 
 ```sh
 node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-baseline.jsonl
-node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-defaults.jsonl --batches 128,512,2000
+node tests/cluster/waiting-call-capacity.mjs "$kernel" build/waiting-call-defaults.jsonl \
+  --node-memory-gib 20 --batches 2000 --ramp-ms 300 --expect-full
 ```
 
 Use a new output path for each run. Custom batches record refusals and partial overlap. Add
@@ -214,11 +215,17 @@ counters and requires all replies to contain the row, with the original threaded
 and no admission overloads.
 
 A Linux ARM64 run with the Worker on the database owner served 121 of 128 D1 requests.
-The other seven hit the node's root admission threshold, which counts both Worker roots
-and active database calls on that node. Running the Worker on a peer gives its roots their
-own default node admission budget. [Maintainer decision](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7183434485)
+The other seven hit the historical 128-call root ceiling, which counted both Worker roots
+and active database calls on that node. Running the Worker on a peer gives its roots a
+separate node admission budget. [Maintainer decision](https://github.com/coworkerd/coworkerd/issues/91#issuecomment-7183434485)
 
 ### Threaded SQLite memory limit
+
+For an ordinary-object latency and CPU comparison, use
+`node tests/cluster/durable-object-sql-heap-measure.mjs "$baseline" "$candidate"`. The driver
+uses the same daemon build at 100 requests per second in alternating kernel order and records
+read and write latency, request counts and durable child CPU ticks. It verifies the actor
+instance and every increment acknowledged by the output gate.
 
 Run `node tests/cluster/run.mjs "$kernel" threaded-sql-memory-limit` with the matching Linux
 binaries. The threaded owner uses a 1 MiB SQLite heap budget. The case checks repeated queries
@@ -287,6 +294,55 @@ The probe sets the ingress ceiling to the requested sample size and raises the n
 to accommodate all its invocation channels. It verifies the ingress and execution relay counts. It compares
 median Linux `smaps_rollup` RSS with 32 and 3,072 idle connections to the same Worker and reports the delta per
 added connection for the daemon and ordinary workerd process on each measured node.
+
+### Threaded WebSocket message memory
+
+Run the two fixed local checks on a Linux Docker engine with cgroup v2. The first measures a
+bounded workload and the second checks the default home mailbox's current behavior.
+
+```sh
+node tests/cluster/websocket-frame-memory.mjs "$kernel"
+node tests/cluster/websocket-frame-memory.mjs "$kernel" --default-mailbox
+```
+
+The measurement opens eight hibernatable connections from one tenant on `node-1`. The fixture
+sends one 512 KiB binary message per connection, two at a time, with a 2 MiB node reservation
+limit. A pong on each of the first two connections confirms that ingress processed the first
+fragment. The reservation remains zero at that point. The existing adoption gate then holds both
+complete messages with exactly 2 MiB reserved. When the gate opens, the handler acknowledges
+the length and selected bytes of each message. Each wave returns the reservation to zero. The
+node container has two CPUs, a 512 MiB memory limit and zero swap. It runs one ordinary and one
+durable workerd child, with 32 in-flight places and no quarantine children.
+
+RSS samples come from `smaps_rollup` for the same daemon and child PIDs throughout the run. The
+sampler sleeps 5 ms between readings in the delivery check. The gated intervals use the maximum
+of five samples each. The release interval ends with the last handler acknowledgement. Short
+handoff transients may fall between samples. The container's `memory.peak` includes its processes,
+file cache and other cgroup charges. It is measured separately from process RSS, which includes
+resident shared pages. The client, control plane, storage and other containers are outside these
+readings. The reservation accounts for message bytes after the managed relay receives them.
+
+Three fresh ARM64 Docker Desktop runs on an Apple M4 used Linux 6.12.76, the release daemon from
+`4b8aa8f` and the verified `ad2ece2dcdd8` kernel series. All values are MiB.
+
+| Run | Daemon, parked baseline | Daemon, first fragments | Daemon, reservation held | Daemon, gate release to acknowledgements | Daemon, drained | Daemon, sampled peak | Container peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 29.98 | 30.49 | 31.08 | 31.54 | 30.75 | 31.76 | 51.39 |
+| 2 | 30.00 | 30.56 | 31.20 | 31.46 | 30.77 | 31.90 | 52.48 |
+| 3 | 29.97 | 30.48 | 31.11 | 31.20 | 30.71 | 32.04 | 51.00 |
+
+The ordinary child peaked at 55.55–56.73 MiB and the durable child at 54.29–54.41 MiB. All
+24 messages were acknowledged with no refusal, process change or cgroup OOM kill. The independent
+`durable-threaded-socket-frame-budget` case checks code 1013 and credit return at an eight-byte limit.
+
+With the default 128 MiB node reservation and default home mailbox, a single 3 MiB message reached
+home admission and was refused with `1013 Durable Object socket wake refused`. The durable child's
+overload counter increased by one, the node frame-budget refusal count stayed at zero, and the
+reservation returned to zero. Daemon RSS went from 29.84 to 32.42 MiB and the container peaked at
+53.13 MiB. A separate 32 MiB pilot through the Worker's forwarded upgrade hit a Cap’n Proto traversal
+limit in ordinary workerd before the managed handoff. These observations cover the fixed local
+workloads above. Maximum-size delivery with default settings remains an acceptance item for
+[#61](https://github.com/coworkerd/coworkerd/issues/61).
 
 The [database home benchmark](../../docs/database-home-benchmark.md) compares the published Object and native
 kernels through stateless Worker bindings. Its driver starts a single-node cluster for each side and records
@@ -512,6 +568,8 @@ get those files and the cluster runner's combined output in `cluster.log`.
 | `durable-platform-definition` | A separate node executable installs fixture definitions for two tenants. Ordinary bindings reach the shard owner's build across two builds. Copy tokens show warm reuse within a tenant and isolation across tenants. A platform object runs an alarm, reopens after idle release, and recovers every acknowledged SQL write after owner loss. |
 | `durable-threaded-fence` | A paused old owner has positive acknowledgements withheld until a live node acquires a higher shard epoch. Releasing the acknowledgements before the confirmation deadline must never return success to that old owner's write. The next owner still reads the earlier confirmed value. |
 | `durable-threaded-alarm-fence` | A nonretrying abort clears its schedule, and a constructor exception consumes retries with backoff. When both peers hold confirmations through shard takeover, the old owner's alarm clear cannot succeed or suppress the recovered alarm. The successor stops dispatching a previously confirmed clear, and replacing an inherited schedule prevents it from firing at the old time. |
+| `durable-threaded-object-sqlite-heap` | A 1 MiB fixture rolls back synchronous and asynchronous SQL transactions, including a caught refusal followed by a KV write. A single refused write preserves the object for a later write. A rollback of earlier writes or pending alarm changes fails the response and preserves confirmed storage. The fixture checks two idle trims on an open ordinary WebSocket, then opens objects one at a time to measure 256 simultaneously open connections. It checks idle and close credits and confirmation for an object with a retained cursor. |
+| `durable-threaded-object-sqlite-process-memory` | A live ArrayBuffer consumes shared process headroom. A larger SQL allocation rolls back with a retryable `OVERLOADED` exception and the original connection still serves a read. |
 | `durable-threaded-migration` | An open stream stays on its original version until the drain expires. A request still waiting for headers receives `DO_CODE_UPDATED` with an uncertain result and its confirmed write occurs once. The old RPC capability and WebSockets close, including a parked facet socket whose startup options are discarded across the definition change. The renamed class keeps its namespace, ID and confirmed storage and handles an alarm due during the drain. Class deletion removes the namespace from admission. |
 | `durable-threaded-hibernation` | Two root connections and a nested facet connection park together and answer ping and automatic replies with zero actor sessions. The facet parks again after a root-only residency, then receives its frames in order and reaches the original bindings. An HTTP reopen verifies constructor-visible socket state. The case also checks startup option limits, unforwarded upgrades, facet abort and deletion, and fencing after a shard takeover. |
 | `durable-threaded-socket-frame-budget` | With an eight-byte budget, a four-byte message uses all reserved bytes while its parked socket waits for adoption. A second socket receives `1013` and its object receives the close event. When adoption resumes, the first delivery returns the reservation and a subsequent binary message round-trips unchanged. |
