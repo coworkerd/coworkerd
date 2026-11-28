@@ -9,6 +9,12 @@ requests completed. The client saw zero refusals or other errors, and 121 replie
 after offers stopped. The first reading at 15.0/s also completed every request and shows
 how concentrating the queue on the home node lengthens the drain.
 
+The pilot's 11.57 and 13.53 replies/s calibration scores and the first reading's 13.47 and
+13.60 replies/s scores largely precede V8's change in tier. The 9.63/s score at 96 lanes and
+the 12.23/s score after a 90 s ramp span the change. The 150 s ramp bracket scored after the
+change on every node and measured 9.07 and 9.30 replies/s on the 8-vCPU M1 Pro VM. A separate
+ten-minute run measured [steady throughput on an M4 VM](hot-worker-sustained.md#ten-minute-product-readings).
+
 ## First reading on a 10-vCPU VM
 
 At 15.0 requests/s, all 900 requests completed. There were zero client `OVERLOADED` and
@@ -24,8 +30,8 @@ between the initial scores and the fixed-rate windows. The home served 5.00–5.
 48- and 72-lane scores. In the 72-lane drain it served 41 waiting requests at 3.50/s. The
 slowdown was already visible before the 96-lane calibration. The home continued near 3.5/s in
 the overload drains, even after the peers finished. The peers also delivered fewer replies
-per second in the later calibration and fixed-rate windows. The source of the shift is
-undetermined.
+per second in the later calibration and fixed-rate windows. The shift follows each isolate's
+invocation count, as explained in the [V8 diagnosis](hot-worker-sustained.md#why-the-rate-changes).
 
 | Closed-loop lanes | Scored completions by node (1 / 2 / 3) | Scored completions by 10 s interval | Completed/s | Valid replies including ramp and drain | p99 including ramp and drain (s) |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -139,6 +145,8 @@ fixture used the same resource limits for the entire run.
 
 ## Fixture and method
 
+The 150-second ramp reading used the following setup.
+
 - Use an Apple M1 Pro host with eight performance and two efficiency cores, a Docker Desktop
   Linux ARM64 VM (`6.10.14-linuxkit`), Docker Engine 28.5.1, and a Node.js 22.23.5 client.
   The pilot and first reading used 10 vCPUs and 7.65 GiB of VM memory. The bracketed reading
@@ -176,6 +184,9 @@ fixture used the same resource limits for the entire run.
 
 Use a quiet Docker engine with spare CPU. Build the daemons and launcher using the
 [cluster build prerequisites](../tests/cluster/README.md#requirements-and-commands) before timing the run.
+The current driver waits for at least 550 validated warm-up replies per execution node before
+calibrating. Both 30 s calibration scores follow a 10 s ramp. The fixed-rate control and overload
+windows use the same timing and drain method as the historical readings above.
 
 ```sh
 npm ci --prefix cli --registry=https://registry.npmjs.org
@@ -186,3 +197,4 @@ node tests/cluster/hot-worker-placement.mjs overload "$PWD" "$kernel" build/hot-
 Use a new output filename for each run. The JSONL records the product commit, binary and kernel hashes,
 CPU and placement readings, and every request's timing and outcome.
 The first reading used the [driver at `4efbc69`](https://github.com/coworkerd/coworkerd/tree/4efbc69e5ce72ab9d340ab204acbbe35c2b91475/tests/cluster).
+The 150 s ramp reading used the [driver at `b66d2b4`](https://github.com/coworkerd/coworkerd/tree/b66d2b4828ed1822d5299ea6cdd2bc74ec419f17/tests/cluster).
