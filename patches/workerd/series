@@ -125,3 +125,4 @@
 0191-return-wal-slots-before-admission-tree-credit.patch
 0192-bound-admission-wal-return.patch
 0193-scope-wal-admission-test-event-loops.patch
+0194-reserve-durable-homes-on-demand.patch
