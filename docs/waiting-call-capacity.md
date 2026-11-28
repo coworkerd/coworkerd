@@ -80,11 +80,13 @@ headroom for quarantine and replacement generations. [Installation guide](guide/
 
 ## Reproduction
 
-Build the daemons and launcher for the host Linux architecture and fetch the checkout's pinned
-published kernel. Run each command with a new output path. To use the original binaries, set
-`COWORKERD_CLUSTER_PRODUCT_COMMIT=e972a74` and point `COWORKERD_CLUSTER_BIN_DIR` to that build.
-The fixture records binary SHA-256 digests, the effective configuration, kernel provenance, raw
-timestamps and resource samples.
+The readings above used the fixture at `6b184e8`, which pins the same published kernel as the
+measured product `e972a74`. Build the daemons and launcher from `e972a74`, then run the commands
+below from the fixture checkout at `6b184e8`. Set `COWORKERD_CLUSTER_PRODUCT_COMMIT=e972a74` and
+point `COWORKERD_CLUSTER_BIN_DIR` to the directory containing those binaries. Use a new output
+path for each run. To measure another revision, build its matching binaries and use its pinned
+kernel. The fixture records binary SHA-256 digests, effective configuration, kernel provenance,
+raw timestamps and resource samples. [Measured product](https://github.com/coworkerd/coworkerd/tree/e972a74) · [Historical fixture and kernel pin](https://github.com/coworkerd/coworkerd/tree/6b184e810cb310e20ba71fe638ce5e5f591b356d)
 
 ```sh
 kernel=$(python3 scripts/fetch-kernel.py)
